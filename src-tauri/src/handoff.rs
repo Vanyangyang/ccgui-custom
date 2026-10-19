@@ -351,11 +351,14 @@ fn ensure_auto_build() {
         let batch_id = batch.id.clone();
         let owner = batch.owner.clone();
         if let Err(reason) = run_auto_build_batch(batch).await {
-            if let Ok(update) = store() {
-                let _ = update.coordinate_update(
+            let released = store().and_then(|update| {
+                update.coordinate_update(
                     owner,
-                    crate::live_update::channel::Request::Abort { batch_id: batch_id.clone(), reason },
-                );
+                    crate::live_update::channel::Request::abort_after_failure(batch_id.clone(), &reason),
+                ).map(|_| ())
+            });
+            if let Err(error) = released {
+                eprintln!("self-update batch {batch_id} failure could not release its channel: {error}");
             }
         }
         ACTIVE_AUTO_BUILDS

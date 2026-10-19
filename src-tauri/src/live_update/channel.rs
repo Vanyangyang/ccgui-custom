@@ -74,6 +74,22 @@ pub enum Request {
     Abort { batch_id: String, reason: String },
 }
 
+impl Request {
+    /// Native errors may be localized, multiline and include a long path. Keep
+    /// the automatic failure receipt within the same contract as MCP callers.
+    pub(crate) fn abort_after_failure(batch_id: String, error: &str) -> Self {
+        let mut reason: String = error.chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect::<String>()
+            .split_whitespace().collect::<Vec<_>>().join(" ");
+        if reason.is_empty() { reason = "self-update preparation failed".into(); }
+        let mut end = reason.len().min(512);
+        while !reason.is_char_boundary(end) { end -= 1; }
+        reason.truncate(end);
+        Self::Abort { batch_id, reason }
+    }
+}
+
 fn label(value: &str, max: usize) -> bool {
     !value.trim().is_empty() && value.len() <= max && !value.chars().any(char::is_control)
 }
@@ -881,6 +897,28 @@ mod tests {
         assert_eq!(terminal.channel.batch.unwrap().phase, Phase::Aborted);
         assert_eq!(terminal.channel.ready.len(), 1);
         assert!(f.store().request_update_from_main_window("desktop-2".into()).unwrap().start_build);
+    }
+
+    #[test]
+    fn staging_failure_with_localized_multiline_error_releases_batch() {
+        let f = Fixture::new();
+        f.ready(&owner("codex"), "firewall", "r1");
+        let batch = f.store().request_update_from_main_window("firewall-timeout".into()).unwrap().channel.batch.unwrap();
+        let package = f.package(&batch);
+        let hash = f.hash(&package);
+        f.store().bind_update_package(&batch.owner, Some(&batch.id), &hash, &package).unwrap();
+        let error = format!("防火墙安装超时。\r\n\n{}\t\0", "很长的候选路径".repeat(100));
+        // This was rejected before Abort could release Staging.
+        assert!(validate_request(&Request::Abort { batch_id: batch.id.clone(), reason: error.clone() }).is_err());
+        let request = Request::abort_after_failure(batch.id.clone(), &error);
+        validate_request(&request).unwrap();
+        let reply = f.store().coordinate_update(batch.owner, request).unwrap();
+        let ended = reply.channel.batch.unwrap();
+        assert_eq!(ended.phase, Phase::Aborted);
+        assert!(ended.error.unwrap().starts_with("防火墙安装超时。"));
+        assert_eq!(reply.channel.ready, batch.changes);
+        assert!(f.store().read_state().unwrap().transaction.is_none());
+        validate_request(&Request::abort_after_failure(batch.id, "\r\n\t\0")).unwrap();
     }
 
     #[test]
