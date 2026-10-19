@@ -91,12 +91,8 @@ This repository is a customized distribution (`custom/protected`) based on upstr
 2. **Disabled Upstream Online Auto-Updater**
    - Enabled `IS_CUSTOM_DISTRIBUTION = true` and disabled `createUpdaterArtifacts` as well as upstream GitHub Release update checks, preventing generic upstream installers from overwriting the custom build. Updates are handled exclusively via the local `runtime-updates` pipeline.
 
-3. **Retired External Spellcast Workbench & Legacy Bridge Plugin**
-   - Removed the external Spellcast workbench UI, connection toggles, and legacy IPC/Web routes; permanently disabled the legacy `spellcast-canvas-bridge` plugin in favor of CC GUI's native assistant notices and observer.
-
-4. **Removed Redundant Controls & Legacy Tool Aliases**
+3. **Removed Redundant Composer Proxy Toggle**
    - Removed the quick proxy toggle button from the chat composer footer (proxy settings are managed centrally in Settings).
-   - Removed legacy `leader_*` public MCP tool aliases in favor of the unified `task_*` toolset.
 
 ---
 
