@@ -14,7 +14,7 @@ pub(super) async fn structured(call: StructuredCall<'_>) -> Result<SideCallOutpu
 async fn structured_inner(call: StructuredCall<'_>) -> Result<SideCallOutput, SideCallError> {
     let deadline = Instant::now() + call.timeout;
     let context =
-        crate::engine::models::PiNamingContext::load().map_err(|_| SideCallError::Unavailable)?;
+        crate::engine::models::PiNamingContext::load_for(call.provider_id).map_err(|_| SideCallError::Unavailable)?;
     let cwd =
         crate::engine::models::pi_naming_directory().map_err(|_| SideCallError::Unavailable)?;
     let _cleanup = super::StagedFiles(vec![cwd.clone()]);
@@ -321,6 +321,7 @@ mod tests {
         let schema = serde_json::json!({"type":"object"});
         for effort in ["off", "minimal", "low", "medium", "high", "xhigh", "max"] {
             let call = StructuredCall {
+                provider_id: None,
                 system_prompt: "host system",
                 input: "stdin-only prompt",
                 json_schema: &schema,
@@ -370,6 +371,7 @@ mod tests {
         }
         for effort in ["ultra", "bogus", ""] {
             let call = StructuredCall {
+                provider_id: None,
                 system_prompt: "host system",
                 input: "fixture",
                 json_schema: &schema,

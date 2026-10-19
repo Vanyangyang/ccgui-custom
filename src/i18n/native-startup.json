@@ -13,7 +13,9 @@
     "gui_firewall_not_ready": "CC GUI 防火墙边界未就绪。",
     "webview_proxy_not_ready": "WebView2 代理策略未就绪。",
     "protection_timeout": "保护检查超时。",
-    "protection_check_failed": "保护检查无法完成。"
+    "protection_check_failed": "保护检查无法完成。",
+    "firewall_install_timeout": "CC GUI 防火墙安装超时，请重试更新。",
+    "firewall_install_failed": "CC GUI 防火墙安装失败或已取消，请重试更新。"
   },
   "en": {
     "singleInstanceErrorTitle": "CC GUI could not start",
@@ -29,6 +31,8 @@
     "gui_firewall_not_ready": "The CC GUI firewall boundary is not ready.",
     "webview_proxy_not_ready": "The WebView2 proxy policy is not ready.",
     "protection_timeout": "A protection check timed out.",
-    "protection_check_failed": "A protection check could not finish."
+    "protection_check_failed": "A protection check could not finish.",
+    "firewall_install_timeout": "The CC GUI firewall installation timed out. Retry the update.",
+    "firewall_install_failed": "The CC GUI firewall installation failed or was canceled. Retry the update."
   }
 }

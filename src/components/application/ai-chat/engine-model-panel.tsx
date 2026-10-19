@@ -318,7 +318,8 @@ function RefreshButton({ onRefresh }: { onRefresh: () => void | Promise<void> })
       disabled={refreshing}
       onClick={() => {
         if (refreshing) return;
-        void refreshAction.start(() => Promise.resolve(onRefresh()));
+        // The callback owns its error state; feedback already settles as failed.
+        void refreshAction.start(() => Promise.resolve(onRefresh())).catch(() => {});
       }}
       className="flex size-7 items-center justify-center rounded-lg text-foreground-icon-secondary hover:bg-background-secondary-hover hover:text-foreground-icon-primary disabled:cursor-default"
     >
@@ -497,6 +498,7 @@ function EffortFooter({
   onOmpServiceTierChange,
   codexServiceTier,
   onCodexServiceTierChange,
+  selectionScope,
 }: {
   engineId: string;
   selectedModelId: string;
@@ -504,24 +506,25 @@ function EffortFooter({
   onEffortChange: (engine: string, level: EffortLevel) => void;
   claudeUltracode?: boolean;
   onClaudeUltracodeChange?: (enabled: boolean) => void;
-  ompServiceTier: OmpServiceTier;
-  onOmpServiceTierChange: (tier: OmpServiceTier) => Promise<void>;
-  codexServiceTier: OmpServiceTier;
-  onCodexServiceTierChange: (tier: OmpServiceTier) => Promise<void>;
+  ompServiceTier?: OmpServiceTier;
+  onOmpServiceTierChange?: (tier: OmpServiceTier) => Promise<void>;
+  codexServiceTier?: OmpServiceTier;
+  onCodexServiceTierChange?: (tier: OmpServiceTier) => Promise<void>;
+  selectionScope?: "chat" | "task";
 }) {
   const { t } = useTranslation();
   const ultracodeDescriptionId = useId();
   const displayEffort = normalizeEffortLevel(engineId, effort);
   const ompFast = engineId === "omp" && supportsOmpFastMode(selectedModelId);
   const codexFast = engineId === "codex";
-  const showFast = ompFast || codexFast;
+  const showFast = selectionScope !== "task" && (ompFast || codexFast);
   const fastTier = codexFast ? codexServiceTier : ompServiceTier;
   const onFastChange = codexFast ? onCodexServiceTierChange : onOmpServiceTierChange;
-  const header = showFast ? (
+  const header = showFast && onFastChange ? (
     <OmpSpeedSection
       model={selectedModelId}
       supported={codexFast || undefined}
-      value={fastTier}
+      value={fastTier ?? null}
       onChange={onFastChange}
     >
       <span className="text-body-medium text-text-secondary">{t("chat.effort")}</span>
@@ -531,12 +534,12 @@ function EffortFooter({
     <>
       <div aria-hidden className={cx("-mx-1 mt-[7px] h-px bg-border-button-default", showFast ? "mb-1" : "mb-3")} />
       <FlyoutEffortSection
-        levels={getEffortLevels(engineId)}
+        levels={getEffortLevels(engineId).filter((level) => selectionScope !== "task" || engineId !== "pi" || level !== "ultra")}
         header={header}
         effort={displayEffort}
         onChange={(level) => onEffortChange(engineId, level)}
       />
-      {engineId === "claude" && (
+      {selectionScope !== "task" && engineId === "claude" && (
         <div className="flex items-start justify-between gap-3 px-2 pb-2">
           <div className="min-w-0 flex-1">
             <span className="text-body-medium text-text-primary">{t("chat.ultracode")}</span>
@@ -588,6 +591,7 @@ export function EngineModelPanel({
   onClose,
   loading,
   cursorModels,
+  selectionScope = "chat",
 }: {
   option: MenuOption;
   models: ModelOption[];
@@ -602,10 +606,11 @@ export function EngineModelPanel({
   channels?: ChannelOption[];
   selectedChannelId?: string;
   onPickChannel?: (engine: string, id: string) => void;
-  ompServiceTier: OmpServiceTier;
-  onOmpServiceTierChange: (tier: OmpServiceTier) => Promise<void>;
-  codexServiceTier: OmpServiceTier;
-  onCodexServiceTierChange: (tier: OmpServiceTier) => Promise<void>;
+  ompServiceTier?: OmpServiceTier;
+  onOmpServiceTierChange?: (tier: OmpServiceTier) => Promise<void>;
+  codexServiceTier?: OmpServiceTier;
+  onCodexServiceTierChange?: (tier: OmpServiceTier) => Promise<void>;
+  selectionScope?: "chat" | "task";
   /** Re-probe provider configs and model catalogs without an app restart. */
   onRefresh?: () => void | Promise<void>;
   onClose?: () => void;
@@ -623,6 +628,7 @@ export function EngineModelPanel({
   const [channelQuery, setChannelQuery] = useState("");
   const engineChannels = channels ?? [];
   const hasChannels = engineChannels.length > 0;
+  if (option.disabled) return null;
 
   return (
     <div className="flex w-full flex-col gap-1.5">
@@ -667,6 +673,7 @@ export function EngineModelPanel({
       )}
       {option.id !== "cursor" && supportsEffort(option.id) && !encodedModelEffort(option.id, selectedModelId) && (
         <EffortFooter
+          selectionScope={selectionScope}
           engineId={option.id}
           selectedModelId={selectedModelId}
           effort={effort}

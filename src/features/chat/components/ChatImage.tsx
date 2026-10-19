@@ -36,7 +36,7 @@ export function ChatImage({ src, alt, workspacePath = "" }: { src: string; alt?:
   );
   if (!url) return <span className="inline-block h-24 w-32 max-w-full animate-pulse rounded-lg bg-background-tertiary-default" aria-hidden />;
   return <>
-    <button type="button" onClick={event => { event.preventDefault(); event.stopPropagation(); setZoom(true); }}
+    <button type="button" data-onboarding-target={target ? "image-preview" : undefined} onClick={event => { event.preventDefault(); event.stopPropagation(); setZoom(true); }}
       className="inline-block max-w-full cursor-zoom-in overflow-hidden rounded-lg align-middle" aria-label={t("chat.previewImage", { name })}>
       <img src={url} alt={name} onError={() => setFailed(url)} className="max-h-48 max-w-full rounded-lg object-contain" style={{ width: "auto", height: "auto", maxWidth: "min(16rem, 100%)" }} loading="lazy" />
     </button>

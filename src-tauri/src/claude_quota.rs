@@ -68,7 +68,7 @@ pub struct QuotaAccount {
 }
 // A separate disk schema deliberately excludes status/errors, auth metadata,
 // credential contents and raw protocol output. Unknown fields fail closed.
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PersistedQuota {
     version: u32,
@@ -78,25 +78,25 @@ struct PersistedQuota {
     collected_at: Option<u64>,
     source: Option<PersistedSource>,
 }
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PersistedAccount {
     email: Option<String>,
     plan: String,
 }
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PersistedWindows {
     five_hour: Option<PersistedWindow>,
     seven_day: Option<PersistedWindow>,
 }
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PersistedWindow {
     used_percentage: f64,
     resets_at: Option<u64>,
 }
-#[derive(Clone, Copy, Deserialize, Serialize)]
+#[derive(Clone, Copy, Deserialize, Serialize, PartialEq)]
 enum PersistedSource {
     #[serde(rename = "native_control")]
     Control,
@@ -268,6 +268,10 @@ struct Cache {
     last_attempt: Option<Instant>,
     revision: u64,
     persistence_loaded: bool,
+    // Remember content, not just second-resolution collected_at: another worker
+    // can publish a different observation in the same second. An unchanged disk
+    // record must never undo a newer in-memory observation after a write failure.
+    last_persisted: Option<PersistedQuota>,
 }
 impl Cache {
     fn bind(&mut self, stamp: &str) {
@@ -321,13 +325,8 @@ pub static STATE: LazyLock<Arc<ClaudeQuotaState>> =
 
 /// Never emit quota values or account metadata on the global event channel.
 /// Every consumer re-reads through the account/project-validated cache command.
-pub(crate) fn install_events(app: &tauri::AppHandle) {
-    use crate::event_sink::Emit;
-    use tauri::Manager;
-    let emitters = Arc::clone(&app.state::<crate::AppState>().emitters);
-    STATE.set_notifier(move || {
-        emitters.emit_json("claude-quota://changed", "null");
-    });
+pub(crate) fn install_events(emitters: Arc<crate::event_sink::BroadcastEmit>) {
+    STATE.install_events(emitters);
 }
 fn now_seconds() -> u64 {
     SystemTime::now()
@@ -827,14 +826,24 @@ impl ClaudeQuotaState {
         cache.bind(stamp);
         if !cache.persistence_loaded {
             cache.persistence_loaded = true;
-            if cache.snapshot.is_none() {
-                cache.snapshot = self.persistence_path.as_deref()
-                    .and_then(read_persisted)
-                    .and_then(|record| record.snapshot(stamp, now_seconds()));
-            }
+            self.refresh_persisted(cache, stamp);
         }
     }
-    fn persist_cache(&self, cache: &Cache, identity_validated: bool) -> Result<(), ()> {
+    fn refresh_persisted(&self, cache: &mut Cache, stamp: &str) {
+        let Some(record) = self.persistence_path.as_deref().and_then(read_persisted) else {
+            return;
+        };
+        let Some(snapshot) = record.snapshot(stamp, now_seconds()) else { return; };
+        if cache.last_persisted.as_ref() == Some(&record) { return; }
+        // Account-validated new disk content is authoritative for equal-second
+        // observations, but a late writer must not move collection time backwards.
+        if cache.snapshot.as_ref().is_none_or(|current| snapshot.collected_at >= current.collected_at) {
+            cache.snapshot = Some(snapshot);
+            cache.revision = cache.revision.wrapping_add(1);
+        }
+        cache.last_persisted = Some(record);
+    }
+    fn persist_cache(&self, cache: &mut Cache, identity_validated: bool) -> Result<(), ()> {
         let Some(path) = self.persistence_path.as_deref() else { return Ok(()); };
         let (Some(stamp), Some(snapshot)) = (cache.stamp.as_deref(), cache.snapshot.as_ref()) else {
             return Ok(());
@@ -857,9 +866,16 @@ impl ClaudeQuotaState {
         }
         let content = serde_json::to_string(&record).map_err(|_| ())?;
         if content.len() > MAX_PERSISTED_BYTES { return Err(()); }
-        write_persisted(path, &content)
+        write_persisted(path, &content)?;
+        // A validated identity write may preserve another process's newer
+        // usage. It has not reached our memory yet; leave it unseen so the
+        // next cache read imports it rather than suppressing that update.
+        if record.collected_at == snapshot.collected_at {
+            cache.last_persisted = Some(record);
+        }
+        Ok(())
     }
-    fn persist_or_warn(&self, cache: &Cache, identity_validated: bool) {
+    fn persist_or_warn(&self, cache: &mut Cache, identity_validated: bool) {
         if self.persist_cache(cache, identity_validated).is_err()
             && !self.persistence_warned.swap(true, std::sync::atomic::Ordering::Relaxed)
         {
@@ -868,6 +884,15 @@ impl ClaudeQuotaState {
     }
     fn set_notifier(&self, notifier: impl Fn() + Send + Sync + 'static) {
         *self.changed.lock().unwrap_or_else(|p| p.into_inner()) = Some(Box::new(notifier));
+    }
+    pub(crate) fn install_events(&self, emitters: Arc<crate::event_sink::BroadcastEmit>) {
+        use crate::event_sink::Emit;
+        let emitters = Arc::downgrade(&emitters);
+        self.set_notifier(move || {
+            if let Some(emitters) = emitters.upgrade() {
+                emitters.emit_json("claude-quota://changed", "null");
+            }
+        });
     }
     fn notify_changed(&self) {
         if let Some(notify) = self
@@ -880,7 +905,7 @@ impl ClaudeQuotaState {
         }
     }
     #[cfg(test)]
-    fn ingest_bound(&self, stamp: &str, windows: QuotaWindows) {
+    pub(crate) fn ingest_bound(&self, stamp: &str, windows: QuotaWindows) {
         self.ingest_bound_checked(stamp, windows, || true);
     }
     fn ingest_bound_checked(&self, stamp: &str, windows: QuotaWindows, channel_unchanged: impl Fn() -> bool) {
@@ -915,7 +940,7 @@ impl ClaudeQuotaState {
             cache.revision = cache.revision.wrapping_add(1);
             // A disk failure must not discard a valid live observation. The
             // IPC result makes no durability claim; never log account data.
-            self.persist_or_warn(&cache, false);
+            self.persist_or_warn(&mut cache, false);
         }
         self.notify_changed();
     }
@@ -929,6 +954,10 @@ impl ClaudeQuotaState {
         }
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         self.bind_cache(&mut cache, stamp);
+        // Normal conversations run in independent workers. Their invalidation
+        // event (or the periodic/focus fallback) must read their latest disk
+        // observation rather than this host's first-loaded memory snapshot.
+        self.refresh_persisted(&mut cache, stamp);
         let mut result = cache
             .snapshot
             .clone()
@@ -1014,7 +1043,7 @@ impl ClaudeQuotaState {
                     cache.revision = cache.revision.wrapping_add(1);
                     identity_changed = true;
                 }
-                self.persist_or_warn(&cache, true);
+                self.persist_or_warn(&mut cache, true);
             }
             drop(cache);
             if identity_changed { self.notify_changed(); }
@@ -1051,7 +1080,7 @@ impl ClaudeQuotaState {
         snapshot.account = account;
         cache.snapshot = Some(snapshot.clone());
         cache.revision = cache.revision.wrapping_add(1);
-        self.persist_or_warn(&cache, identity_validated);
+        self.persist_or_warn(&mut cache, identity_validated);
         drop(cache);
         self.notify_changed();
         if !channel_unchanged() { return ClaudeQuotaSnapshot::unavailable("auth_changed"); }
@@ -1183,13 +1212,36 @@ mod tests {
         assert_eq!(reset.account, Some(known_account()));
     }
     #[test]
-    fn persistence_restore_rechecks_auth_and_loads_only_once_per_binding() {
+    fn running_host_observes_worker_quota_without_restart() {
+        let scratch = QuotaScratch::new();
+        let host = scratch.state();
+        let worker = scratch.state();
+        assert_eq!(host.cached_bound("account-a", || true).error_code, Some("not_loaded"));
+        let windows = known_window();
+        worker.ingest_bound("account-a", windows.clone());
+        assert_eq!(host.cached_bound("account-a", || true).windows, windows);
+    }
+    #[test]
+    fn running_host_observes_changed_disk_quota_even_in_same_second() {
+        let scratch = QuotaScratch::new();
+        let mut record = persisted_fixture();
+        scratch.write(&record);
+        let host = scratch.state();
+        let original = host.cached_bound("account-a", || true);
+        record["windows"]["fiveHour"]["usedPercentage"] = json!(42.0);
+        scratch.write(&record);
+        let updated = host.cached_bound("account-a", || true);
+        assert_eq!(updated.windows.five_hour.unwrap().used_percentage, 42.0);
+        assert_eq!(updated.collected_at, original.collected_at);
+    }
+    #[test]
+    fn persistence_refresh_rechecks_auth_and_resets_observation_on_binding_change() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let scratch = QuotaScratch::new();
         let state = scratch.state();
         assert_eq!(state.cached_bound("account-a", || true).error_code, Some("not_loaded"));
         scratch.write(&persisted_fixture());
-        assert_eq!(state.cached_bound("account-a", || true).account, None);
+        assert_eq!(state.cached_bound("account-a", || true).account, Some(known_account()));
         assert_eq!(state.cached_bound("account-b", || true).account, None);
         assert_eq!(state.cached_bound("account-a", || true).account, Some(known_account()));
         let checks = AtomicUsize::new(0);
@@ -1200,6 +1252,55 @@ mod tests {
         let rejected = scratch.state();
         assert_eq!(rejected.cached_bound("account-a", || false).account, None);
         assert!(!rejected.cache.lock().unwrap().persistence_loaded);
+    }
+    #[test]
+    fn persistence_refresh_rejects_older_invalid_and_other_account_records() {
+        let scratch = QuotaScratch::new();
+        let original = persisted_fixture();
+        scratch.write(&original);
+        let host = scratch.state();
+        let expected = host.cached_bound("account-a", || true);
+        for (key, value) in [
+            ("collectedAt", json!(original["collectedAt"].as_u64().unwrap() - 1)),
+            ("collectedAt", json!(now_seconds() + 3600)),
+            ("accountFingerprint", json!(account_fingerprint("account-b"))),
+        ] {
+            let mut record = original.clone();
+            record[key] = value;
+            record["windows"]["fiveHour"]["usedPercentage"] = json!(1.0);
+            scratch.write(&record);
+            assert_eq!(host.cached_bound("account-a", || true), expected);
+        }
+        for bytes in [b"{malformed".to_vec(), vec![b' '; MAX_PERSISTED_BYTES + 1]] {
+            std::fs::write(scratch.path(), bytes).unwrap();
+            assert_eq!(host.cached_bound("account-a", || true), expected);
+        }
+        std::fs::remove_file(scratch.path()).unwrap();
+        assert_eq!(host.cached_bound("account-a", || true), expected);
+    }
+    #[test]
+    fn unchanged_disk_cannot_undo_live_usage_after_failed_persistence() {
+        let scratch = QuotaScratch::new();
+        let original = persisted_fixture();
+        scratch.write(&original);
+        let state = scratch.state();
+        state.cached_bound("account-a", || true);
+        let mut intermediate = known_window();
+        intermediate.five_hour.as_mut().unwrap().used_percentage = 30.0;
+        state.ingest_bound("account-a", intermediate);
+        let original: Value = serde_json::from_slice(&std::fs::read(scratch.path()).unwrap()).unwrap();
+        std::fs::remove_file(scratch.path()).unwrap();
+        std::fs::create_dir(scratch.path()).unwrap(); // Force the atomic publish to fail.
+        let mut fresh = known_window();
+        fresh.five_hour.as_mut().unwrap().used_percentage = 42.0;
+        state.ingest_bound("account-a", fresh.clone());
+        // Force the equal-second case even if this test crosses a clock tick.
+        state.cache.lock().unwrap().snapshot.as_mut().unwrap().collected_at = original["collectedAt"].as_u64();
+        std::fs::remove_dir(scratch.path()).unwrap();
+        scratch.write(&original);
+        for _ in 0..2 {
+            assert_eq!(state.cached_bound("account-a", || true).windows, fresh);
+        }
     }
     #[test]
     fn persisted_schema_rejects_invalid_future_and_oversized_records() {
@@ -1323,6 +1424,9 @@ mod tests {
             identity_process.read_bound("account-a", async {
                 Ok(QuotaQueryResult { account: account.clone(), windows: Err("quota_not_available") })
             }, || true).await;
+            let live = identity_process.cached_bound("account-a", || true);
+            assert_eq!(live.windows, fresh);
+            assert_eq!(live.account, account);
             let restored = scratch.state().cached_bound("account-a", || true);
             assert_eq!(restored.account, account);
             assert_eq!(restored.windows, fresh);
@@ -1400,7 +1504,7 @@ mod tests {
         assert_eq!(loaded.account, Some(known_account()));
         assert_eq!(loaded.status, "ready");
         assert_eq!(state.cached_bound("account-a", || true), loaded);
-        assert!(state.persist_cache(&state.cache.lock().unwrap(), false).is_err());
+        assert!(state.persist_cache(&mut state.cache.lock().unwrap(), false).is_err());
         assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 1);
         state.ingest_bound("account-a", known_window());
         assert_eq!(state.cached_bound("account-a", || true).account, loaded.account);
@@ -1417,7 +1521,7 @@ mod tests {
         let snapshot = cache.snapshot.as_mut().unwrap();
         snapshot.collected_at = Some(now_seconds() - 1);
         snapshot.windows.five_hour.as_mut().unwrap().used_percentage = 10.0;
-        assert!(state.persist_cache(&cache, false).is_ok());
+        assert!(state.persist_cache(&mut cache, false).is_ok());
         let unchanged: Value = serde_json::from_slice(&std::fs::read(scratch.path()).unwrap()).unwrap();
         assert_eq!(unchanged, latest);
     }

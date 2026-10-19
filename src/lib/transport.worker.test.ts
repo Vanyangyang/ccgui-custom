@@ -136,6 +136,28 @@ describe("worker transport integration", () => {
     expect(callbacks.has("engine://event")).toBe(false);
   });
 
+  it("delivers value-free Claude quota invalidations from the worker journal, including replay", async () => {
+    const callbacks = new Map<string, (event: { payload: unknown }) => void>();
+    native.listen.mockImplementation(async (name: string, cb: (event: { payload: unknown }) => void) => { callbacks.set(name, cb); return () => callbacks.delete(name); });
+    const envelope = { stream_id: "worker-a", seq: 1, name: "claude-quota://changed", payload: null };
+    native.invoke.mockImplementation(async (cmd: string) => cmd === "runtime_worker_sources"
+      ? [{ streamId: "worker-a", runId: "run-a", head: 1 }]
+      : { stream_id: "worker-a", through: 1, events: [envelope] });
+    const transport = await import("./transport");
+    await transport.initializeWorkerEvents({ "worker-a": 0 });
+    const changed = vi.fn();
+    const stopQuota = await transport.listen("claude-quota://changed", changed);
+    const stopEngine = await transport.listen("engine://event", vi.fn());
+    await transport.resumeWorkerEvents();
+    callbacks.get("runtime://worker-event")!({ payload: envelope });
+    callbacks.get("runtime://worker-event")!({ payload: { ...envelope, seq: 2 } });
+    await transport.pauseWorkerEvents();
+    expect(changed.mock.calls).toEqual([[{ payload: null }], [{ payload: null }]]);
+    expect(transport.getWorkerEventCursors()).toEqual({ "worker-a": 2 });
+    stopQuota();
+    stopEngine();
+  });
+
   it.each([
     ["interrupt_session", { sessionId: "s" }, { op: "interrupt" }],
     ["interrupt_turn", { sessionId: "s" }, { op: "interrupt_turn" }],

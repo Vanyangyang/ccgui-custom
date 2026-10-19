@@ -389,6 +389,7 @@ export function SelfUpdateStatusChip() {
           <button
             type="button"
             data-testid="statusbar-self-update-chip"
+            data-onboarding-target="self-update-status"
             data-self-update-kind={requesting ? "requesting" : visibleRequestError ? "request-error" : summary?.kind ?? "idle"}
             aria-label={label}
             aria-busy={requesting || summary?.activeTask || undefined}
@@ -445,6 +446,7 @@ export function SelfUpdateStatusChip() {
           {canRequest && <button
             type="button"
             data-testid="statusbar-self-update-details"
+            data-onboarding-target="self-update-details"
             aria-label={t("statusbar.selfUpdateDetails")}
             title={t("statusbar.selfUpdateDetails")}
             onClick={() => { window.location.hash = "#/settings?page=update"; }}

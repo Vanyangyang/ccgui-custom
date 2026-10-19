@@ -40,6 +40,10 @@ export interface EngineModelsState {
   cursorPickerModels: CursorModel[];
   refresh: () => Promise<void>;
   pendingEngines: Record<string, true>;
+  currentChannels: Record<string, string>;
+  channelModelsByEngine: Record<string, Record<string, string>>;
+  failedEngines: Record<string, true>;
+  configStatus: "loading" | "loaded" | "error";
 }
 
 function adoptCursorCatalog(models: CursorCatalogModel[]): CursorModel[] {
@@ -87,9 +91,11 @@ export function useEngineModels(
   /** Session-resolved channel per engine; falls back to `section.current`. */
   providers: Record<string, string> = {},
   workspacePath?: string,
+  selectionScope: "chat" | "task" = "chat",
 ): EngineModelsState {
   const { t } = useTranslation();
   const [cliConfig, setCliConfig] = useState<CliConfig | null>(null);
+  const [configStatus, setConfigStatus] = useState<"loading" | "loaded" | "error">("loading");
   // A catalog is a property of the *context*, not of every workspace: the
   // backend answers from the local CLIs unless the workspace is a remote one
   // (a WSL distro's CLIs answer differently), so all local workspaces share
@@ -122,6 +128,7 @@ export function useEngineModels(
   // it already knows (usually just the configured model) until it lands, so
   // the panel needs to say "still loading" instead of looking truncated.
   const [pendingByWs, setPendingByWs] = useState<Record<string, Record<string, true>>>({});
+  const [failedByWs, setFailedByWs] = useState<Record<string, Record<string, true>>>({});
   // Probes already dispatched, keyed by workspace — see the probe effect.
   const probedByWs = useRef<Record<string, Set<string>>>({});
   const catalogRequests = useRef(new Map<string, { token: object; promise: Promise<void> }>());
@@ -136,15 +143,20 @@ export function useEngineModels(
     lastAgyProbeAt.current = 0;
   }, []);
 
-  // Provider configs feed the model picker's per-engine model lists.
-  useEffect(() => {
-    ipc.getCliConfig().then(setCliConfig).catch(() => {});
+  const loadConfig = useCallback(async () => {
+    try {
+      setCliConfig(await ipc.getCliConfig());
+      setConfigStatus("loaded");
+    } catch (error) {
+      setConfigStatus("error");
+      throw error;
+    }
   }, []);
   // The settings CLI page mutates provider config and custom models outside
   // this tree; refetch so the picker tracks both immediately.
   useEffect(() => {
     const reload = () => {
-      ipc.getCliConfig().then(setCliConfig).catch(() => {});
+      void loadConfig().catch(() => {});
       ipc
         .getAppSettings()
         .then((s) => {
@@ -156,7 +168,7 @@ export function useEngineModels(
     reload();
     window.addEventListener(CLI_CONFIG_CHANGED_EVENT, reload);
     return () => window.removeEventListener(CLI_CONFIG_CHANGED_EVENT, reload);
-  }, []);
+  }, [loadConfig]);
   // Catalog for the active workspace. Until the workspace's context is known
   // the shared local catalog proves nothing about it (it may be a remote one),
   // so the picker starts empty there and fills as the workspace's probes land.
@@ -168,8 +180,10 @@ export function useEngineModels(
         ? localCatalogs
         : EMPTY_CATALOGS;
   const pending = pendingByWs[wsKey] ?? EMPTY_PENDING;
+  const failedEngines = failedByWs[wsKey] ?? EMPTY_PENDING;
   const cursorRemote = catalogs.cursor?.remote === true;
   const cursorPickerModels = useMemo(() => {
+    if (selectionScope === "task") return [];
     if (cursorRemote) return [];
     const base = cursorCatalog && cursorCatalog.length > 0
       ? cursorCatalog
@@ -181,19 +195,20 @@ export function useEngineModels(
       .filter((id) => !matchCursorBase(id, base))
       .map((id) => ({ id, name: customModelLabels.cursor?.[id]?.trim() || id, parameters: [] }));
     return extras.length > 0 ? [...base, ...extras] : base;
-  }, [cursorRemote, cursorCatalog, catalogs.cursor, customModels.cursor, customModelLabels.cursor]);
+  }, [selectionScope, cursorRemote, cursorCatalog, catalogs.cursor, customModels.cursor, customModelLabels.cursor]);
   useEffect(() => {
-    if (cursorRemote) return;
+    if (cursorRemote || selectionScope === "task") return;
     publishCursorCatalog(cursorPickerModels);
-  }, [cursorRemote, cursorPickerModels]);
+  }, [selectionScope, cursorRemote, cursorPickerModels]);
   const loadCursorCatalog = useCallback(async () => {
+    if (selectionScope === "task") return;
     if (!engines.some((engine) => engine.id === "cursor" && engine.available)) return;
     try {
       setCursorCatalog(adoptCursorCatalog(await ipc.cursorModelCatalog()));
     } catch {
       setCursorCatalog([]);
     }
-  }, [engines]);
+  }, [engines, selectionScope]);
   useEffect(() => {
     // 【cursor模型】只读本机 CLI。工作区还没确认、或已确认是远程时不套用这份目录。
     if (context !== "local") return;
@@ -264,9 +279,21 @@ export function useEngineModels(
         .then((list) => {
           // A settings/manual refresh can overtake an older probe. Only the
           // latest request may replace its catalog or clear its spinner.
-          if (catalogRequests.current.get(key)?.token === token) applyCatalog(engineId, ws, list, revision);
+          if (catalogRequests.current.get(key)?.token === token) {
+            applyCatalog(engineId, ws, list, revision);
+            setFailedByWs(prev => {
+              const next = { ...(prev[ws] ?? {}) };
+              delete next[engineId];
+              return { ...prev, [ws]: next };
+            });
+          }
         })
-        .catch(() => {})
+        .catch(error => {
+          if (catalogRequests.current.get(key)?.token === token) {
+            setFailedByWs(prev => ({ ...prev, [ws]: { ...(prev[ws] ?? {}), [engineId]: true } }));
+          }
+          if (force && selectionScope === "task") throw error;
+        })
         .finally(() => {
           if (catalogRequests.current.get(key)?.token === token) {
             catalogRequests.current.delete(key);
@@ -276,7 +303,7 @@ export function useEngineModels(
       catalogRequests.current.set(key, { token, promise });
       return promise;
     },
-    [applyCatalog, markPending],
+    [applyCatalog, markPending, selectionScope],
   );
   const probeCatalog = useCallback(
     (engineId: string) => requestCatalog(engineId, wsKey),
@@ -319,7 +346,7 @@ export function useEngineModels(
         channelRaw(engine.id, cliConfig, providers[engine.id]),
       );
       const providerModels = configured ? [configured] : [];
-      const current = models[engine.id]?.trim();
+      const current = selectionScope === "task" ? undefined : models[engine.id]?.trim();
       const catalog = catalogs[engine.id]?.models ?? [];
       // Remote workspace (WSL distro): local channel/custom models cannot
       // run there — the distro CLI's own list is the entire menu.
@@ -374,7 +401,7 @@ export function useEngineModels(
       });
     }
     return result;
-  }, [engines, cliConfig, catalogs, wsKey, models, customModels, customModelLabels, providers, t, cursorPickerModels]);
+  }, [selectionScope, engines, cliConfig, catalogs, wsKey, models, customModels, customModelLabels, providers, t, cursorPickerModels]);
   // Selectable ids WITHOUT the current-override append: what the channel,
   // the backend catalog, and the custom model list can actually serve.
   const knownIdsByEngine = useMemo(() => {
@@ -412,12 +439,23 @@ export function useEngineModels(
     }
     return result;
   }, [engines, cliConfig, t]);
+  const currentChannels = useMemo(() => Object.fromEntries(engines.map(engine => [
+    engine.id, cliConfig?.[engine.id as EngineId]?.current || PSEUDO_LOCAL,
+  ])), [engines, cliConfig]);
+  const channelModelsByEngine = useMemo(() => Object.fromEntries(engines.map(engine => [
+    engine.id, Object.fromEntries((channelsByEngine[engine.id] ?? []).map(channel => [
+      channel.id, configuredModel(engine.id, cliConfig, channel.id),
+    ])),
+  ])), [engines, cliConfig, channelsByEngine]);
   // No "default" pseudo entry: an unset selection would hide which model
   // actually runs. Pin it to the first entry — the CLI's effective default.
   // An authoritative catalog also invalidates stale stored picks (leftovers
   // from older, broader catalogs) that the CLI's model flag cannot resolve.
   // All engines' pins are computed first and written in ONE store action:
   useEffect(() => {
+    // A task's explicit selection must never repair chat defaults or seed the
+    // shared Cursor parameter store. Missing selections stay visible for repair.
+    if (selectionScope === "task") return;
     const updates: Record<string, string> = {};
     for (const engine of engines) {
       // Remote catalogs (WSL 发行版) are display-only: `models` is a single
@@ -457,7 +495,7 @@ export function useEngineModels(
       }
     }
     if (Object.keys(updates).length > 0) void pinModels(updates);
-  }, [engines, models, cliConfig, catalogs, wsKey, customModels, knownIdsByEngine, pinModels, cursorPickerModels]);
+  }, [selectionScope, engines, models, cliConfig, catalogs, wsKey, customModels, knownIdsByEngine, pinModels, cursorPickerModels]);
 
   // Manual refresh from the flyout: re-read provider configs and re-probe the
   // catalogs. The probe effect skips engines already probed, so settings edits
@@ -466,7 +504,7 @@ export function useEngineModels(
   // share one catalog, so refreshing any of them covers the rest, while each
   // remote (distro) workspace keeps its own and would otherwise stay stale.
   const refresh = useCallback(async () => {
-    await ipc.getCliConfig().then(setCliConfig).catch(() => {});
+    await loadConfig().catch(error => { if (selectionScope === "task") throw error; });
     // Local context first — probed with the active workspace when that one is
     // local, so the spinner lands in the bucket the picker reads — then every
     // cached remote context, each of which owns its own catalog.
@@ -482,9 +520,11 @@ export function useEngineModels(
         probes.push(requestCatalog(engine.id, ws, true));
       }
     }
-    await Promise.all(probes);
+    const results = await Promise.allSettled(probes);
+    const failed = results.find(result => result.status === "rejected");
+    if (failed?.status === "rejected") throw failed.reason;
     if (context === "local") await loadCursorCatalog();
-  }, [engines, wsKey, context, requestCatalog, contextByWs, loadCursorCatalog]);
+  }, [engines, wsKey, context, requestCatalog, contextByWs, loadCursorCatalog, loadConfig, selectionScope]);
 
   // AGY's account catalog changes independently of the application. Keep the
   // local picker current without polling hidden windows or restarting the app.
@@ -517,5 +557,9 @@ export function useEngineModels(
     cursorPickerModels,
     refresh,
     pendingEngines: pending,
+    currentChannels,
+    channelModelsByEngine,
+    failedEngines,
+    configStatus,
   };
 }

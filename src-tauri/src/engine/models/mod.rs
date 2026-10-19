@@ -224,9 +224,13 @@ pub(crate) struct PiNamingContext {
 
 impl PiNamingContext {
     pub(crate) fn load() -> Result<Self, String> {
+        Self::load_for(None)
+    }
+
+    pub(crate) fn load_for(provider_id: Option<&str>) -> Result<Self, String> {
         crate::config::ensure_engine_enabled("pi")?;
         let settings = crate::settings::read_settings()?;
-        let provider = crate::config::resolve_provider("pi", None)?;
+        let provider = crate::config::resolve_provider("pi", provider_id)?;
         Ok(Self {
             bin: super::engine_bin(&settings, "pi"),
             env: match provider.as_ref() {

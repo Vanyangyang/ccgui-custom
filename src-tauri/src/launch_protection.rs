@@ -13,10 +13,13 @@ use std::time::Duration;
 
 use crate::startup::Mode;
 
+#[cfg(windows)]
+mod firewall_install;
+
 const APPROVED_PROXY: &str = crate::proxy::APPROVED_LAUNCH_PROXY;
 const OUTPUT_LIMIT: usize = 64 * 1024;
 const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
-const FAILURE_CODES: [&str; 10] = [
+const FAILURE_CODES: [&str; 12] = [
     "proxy_not_approved",
     "claude_bin_not_approved",
     "settings_unreadable",
@@ -27,6 +30,8 @@ const FAILURE_CODES: [&str; 10] = [
     "webview_proxy_not_ready",
     "protection_timeout",
     "protection_check_failed",
+    "firewall_install_timeout",
+    "firewall_install_failed",
 ];
 
 #[derive(Debug, PartialEq, Eq)]
@@ -217,8 +222,7 @@ pub(crate) fn verify_update_candidate(executable: &Path) -> Result<(), String> {
         }
         let result = match verify(executable) {
             Err(failure) if failure.code == "gui_firewall_not_ready" => {
-                let _ = install_candidate_gui_firewall(executable);
-                verify(executable)
+                install_candidate_gui_firewall(executable).and_then(|()| verify(executable))
             }
             other => other,
         };
@@ -240,35 +244,20 @@ pub(crate) fn verify_update_candidate(executable: &Path) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-fn install_candidate_gui_firewall(executable: &Path) -> Result<(), ()> {
+fn install_candidate_gui_firewall(executable: &Path) -> Result<(), Failure> {
     let profile = std::env::var_os("USERPROFILE")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .ok_or(())?;
+        .ok_or_else(|| Failure::code("firewall_install_failed"))?;
     let gui_firewall = profile
         .join("agent-assets")
         .join("scripts")
         .join("ccgui-firewall.ps1");
     if !gui_firewall.is_file() || !executable.is_file() {
-        return Err(());
+        return Err(Failure::code("firewall_install_failed"));
     }
-    let powershell = powershell_exe();
-    let script_escaped = gui_firewall.to_string_lossy().replace('\'', "''");
-    let exe_escaped = executable.to_string_lossy().replace('\'', "''");
-    let command = format!(
-        "$p = Start-Process -FilePath 'powershell.exe' -Verb RunAs -Wait -PassThru -ArgumentList @('-WindowStyle','Hidden','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File','{script_escaped}','-Mode','Install','-GuiExe','{exe_escaped}'); if ($null -eq $p -or $p.ExitCode -ne 0) {{ exit 1 }}"
-    );
-    let mut child = std::process::Command::new(powershell);
-    child
-        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &command])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    {
-        use std::os::windows::process::CommandExt;
-        child.creation_flags(0x0900_0000);
-    }
-    child.status().ok().filter(|s| s.success()).map(|_| ()).ok_or(())
+    firewall_install::install(&powershell_exe(), &gui_firewall, executable)
+        .map_err(Failure::code)
 }
 
 pub(crate) fn update_protection_required() -> bool {

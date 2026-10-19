@@ -17,6 +17,7 @@ import { getPromptCacheHeatRatio } from "./prompt-cache";
 import { EMPTY_SESSION } from "./store/stream";
 import { ipc, type SessionMeta } from "@/lib/ipc";
 import { StatusBar } from "@/components/application/ai-chat/ai-chat-composer";
+import { DEFAULT_HANDOFF_COMPRESSION_MODEL, HANDOFF_PREFERENCES_KEY } from "./handoff-preferences";
 
 Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
 
@@ -236,7 +237,7 @@ describe("session-cleanup & evidence-based cache window", () => {
     });
     expect(ok).toBe(true);
     expect(currentDraft).toContain("涉及文件：`src/components/application/ai-chat/cli-menu.tsx`");
-    expect(currentDraft).toContain("上一会话交接摘要（Grok 4.7 提炼）：");
+    expect(currentDraft).toContain("上一会话交接摘要（模型提炼）：");
     expect(currentDraft).toContain("> - **目标与背景**：实现 /handoff");
     expect(currentDraft).toContain("接下来请继续：请接着加上缓存清理");
 
@@ -251,6 +252,10 @@ describe("StatusBar cacheHeat & Archive and Handoff", () => {
   let root: Root;
 
   beforeEach(() => {
+    localStorage.removeItem(HANDOFF_PREFERENCES_KEY);
+    vi.stubGlobal("matchMedia", vi.fn().mockImplementation((query: string) => ({
+      matches: false, media: query, addEventListener: vi.fn(), removeEventListener: vi.fn(),
+    })));
     container = document.createElement("div");
     document.body.appendChild(container);
     root = createRoot(container);
@@ -259,6 +264,7 @@ describe("StatusBar cacheHeat & Archive and Handoff", () => {
   afterEach(async () => {
     await act(async () => root.unmount());
     container.remove();
+    vi.unstubAllGlobals();
   });
 
   it("renders scarlet red when hot and exposes Archive & Handoff button when cold", async () => {
@@ -307,6 +313,15 @@ describe("StatusBar cacheHeat & Archive and Handoff", () => {
     const { useHandoffStore } = await import("./session-cleanup");
     const { HandoffOverlayCard } = await import("./components/HandoffOverlayCard");
     const archiveSpy = vi.spyOn(ipc, "archiveSession").mockResolvedValue();
+    const enginesSpy = vi.spyOn(ipc, "listEngines").mockResolvedValue([
+      { id: "cursor", enabled: true, available: true, supportsImages: false, permissions: [] },
+    ]);
+    const configSpy = vi.spyOn(ipc, "getCliConfig").mockResolvedValue({} as Awaited<ReturnType<typeof ipc.getCliConfig>>);
+    const settingsSpy = vi.spyOn(ipc, "getAppSettings").mockResolvedValue({} as Awaited<ReturnType<typeof ipc.getAppSettings>>);
+    const catalogSpy = vi.spyOn(ipc, "listEngineModels").mockResolvedValue({
+      authoritative: true,
+      models: [{ id: DEFAULT_HANDOFF_COMPRESSION_MODEL, name: "Grok compression", provider: "cursor" }],
+    });
 
     let resolveGrok!: (val: string) => void;
     const grokPromise = new Promise<string>((r) => {
@@ -371,7 +386,7 @@ describe("StatusBar cacheHeat & Archive and Handoff", () => {
       "接下来请继续：继续跑边界测试",
     );
 
-    // 3. Render HandoffOverlayCard while Grok 4.7 is running
+    // 3. Opening handoff stays local until the user explicitly enables compression.
     await act(async () => {
       root.render(
         <HandoffOverlayCard
@@ -383,6 +398,11 @@ describe("StatusBar cacheHeat & Archive and Handoff", () => {
     const card = container.querySelector("[data-testid='handoff-overlay-card']");
     expect(card).not.toBeNull();
     const grokStatus = container.querySelector("[data-testid='handoff-grok-status']");
+    expect(grokStatus?.getAttribute("data-grok-status")).toBe("idle");
+    expect(grokSpy).not.toHaveBeenCalled();
+    const compressionSwitch = container.querySelector<HTMLInputElement>('input[role="switch"]')!;
+    await act(async () => compressionSwitch.click());
+    expect(grokSpy).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ compressionModel: DEFAULT_HANDOFF_COMPRESSION_MODEL }));
     expect(grokStatus?.getAttribute("data-grok-status")).toBe("running");
 
     // 4. Complete Grok 4.7 distillation in background and verify draft + status update
@@ -392,13 +412,14 @@ describe("StatusBar cacheHeat & Archive and Handoff", () => {
     });
     expect(grokStatus?.getAttribute("data-grok-status")).toBe("done");
     expect(useChatStore.getState().drafts[targetDraftKey]).toContain(
-      "上一会话交接摘要（Grok 4.7 提炼）：",
+      "上一会话交接摘要（模型提炼）：",
     );
     expect(useChatStore.getState().drafts[targetDraftKey]).toContain(
       "> - **目标与背景**：恢复 Vertex 点数",
     );
 
     // 5. Switch compression mode to `detailed` and `local` and verify in-place draft update
+    await act(async () => compressionSwitch.click());
     const detailedBtn = container.querySelector<HTMLButtonElement>("[data-testid='handoff-mode-detailed']")!;
     await act(async () => {
       detailedBtn.click();
@@ -414,11 +435,10 @@ describe("StatusBar cacheHeat & Archive and Handoff", () => {
     expect(useChatStore.getState().drafts[targetDraftKey]).toContain("上一会话最后结论摘要：");
     expect(useChatStore.getState().drafts[targetDraftKey]).toContain("> Restored Free Trial $370.64 and GDP $51.13.");
 
-    const grokBtn = container.querySelector<HTMLButtonElement>("[data-testid='handoff-mode-grok']")!;
     await act(async () => {
-      grokBtn.click();
+      compressionSwitch.click();
     });
-    expect(useChatStore.getState().drafts[targetDraftKey]).toContain("上一会话交接摘要（Grok 4.7 提炼）：");
+    expect(useChatStore.getState().drafts[targetDraftKey]).toContain("上一会话交接摘要（模型提炼）：");
 
     // 6. Toggle archiveSourceOnSend and complete handoff on send
     const checkbox = container.querySelector<HTMLInputElement>("[data-testid='handoff-archive-on-send-checkbox']")!;
@@ -436,6 +456,10 @@ describe("StatusBar cacheHeat & Archive and Handoff", () => {
 
     grokSpy.mockRestore();
     archiveSpy.mockRestore();
+    catalogSpy.mockRestore();
+    enginesSpy.mockRestore();
+    configSpy.mockRestore();
+    settingsSpy.mockRestore();
   });
 });
 

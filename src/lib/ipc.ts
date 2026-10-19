@@ -529,6 +529,14 @@ export interface AutoTitleModel {
   effortLevels?: string[];
 }
 
+/** Independent routing for one handoff compression, never the destination chat. */
+export interface HandoffCompressionSelection {
+  engine: "claude" | "codex" | "pi" | "cursor";
+  model: string;
+  providerId?: string;
+  effort?: string;
+}
+
 export interface AppCacheSummary {
   runtimeUpdatesBytes: number;
   runtimeUpdatesCount: number;
@@ -1539,6 +1547,9 @@ export const ipc = {
     sessionId: string;
     title?: string | null;
     transcriptExcerpt?: string | null;
+    /** Legacy Cursor selector; new callers send the complete selection. */
+    compressionModel?: string | null;
+    compressionSelection?: HandoffCompressionSelection | null;
   }) => invoke<string>("summarize_session_handoff", args),
   inspectAppCache: () => invoke<AppCacheSummary>("inspect_app_cache"),
   pruneAppCache: () => invoke<PruneAppCacheResult>("prune_app_cache"),

@@ -90,6 +90,7 @@ export function ComposerEditable({
     <div
       ref={editableRef}
       contentEditable
+      data-onboarding-target="composer-input"
       role="textbox"
       aria-multiline="true"
       aria-label={t("chat.send")}

@@ -153,6 +153,7 @@ pub(super) async fn generate(
             let output = side_call::structured(
                 &selection.engine,
                 StructuredCall {
+                    provider_id: None,
                     system_prompt: vertex::INSTRUCTIONS,
                     input: &input,
                     json_schema: &schema,

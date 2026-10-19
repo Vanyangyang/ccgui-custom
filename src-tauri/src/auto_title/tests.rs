@@ -1041,6 +1041,7 @@ async fn real_namer_follows_the_naming_rules() {
     for (name, input, expected) in cases {
         let current = input["current_title"].as_str().unwrap().to_string();
         let answer = side_call::claude_structured(side_call::StructuredCall {
+            provider_id: None,
             system_prompt: PROMPT,
             input: &input.to_string(),
             json_schema: &schema,

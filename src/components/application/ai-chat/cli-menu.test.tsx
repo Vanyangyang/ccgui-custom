@@ -2,7 +2,7 @@ import { act, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import "@/lib/i18n";
-import { CliMenu } from "./cli-menu";
+import { CliMenu, requestCliMenuOpen } from "./cli-menu";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT =
   true;
@@ -251,4 +251,68 @@ describe("CliMenu flyout switching", () => {
     await click(document.querySelector('[aria-label="Claude Opus 5.5 · 中"]')!);
     expect(container.querySelector("button")?.getAttribute("aria-label")).toBe("Antigravity CLI / Claude Opus 5.5 · 中");
   });
+  const taskProps = () => ({
+    selectionScope: "task" as const, options: OPTIONS, value: "codex",
+    modelsByEngine: MODELS, models: {}, efforts: {},
+    onChange: vi.fn(), onModelChange: vi.fn(), onEffortChange: vi.fn(),
+    channelsByEngine: CHANNELS, selectedChannels: { codex: "c1" }, onChannelChange: vi.fn(),
+  });
+
+  it("programmatic opening targets chat only when a task picker is mounted", async () => {
+    act(() => root.render(<><Harness /><CliMenu {...taskProps()} /></>));
+    await act(async () => requestCliMenuOpen());
+    expect(document.querySelectorAll('[role="dialog"]')).toHaveLength(1);
+    expect(flyoutTitle()).toBe("Claude Code 引擎");
+  });
+
+  it.each([false, true])("disabling an open task picker closes its panel and blocks selection (mobile=%s)", async (mobile) => {
+    if (mobile) vi.stubGlobal("matchMedia", (media: string) => ({
+      matches: media.includes("max-width"), media, addEventListener() {}, removeEventListener() {},
+    }));
+    const props = taskProps();
+    act(() => root.render(<CliMenu {...props} />));
+    await openMenu();
+    if (mobile) await click(engineRow("Codex")!);
+    const model = [...document.querySelectorAll<HTMLButtonElement>('[role="radio"]')].find(row => row.textContent === "gpt-6-astra")!;
+    expect(model).toBeTruthy();
+    act(() => root.render(<CliMenu {...props} disabled />));
+    expect(container.querySelector("button")?.disabled).toBe(true);
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    await click(model);
+    await openMenu();
+    await act(async () => requestCliMenuOpen());
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(props.onModelChange).not.toHaveBeenCalled();
+  });
+
+  it("task picker hides chat speed controls while retaining effort and channel callbacks", async () => {
+    const props = taskProps();
+    act(() => root.render(<CliMenu {...props} codexServiceTier="priority" onCodexServiceTierChange={vi.fn()} />));
+    await openMenu();
+    expect(document.body.textContent).not.toContain("Fast");
+    const effort = document.querySelector<HTMLButtonElement>('[data-engine-flyout] [role="radio"][aria-label="高"]');
+    const effortButtons = [...document.querySelectorAll<HTMLButtonElement>('[data-engine-flyout] button')];
+    await click(effort ?? effortButtons.find(button => button.textContent === "高")!);
+    expect(props.onEffortChange).toHaveBeenCalledWith("codex", "high");
+    await click(document.querySelector('[data-engine-flyout] button[aria-expanded]')!);
+    await click([...document.querySelectorAll('[role="radio"]')].find(row => row.textContent === "codex-two")!);
+    expect(props.onChannelChange).toHaveBeenCalledWith("codex", "c2");
+    await click(engineRow("Claude")!);
+    expect(document.querySelector('[role="switch"]')).toBeNull();
+  });
+
+  it.each([false, true])("disabled engines cannot be selected from an already open picker (mobile=%s)", async (mobile) => {
+    if (mobile) vi.stubGlobal("matchMedia", (media: string) => ({
+      matches: media.includes("max-width"), media, addEventListener() {}, removeEventListener() {},
+    }));
+    const props = taskProps();
+    act(() => root.render(<CliMenu {...props} />));
+    await openMenu();
+    if (mobile) await click(engineRow("Codex")!);
+    act(() => root.render(<CliMenu {...props} options={OPTIONS.map(option => ({ ...option, disabled: true }))} />));
+    expect(document.querySelector('[role="radio"]')).toBeNull();
+    expect(props.onChange).not.toHaveBeenCalled();
+    expect(props.onModelChange).not.toHaveBeenCalled();
+  });
+
 });

@@ -190,4 +190,25 @@ describe("EngineModelPanel channel picker", () => {
     });
     expect(container.querySelector("[aria-label='推理强度']")).toBeTruthy();
   });
+  it("task Pi excludes unsupported ultra while chat retains it", () => {
+    const props = { option: { id: "pi", label: "Pi" }, models: [], selectedModelId: "", query: "",
+      onQueryChange: vi.fn(), effort: "high" as const, onPickModel: vi.fn(), onEffortChange: vi.fn() };
+    act(() => root.render(<EngineModelPanel {...props} selectionScope="task" />));
+    expect(container.textContent).not.toContain(i18n.t("chat.effortUltra"));
+    act(() => root.render(<EngineModelPanel {...props} />));
+    expect(container.textContent).toContain(i18n.t("chat.effortUltra"));
+  });
+
+  it("task Cursor without cursorModels uses ordinary model groups and local selection", () => {
+    const onPickModel = vi.fn();
+    act(() => root.render(<EngineModelPanel selectionScope="task"
+      option={{ id: "cursor", label: "Cursor" }} models={[{ id: "opus", label: "Opus", provider: "Anthropic" }]}
+      selectedModelId="" query="" onQueryChange={vi.fn()} effort="high"
+      onPickModel={onPickModel} onEffortChange={vi.fn()} />));
+    expect(container.textContent).toContain("Anthropic");
+    act(() => container.querySelector<HTMLButtonElement>('[role="radio"]')!.click());
+    expect(onPickModel).toHaveBeenCalledWith("cursor", "opus");
+    expect(container.querySelector('[role="switch"]')).toBeNull();
+  });
+
 });

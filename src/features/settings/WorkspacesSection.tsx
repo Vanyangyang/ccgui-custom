@@ -182,6 +182,7 @@ export function WorkspacesSection() {
                     disabled={!canBuildSelfDev}
                     onClick={() => void liveUpdate.requestUpdate(selfDev.path!)}
                     data-testid="settings-self-dev-build"
+                    data-onboarding-target="self-update-build"
                   >
                     {isBuildingSelfDev && (
                       <Loader2 className="size-3.5 animate-spin motion-reduce:animate-none" aria-hidden />

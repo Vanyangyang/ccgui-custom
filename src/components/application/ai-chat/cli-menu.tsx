@@ -190,6 +190,8 @@ function CliMenuTrigger({
   codexServiceTier,
   modelId,
   isOpen,
+  disabled,
+  selectionScope,
 }: {
   triggerRef: Ref<HTMLButtonElement>;
   engine: string;
@@ -199,17 +201,19 @@ function CliMenuTrigger({
   model: ModelOption | undefined;
   effort: EffortLevel;
   claudeUltracode?: boolean;
-  ompServiceTier: OmpServiceTier;
-  codexServiceTier: OmpServiceTier;
+  ompServiceTier?: OmpServiceTier;
+  codexServiceTier?: OmpServiceTier;
   modelId: string;
   /** While open, lock the trigger's min-width so model picks don't shrink it
    *  and nudge the top-end popover. */
   isOpen: boolean;
+  disabled: boolean;
+  selectionScope: "chat" | "task";
 }) {
   const { t } = useTranslation();
-  const showFast =
+  const showFast = selectionScope === "chat" && (
     (engine === "omp" && supportsOmpFastMode(modelId) && ompServiceTier === "priority") ||
-    (engine === "codex" && codexServiceTier === "priority");
+    (engine === "codex" && codexServiceTier === "priority"));
   // Snapshot width on open; clear on close. Shorter model labels then can't
   // shrink the trigger mid-session and slide the popover.
   const lockedMinWidth = useLockedMinWidth(isOpen, triggerRef);
@@ -217,10 +221,11 @@ function CliMenuTrigger({
   const encodedEffort = encodedModelEffort(engine, modelId);
   const displayEffort = encodedEffort ?? normalizeEffortLevel(engine, effort);
   const modelLabel = model ? modelBaseLabel(engine, model) : undefined;
-  const showUltracode = engine === "claude" && claudeUltracode;
+  const showUltracode = selectionScope === "chat" && engine === "claude" && claudeUltracode;
   return (
     <AriaButton
       ref={triggerRef}
+      isDisabled={disabled}
       aria-label={`${engineName}${modelLabel ? ` / ${modelLabel}` : ""}${hasEffort ? ` · ${t(EFFORT_LABEL_KEYS[displayEffort])}` : ""}${showUltracode ? ` · ${t("chat.ultracode")}` : ""}`}
       style={lockedMinWidth ? { minWidth: lockedMinWidth } : undefined}
       className="group flex min-w-0 cursor-pointer items-center gap-1.5 rounded-md px-1.5 py-1 outline-none focus-visible:ring-2 focus-visible:ring-border-focus-ring"
@@ -251,7 +256,7 @@ function CliMenuTrigger({
             </span>
           </>
         )}
-        {(engine === "omp" && supportsOmpFastMode(modelId)) || engine === "codex" ? (
+        {selectionScope === "chat" && ((engine === "omp" && supportsOmpFastMode(modelId)) || engine === "codex") ? (
           <span aria-hidden={!showFast} className={cx("w-7 shrink-0 text-center text-text-primary", !showFast && "invisible")}>Fast</span>
         ) : null}
         {showUltracode && (
@@ -296,6 +301,7 @@ function EngineMenuBody({
   onRefreshModels,
   loadingEngines,
   cursorModels,
+  selectionScope = "chat",
 }: {
   options: MenuOption[];
   value: string;
@@ -321,14 +327,15 @@ function EngineMenuBody({
   channelsByEngine?: Record<string, ChannelOption[]>;
   selectedChannels?: Record<string, string>;
   onPickChannel?: (engine: string, id: string) => void;
-  ompServiceTier: OmpServiceTier;
-  onOmpServiceTierChange: (tier: OmpServiceTier) => Promise<void>;
-  codexServiceTier: OmpServiceTier;
-  onCodexServiceTierChange: (tier: OmpServiceTier) => Promise<void>;
+  ompServiceTier?: OmpServiceTier;
+  onOmpServiceTierChange?: (tier: OmpServiceTier) => Promise<void>;
+  codexServiceTier?: OmpServiceTier;
+  onCodexServiceTierChange?: (tier: OmpServiceTier) => Promise<void>;
   onRefreshModels?: () => void | Promise<void>;
   /** Engine ids whose catalog probe has not returned yet. */
   loadingEngines?: readonly string[];
   cursorModels?: CursorModel[];
+  selectionScope?: "chat" | "task";
 }) {
   const flyoutOption = options.find((o) => o.id === openEngine);
   return (
@@ -363,6 +370,7 @@ function EngineMenuBody({
             // Remount per engine: the panel's channel filter is local state
             // and must not leak into the next engine's flyout.
             key={flyoutOption.id}
+            selectionScope={selectionScope}
             option={flyoutOption}
             models={modelsByEngine[flyoutOption.id] ?? []}
             selectedModelId={models[flyoutOption.id] ?? ""}
@@ -413,6 +421,7 @@ function EngineModelDialog({
   onRefreshModels,
   onClose,
   cursorModels,
+  selectionScope = "chat",
 }: {
   /** Engine being configured; undefined when the dialog is closed. */
   option: MenuOption | undefined;
@@ -428,13 +437,14 @@ function EngineModelDialog({
   channelsByEngine?: Record<string, ChannelOption[]>;
   selectedChannels?: Record<string, string>;
   onPickChannel?: (engine: string, id: string) => void;
-  ompServiceTier: OmpServiceTier;
-  onOmpServiceTierChange: (tier: OmpServiceTier) => Promise<void>;
-  codexServiceTier: OmpServiceTier;
-  onCodexServiceTierChange: (tier: OmpServiceTier) => Promise<void>;
+  ompServiceTier?: OmpServiceTier;
+  onOmpServiceTierChange?: (tier: OmpServiceTier) => Promise<void>;
+  codexServiceTier?: OmpServiceTier;
+  onCodexServiceTierChange?: (tier: OmpServiceTier) => Promise<void>;
   onRefreshModels?: () => void | Promise<void>;
   onClose: () => void;
   cursorModels?: CursorModel[];
+  selectionScope?: "chat" | "task";
 }) {
   const { t } = useTranslation();
   if (!option) return null;
@@ -445,6 +455,7 @@ function EngineModelDialog({
       className="max-w-[calc(100vw-32px)]"
     >
       <EngineModelPanel
+        selectionScope={selectionScope}
         option={option}
         models={modelsByEngine[option.id] ?? []}
         selectedModelId={models[option.id] ?? ""}
@@ -499,6 +510,8 @@ export function CliMenu({
   onRefreshModels,
   loadingEngines,
   cursorModels,
+  selectionScope = "chat",
+  disabled = false,
 }: {
   options: MenuOption[];
   value: string;
@@ -517,18 +530,26 @@ export function CliMenu({
   channelsByEngine?: Record<string, ChannelOption[]>;
   selectedChannels?: Record<string, string>;
   onChannelChange?: (engine: string, id: string) => void;
-  ompServiceTier: OmpServiceTier;
-  onOmpServiceTierChange: (tier: OmpServiceTier) => Promise<void>;
-  codexServiceTier: OmpServiceTier;
-  onCodexServiceTierChange: (tier: OmpServiceTier) => Promise<void>;
+  ompServiceTier?: OmpServiceTier;
+  onOmpServiceTierChange?: (tier: OmpServiceTier) => Promise<void>;
+  codexServiceTier?: OmpServiceTier;
+  onCodexServiceTierChange?: (tier: OmpServiceTier) => Promise<void>;
   /** Re-probe provider configs and model catalogs (flyout refresh button). */
   onRefreshModels?: () => void | Promise<void>;
   /** Engine ids whose catalog probe has not returned yet (loading hint). */
   loadingEngines?: readonly string[];
   cursorModels?: CursorModel[];
+  /** Task pickers keep selection local and omit chat-only workflow/speed controls. */
+  selectionScope?: "chat" | "task";
+  /** Locks selection and dismisses any open desktop or mobile panel. */
+  disabled?: boolean;
 }) {
   const { t } = useTranslation();
   const { isOpen, triggerRef, popoverRef, close, setOpen } = usePopoverState();
+  const selectionState = useRef({ disabled, options });
+  selectionState.current = { disabled, options };
+  const canSelect = (engine: string) => !selectionState.current.disabled &&
+    selectionState.current.options.some((option) => option.id === engine && !option.disabled);
   const current = options.find((o) => o.id === value);
 
   // Trigger carries the whole selection at a glance:
@@ -561,6 +582,7 @@ export function CliMenu({
   }, [dialogEngine]);
 
   const handleOpenChange = (o: boolean) => {
+    if (o && disabled) return;
     if (!setOpen(o)) return;
     clearHoverTimer();
     setOpenEngine(o ? value : null);
@@ -568,7 +590,9 @@ export function CliMenu({
   };
 
   useEffect(() => {
+    if (selectionScope !== "chat" || disabled) return;
     const openPanel = () => {
+      if (selectionState.current.disabled) return;
       clearHoverTimer();
       if (setOpen(true)) {
         setOpenEngine(value);
@@ -580,6 +604,15 @@ export function CliMenu({
       cliMenuOpenListeners.delete(openPanel);
     };
   });
+
+  useEffect(() => {
+    if (!disabled) return;
+    clearHoverTimer();
+    close();
+    setOpenEngine(null);
+    setDialogEngine(null);
+    setQuery("");
+  }, [disabled, close]);
 
   const dialogOption = options.find((o) => o.id === dialogEngine);
   // Hover pre-opens the row's flyout after a short intent delay: long
@@ -601,11 +634,12 @@ export function CliMenu({
 
   const hoverEngine = (option: MenuOption) => {
     clearHoverTimer();
-    if (option.disabled) return;
+    if (!canSelect(option.id)) return;
     if ((modelsByEngine[option.id] ?? []).length === 0) return;
     if (option.id === openEngine) return;
     hoverTimerRef.current = window.setTimeout(() => {
       hoverTimerRef.current = null;
+      if (!canSelect(option.id)) return;
       const active = document.activeElement;
       if (
         active instanceof HTMLElement &&
@@ -622,7 +656,7 @@ export function CliMenu({
 
   const focusEngine = (option: MenuOption) => {
     clearHoverTimer();
-    if (option.disabled) return;
+    if (!canSelect(option.id)) return;
     if ((modelsByEngine[option.id] ?? []).length === 0) return;
     setOpenEngine(option.id);
   };
@@ -632,6 +666,7 @@ export function CliMenu({
   // picking on another installed engine so pending/handoff tabs retarget and
   // stamp the chosen model/channel in sync.
   const pickModel = (engine: string, id: string) => {
+    if (!canSelect(engine)) return;
     const target = options.find((o) => o.id === engine);
     if (engine !== value && target && !target.disabled) onChange(engine);
     onModelChange(engine, id);
@@ -639,6 +674,7 @@ export function CliMenu({
   };
 
   const pickChannel = (engine: string, id: string) => {
+    if (!canSelect(engine)) return;
     const target = options.find((o) => o.id === engine);
     if (engine !== value && target && !target.disabled) onChange(engine);
     onChannelChange?.(engine, id);
@@ -647,6 +683,7 @@ export function CliMenu({
 
   const selectEngine = (option: MenuOption) => {
     clearHoverTimer();
+    if (!canSelect(option.id)) return;
     // Mobile: the row tap drills into the second-level model dialog instead
     // of switching engines outright — the engine switches when a model is
     // picked there.
@@ -655,7 +692,6 @@ export function CliMenu({
       close();
       return;
     }
-    if (option.disabled) return;
     // Desktop: the row switches WHICH model list is shown, nothing more. The
     // engine itself changes when a model is picked from that list (see
     // pickModel), so browsing another CLI can never switch the active engine.
@@ -673,8 +709,10 @@ export function CliMenu({
 
   return (
     <>
-    <AriaDialogTrigger isOpen={isOpen} onOpenChange={handleOpenChange}>
+    <AriaDialogTrigger isOpen={isOpen && !disabled} onOpenChange={handleOpenChange}>
       <CliMenuTrigger
+        disabled={disabled}
+        selectionScope={selectionScope}
         triggerRef={triggerRef}
         engine={value}
         engineName={engineName}
@@ -696,6 +734,7 @@ export function CliMenu({
       >
         <AriaDialog aria-label={t("chat.cliPicker")} className="outline-none">
           <EngineMenuBody
+            selectionScope={selectionScope}
             options={options}
             value={value}
             openEngine={openEngine}
@@ -710,16 +749,16 @@ export function CliMenu({
             onHoverEngineEnd={clearHoverTimer}
             onFocusEngine={focusEngine}
             onPickModel={pickModel}
-            onEffortChange={onEffortChange}
+            onEffortChange={(engine, level) => { if (canSelect(engine)) onEffortChange(engine, level); }}
             claudeUltracode={claudeUltracode}
-            onClaudeUltracodeChange={onClaudeUltracodeChange}
+            onClaudeUltracodeChange={onClaudeUltracodeChange && ((enabled) => { if (canSelect("claude")) onClaudeUltracodeChange(enabled); })}
             channelsByEngine={channelsByEngine}
             selectedChannels={selectedChannels}
             onPickChannel={pickChannel}
             ompServiceTier={ompServiceTier}
-            onOmpServiceTierChange={onOmpServiceTierChange}
+            onOmpServiceTierChange={onOmpServiceTierChange && (async (tier) => { if (canSelect("omp")) await onOmpServiceTierChange(tier); })}
             codexServiceTier={codexServiceTier}
-            onCodexServiceTierChange={onCodexServiceTierChange}
+            onCodexServiceTierChange={onCodexServiceTierChange && (async (tier) => { if (canSelect("codex")) await onCodexServiceTierChange(tier); })}
             onRefreshModels={onRefreshModels}
             loadingEngines={loadingEngines}
             cursorModels={cursorModels}
@@ -729,23 +768,24 @@ export function CliMenu({
     </AriaDialogTrigger>
 
     <EngineModelDialog
-      option={dialogOption}
+      selectionScope={selectionScope}
+      option={disabled ? undefined : dialogOption}
       modelsByEngine={modelsByEngine}
       models={models}
       efforts={efforts}
       query={query}
       onQueryChange={setQuery}
       onPickModel={pickModel}
-      onEffortChange={onEffortChange}
+      onEffortChange={(engine, level) => { if (canSelect(engine)) onEffortChange(engine, level); }}
       claudeUltracode={claudeUltracode}
-      onClaudeUltracodeChange={onClaudeUltracodeChange}
+      onClaudeUltracodeChange={onClaudeUltracodeChange && ((enabled) => { if (canSelect("claude")) onClaudeUltracodeChange(enabled); })}
       channelsByEngine={channelsByEngine}
       selectedChannels={selectedChannels}
       onPickChannel={pickChannel}
       ompServiceTier={ompServiceTier}
-      onOmpServiceTierChange={onOmpServiceTierChange}
+      onOmpServiceTierChange={onOmpServiceTierChange && (async (tier) => { if (canSelect("omp")) await onOmpServiceTierChange(tier); })}
       codexServiceTier={codexServiceTier}
-      onCodexServiceTierChange={onCodexServiceTierChange}
+      onCodexServiceTierChange={onCodexServiceTierChange && (async (tier) => { if (canSelect("codex")) await onCodexServiceTierChange(tier); })}
       onRefreshModels={onRefreshModels}
       onClose={() => setDialogEngine(null)}
       cursorModels={cursorModels}

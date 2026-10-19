@@ -4,6 +4,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import i18n from "@/lib/i18n";
 import { SelfUpdateStatusChip } from "./SelfUpdateStatusChip";
 import { useLiveUpdateStore } from "./live-update";
+import { OnboardingTourHost } from "@/features/onboarding/OnboardingTour";
+import { useOnboardingStore } from "@/features/onboarding/store";
 
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -24,8 +26,52 @@ describe("self-update status action", () => {
   });
   afterEach(async () => {
     await act(async () => { root.unmount(); }); container.remove(); useLiveUpdateStore.setState(initial, true);
+    useOnboardingStore.setState({ open: false });
+    vi.restoreAllMocks();
   });
   const button = () => container.querySelector<HTMLButtonElement>("button")!;
+
+  async function guide(step: number) {
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      return { top: 600, left: this.dataset.onboardingTarget === "self-update-details" ? 200 : 100, width: 40, height: 24 } as DOMRect;
+    });
+    await act(async () => {
+      useOnboardingStore.getState().openTour("selfUpdate");
+      for (let index = 0; index < step; index++) useOnboardingStore.getState().nextStep();
+      root.render(<><SelfUpdateStatusChip /><OnboardingTourHost /></>);
+    });
+  }
+
+  it("guides review through the real bottom-right list button without requesting an update", async () => {
+    await guide(0);
+    expect(document.querySelector<HTMLElement>('[data-testid="onboarding-spotlight-ring"]')?.style.left).toBe("194px");
+    const action = document.querySelector<HTMLButtonElement>('[data-testid="onboarding-step-action-self-update-review"]')!;
+    await act(async () => action.click());
+    expect(window.location.hash).toBe("#/settings?page=update");
+    expect(useOnboardingStore.getState().open).toBe(false);
+    expect(requestUpdate).not.toHaveBeenCalled();
+  });
+
+  it("focuses the real self-update button and requires an explicit click to request changes", async () => {
+    await guide(1);
+    expect(document.querySelector<HTMLElement>('[data-testid="onboarding-spotlight-ring"]')?.style.left).toBe("94px");
+    const action = document.querySelector<HTMLButtonElement>('[data-testid="onboarding-step-action-self-update-request"]')!;
+    await act(async () => action.click());
+    expect(document.activeElement).toBe(button());
+    expect(requestUpdate).not.toHaveBeenCalled();
+    await act(async () => button().click());
+    expect(requestUpdate).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the guided in-progress entry available for details without duplicating the request", async () => {
+    await act(async () => useLiveUpdateStore.setState({ channel: { version: 1, ready: [change],
+      updateRequest: { id: "r1", requestId: "r1", sourceRoot: "G:/source", targetChangeIds: ["fix"], waitingFor: ["fix"] } } }));
+    await guide(1);
+    await act(async () => document.querySelector<HTMLButtonElement>('[data-testid="onboarding-step-action-self-update-request"]')!.click());
+    await act(async () => button().click());
+    expect(window.location.hash).toBe("#/settings?page=update");
+    expect(requestUpdate).not.toHaveBeenCalled();
+  });
 
   it("requests real registered changes without navigating away", async () => {
     const hash = window.location.hash;

@@ -17,25 +17,47 @@ export const ONBOARDING_TOPICS = [
 
 export type OnboardingTopicId = (typeof ONBOARDING_TOPICS)[number];
 
+export interface OnboardingTargetSpec {
+  selector: string;
+  labelKey: string;
+  /** Only focus inputs or open an existing UI. Never submit, save, or build. */
+  interaction?: "focus" | "open";
+  actionLabelKey?: string;
+}
+
 export interface OnboardingStepSpec {
   id: string;
-  /** CSS selector for the spotlight cutout target; if absent or not mounted, bubble centers on screen. */
-  targetSelector?: string;
+  /** Prefer the first visible, specific control; never substitute an entire pane. */
+  targets: OnboardingTargetSpec[];
   titleKey: string;
-  bodyKey: string;
-  tipKey?: string;
-  action?:
-    | { kind: "openSettings"; page: string; labelKey: string }
-    | { kind: "closeSettings"; labelKey: string };
+  instructionKeys: string[];
+  resultKey: string;
+  missingTargetKey: string;
+  exampleKey?: string;
+  noteKey?: string;
+  action?: { kind: "openSettings"; page: string; labelKey: string };
 }
+
+const COMPOSER_INPUT: OnboardingTargetSpec = {
+  selector: '[data-onboarding-target="composer-input"]',
+  labelKey: "onboarding.targets.composerInput",
+  interaction: "focus",
+  actionLabelKey: "onboarding.actions.focusInput",
+};
 
 export const ONBOARDING_STEPS_BY_TOPIC: Record<OnboardingTopicId, OnboardingStepSpec[]> = {
   proxy: [
     {
       id: "proxy-config",
-      targetSelector: '[data-setting-anchor="proxyAddress"], [data-onboarding-target="sidebar-settings"]',
+      targets: [
+        { selector: '[data-setting-anchor="proxyAddress"] input', labelKey: "onboarding.targets.proxyAddress", interaction: "focus", actionLabelKey: "onboarding.actions.focusProxyAddress" },
+        { selector: '[data-onboarding-target="sidebar-settings"]', labelKey: "onboarding.targets.settings" },
+      ],
       titleKey: "onboarding.steps.proxyConfigTitle",
-      bodyKey: "onboarding.steps.proxyConfigBody",
+      instructionKeys: ["onboarding.steps.proxyConfigBody", "onboarding.steps.proxySaveInstruction"],
+      resultKey: "onboarding.steps.proxyConfigResult",
+      missingTargetKey: "onboarding.missing.proxy",
+      exampleKey: "onboarding.examples.proxy",
       action: {
         kind: "openSettings",
         page: "proxy",
@@ -45,10 +67,35 @@ export const ONBOARDING_STEPS_BY_TOPIC: Record<OnboardingTopicId, OnboardingStep
   ],
   selfUpdate: [
     {
+      id: "self-update-review",
+      targets: [
+        { selector: '[data-onboarding-target="self-update-details"]', labelKey: "onboarding.targets.selfUpdateDetails", interaction: "open", actionLabelKey: "onboarding.actions.reviewUpdate" },
+        { selector: '[data-onboarding-target="self-update-status"]', labelKey: "onboarding.targets.selfUpdateStatus", interaction: "focus", actionLabelKey: "onboarding.actions.goToUpdate" },
+      ],
+      titleKey: "onboarding.steps.selfUpdateReviewTitle",
+      instructionKeys: ["onboarding.steps.selfUpdateReviewBody"],
+      resultKey: "onboarding.steps.selfUpdateReviewResult",
+      missingTargetKey: "onboarding.missing.selfUpdateStatus",
+      action: { kind: "openSettings", page: "update", labelKey: "onboarding.actions.openLiveUpdateSettings" },
+    },
+    {
+      id: "self-update-request",
+      targets: [{ selector: '[data-onboarding-target="self-update-status"]', labelKey: "onboarding.targets.selfUpdateStatus", interaction: "focus", actionLabelKey: "onboarding.actions.goToUpdate" }],
+      titleKey: "onboarding.steps.selfUpdateRequestTitle",
+      instructionKeys: ["onboarding.steps.selfUpdateRequestBody", "onboarding.steps.selfUpdateProgressInstruction"],
+      resultKey: "onboarding.steps.selfUpdateRequestResult",
+      missingTargetKey: "onboarding.missing.selfUpdateStatus",
+      noteKey: "onboarding.steps.selfUpdateStatusRequirement",
+      action: { kind: "openSettings", page: "update", labelKey: "onboarding.actions.openLiveUpdateSettings" },
+    },
+    {
       id: "self-update-workspace",
-      targetSelector: '[data-self-dev-workspace="true"], [data-onboarding-target="workspace-section"]',
+      targets: [{ selector: '[data-onboarding-target="self-update-build"]', labelKey: "onboarding.targets.selfUpdateBuild", interaction: "focus", actionLabelKey: "onboarding.actions.goToBuild" }],
       titleKey: "onboarding.steps.selfUpdateWorkspaceTitle",
-      bodyKey: "onboarding.steps.selfUpdateWorkspaceBody",
+      instructionKeys: ["onboarding.steps.selfUpdateWorkspaceBody", "onboarding.steps.selfUpdateTriggerInstruction"],
+      resultKey: "onboarding.steps.selfUpdateWorkspaceResult",
+      missingTargetKey: "onboarding.missing.selfUpdate",
+      noteKey: "onboarding.steps.selfUpdateRequirement",
       action: {
         kind: "openSettings",
         page: "workspaces",
@@ -59,41 +106,58 @@ export const ONBOARDING_STEPS_BY_TOPIC: Record<OnboardingTopicId, OnboardingStep
   handoff: [
     {
       id: "handoff-command",
-      targetSelector: '[data-onboarding-target="composer-status"], [data-onboarding-target="composer"]',
+      targets: [COMPOSER_INPUT],
       titleKey: "onboarding.steps.handoffCommandTitle",
-      bodyKey: "onboarding.steps.handoffCommandBody",
+      instructionKeys: ["onboarding.steps.handoffCommandBody", "onboarding.steps.handoffSendInstruction"],
+      resultKey: "onboarding.steps.handoffCommandResult",
+      missingTargetKey: "onboarding.missing.composer",
+      exampleKey: "onboarding.examples.handoff",
+      noteKey: "onboarding.steps.handoffRequirement",
     },
   ],
   sidechat: [
     {
       id: "sidechat-overview",
-      targetSelector: '[data-onboarding-target="composer"]',
+      targets: [{ selector: '[data-onboarding-target="sidechat-toggle"]', labelKey: "onboarding.targets.sidechat", interaction: "open", actionLabelKey: "onboarding.actions.openSidechat" }],
       titleKey: "onboarding.steps.sidechatTitle",
-      bodyKey: "onboarding.steps.sidechatBody",
+      instructionKeys: ["onboarding.steps.sidechatBody", "onboarding.steps.sidechatSendInstruction"],
+      resultKey: "onboarding.steps.sidechatResult",
+      missingTargetKey: "onboarding.sidechatUnavailable",
     },
   ],
   btw: [
     {
       id: "btw-overview",
-      targetSelector: '[data-onboarding-target="composer"]',
+      targets: [COMPOSER_INPUT],
       titleKey: "onboarding.steps.btwTitle",
-      bodyKey: "onboarding.steps.btwBody",
+      instructionKeys: ["onboarding.steps.btwBody"],
+      resultKey: "onboarding.steps.btwResult",
+      missingTargetKey: "onboarding.missing.composer",
+      exampleKey: "onboarding.examples.btw",
+      noteKey: "onboarding.steps.btwRequirement",
     },
   ],
   imageAnnotation: [
     {
       id: "image-annotation-overview",
-      targetSelector: '[data-onboarding-target="chat-center"]',
+      targets: [
+        { selector: '[data-onboarding-target="image-preview"]', labelKey: "onboarding.targets.imagePreview", interaction: "open", actionLabelKey: "onboarding.actions.openImage" },
+        COMPOSER_INPUT,
+      ],
       titleKey: "onboarding.steps.imageAnnotationTitle",
-      bodyKey: "onboarding.steps.imageAnnotationBody",
+      instructionKeys: ["onboarding.steps.imageAnnotationBody", "onboarding.steps.imageAnnotationDrawInstruction", "onboarding.steps.imageAnnotationSendInstruction"],
+      resultKey: "onboarding.steps.imageAnnotationResult",
+      missingTargetKey: "onboarding.missing.composer",
     },
   ],
   assistantNotices: [
     {
       id: "assistant-notices-overview",
-      targetSelector: '[data-onboarding-target="assistant-notices"]',
+      targets: [{ selector: '[data-onboarding-target="assistant-notices"]', labelKey: "onboarding.targets.notices", interaction: "open", actionLabelKey: "onboarding.actions.openNotices" }],
       titleKey: "onboarding.steps.assistantNoticesTitle",
-      bodyKey: "onboarding.steps.assistantNoticesBody",
+      instructionKeys: ["onboarding.steps.assistantNoticesBody", "onboarding.steps.assistantNoticesSaveInstruction"],
+      resultKey: "onboarding.steps.assistantNoticesResult",
+      missingTargetKey: "onboarding.missing.notices",
       action: {
         kind: "openSettings",
         page: "assistantNotices",
@@ -104,9 +168,12 @@ export const ONBOARDING_STEPS_BY_TOPIC: Record<OnboardingTopicId, OnboardingStep
   intelligenceUi: [
     {
       id: "intelligence-ui-overview",
-      targetSelector: '[data-onboarding-target="chat-center"]',
+      targets: [COMPOSER_INPUT],
       titleKey: "onboarding.steps.intelligenceUiTitle",
-      bodyKey: "onboarding.steps.intelligenceUiBody",
+      instructionKeys: ["onboarding.steps.intelligenceUiBody", "onboarding.steps.intelligenceUiContinueInstruction"],
+      resultKey: "onboarding.steps.intelligenceUiResult",
+      missingTargetKey: "onboarding.missing.composer",
+      exampleKey: "onboarding.examples.intelligenceUi",
     },
   ],
 };

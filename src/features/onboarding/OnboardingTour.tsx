@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import Compass from "lucide-react/dist/esm/icons/compass";
@@ -12,9 +12,9 @@ import {
   ONBOARDING_TOPICS,
   useOnboardingStore,
   type OnboardingStepSpec,
+  type OnboardingTargetSpec,
   type OnboardingTopicId,
 } from "./store";
-import { OnboardingInteractiveDemo } from "./OnboardingInteractiveDemo";
 
 interface SpotlightRect {
   top: number;
@@ -23,7 +23,14 @@ interface SpotlightRect {
   height: number;
 }
 
-const BUBBLE_WIDTH = 440;
+interface SpotlightTarget {
+  element: HTMLElement;
+  spec: OnboardingTargetSpec;
+  rect: SpotlightRect;
+  disabled: boolean;
+}
+
+const BUBBLE_WIDTH = 380;
 const BUBBLE_MARGIN = 16;
 const SPOTLIGHT_PADDING = 6;
 
@@ -37,7 +44,11 @@ function findVisibleTarget(selector?: string): HTMLElement | null {
     const candidates = document.querySelectorAll<HTMLElement>(part);
     for (const el of candidates) {
       const rect = el.getBoundingClientRect();
-      if (rect.width > 4 && rect.height > 4) {
+      if (rect.width > 4 && rect.height > 4 &&
+          rect.left + rect.width > 0 && rect.top + rect.height > 0 &&
+          rect.left < window.innerWidth && rect.top < window.innerHeight &&
+          !el.closest('[hidden], [aria-hidden="true"]') &&
+          getComputedStyle(el).visibility !== "hidden") {
         return el;
       }
     }
@@ -163,9 +174,10 @@ export function OnboardingTourHost() {
   const setShowEntry = useOnboardingStore((s) => s.setShowEntry);
   const autoStartIfFirstInstall = useOnboardingStore((s) => s.autoStartIfFirstInstall);
 
-  const [targetRect, setTargetRect] = useState<SpotlightRect | null>(null);
+  const [measuredTarget, setMeasuredTarget] = useState<SpotlightTarget | null>(null);
   const [bubbleHeight, setBubbleHeight] = useState(320);
   const [hiddenNotice, setHiddenNotice] = useState(false);
+  const revealSettingsTarget = useRef<string | null>(null);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -176,29 +188,53 @@ export function OnboardingTourHost() {
 
   const steps = ONBOARDING_STEPS_BY_TOPIC[topic] ?? ONBOARDING_STEPS_BY_TOPIC.proxy;
   const currentStep: OnboardingStepSpec = steps[Math.min(stepIndex, steps.length - 1)] ?? steps[0];
+  const target = measuredTarget && currentStep.targets.includes(measuredTarget.spec) ? measuredTarget : null;
+  const targetRect = target?.rect ?? null;
 
   const measureTarget = useCallback(() => {
     if (!open) return;
-    const el = findVisibleTarget(currentStep?.targetSelector);
-    if (!el) {
-      setTargetRect(null);
+    if (revealSettingsTarget.current === currentStep.id) {
+      const settingsInput = document.querySelector<HTMLElement>(currentStep.targets[0].selector);
+      if (settingsInput && settingsInput.getBoundingClientRect().width > 4) {
+        revealSettingsTarget.current = null;
+        settingsInput.scrollIntoView?.({ block: "center", inline: "nearest", behavior: "instant" });
+      }
+    }
+    const match = currentStep.targets.map((spec) => ({ spec, element: findVisibleTarget(spec.selector) }))
+      .find((candidate) => candidate.element);
+    if (!match?.element) {
+      setMeasuredTarget(null);
       return;
     }
+    const el = match.element;
     const rect = el.getBoundingClientRect();
-    setTargetRect({
+    const nextRect = {
       top: Math.max(2, rect.top - SPOTLIGHT_PADDING),
       left: Math.max(2, rect.left - SPOTLIGHT_PADDING),
       width: rect.width + SPOTLIGHT_PADDING * 2,
       height: rect.height + SPOTLIGHT_PADDING * 2,
+    };
+    const disabled = el.matches(':disabled, [aria-disabled="true"]');
+    setMeasuredTarget((previous) => {
+      if (previous?.element === el && previous.spec === match.spec && previous.disabled === disabled &&
+          previous.rect.top === nextRect.top && previous.rect.left === nextRect.left &&
+          previous.rect.width === nextRect.width && previous.rect.height === nextRect.height) return previous;
+      return { element: el, spec: match.spec, rect: nextRect, disabled };
     });
   }, [open, currentStep]);
 
   useLayoutEffect(() => {
-    if (!open) return;
+    if (!open) {
+      revealSettingsTarget.current = null;
+      setMeasuredTarget(null);
+      return;
+    }
     const chatTopics: OnboardingTopicId[] = [
       "handoff",
       "sidechat",
       "btw",
+      "imageAnnotation",
+      "assistantNotices",
       "intelligenceUi",
     ];
     if (
@@ -209,17 +245,36 @@ export function OnboardingTourHost() {
       window.location.hash = "#/";
     }
     measureTarget();
-    const timer = window.setTimeout(measureTarget, 180);
-    window.addEventListener("resize", measureTarget);
-    window.addEventListener("scroll", measureTarget, true);
-    window.addEventListener("hashchange", measureTarget);
+    let frame: number | null = null;
+    const scheduleMeasure = () => {
+      if (frame !== null) return;
+      frame = window.requestAnimationFrame(() => {
+        frame = null;
+        measureTarget();
+      });
+    };
+    // Settings and chat controls can arrive after route navigation or async loading.
+    const observer = new MutationObserver(scheduleMeasure);
+    observer.observe(document.body, { childList: true, subtree: true, attributes: true,
+      attributeFilter: ["hidden", "aria-hidden", "disabled", "aria-disabled", "data-onboarding-target"] });
+    window.addEventListener("resize", scheduleMeasure);
+    window.addEventListener("scroll", scheduleMeasure, true);
+    window.addEventListener("hashchange", scheduleMeasure);
     return () => {
-      window.clearTimeout(timer);
-      window.removeEventListener("resize", measureTarget);
-      window.removeEventListener("scroll", measureTarget, true);
-      window.removeEventListener("hashchange", measureTarget);
+      observer.disconnect();
+      if (frame !== null) window.cancelAnimationFrame(frame);
+      window.removeEventListener("resize", scheduleMeasure);
+      window.removeEventListener("scroll", scheduleMeasure, true);
+      window.removeEventListener("hashchange", scheduleMeasure);
     };
   }, [open, topic, stepIndex, measureTarget]);
+
+  useLayoutEffect(() => {
+    if (!open || !target?.element || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measureTarget);
+    observer.observe(target.element);
+    return () => observer.disconnect();
+  }, [open, target?.element, measureTarget]);
 
   useEffect(() => {
     if (!open) {
@@ -227,10 +282,14 @@ export function OnboardingTourHost() {
       return;
     }
     const onKeyDown = (e: KeyboardEvent) => {
+      if (e.isComposing || e.ctrlKey || e.metaKey || e.altKey) return;
       if (e.key === "Escape") {
         e.preventDefault();
         closeTour();
-      } else if (e.key === "ArrowRight") {
+        return;
+      }
+      if (e.target instanceof HTMLElement && e.target.closest('input, textarea, [contenteditable="true"]')) return;
+      if (e.key === "ArrowRight") {
         e.preventDefault();
         nextStep();
       } else if (e.key === "ArrowLeft") {
@@ -251,17 +310,25 @@ export function OnboardingTourHost() {
 
   const bubblePos = computeBubblePosition(targetRect, bubbleHeight);
 
-  const handleStepAction = (action: NonNullable<OnboardingStepSpec["action"]>) => {
-    if (action.kind === "openSettings") {
-      window.location.hash = `#/settings?page=${encodeURIComponent(action.page)}`;
-      window.setTimeout(measureTarget, 220);
+  const handleStepAction = () => {
+    if (target?.spec.interaction) {
+      const element = target.element;
+      if (!element.isConnected || element.matches(':disabled, [aria-disabled="true"]')) return;
+      closeTour();
+      element.focus({ preventScroll: true });
+      // Inputs/build controls are focus-only. Open actions never collapse an already open UI.
+      if (target.spec.interaction === "open" && element.getAttribute("aria-pressed") !== "true" &&
+          element.getAttribute("aria-expanded") !== "true") element.click();
       return;
     }
-    if (action.kind === "closeSettings") {
-      window.location.hash = "#/";
-      window.setTimeout(measureTarget, 180);
+    const action = currentStep.action;
+    if (action) {
+      revealSettingsTarget.current = currentStep.id;
+      window.location.hash = `#/settings?page=${encodeURIComponent(action.page)}`;
+      measureTarget();
     }
   };
+  const actionLabelKey = target?.spec.interaction ? target.spec.actionLabelKey : currentStep.action?.labelKey;
 
   return createPortal(
     <div
@@ -274,7 +341,17 @@ export function OnboardingTourHost() {
         <>
           <div
             aria-hidden
-            onClick={closeTour}
+            onClick={(event) => {
+              const withinTarget = event.clientX >= targetRect.left &&
+                event.clientX <= targetRect.left + targetRect.width &&
+                event.clientY >= targetRect.top && event.clientY <= targetRect.top + targetRect.height;
+              if (withinTarget && actionLabelKey && !target?.disabled) {
+                handleStepAction();
+              } else {
+                closeTour();
+              }
+            }}
+            data-testid="onboarding-spotlight-backdrop"
             className="fixed inset-0 cursor-pointer bg-transparent"
           />
           <div
@@ -314,7 +391,7 @@ export function OnboardingTourHost() {
           left: bubblePos.left,
           width: Math.min(BUBBLE_WIDTH, (typeof window !== "undefined" ? window.innerWidth : 1280) - BUBBLE_MARGIN * 2),
         }}
-        className="fixed z-10 flex flex-col gap-2.5 rounded-2xl border border-border-button-default bg-background-primary-default p-4 shadow-dropdown transition-all duration-200 ease-out"
+        className="fixed z-10 flex max-h-[calc(100dvh-32px)] flex-col gap-2.5 overflow-y-auto rounded-2xl border border-border-button-default bg-background-primary-default p-4 shadow-dropdown transition-all duration-200 ease-out"
       >
         {/* Header: Title + Close button */}
         <div className="flex items-center justify-between gap-2">
@@ -368,31 +445,51 @@ export function OnboardingTourHost() {
           })}
         </div>
 
-        {/* Step Content: Concise 1-line summary + visual interactive walkthrough */}
-        <div className="flex flex-col gap-1.5">
+        {/* Keep instructions still: one action and one concrete outcome. */}
+        <div className="flex flex-col gap-3">
           <div className="flex items-center justify-between gap-2">
             <h3 className="text-body-medium text-text-primary">
               {t(currentStep.titleKey)}
+              {steps.length > 1 && <span data-testid="onboarding-step-count" className="ml-2 whitespace-nowrap text-caption-1-regular text-text-tertiary">
+                {t("onboarding.stepCount", { current: stepIndex + 1, total: steps.length })}
+              </span>}
             </h3>
-            {currentStep.action && (
+            {actionLabelKey && (
               <Button
                 size="small"
                 variant="secondary"
                 data-testid={`onboarding-step-action-${currentStep.id}`}
-                onClick={() => handleStepAction(currentStep.action!)}
+                disabled={target?.disabled}
+                onClick={handleStepAction}
               >
-                {t(currentStep.action.labelKey)}
+                {t(actionLabelKey)}
               </Button>
             )}
           </div>
-          <p className="text-caption-1-regular text-text-secondary">
-            {t(currentStep.bodyKey)}
-          </p>
-
-          <OnboardingInteractiveDemo
-            topic={topic}
-            stepIndex={stepIndex}
-          />
+          <div>
+            {target && <p data-testid="onboarding-target-label" className="mb-2 text-caption-1-medium text-accent-300">
+              {t("onboarding.highlightLabel", { target: t(target.spec.labelKey) })}
+            </p>}
+            <p className="mb-1 text-caption-1-medium text-text-primary">{t("onboarding.howToLabel")}</p>
+            <ol data-testid="onboarding-instruction" className="list-decimal space-y-1 pl-4 text-body-regular text-text-secondary">
+              {currentStep.instructionKeys.map((key) => <li key={key}>{t(key)}</li>)}
+            </ol>
+            {currentStep.exampleKey && <div className="mt-2">
+              <p className="mb-1 text-caption-1-regular text-text-tertiary">{t("onboarding.exampleLabel")}</p>
+              <code data-testid="onboarding-input-example" className="block select-text whitespace-pre-wrap break-words rounded-lg bg-background-secondary-default px-2 py-1.5 text-caption-1-regular text-text-primary">{t(currentStep.exampleKey)}</code>
+            </div>}
+          </div>
+          <div>
+            <p className="mb-1 text-caption-1-medium text-text-primary">{t("onboarding.resultLabel")}</p>
+            <p data-testid="onboarding-result" className="text-body-regular text-text-secondary">
+              {t(currentStep.resultKey)}
+            </p>
+          </div>
+          {currentStep.noteKey && <p className="text-caption-1-regular text-text-tertiary">{t(currentStep.noteKey)}</p>}
+          {!target && (
+            <p data-testid="onboarding-missing-target" className="text-caption-1-regular text-text-tertiary">{t(currentStep.missingTargetKey)}</p>
+          )}
+          {target?.disabled && <p className="text-caption-1-regular text-text-tertiary">{t("onboarding.targetDisabled")}</p>}
         </div>
 
         {/* Footer: Hide Top-Bar Entry & Step Navigation */}

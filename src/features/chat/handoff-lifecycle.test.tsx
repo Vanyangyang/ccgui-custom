@@ -5,6 +5,7 @@ import { ipc } from "@/lib/ipc";
 import { useChatStore, sessionKey } from "./store";
 import { EMPTY_SESSION } from "./store/stream";
 import { replaceHandoffDraftSummary, useHandoffStore } from "./session-cleanup";
+import { HANDOFF_PREFERENCES_KEY } from "./handoff-preferences";
 import { useComposerActions } from "./components/use-composer-actions";
 import type { ComposerInputHandle } from "@/components/application/ai-chat/ai-chat-composer";
 
@@ -14,7 +15,7 @@ const workspacePath = "/handoff-test";
 const key = sessionKey("codex", null, workspacePath);
 const state = { ...EMPTY_SESSION, messages: [{ seq: 1, ts: "1", role: "assistant" as const, text: "original conclusion" }] };
 const sourceMeta = { engine: "codex", sessionId: "source-session", workspacePath } as Parameters<typeof ipc.archiveSession>[0];
-const args = { workspacePath, sourceEngine: "codex", sourceSessionId: "source-session", sourceTitle: "Source", sourceState: state, sourceMeta };
+const args = { workspacePath, sourceEngine: "codex", sourceSessionId: "source-session", sourceTitle: "Source", sourceState: state, sourceMeta, initialMode: "grok" as const };
 function deferred<T>() {
   let resolve!: (value: T) => void;
   let reject!: (reason: Error) => void;
@@ -24,6 +25,7 @@ function deferred<T>() {
 function draft() { return useChatStore.getState().drafts[key]; }
 
 beforeEach(() => {
+  localStorage.removeItem(HANDOFF_PREFERENCES_KEY);
   useHandoffStore.setState({ byWorkspace: {} });
   useChatStore.setState({ ...original, activeEngine: "codex", active: null, openTabs: [], drafts: {}, sessions: [], archivedSessionKeys: {}, streamingByKey: {} });
 });
@@ -285,7 +287,7 @@ describe("handoff lifecycle ownership", () => {
     useHandoffStore.getState().setCompressionMode(workspacePath, "grok");
     summary.resolve("- **目标与背景**：二次交接提炼完成");
     await summary.promise;
-    expect(draft()).toContain("上一会话交接摘要（Grok 4.7 提炼）：\n> - **目标与背景**：二次交接提炼完成");
+    expect(draft()).toContain("上一会话交接摘要（模型提炼）：\n> - **目标与背景**：二次交接提炼完成");
     expect(draft()).not.toContain("上一会话最后结论摘要：");
     expect(replaceHandoffDraftSummary(draft(), "")).not.toContain("\n\n\n接下来请继续：");
   });

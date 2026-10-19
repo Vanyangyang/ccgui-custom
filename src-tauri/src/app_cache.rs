@@ -1,4 +1,4 @@
-//! Session handoff distillation (Cursor CLI `grok-4.7` ephemeral side-call)
+//! Session handoff distillation (isolated engine side-calls)
 //! and CCGUI local cache inspection & pruning (`runtime-updates`, `backups`,
 //! `pasted-images`, host staging, and SQLite WAL checkpointing).
 
@@ -17,6 +17,147 @@ const HANDOFF_FALLBACK_MODEL: &str = "grok-4.7-low";
 // successful short summary can already take ~25s with only ~7s spent on the API.
 const HANDOFF_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_EXCERPT_CHARS: usize = 6000;
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HandoffCompressionSelection {
+    engine: String,
+    model: String,
+    provider_id: Option<String>,
+    effort: Option<String>,
+}
+
+impl HandoffCompressionSelection {
+    fn validate(&self) -> Result<(), String> {
+        if !matches!(self.engine.as_str(), "claude" | "codex" | "pi" | "cursor") {
+            return Err("unsupported handoff compression engine".into());
+        }
+        // Native model IDs include provider/model and Claude's [1m] suffix.
+        // Keep the selector verbatim; never normalize it to a different model.
+        let valid_selector = |value: &str| {
+            !value.is_empty() && value.len() <= 512 && !value.starts_with('-')
+                && !value.chars().any(|c| c.is_control() || c.is_whitespace())
+        };
+        if !valid_selector(&self.model) {
+            return Err("invalid handoff compression model".into());
+        }
+        if self.provider_id.as_deref().is_some_and(|id| {
+            id.is_empty() || id.len() > 512 || id.trim() != id || id.chars().any(char::is_control)
+        }) {
+            return Err("invalid handoff compression provider".into());
+        }
+        if self.engine == "cursor" && self.provider_id.as_deref().is_some_and(|id| {
+            id != crate::config::LOCAL_PROVIDER_ID && id != crate::config::LEGACY_LOCAL_CONFIG_TOML_ID
+        }) {
+            return Err("Cursor handoff does not support custom providers".into());
+        }
+        if self.effort.as_deref().is_some_and(|effort| !matches!(effort,
+            "none" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra")) {
+            return Err("invalid handoff compression effort".into());
+        }
+        Ok(())
+    }
+
+    fn structured_call<'a>(&'a self, input: &'a str, schema: &'a serde_json::Value) -> side_call::StructuredCall<'a> {
+        side_call::StructuredCall {
+            system_prompt: "Return a JSON object with the handoff Markdown in its summary field.",
+            input,
+            json_schema: schema,
+            model: &self.model,
+            provider_id: Some(self.provider_id.as_deref().unwrap_or(crate::config::LOCAL_PROVIDER_ID)),
+            effort: self.effort.as_deref().unwrap_or("low"),
+            timeout: HANDOFF_TIMEOUT,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum HandoffRoute<'a> {
+    Explicit(&'a HandoffCompressionSelection),
+    Legacy(HandoffModels<'a>),
+}
+
+fn handoff_route<'a>(selection: Option<&'a HandoffCompressionSelection>, legacy: Option<&'a str>)
+    -> Result<HandoffRoute<'a>, String>
+{
+    match selection {
+        Some(selection) => {
+            selection.validate()?;
+            Ok(HandoffRoute::Explicit(selection))
+        }
+        None => Ok(HandoffRoute::Legacy(handoff_models(legacy)?)),
+    }
+}
+
+async fn run_handoff_route(route: HandoffRoute<'_>, input: &str) -> Result<String, SideCallError> {
+    match route {
+        HandoffRoute::Explicit(selection) if selection.engine == "cursor" => {
+            crate::config::ensure_engine_enabled("cursor").map_err(|_| SideCallError::Unavailable)?;
+            side_call::cursor_text_call(&selection.model, input, HANDOFF_TIMEOUT).await
+        }
+        HandoffRoute::Explicit(selection) => {
+            let schema = serde_json::json!({
+                "type": "object", "properties": {"summary": {"type": "string"}},
+                "required": ["summary"], "additionalProperties": false
+            });
+            let output = side_call::structured(&selection.engine, selection.structured_call(input, &schema)).await?;
+            structured_handoff_summary(&output.structured)
+        }
+        HandoffRoute::Legacy(models) => {
+            match side_call::cursor_text_call(models.primary, input, HANDOFF_TIMEOUT).await {
+                Ok(text) => Ok(text),
+                Err(err) => match models.fallback_after(&err) {
+                    Some(fallback) => side_call::cursor_text_call(fallback, input, HANDOFF_TIMEOUT).await,
+                    None => Err(err),
+                },
+            }
+        }
+    }
+}
+
+fn structured_handoff_summary(value: &serde_json::Value) -> Result<String, SideCallError> {
+    value.get("summary").and_then(serde_json::Value::as_str)
+        .and_then(sanitize_distilled_summary).ok_or(SideCallError::BadOutput)
+}
+
+#[derive(Debug)]
+struct HandoffModels<'a> {
+    primary: &'a str,
+    fallback: Option<&'a str>,
+}
+
+impl<'a> HandoffModels<'a> {
+    fn fallback_after(&self, error: &SideCallError) -> Option<&'a str> {
+        match error {
+            SideCallError::Failed | SideCallError::BadOutput => self.fallback,
+            _ => None,
+        }
+    }
+}
+
+fn handoff_models(compression_model: Option<&str>) -> Result<HandoffModels<'_>, String> {
+    let Some(raw) = compression_model else {
+        return Ok(HandoffModels {
+            primary: HANDOFF_MODEL,
+            fallback: Some(HANDOFF_FALLBACK_MODEL),
+        });
+    };
+    let model = raw.trim();
+    if raw.chars().any(char::is_control)
+        || model.is_empty()
+        || model.len() > 128
+        || model.starts_with('-')
+        || !model
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return Err("invalid handoff compression model".to_string());
+    }
+    Ok(HandoffModels {
+        primary: model,
+        fallback: None,
+    })
+}
 
 const HANDOFF_DISTILL_PROMPT: &str = "\
 你是 CCGUI 的会话交接压缩助手。请将下方旧会话的对话轨迹浓缩成一段高密度、零废话的交接摘要，供新会话的模型直接承接上下文。
@@ -127,7 +268,10 @@ pub async fn summarize_session_handoff(
     session_id: String,
     title: Option<String>,
     transcript_excerpt: Option<String>,
+    compression_model: Option<String>,
+    compression_selection: Option<HandoffCompressionSelection>,
 ) -> Result<String, String> {
+    let route = handoff_route(compression_selection.as_ref(), compression_model.as_deref())?;
     let mut excerpt = transcript_excerpt
         .unwrap_or_default()
         .trim()
@@ -163,18 +307,13 @@ pub async fn summarize_session_handoff(
         "{HANDOFF_DISTILL_PROMPT}\n\n---\n{title_line}原会话引擎与 ID：{engine}/{session_id}\n\n{excerpt}"
     );
 
-    let raw = match side_call::cursor_text_call(HANDOFF_MODEL, &input, HANDOFF_TIMEOUT).await {
-        Ok(text) => Ok(text),
-        Err(SideCallError::Failed | SideCallError::BadOutput) => {
-            side_call::cursor_text_call(HANDOFF_FALLBACK_MODEL, &input, HANDOFF_TIMEOUT).await
-        }
-        Err(err) => Err(err),
-    }
+    let selected_engine = compression_selection.as_ref().map(|s| s.engine.as_str()).unwrap_or("cursor");
+    let raw = run_handoff_route(route, &input).await
     .map_err(|err| match err {
-        SideCallError::Unavailable => "Cursor CLI unavailable".to_string(),
-        SideCallError::Timeout => "Cursor grok-4.7 handoff summary timed out".to_string(),
-        SideCallError::BadOutput => "Cursor grok-4.7 returned empty summary".to_string(),
-        SideCallError::Failed => "Cursor grok-4.7 handoff summary failed".to_string(),
+        SideCallError::Unavailable => format!("{selected_engine} handoff provider/model unavailable"),
+        SideCallError::Timeout => format!("{selected_engine} handoff summary timed out"),
+        SideCallError::BadOutput => format!("{selected_engine} returned invalid summary"),
+        SideCallError::Failed => format!("{selected_engine} handoff summary failed"),
     })?;
 
     sanitize_distilled_summary(&raw).ok_or_else(|| "distilled summary too short".to_string())
@@ -605,6 +744,134 @@ pub(crate) fn spawn_startup_cache_maintenance() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handoff_structured_summary_requires_valid_summary_field() {
+        let summary = "- 保留原会话的目标、改动与待继续事项";
+        assert_eq!(structured_handoff_summary(&serde_json::json!({"summary": format!("```markdown\n{summary}\n```") })), Ok(summary.into()));
+        for value in [serde_json::json!({}), serde_json::json!({"summary": 123}),
+            serde_json::json!({"summary": "短"}), serde_json::json!({"text": summary})] {
+            assert_eq!(structured_handoff_summary(&value), Err(SideCallError::BadOutput));
+        }
+    }
+
+    #[test]
+    fn handoff_selection_routes_native_models_and_overrides_legacy() {
+        for (engine, model) in [("claude", "opus[1m]"), ("codex", "gpt-5.4"),
+            ("pi", "openrouter/anthropic/claude-sonnet-4.6"), ("cursor", "grok-4.7-low-fast")] {
+            let selection: HandoffCompressionSelection = serde_json::from_value(serde_json::json!({
+                "engine": engine, "model": model,
+                "providerId": crate::config::LOCAL_PROVIDER_ID, "effort": "high"
+            })).unwrap();
+            let HandoffRoute::Explicit(actual) = handoff_route(Some(&selection), Some("--invalid-legacy")).unwrap() else {
+                panic!("explicit route fell back to legacy");
+            };
+            assert_eq!(actual.engine, engine);
+            assert_eq!(actual.model, model);
+            assert_eq!(actual.provider_id.as_deref(), Some(crate::config::LOCAL_PROVIDER_ID));
+        }
+        assert!(matches!(handoff_route(None, None).unwrap(), HandoffRoute::Legacy(_)));
+    }
+
+    #[test]
+    fn handoff_structured_request_pins_official_or_explicit_provider() {
+        let schema = serde_json::json!({"type": "object"});
+        for engine in ["claude", "codex", "pi"] {
+            for provider in [None, Some("custom provider channel")] {
+                let selection = HandoffCompressionSelection {
+                    engine: engine.into(), model: "provider/model[1m]".into(),
+                    provider_id: provider.map(str::to_owned), effort: Some("high".into()),
+                };
+                selection.validate().unwrap();
+                let call = selection.structured_call("excerpt", &schema);
+                assert_eq!(call.provider_id, Some(provider.unwrap_or(crate::config::LOCAL_PROVIDER_ID)));
+                assert_eq!(call.model, "provider/model[1m]");
+                assert_eq!(call.effort, "high");
+                assert_eq!(call.input, "excerpt");
+                assert_eq!(call.json_schema, &schema);
+                assert_eq!(call.timeout, HANDOFF_TIMEOUT);
+            }
+        }
+    }
+
+    #[test]
+    fn handoff_selection_rejects_invalid_route_without_legacy_fallback() {
+        for value in [
+            serde_json::json!({"engine":"unknown","model":"valid"}),
+            serde_json::json!({"engine":"codex","model":""}),
+            serde_json::json!({"engine":"claude","model":"--model"}),
+            serde_json::json!({"engine":"pi","model":"model\n"}),
+            serde_json::json!({"engine":"pi","model":"model --flag"}),
+            serde_json::json!({"engine":"claude","model":"opus","providerId":""}),
+            serde_json::json!({"engine":"claude","model":"opus","providerId":" leading"}),
+            serde_json::json!({"engine":"claude","model":"opus","providerId":"trailing "}),
+            serde_json::json!({"engine":"claude","model":"opus","providerId":"control\ncharacter"}),
+            serde_json::json!({"engine":"claude","model":"opus","providerId":"a".repeat(513)}),
+            serde_json::json!({"engine":"cursor","model":"valid","providerId":"custom"}),
+            serde_json::json!({"engine":"codex","model":"valid","effort":"--flag"}),
+        ] {
+            let selection = serde_json::from_value(value).unwrap();
+            assert!(handoff_route(Some(&selection), Some(HANDOFF_MODEL)).is_err());
+        }
+    }
+
+    #[test]
+    fn handoff_models_preserve_explicit_selection_without_fallback() {
+        for model in ["claude-opus-4.6", "gemini_3.1-pro", HANDOFF_MODEL] {
+            let padded = format!("  {model}  ");
+            let models = handoff_models(Some(&padded)).unwrap();
+            assert_eq!(models.primary, model);
+            for error in [
+                SideCallError::Failed,
+                SideCallError::BadOutput,
+                SideCallError::Timeout,
+                SideCallError::Unavailable,
+            ] {
+                assert_eq!(models.fallback_after(&error), None);
+            }
+        }
+        assert!(handoff_models(Some(&"a".repeat(128))).is_ok());
+    }
+
+    #[test]
+    fn handoff_models_absent_retains_legacy_fallback_policy() {
+        let models = handoff_models(None).unwrap();
+        assert_eq!(models.primary, HANDOFF_MODEL);
+        for error in [SideCallError::Failed, SideCallError::BadOutput] {
+            assert_eq!(models.fallback_after(&error), Some(HANDOFF_FALLBACK_MODEL));
+        }
+        for error in [SideCallError::Timeout, SideCallError::Unavailable] {
+            assert_eq!(models.fallback_after(&error), None);
+        }
+    }
+
+    #[test]
+    fn handoff_models_reject_invalid_selection() {
+        for model in [
+            "",
+            "   ",
+            "--model",
+            "-x",
+            "model --flag",
+            "model=other",
+            "model:high",
+            "model/other",
+            "model?x=1",
+            "model%0A",
+            "model\n",
+            "\tmodel",
+            "model\0",
+            "模型",
+            "model\u{200b}",
+        ] {
+            assert_eq!(
+                handoff_models(Some(model)).unwrap_err(),
+                "invalid handoff compression model",
+                "accepted invalid model: {model:?}"
+            );
+        }
+        assert!(handoff_models(Some(&"a".repeat(129))).is_err());
+    }
 
     #[test]
     fn sanitize_distilled_summary_strips_code_fences_and_trims() {

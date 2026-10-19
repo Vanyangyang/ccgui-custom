@@ -35,7 +35,7 @@ const sourceState = { ...EMPTY_SESSION, messages: [
   { seq: 3, role: "user", text: "请继续验证中文、emoji 🧩 和窄屏布局。", ts: null },
   { seq: 4, role: "assistant", text: "本地结论：保留原会话及用户补充；仅在启动确认后完成交接。下一步检查失败重试。", ts: null },
 ] };
-const engines: EngineInfo[] = [{ id: "claude", available: true, enabled: true, supportsImages: true, supportsComputerUse: false, permissions: ["auto", "manual", "bypass"] }];
+const engines: EngineInfo[] = ["claude", "codex", "pi", "cursor", "agy"].map(id => ({ id, available: true, enabled: true, supportsImages: true, supportsComputerUse: false, permissions: ["auto", "manual", "bypass"] }));
 type Pending = { resolve: (value: unknown) => void; reject: (error: Error) => void; args: Record<string, unknown> };
 const summaries: Pending[] = [];
 const sends: Pending[] = [];
@@ -58,8 +58,16 @@ window.__HANDOFF_INVOKE__ = async (command, args = {}) => {
   if (command === "list_archived_sessions") return archived ? [source] : [];
   if (command === "load_session_page") return { messages: sourceState.messages, nextBefore: null, subagentHistory: [] };
   if (command === "list_engines") return engines;
-  if (command === "list_engine_models") return { models: [], authoritative: false };
-  if (command === "get_cli_config") return {};
+  if (command === "list_engine_models") return args.engine === "cursor"
+    ? { authoritative: true, models: [
+      { id: "grok-4.7-low-fast", name: "Grok fixture", provider: "cursor" },
+      { id: "fixture-balanced", name: "Balanced fixture model", provider: "cursor" },
+    ] }
+    : { models: [{ id: args.engine === "claude" ? "opus" : args.engine === "pi" ? "fixture/provider-model" : "fixture-model", name: `${args.engine} fixture model` }], authoritative: true };
+  if (command === "get_cli_config") return { claude: { current: "__local_settings_json__", providers: {
+    "fixture-relay": { name: "示例供应商", env: { ANTHROPIC_MODEL: "fixture/opus[1m]" } },
+  } } };
+  if (command === "get_app_settings") return {};
   if (command === "claude_quota_read") return { status: "unavailable", windows: {}, errorCode: "fixture" };
   if (command === "prompts_dirs") return { workspace: "/synthetic/prompts", global: "/synthetic/global-prompts" };
   if (command === "git_status") return { branch: "fixture", staged: [], unstaged: [], untracked: [], files: [] };
@@ -89,8 +97,8 @@ function Fixture() {
   }, []);
   const settleSummary = (success: boolean) => {
     const pending = summaries.shift();
-    if (success) pending?.resolve("Grok 模拟摘要：保留来源、草稿和用户补充；确认新会话启动后再按选择归档。\n待办：完成窄屏与失败重试验证。");
-    else pending?.reject(new Error("Mocked IPC: Grok summary failed; retry is available."));
+    if (success) pending?.resolve("模型模拟摘要：保留来源、草稿和用户补充；确认新会话启动后再按选择归档。\n待办：完成窄屏与失败重试验证。");
+    else pending?.reject(new Error("Mocked IPC: model summary failed; retry is available."));
     notify();
   };
   const settleSend = (success: boolean) => {
@@ -103,9 +111,13 @@ function Fixture() {
     activeSession: chat.active?.sessionId ?? "draft", sourceArchived: Boolean(chat.archivedSessionKeys[sourceKey]),
     mockArchive: archived, sourceVisible: chat.sessions.some(s => s.sessionId === source.sessionId),
     mode: entry?.mode ?? null, grokStatus: entry?.grokStatus ?? null, sending: entry?.sending ?? false,
+    compressionModel: entry?.compressionModel ?? null,
+    compressionSelection: entry?.compressionSelection ?? null,
+    destinationModels: chat.models,
     archiveSourceOnSend: entry?.archiveSourceOnSend ?? null, handoffPresent: Boolean(entry),
     pendingSummaries: summaries.length, pendingSends: sends.length,
     summaryCalls: calls.filter(c => c.command === "summarize_session_handoff").length,
+    lastSummary: calls.filter(c => c.command === "summarize_session_handoff").at(-1)?.args ?? null,
     sendCalls: calls.filter(c => c.command === "send_message").length,
     archiveCalls: calls.filter(c => c.command === "archive_session").length,
     restoreCalls: calls.filter(c => c.command === "restore_session").length,
@@ -119,8 +131,8 @@ function Fixture() {
       <strong>真实组件 · mocked IPC · 无真实模型/存储</strong>
       <span>在来源输入 /handoff 后发送；再编辑交接草稿。</span>
       <button onClick={() => { useChatStore.getState().setDraft(sourceKey, "/handoff 继续验证，并保留用户附加内容 🧩"); ref.current?.focus(); }}>填入 /handoff（仍需发送）</button>
-      <button disabled={!summaries.length} onClick={() => settleSummary(true)}>Grok 模拟完成</button>
-      <button disabled={!summaries.length} onClick={() => settleSummary(false)}>Grok 模拟失败</button>
+      <button disabled={!summaries.length} onClick={() => settleSummary(true)}>压缩模拟完成</button>
+      <button disabled={!summaries.length} onClick={() => settleSummary(false)}>压缩模拟失败</button>
       <button disabled={!sends.length} onClick={() => settleSend(true)}>确认发送成功</button>
       <button disabled={!sends.length} onClick={() => settleSend(false)}>确认发送失败</button>
       <button onClick={() => void useChatStore.getState().selectSession(source.engine, source.sessionId, workspace.path)}>查看来源</button>

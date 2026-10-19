@@ -7,6 +7,7 @@ import { MessageRow } from "./MessageTimeline";
 import { ipc, type FileContent } from "@/lib/ipc";
 import i18n from "@/lib/i18n";
 import { resolveChatImage } from "./chat-image-refs";
+import { ImageAnnotationTargetProvider } from "./image-annotation-target";
 
 vi.mock("@/components/base/image-lightbox", () => ({ ImageLightbox: ({ src, name, onClose }: { src: string; name: string; onClose: () => void }) => <dialog open aria-label={name}><img src={src} /><button onClick={onClose}>Close</button></dialog> }));
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -42,6 +43,18 @@ describe("chat image rendering", () => {
     expect(document.body.querySelector("dialog img")?.getAttribute("src")).toBe(png);
     expect(container.querySelector("dialog")).toBeNull();
     expect(container.querySelector("p div")).toBeNull();
+  });
+
+  it("offers an onboarding image target only when that preview supports annotation", async () => {
+    await render(<ChatImage src={png} />);
+    expect(container.querySelector('[data-onboarding-target="image-preview"]')).toBeNull();
+    await render(<ImageAnnotationTargetProvider value={{ sessionKey: "guide-image", supportsImages: true, attachFiles: vi.fn() }}>
+      <ChatImage src={png} />
+    </ImageAnnotationTargetProvider>);
+    const target = container.querySelector<HTMLButtonElement>('[data-onboarding-target="image-preview"]');
+    expect(target).not.toBeNull();
+    await act(async () => target!.click());
+    expect(document.body.querySelector("dialog img")?.getAttribute("src")).toBe(png);
   });
 
   it.each(["https://example.test/a.png", "//example.test/a.png", "\\\\host\\a.png", "file:///tmp/a.png", "javascript:alert(1)", "data:image/svg+xml;base64,PHN2Zz4=", "ccgui-file:https%3A%2F%2Fexample.test%2Fa.png"])("blocks %s without browser or IPC loading", async src => {

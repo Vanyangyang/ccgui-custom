@@ -21,6 +21,7 @@ export const SidechatToggle = memo(function SidechatToggle({
   return (
     <button
       type="button"
+      data-onboarding-target="sidechat-toggle"
       aria-label={label}
       aria-pressed={open}
       title={label}

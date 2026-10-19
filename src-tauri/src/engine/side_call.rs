@@ -42,6 +42,7 @@ pub(crate) struct StructuredCall<'a> {
     pub json_schema: &'a Value,
     /// Source-native selector (a Claude alias, Codex id or Pi provider/model).
     pub model: &'a str,
+    pub provider_id: Option<&'a str>,
     pub effort: &'a str,
     pub timeout: Duration,
 }
@@ -146,7 +147,7 @@ fn build(call: &StructuredCall<'_>) -> Result<(BuiltCommand, std::path::PathBuf)
     };
     crate::config::ensure_engine_enabled("claude").map_err(|e| unavailable("disabled", e))?;
     let provider =
-        crate::config::resolve_provider("claude", None).map_err(|e| unavailable("channel", e))?;
+        crate::config::resolve_provider("claude", call.provider_id).map_err(|e| unavailable("channel", e))?;
     let mut channel_env = provider
         .as_ref()
         .map(|p| crate::provider_files::channel_env("claude", p))
@@ -497,23 +498,7 @@ pub(crate) async fn cursor_text_call(
         cursor_home,
         workspace: cwd.clone(),
     };
-    let mut command = command_for_binary(&bin);
-    crate::proxy::configure_cursor_command_proxy(&mut command);
-    let model_flag = super::cursor_picker::split_launch_model(model)
-        .map(|m| super::cursor_picker::cli_model_flag(&m.model_id).to_string())
-        .unwrap_or_else(|_| "grok-4.7".to_string());
-    command.args([
-        "-p",
-        "--output-format",
-        "stream-json",
-        "--trust",
-        "--mode",
-        "ask",
-        "--model",
-        &model_flag,
-        "--workspace",
-    ]);
-    command.arg(cwd.as_os_str());
+    let command = cursor_text_command(&bin, model, &cwd);
     let output = run_with_parser(
         "cursor",
         command,
@@ -531,6 +516,26 @@ pub(crate) async fn cursor_text_call(
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .ok_or(SideCallError::BadOutput)
+}
+
+fn cursor_text_command(bin: &str, model: &str, cwd: &Path) -> tokio::process::Command {
+    let mut command = command_for_binary(bin);
+    crate::proxy::configure_cursor_command_proxy(&mut command);
+    // Side-call callers supply a CLI slug, not a chat picker composite ID.
+    // In particular keep -low/-fast suffixes and never substitute another model.
+    command.args([
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--trust",
+        "--mode",
+        "ask",
+        "--model",
+        model,
+        "--workspace",
+    ]);
+    command.arg(cwd.as_os_str());
+    command
 }
 
 fn parse_cursor_text_result(stdout: &[u8]) -> Result<SideCallOutput, SideCallError> {
@@ -633,6 +638,18 @@ pub(crate) fn parse_cursor_text_result_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handoff_cursor_command_preserves_exact_slug_and_ask_mode() {
+        for model in ["grok-4.7-low-fast", "grok-4.7-low", "future-model-unknown"] {
+            let command = cursor_text_command("cursor-agent", model, Path::new("private-side-call"));
+            let args: Vec<_> = command.as_std().get_args().map(|s| s.to_string_lossy().into_owned()).collect();
+            let value = |flag| args.iter().position(|arg| arg == flag).map(|index| args[index + 1].as_str());
+            assert_eq!(value("--model"), Some(model));
+            assert_eq!(value("--mode"), Some("ask"));
+            assert_eq!(value("--workspace"), Some("private-side-call"));
+        }
+    }
     use std::io::{Read, Write};
 
     const FIXTURE: &str = "engine::side_call::tests::fake_claude_process";
@@ -892,6 +909,7 @@ mod tests {
             serde_json::json!({"type": "object", "properties": {"title": {"type": "string"}}});
         for model in ["sonnet", "haiku", "relay-sonnet"] {
             let call = StructuredCall {
+                provider_id: None,
                 system_prompt: "fixture system prompt",
                 input: "fixture input",
                 json_schema: &schema,

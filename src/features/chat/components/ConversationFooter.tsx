@@ -78,6 +78,7 @@ function AttachmentChip({
   onZoom: (zoom: NonNullable<ZoomImage>) => void;
 }) {
   const { t } = useTranslation();
+  const annotationTarget = useImageAnnotationTarget();
   const name = preview?.name ?? baseName(path);
   const meta = preview ? imageMetaText(preview) : "";
   return (
@@ -86,6 +87,7 @@ function AttachmentChip({
     >
       <button
         type="button"
+        data-onboarding-target={preview && annotationTarget ? "image-preview" : undefined}
         onClick={() =>
           preview && onZoom({ src: preview.url, name: preview.name })
         }

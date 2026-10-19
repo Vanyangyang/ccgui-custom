@@ -318,7 +318,7 @@ pub fn run() {
             app.manage(config::ConfigStore::default());
             assistant_notices::init(app.handle());
             app.manage(Arc::clone(&claude_quota::STATE));
-            claude_quota::install_events(app.handle());
+            claude_quota::install_events(Arc::clone(&app.state::<AppState>().emitters));
             app.manage(Arc::clone(&codex_quota::STATE));
             codex_quota::install_events(app.handle());
             app.manage(Arc::clone(&agy_quota::STATE));

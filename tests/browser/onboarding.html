@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Onboarding isolated regression</title></head>
+<body style="margin:0"><div id="fixture"></div>
+<script>
+  const storage = () => { const data = new Map(); return { get length(){return data.size;}, key:i=>[...data.keys()][i]??null,
+    getItem:key=>data.get(String(key))??null,setItem:(key,value)=>data.set(String(key),String(value)),removeItem:key=>data.delete(String(key)),clear:()=>data.clear() }; };
+  Object.defineProperty(window,"localStorage",{value:storage()});
+  Object.defineProperty(window,"sessionStorage",{value:storage()});
+  localStorage.setItem("ccgui-next.onboardingCompleted:v1", "1");
+  window.__TAURI_INTERNALS__={transformCallback:()=>1,unregisterCallback:()=>{},convertFileSrc:p=>p,
+    metadata:{currentWebview:{label:"main"},currentWindow:{label:"main"}},
+    async invoke(command){
+      if(command==="get_app_settings")return {};
+      if(command==="plugin:event|listen")return 1;
+      if(command==="plugin:event|unlisten")return null;
+      throw new Error("Fixture rejects IPC: "+command);
+    }};
+</script>
+<script type="module" src="./onboarding.tsx"></script></body></html>

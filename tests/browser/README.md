@@ -1,5 +1,21 @@
 # Chat streaming regression
 
+Open `/tests/browser/onboarding.html` for the production feature guide and
+Sidechat toolbar button, with synthetic input/settings/image/notice controls.
+Use `?topic=handoff`, `btw`, `imageAnnotation`, `proxy`, `selfUpdate`,
+`assistantNotices`, or `intelligenceUi` (default: `sidechat`). Instructions stay
+still; command examples identify the actual input field and require submission.
+Going to an input preserves the draft; locating the build button must leave the
+mock build click count at zero. Opening settings reveals its precise control.
+Self-update has three manual steps: review the bottom-right list, decide whether
+to request the update, then the optional workspace build route. Review must keep
+mock requests at zero; locating the status button must also keep it at zero until
+the user clicks the real button after leaving the guide. `&update=busy` makes
+that button open details instead of requesting another update.
+Variants: `&image=1`, `&disabled=1`, `&target=missing`, `&lang=en&theme=dark`;
+check desktop and narrow viewports. Storage and IPC are isolated; image/notice
+panes and build actions are fixtures. No model runs or real updates occur.
+
 Open `/tests/browser/self-update.html` for the production self-update status chip
 and complete change list with synthetic state. Variants: `?mode=rollback`,
 `?mode=unverified`, `?mode=building`, `?mode=queued`, `?width=320`, and
@@ -203,7 +219,15 @@ an isolated iframe with a real 320 px viewport. Both storage objects and all
 Tauri IPC/events are replaced before production imports; no saved conversation,
 user settings, native application, Cursor process or model request is used.
 Enter `/handoff` in the source composer (or fill it with the fixture button and
-then send). Check the source card and Grok/local/detailed controls. Append text
+then send). Check that model compression starts off with zero summary calls.
+Open the shared provider/model menu, choose Claude Code and the fixture relay
+channel, then enable compression and check `lastSummary.compressionSelection`
+for its engine, providerId, model and effort. `destinationModels` must stay unchanged.
+The same menu supports Codex, Pi and Cursor; AGY is explicitly unavailable for
+compression. Refresh the catalog without making a summary request. The takeover
+button must open only the main chat menu, and sending must close/lock the compression
+menu. Switch off to use local/detailed digests;
+complete the old mocked request and verify that its result is ignored. Append text
 after the continuation marker, switch modes, and finish/fail the pending mocked
 summary with the toolbar. Retry through the real card; summary replacement must
 preserve the added text. Source retention is the default. Choose archive-on-send,

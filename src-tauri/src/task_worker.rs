@@ -527,6 +527,9 @@ fn validate_config(config: &WorkerConfig) -> Result<PathBuf, WorkerError> {
 fn app_state(db: Arc<crate::db::Db>, journal: Arc<storage::Journal>) -> Arc<crate::AppState> {
     let emitter: Arc<dyn Emit> = Arc::new(JournalEmitter(journal));
     let emitters = BroadcastEmit::new(emitter);
+    // Quota writes happen in this process, not the desktop host. Journal the
+    // same value-free invalidation so attached clients immediately re-read it.
+    crate::claude_quota::install_events(emitters.clone());
     Arc::new(crate::AppState {
         db,
         sink: EventSink::new(emitters.clone()),
@@ -1220,6 +1223,29 @@ async fn serve_connection(worker: Arc<Worker>, socket: tokio::net::TcpStream) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_quota_invalidation_is_journaled_without_account_or_usage_payload() {
+        let (worker, directory) = fixture();
+        // A private state avoids cross-test interference with the process-wide
+        // notifier while using the production BroadcastEmit -> JournalEmitter.
+        let quota = crate::claude_quota::ClaudeQuotaState::default();
+        quota.install_events(worker.app.emitters.clone());
+        quota.ingest_bound("synthetic-account", crate::claude_quota::QuotaWindows {
+            five_hour: Some(crate::claude_quota::QuotaWindow {
+                used_percentage: 42.0,
+                resets_at: None,
+            }),
+            seven_day: None,
+        });
+        let page = worker.journal.replay("worker-test", 0, 64).unwrap();
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].name, "claude-quota://changed");
+        assert_eq!(page.events[0].payload, Value::Null);
+        drop(quota);
+        drop(worker);
+        let _ = std::fs::remove_dir_all(directory);
+    }
 
     fn fixture() -> (Arc<Worker>, PathBuf) {
         let directory =

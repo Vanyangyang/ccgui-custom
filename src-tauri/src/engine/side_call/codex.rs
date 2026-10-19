@@ -56,7 +56,7 @@ pub(super) async fn structured(call: StructuredCall<'_>) -> Result<SideCallOutpu
 async fn structured_inner(call: &StructuredCall<'_>) -> Result<SideCallOutput, SideCallError> {
     crate::config::ensure_engine_enabled("codex").map_err(|_| SideCallError::Unavailable)?;
     let provider =
-        crate::config::resolve_provider("codex", None).map_err(|_| SideCallError::Unavailable)?;
+        crate::config::resolve_provider("codex", call.provider_id).map_err(|_| SideCallError::Unavailable)?;
     let channel_env = provider
         .as_ref()
         .map(|provider| crate::provider_files::channel_env("codex", provider))
@@ -1201,6 +1201,7 @@ mod tests {
 
     fn call<'a>(schema: &'a Value) -> StructuredCall<'a> {
         StructuredCall {
+            provider_id: None,
             system_prompt: "Return a title",
             input: "fixture input",
             json_schema: schema,
@@ -1433,6 +1434,7 @@ mod tests {
         );
         let schema = json!({"type":"object","properties":{"action":{"type":"string","enum":["keep","rename"]},"title":{"type":"string"},"reason":{"type":"string"}},"required":["action","title","reason"],"additionalProperties":false});
         let result = structured(StructuredCall {
+            provider_id: None,
             system_prompt: include_str!("../../auto_title/naming.md"),
             input: "这是隔离的 CC GUI 命名验收。用户请求：请用三句话说明雨水收集装置中滤网的作用。仅文本回答，不调用工具、不访问文件。当前标题是首条用户消息，请生成简短标题。",
             json_schema: &schema,

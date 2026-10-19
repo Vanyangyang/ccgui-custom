@@ -7,40 +7,14 @@ import Check from "lucide-react/dist/esm/icons/check";
 import ExternalLink from "lucide-react/dist/esm/icons/external-link";
 import Loader2 from "lucide-react/dist/esm/icons/loader-2";
 import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw";
-import Sparkles from "lucide-react/dist/esm/icons/sparkles";
 import X from "lucide-react/dist/esm/icons/x";
 import { Button } from "@/components/base/buttons/button";
 import { requestCliMenuOpen } from "@/components/application/ai-chat/cli-menu";
 import { CLI_DISPLAY_NAMES } from "@/components/foundations/icons/engine-brands";
 import { EngineIcon } from "@/components/foundations/icons/engine-icon";
 import { useChatStore, type ActiveSession } from "../store";
-import {
-  useHandoffStore,
-  type HandoffCompressionMode,
-} from "../session-cleanup";
-import { cx } from "@/utils/cx";
-
-const MODES: {
-  id: HandoffCompressionMode;
-  labelKey: string;
-  descKey: string;
-}[] = [
-  {
-    id: "grok",
-    labelKey: "chat.handoffModeGrok",
-    descKey: "chat.handoffModeGrokDesc",
-  },
-  {
-    id: "local",
-    labelKey: "chat.handoffModeLocal",
-    descKey: "chat.handoffModeLocalDesc",
-  },
-  {
-    id: "detailed",
-    labelKey: "chat.handoffModeDetailed",
-    descKey: "chat.handoffModeDetailedDesc",
-  },
-];
+import { useHandoffStore } from "../session-cleanup";
+import { HandoffCompressionControls } from "./HandoffCompressionControls";
 
 export function HandoffOverlayCard({
   active,
@@ -54,7 +28,6 @@ export function HandoffOverlayCard({
   const entry = useHandoffStore((s) =>
     workspacePath ? s.byWorkspace[workspacePath] : undefined,
   );
-  const setCompressionMode = useHandoffStore((s) => s.setCompressionMode);
   const retryGrok = useHandoffStore((s) => s.retryGrok);
   const setArchiveSourceOnSend = useHandoffStore((s) => s.setArchiveSourceOnSend);
   const archiveSourceNow = useHandoffStore((s) => s.archiveSourceNow);
@@ -65,7 +38,7 @@ export function HandoffOverlayCard({
   const [elapsedMs, setElapsedMs] = useState(0);
 
   useEffect(() => {
-    if (!entry || entry.grokStatus !== "running" || !entry.grokStartedAt) {
+    if (!entry || entry.mode !== "grok" || entry.grokStatus !== "running" || !entry.grokStartedAt) {
       setElapsedMs(0);
       return;
     }
@@ -75,7 +48,7 @@ export function HandoffOverlayCard({
       setElapsedMs(Math.max(0, Date.now() - start));
     }, 200);
     return () => window.clearInterval(timer);
-  }, [entry?.id, entry?.grokStatus, entry?.grokStartedAt]);
+  }, [entry?.id, entry?.mode, entry?.grokStatus, entry?.grokStartedAt]);
 
   if (!active || active.sessionId !== null || !entry) return null;
 
@@ -104,10 +77,10 @@ export function HandoffOverlayCard({
       <section
         data-testid="handoff-overlay-card"
         aria-label={t("chat.handoffBannerTitle")}
-        aria-busy={entry.grokStatus === "running"}
+        aria-busy={entry.mode === "grok" && entry.grokStatus === "running"}
         className="flex min-w-0 flex-col gap-2 rounded-xl border border-border-button-default bg-background-secondary-default px-3 py-2.5 shadow-xs"
       >
-        {/* Top Row: Source session identity + Live Grok 4.7 distillation status + Dismiss */}
+        {/* Top Row: Source session identity + Live model compression status + Dismiss */}
         <header className="flex min-w-0 flex-wrap items-center justify-between gap-2">
           <div className="flex min-w-0 flex-1 items-center gap-2">
             <span className="shrink-0 rounded-md bg-background-tertiary-default px-1.5 py-0.5 font-mono text-caption-1-medium text-text-secondary">
@@ -136,7 +109,7 @@ export function HandoffOverlayCard({
               data-grok-status={entry.grokStatus}
               className="flex min-w-0 max-w-full flex-wrap items-center gap-1.5"
             >
-              {entry.grokStatus === "running" ? (
+              {entry.mode !== "grok" ? null : entry.grokStatus === "running" ? (
                 <span className="inline-flex items-center gap-1.5 rounded-full bg-background-tertiary-warning px-2 py-0.5 text-caption-1-medium text-text-warning-primary">
                   <Loader2 className="size-3 animate-spin" aria-hidden />
                   <span>
@@ -201,41 +174,18 @@ export function HandoffOverlayCard({
 
         {/* Bottom Row: Compression Mode Segmented Control + Takeover Engine/Model + Source Session Archive Control */}
         <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
-          {/* Compression Options */}
-          <div className="flex flex-wrap items-center gap-1.5">
-            <span className="text-caption-1-regular text-text-tertiary">
-              {t("chat.handoffCompressionLabel")}：
-            </span>
-            <div
-              role="group"
-              aria-label={t("chat.handoffCompressionLabel")}
-              className="inline-flex min-w-0 max-w-full flex-wrap items-center gap-0.5 rounded-lg bg-background-tertiary-default p-0.5"
-            >
-              {MODES.map((m) => {
-                const selected = entry.mode === m.id;
-                return (
-                  <button
-                    key={m.id}
-                    type="button"
-                    data-testid={`handoff-mode-${m.id}`}
-                    aria-pressed={selected}
-                    disabled={entry.sending}
-                    title={t(entry.sending ? "chat.handoffSendingLock" : m.descKey)}
-                    onClick={() => setCompressionMode(workspacePath, m.id)}
-                    className={cx(
-                      "inline-flex cursor-pointer items-center gap-1 rounded-md px-2 py-0.5 text-caption-1-medium transition-colors duration-150 disabled:cursor-wait disabled:opacity-60",
-                      selected
-                        ? "bg-background-primary-default text-text-primary shadow-2xs"
-                        : "text-text-tertiary hover:text-text-secondary",
-                    )}
-                  >
-                    {m.id === "grok" && <Sparkles className="size-3" aria-hidden />}
-                    <span>{t(m.labelKey)}</span>
-                  </button>
-                );
-              })}
-            </div>
-          </div>
+          <HandoffCompressionControls
+            workspacePath={workspacePath}
+            mode={entry.mode}
+            compressionModel={entry.compressionModel}
+            compressionSelection={entry.compressionSelection}
+            sending={entry.sending === true}
+          />
+          {entry.compressionPreferenceError && (
+            <p role="status" className="text-caption-1-regular text-text-warning-primary">
+              {t("chat.handoffPreferenceSaveFailed")}
+            </p>
+          )}
 
           {/* Right side: Takeover Engine/Model Switcher + Archive Source Controls */}
           <div className="flex flex-wrap items-center gap-2">

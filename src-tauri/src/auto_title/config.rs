@@ -91,6 +91,7 @@ impl NamingConfig {
         schema: &'a serde_json::Value,
     ) -> crate::engine::side_call::StructuredCall<'a> {
         crate::engine::side_call::StructuredCall {
+            provider_id: None,
             system_prompt: super::PROMPT,
             input,
             json_schema: schema,
