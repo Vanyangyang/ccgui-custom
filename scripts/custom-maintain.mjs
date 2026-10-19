@@ -4,6 +4,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import os from 'node:os';
+import { assertNativeReleasePaths, prepareReleaseCompiler } from './release-compiler.mjs';
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const UPSTREAM = 'https://github.com/zhukunpenglinyutong/desktop-cc-gui.git';
@@ -24,14 +25,15 @@ export function git(args, cwd = ROOT) {
   return r.stdout.trimEnd();
 }
 export function proxyEnvironment(base = process.env) {
-  const env = { ...base };
-  for (const key of ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy', 'CARGO_HTTP_PROXY']) env[key] = 'http://127.0.0.1:7897';
-  env.NO_PROXY = env.no_proxy = 'localhost,127.0.0.1,::1';
-  return env;
+  // Build tools inherit the invoking terminal's network policy. Do not inject
+  // a maintainer's proxy or read network settings from AI CLI credentials.
+  return { ...base };
 }
-function nativeEnvironment() {
-  const env = proxyEnvironment();
-  delete env.CARGO_TARGET_DIR;
+export function nativeEnvironment(base = process.env) {
+  const env = proxyEnvironment(base);
+  env.CARGO_TARGET_DIR = path.join(ROOT, 'src-tauri', 'target');
+  // Cold native builds should fit an ordinary desktop alongside the running app.
+  env.CARGO_BUILD_JOBS ??= '2';
   return env;
 }
 async function run(label, exe, args, cwd, env, log) {
@@ -70,6 +72,8 @@ async function check() {
   try {
     const env = nativeEnvironment();
     await run('maintenance safety', process.execPath, ['--test', 'scripts/custom-maintain.test.mjs'], ROOT, env, log);
+    await run('self-update build safety', process.execPath, ['--test', 'scripts/self-update-build.test.mjs'], ROOT, env, log);
+    await run('release compiler privacy', process.execPath, ['--test', 'scripts/release-compiler.test.mjs'], ROOT, env, log);
     await run('privacy boundary', process.execPath, ['--experimental-strip-types', '--test', 'tests/privacy-boundary.test.ts'], ROOT, env, log);
     await run('types', process.execPath, ['node_modules/typescript/bin/tsc', '--noEmit'], ROOT, env, log);
     // Bound cold lazy-UI transforms while native work runs in other checkouts.
@@ -80,6 +84,8 @@ async function check() {
     await run('native isolated title calls', 'cargo', ['test', '--quiet', 'engine::side_call::tests', '--lib'], path.join(ROOT, 'src-tauri'), env, log);
     await run('native single instance', 'cargo', ['test', '--quiet', 'single_instance::tests', '--lib'], path.join(ROOT, 'src-tauri'), env, log);
     await run('native startup modes', 'cargo', ['test', '--quiet', 'startup::tests', '--lib'], path.join(ROOT, 'src-tauri'), env, log);
+    await run('native bundled skills', 'cargo', ['test', '--quiet', 'creator_skill::tests', '--lib'], path.join(ROOT, 'src-tauri'), env, log);
+    await run('native bundled agents', 'cargo', ['test', '--quiet', 'agent_catalog::tests', '--lib'], path.join(ROOT, 'src-tauri'), env, log);
     await run('native relay transport', 'cargo', ['test', '--quiet', 'relay', '--lib'], path.join(ROOT, 'src-tauri'), env, log);
     await run('native passive throughput', 'cargo', ['test', '--quiet', 'reader::terminal_event_tests::throughput_', '--lib'], path.join(ROOT, 'src-tauri'), env, log);
     await run('native task control', 'cargo', ['test', '--quiet', 'native_task_control', '--lib'], path.join(ROOT, 'src-tauri'), env, log);
@@ -91,7 +97,7 @@ async function check() {
     await run('native history archive and deletion', 'cargo', ['test', '--quiet', 'history::reader::', '--lib'], path.join(ROOT, 'src-tauri'), env, log);
     await run('native isolated send path', 'cargo', ['test', '--quiet', '--features', 'test-harness', '--test', 'send_path'], path.join(ROOT, 'src-tauri'), env, log);
     git(['diff', '--check']);
-    recordVerification(production, checkedHead, ['maintenance safety', 'privacy boundary', 'types', 'vitest', 'native quota', 'native auto title', 'native isolated title calls', 'native single instance', 'native startup modes', 'native relay transport', 'native passive throughput', 'native task control', 'native host chat', 'native Codex', 'native assistant notices', 'native plugin boundaries', 'native Leader', 'native history archive and deletion', 'native isolated send path', 'diff']);
+    recordVerification(production, checkedHead, ['maintenance safety', 'self-update build safety', 'release compiler privacy', 'privacy boundary', 'types', 'vitest', 'native quota', 'native auto title', 'native isolated title calls', 'native single instance', 'native startup modes', 'native bundled skills', 'native bundled agents', 'native relay transport', 'native passive throughput', 'native task control', 'native host chat', 'native Codex', 'native assistant notices', 'native plugin boundaries', 'native Leader', 'native history archive and deletion', 'native isolated send path', 'diff']);
     console.log(JSON.stringify({ passed: true, log: filename }));
   } finally { log.end(); }
 }
@@ -109,8 +115,12 @@ async function build() {
   const logPath = path.join(artifacts, 'custom-build.log');
   const log = fs.createWriteStream(logPath);
   try {
+    // Ignored files can still be bundled by Vite/Tauri after verification.
+    await run('package privacy', process.execPath, ['--experimental-strip-types', '--test', 'tests/privacy-boundary.test.ts'], ROOT, nativeEnvironment(), log);
+    assertNativeReleasePaths({ root: ROOT, env: nativeEnvironment() });
+    const releaseEnv = prepareReleaseCompiler({ root: ROOT, artifacts, env: nativeEnvironment() });
     const startedAt = Date.now();
-    await run('protected installer', process.execPath, ['node_modules/@tauri-apps/cli/tauri.js', 'build', '--bundles', 'nsis', '--config', configPath], ROOT, nativeEnvironment(), log);
+    await run('protected installer', process.execPath, ['node_modules/@tauri-apps/cli/tauri.js', 'build', '--bundles', 'nsis', '--config', configPath], ROOT, releaseEnv, log);
     const built = recordBuild(production, config.version, startedAt);
     console.log(JSON.stringify({ built: true, version: config.version, commit: report.head, report: built.reportPath, log: logPath }));
   } finally { log.end(); }
@@ -123,7 +133,7 @@ function integrate(context, ref) {
   if (manifest.upstreamRemote !== context.upstream || git(['remote', 'get-url', 'upstream'], root) !== context.upstream) throw new Error('The upstream remote differs from the reviewed source');
   if (path.resolve(git(['remote', 'get-url', 'origin'], root)) !== path.resolve(context.backup)) throw new Error('The backup remote differs from the reviewed local repository');
   if (!Number.isSafeInteger(manifest.patchRevision) || manifest.patchRevision < 0) throw new Error('The patch revision is invalid');
-  git(['-c', 'http.proxy=http://127.0.0.1:7897', 'fetch', '--quiet', '--no-recurse-submodules', 'upstream', '--tags'], root);
+  git(['fetch', '--quiet', '--no-recurse-submodules', 'upstream', '--tags'], root);
   const commit = git(['rev-parse', '--verify', `${ref}^{commit}`], root);
   const ancestor = spawnSync('git', ['merge-base', '--is-ancestor', commit, 'HEAD'], { cwd: root, encoding: 'utf8', windowsHide: true });
   if (ancestor.status !== 0 && ancestor.status !== 1) throw new Error('Could not determine upstream ancestry');
@@ -151,6 +161,20 @@ function integrate(context, ref) {
   return { status: 'merged_candidate', directory, branch, upstream: commit, next: ['pnpm install --frozen-lockfile', 'pnpm maint:check', 'pnpm maint:build'] };
 }
 function sha256(filename) { return createHash('sha256').update(fs.readFileSync(filename)).digest('hex'); }
+function assertNoLocalBuildPaths(filename, context) {
+  const home = context.userProfile || os.homedir();
+  const roots = [context.root, home, process.env.CARGO_HOME || path.join(home, '.cargo')];
+  const normalize = value => value.toLowerCase().replace(/\\+/g, '/');
+  const bytes = fs.readFileSync(filename);
+  const contents = [normalize(bytes.toString('utf8')), normalize(bytes.toString('utf16le')), normalize(bytes.subarray(1).toString('utf16le'))];
+  for (const root of roots) {
+    if (!root || !path.isAbsolute(root) || path.resolve(root) === path.parse(root).root) continue;
+    if (contents.some(text => text.includes(normalize(root)))) {
+      // Never include the detected private path in CLI diagnostics.
+      throw new Error('The executable contains a local build path. Remove compiled source paths or remap compiler paths before distributing it.');
+    }
+  }
+}
 function recordVerification(context, checkedHead, checks) {
   const { root } = context;
   if (git(['rev-parse', 'HEAD'], root) !== checkedHead || git(['status', '--porcelain=v1'], root)) {
@@ -161,9 +185,18 @@ function recordVerification(context, checkedHead, checks) {
   return report;
 }
 function verifiedHead(root) {
-  const report = JSON.parse(fs.readFileSync(checkedPath(root, 'artifacts/custom-verification.json'), 'utf8'));
+  const reportPath = checkedPath(root, 'artifacts/custom-verification.json');
+  let report;
+  try {
+    report = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+  } catch (error) {
+    if (error.code === 'ENOENT' || error instanceof SyntaxError) {
+      throw new Error('No valid verification report. Run pnpm maint:check, then pnpm maint:build.');
+    }
+    throw error;
+  }
   const head = git(['rev-parse', 'HEAD'], root);
-  if (report.clean !== true || report.head !== head || git(['status', '--porcelain=v1'], root)) throw new Error('Commit the source and run maint:check for this exact revision');
+  if (report?.clean !== true || report.head !== head || git(['status', '--porcelain=v1'], root)) throw new Error('Commit the source and run maint:check for this exact revision');
   return head;
 }
 function recordBuild(context, version, startedAt) {
@@ -174,6 +207,7 @@ function recordBuild(context, version, startedAt) {
   if (!Number.isFinite(startedAt) || !fs.statSync(exe).isFile() || fs.statSync(exe).mtimeMs < startedAt - 1000) throw new Error('The executable is stale');
   const installers = fs.readdirSync(bundle).filter(name => name.endsWith('.exe')).map(name => checkedPath(bundle, name)).filter(filename => fs.statSync(filename).mtimeMs >= startedAt - 1000);
   if (installers.length !== 1) throw new Error('Expected exactly one fresh NSIS installer');
+  assertNoLocalBuildPaths(exe, context);
   const report = { head, version, exe, sha256: sha256(exe), installer: installers[0], builtAt: new Date().toISOString() };
   const reportPath = path.join(paths(root), 'custom-build.json');
   fs.writeFileSync(reportPath, JSON.stringify(report, null, 2) + '\n');

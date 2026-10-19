@@ -11,27 +11,37 @@ describe("Claude account quota display", () => {
       .toEqual({ fiveHour: { usedPercentage: 0 }, sevenDay: { usedPercentage: 80, resetsAt: now + 100 } });
     expect(validClaudeQuotaSnapshot(snapshot({ fiveHour: { usedPercentage: 0 } }), now).windows.sevenDay).toBeUndefined();
   });
-  it("drops expired or malformed windows without inventing percentages", () => {
+  it("drops malformed windows without inventing percentages", () => {
     for (const usedPercentage of [NaN, Infinity, -1, 100.1]) {
       expect(validClaudeQuotaSnapshot(snapshot({ fiveHour: { usedPercentage } }), now).windows).toEqual({});
     }
-    for (const resetsAt of [now, now - 1, NaN, Infinity, 1e20]) {
+    for (const resetsAt of [NaN, Infinity, 1e20]) {
       expect(validClaudeQuotaSnapshot(snapshot({ fiveHour: { usedPercentage: 80, resetsAt }, sevenDay: { usedPercentage: 30 } }), now).windows)
         .toEqual({ sevenDay: { usedPercentage: 30 } });
     }
   });
-  it("keeps fractional percentage units and validates cache age", () => {
+  it("keeps fractional percentage units past one hour while validating snapshot availability and timestamps", () => {
     const data = snapshot({ fiveHour: { usedPercentage: 0.8 } });
     expect(validClaudeQuotaSnapshot(data, now).windows.fiveHour?.usedPercentage).toBe(0.8);
     expect(validClaudeQuotaSnapshot(data, now + 119).status).toBe("ready");
     expect(validClaudeQuotaSnapshot(data, now + 120).status).toBe("stale");
     expect(validClaudeQuotaSnapshot(data, now + 601)).toMatchObject({ status: "stale", windows: { fiveHour: { usedPercentage: 0.8 } } });
     expect(validClaudeQuotaSnapshot(data, now + 3599).windows.fiveHour?.usedPercentage).toBe(0.8);
-    expect(validClaudeQuotaSnapshot(data, now + 3600)).toMatchObject({ status: "unavailable", windows: {}, errorCode: "quota_expired" });
-    expect(validClaudeQuotaSnapshot({ ...data, status: "unavailable" }, now).windows).toEqual({});
-    for (const collectedAt of [undefined, NaN, Infinity, 0, now + 1]) {
-      expect(validClaudeQuotaSnapshot({ ...data, collectedAt }, now).windows).toEqual({});
+    for (const age of [3600, 3601, 8 * 24 * 3600]) {
+      expect(validClaudeQuotaSnapshot(data, now + age)).toEqual({ ...data, status: "stale" });
     }
+    expect(validClaudeQuotaSnapshot({ ...data, status: "unavailable" }, now)).toMatchObject({ status: "unavailable", windows: {}, errorCode: "quota_not_available" });
+    for (const collectedAt of [undefined, NaN, Infinity, 0, -1, now + 1]) {
+      expect(validClaudeQuotaSnapshot({ ...data, collectedAt }, now)).toMatchObject({ status: "unavailable", windows: {}, errorCode: "quota_not_available" });
+    }
+  });
+  it("retains both percentages and collection time across reset boundaries until the next snapshot", () => {
+    const data = snapshot({ fiveHour: { usedPercentage: 35, resetsAt: now + 60 }, sevenDay: { usedPercentage: 0, resetsAt: now + 120 } });
+    for (const elapsed of [59, 60, 61, 119, 120, 121, 8 * 24 * 3600]) {
+      expect(validClaudeQuotaSnapshot(data, now + elapsed)).toEqual({ ...data, status: elapsed >= 120 ? "stale" : "ready" });
+    }
+    const next = snapshot({ fiveHour: { usedPercentage: 5 } }, now + 122);
+    expect(validClaudeQuotaSnapshot(next, now + 122)).toEqual(next);
   });
   it("rounds reset countdown up to the next minute", () => {
     expect(quotaResetCountdown(now + 3601, now)).toEqual({ hours: 1, minutes: 1 });
@@ -52,8 +62,8 @@ describe("Claude account quota display", () => {
     }
     expect(compactQuotaReset(now + 100, "sevenDay", "en", NaN)).toBeUndefined();
   });
-  it("reports unavailable when every window is absent or expired and keeps explicit guard errors", () => {
-    for (const windows of [{}, { fiveHour: { usedPercentage: 35, resetsAt: now } }]) {
+  it("reports unavailable when every window is absent or malformed and keeps explicit guard errors", () => {
+    for (const windows of [{}, { fiveHour: { usedPercentage: 35, resetsAt: NaN } }, { sevenDay: { usedPercentage: -1 } }]) {
       expect(validClaudeQuotaSnapshot(snapshot(windows), now)).toMatchObject({ status: "unavailable", windows: {}, errorCode: "quota_not_available" });
     }
     expect(validClaudeQuotaSnapshot({ ...snapshot({}), errorCode: "provider_auth_unavailable" }, now).errorCode).toBe("provider_auth_unavailable");

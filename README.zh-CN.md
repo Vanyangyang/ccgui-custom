@@ -100,27 +100,39 @@
 ## 从 GitHub 安装与自开发热更新（`ccgui-custom`）
 
 ### 1. 首次从 GitHub 克隆与安装
-环境要求：**Node.js 20+**、**pnpm 9+**、**Rust (stable)** 及系统 WebView2 / Tauri 2 构建依赖。
+环境要求：**Node.js 24 LTS**（已测试；最低 **22.13**）、固定版本 **pnpm 11.19.0**、**Git** 和 **Rust stable 1.95+**（已测试 1.99）。Windows 按 [Tauri 官方环境要求](https://v2.tauri.app/start/prerequisites/) 安装 MSVC C++ 构建工具、Windows SDK 和 WebView2，**不需要 Perl**。其他平台仍需各自的 Tauri 系统依赖；下面的 Windows 流程不代表 macOS/Linux 安装包已验证。
 
 ```bash
 # 1. 克隆仓库到本地目录（建议命名为 ccgui-custom）
 git clone https://github.com/Vanyangyang/ccgui-custom.git ccgui-custom
 cd ccgui-custom
 
-# 2. 安装前端与工作区依赖
-pnpm install
+# 2. 安装固定版本包管理器与工作区依赖
+npm install --global pnpm@11.19.0
+pnpm install --frozen-lockfile
 
-# 3. 方式 A：构建并安装桌面发行版（推荐日常使用，生成 NSIS 安装包）
+# 3. 在同一干净检出中先验证，再构建 Windows 正式安装包
+pnpm maint:check
 pnpm maint:build
 # 构建完成后运行 src-tauri/target/release/bundle/nsis/ 下的 setup.exe 完成安装
+```
 
-# 3. 方式 B：直接启动开发调试模式
+检查与打包之间须保持源码干净且处于同一提交。检查失败时修复原因后重新运行；`maint:build` 必须有对应的成功检查记录。正式安装版已内嵌前端，无需运行开发服务器。打包会检查本机路径提示文件及可执行文件中的构建路径；对外分享安装包，不要直接上传本地报告、日志或用户数据目录。
+
+Windows 发布路径脱敏已覆盖空格与中文。源码、用户目录和 Cargo 缓存路径不能包含 `=`：MSVC 对此只会裁剪部分路径，因此打包会在编译前拒绝该情况。
+
+需要开发调试时，可在安装依赖后单独运行：
+
+```bash
 pnpm dev
 ```
 
+构建和打开应用无需安装可选 AI CLI；使用某个引擎时再配置。构建工具继承用户进程环境与 Git 代理设置，不要求本地代理或固定端点，也不读取 Claude 配置。`maint:integrate`、`maint:install` 是维护者的旧式工作流，不是普通 GitHub 用户的安装前置步骤；上述 NSIS 安装不需要私有备份远程或保护启动器。
+
 ### 2. `ccgui-custom` 自开发工程目录会自动生成吗？后续需要手动构建吗？
-**本地 `git clone` 构建后会自动生成，且日常在 CC GUI 内使用无需手动敲命令行构建：**
-1. **构建后自动识别生成**：执行 `pnpm maint:build` 或 `pnpm dev` 时，构建脚本会自动将当前本地 Git 仓库路径登记到本机自更新通道中；首次启动 CC GUI 时，左侧边栏和「设置 → 工作区 → CC GUI 自开发工程目录」会**自动生成并绑定**该目录（带紫色 **`自开发`** 徽章），无需手动添加。
+**本地源码目录可自动登记，之后可在 CC GUI 内发起更新：**
+
+1. **构建后自动识别生成**：执行 `pnpm maint:build` 或 `pnpm dev` 时，脚本将本地源码路径写入用户应用数据目录中的 `default-source-root.txt`。它是仓库外的本机路径提示，同一系统账号下首次启动可自动填充侧栏和「设置 → 工作区 → CC GUI 自开发工程目录」。不要提交或分发这个文件。安装包复制到另一台机器后不会自动知道源码位置，应在设置中选择那台机器上的检出目录。
 2. **让 AI 自动改码并热更新**：在该工作区新建会话，直接让 AI 修改 CC GUI 功能。AI 验证通过后会自动登记「待更新」，你只需对 AI 说一句 **「更新」**，宿主就会自动在后台增量构建并热切换。
 3. **手动 `git pull` 或自己改代码后一键构建**：如果你从 GitHub 拉取了最新代码（`git pull`）或手动修改了源码，无需打开终端敲命令——直接点击 **「设置 → 工作区 → CC GUI 自开发工程目录」**（或 **「设置 → 检查更新 → 运行中更新」**）卡片上的 **「构建并热更新」** 按钮，CC GUI 会自动基于该源码目录后台增量构建并完成无感热切换（纯前端改动秒级复用原生二进制）。
 

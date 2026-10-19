@@ -7,7 +7,7 @@ default-run = "ccgui-next"
 version = "1.1.1"
 description = "CC GUI - multi-CLI AI chat desktop"
 edition = "2021"
-rust-version = "1.77.2"
+rust-version = "1.95"
 
 [lib]
 name = "ccgui_next_lib"
@@ -54,10 +54,6 @@ sha2 = "0.10"
 dirs = "6"
 dunce = "1"
 git2 = "0.20"
-# Feature-unify openssl-sys to "vendored": git2 → libgit2-sys/libssh2-sys otherwise
-# dynamically links Homebrew's libssl/libcrypto (e.g. libssl.4.dylib), which crashes
-# the shipped .app at launch on any machine without that exact Homebrew install.
-openssl-sys = { version = "0.9", features = ["vendored"] }
 trash = "5"
 # .gitignore-aware directory walking for the @-mention file index.
 ignore = "0.4"
@@ -91,6 +87,12 @@ serde_yaml = "0.9"
 # Native HTTP for provider APIs, explicit downloads and granted plugin requests.
 # Use rustls independently of the vendored-openssl stack.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "multipart", "json", "blocking", "socks"] }
+
+[target.'cfg(unix)'.dependencies]
+# Keep Unix git2/libssh2 self-contained, especially on macOS where linking a
+# developer's Homebrew OpenSSL would break on other machines. Windows git2 uses
+# its native TLS backend and must not build an otherwise unused OpenSSL/Perl stack.
+openssl-sys = { version = "0.9", features = ["vendored"] }
 
 [target.'cfg(windows)'.dependencies]
 # Live User/Machine PATH for CLI discovery: a GUI process inherits the PATH

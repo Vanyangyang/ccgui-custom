@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const config = JSON.parse(readFileSync(path.join(root, "src-tauri/tauri.conf.json"), "utf8"));
@@ -107,4 +109,77 @@ test("production startup and native IPC expose no Baidu script or beacon path", 
     /(?:from\s*|import\s*\()\s*["'][^"']*\/analytics["']/,
     "startup must not defer loading the removed analytics module",
   );
+});
+
+function assertNoSourceHints(allowedRoot: string, filename: string): void {
+  const canonicalRoot = realpathSync(allowedRoot);
+  const visited = new Set<string>();
+  const walk = (candidate: string): void => {
+    assert.notEqual(path.basename(candidate), "default-source-root.txt", "remove the local source hint before packaging");
+    const actual = realpathSync(candidate);
+    const relative = path.relative(canonicalRoot, actual);
+    assert.ok(!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`),
+      "bundled resources must not link outside the checkout");
+    assert.notEqual(path.basename(actual), "default-source-root.txt", "remove the local source hint before packaging");
+    if (!statSync(actual).isDirectory() || visited.has(actual)) return;
+    visited.add(actual);
+    for (const entry of readdirSync(actual, { withFileTypes: true })) walk(path.join(actual, entry.name));
+  };
+  walk(filename);
+}
+
+test("resource privacy checks follow internal links and reject external directories and hints", t => {
+  const scratch = mkdtempSync(path.join(os.tmpdir(), "ccgui-resource-privacy-"));
+  t.after(() => {
+    const relative = path.relative(path.resolve(os.tmpdir()), path.resolve(scratch));
+    assert.ok(relative && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+    rmSync(scratch, { recursive: true, force: true });
+  });
+  const checkout = path.join(scratch, "checkout");
+  const assets = path.join(checkout, "assets");
+  const outside = path.join(scratch, "outside");
+  mkdirSync(assets, { recursive: true });
+  mkdirSync(outside);
+  writeFileSync(path.join(assets, "ok.txt"), "bundled fixture");
+  writeFileSync(path.join(outside, "default-source-root.txt"), "synthetic source hint");
+  const linkType = process.platform === "win32" ? "junction" : "dir";
+  const insideLink = path.join(checkout, "inside-link");
+  const outsideLink = path.join(checkout, "outside-link");
+  symlinkSync(assets, insideLink, linkType);
+  symlinkSync(outside, outsideLink, linkType);
+  assert.doesNotThrow(() => assertNoSourceHints(checkout, insideLink));
+  assert.throws(() => assertNoSourceHints(checkout, outsideLink), /must not link outside/);
+  writeFileSync(path.join(assets, "default-source-root.txt"), "synthetic source hint");
+  assert.throws(() => assertNoSourceHints(checkout, insideLink), /remove the local source hint/);
+});
+
+test("machine-local source hints stay untracked and outside distributable resources", () => {
+  const hint = "default-source-root.txt";
+  const tracked = spawnSync("git", ["ls-files", "-z", "--", `*${hint}`], { cwd: root, encoding: "utf8" });
+  assert.equal(tracked.status, 0, "Git must be available to check the source hint boundary");
+  assert.equal(tracked.stdout, "", "machine-local source hints must never be tracked");
+
+  const copies = [hint, `public/${hint}`, `src-tauri/resources/skills/${hint}`];
+  const ignored = spawnSync("git", ["check-ignore", "--no-index", "--stdin"], {
+    cwd: root, input: `${copies.join("\n")}\n`, encoding: "utf8",
+  });
+  assert.equal(ignored.status, 0);
+  assert.deepEqual(ignored.stdout.trim().split(/\r?\n/), copies);
+
+  // Git ignore alone cannot stop Vite/Tauri from copying an untracked file.
+  for (const relative of ["public", "dist"]) {
+    const directory = path.join(root, relative);
+    if (existsSync(directory)) assertNoSourceHints(root, directory);
+  }
+  const custom = JSON.parse(readFileSync(path.join(root, ".custom/tauri.json"), "utf8"));
+  for (const settings of [config, custom]) {
+    const resources = settings.bundle?.resources ?? {};
+    for (const source of Array.isArray(resources) ? resources : Object.keys(resources)) {
+      const directory = path.resolve(root, "src-tauri", source);
+      const relative = path.relative(root, directory);
+      assert.ok(!path.isAbsolute(source) && relative !== ".." && !relative.startsWith(`..${path.sep}`),
+        "bundled resources must come from the checkout, not a user profile");
+      assertNoSourceHints(root, directory);
+    }
+  }
 });

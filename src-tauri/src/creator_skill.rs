@@ -238,6 +238,7 @@ fn named_skill_source_root(resource_dir: Option<&Path>, skill_id: &str) -> Optio
             candidates.push(dir.join(SKILLS_DIR).join(skill_id));
         }
     }
+    #[cfg(any(test, debug_assertions))]
     candidates.push(
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("resources")
@@ -395,6 +396,24 @@ pub(crate) fn sync_self_update_skill_for_workspace(
     )
 }
 
+fn registered_self_update_workspace(profile_root: &Path) -> Result<Option<PathBuf>, String> {
+    let store = crate::live_update::UpdateStore::open(
+        profile_root,
+        crate::live_update::Limits::default(),
+    )
+    .map_err(|_| "could not open local self-update registration".to_string())?;
+    let channel = store
+        .channel_status()
+        .map_err(|_| "could not read local self-update registration".to_string())?;
+    Ok(channel.default_source_root.and_then(|source| {
+        let path = Path::new(&source);
+        if !path.is_absolute() || !path.is_dir() {
+            return None;
+        }
+        self_update_workspace_root(path)
+    }))
+}
+
 /// 启动时逐个同步全局内置 skill，清理旧版遗留在全局 CLI 目录的 `ccgui-self-update`，
 /// 并将 `ccgui-self-update` 同步到 `ccgui-custom` 工作区本地目录。
 pub(crate) fn install_at_startup(app: &tauri::AppHandle) {
@@ -409,11 +428,13 @@ pub(crate) fn install_at_startup(app: &tauri::AppHandle) {
             removed.display()
         );
     }
-    if let Some(repo_root) = Path::new(env!("CARGO_MANIFEST_DIR")).parent() {
-        log_install_report(
+    match registered_self_update_workspace(&crate::paths::app_home()) {
+        Ok(Some(repo_root)) => log_install_report(
             SELF_UPDATE_SKILL_ID,
-            sync_self_update_skill_for_workspace(resource_dir.as_deref(), repo_root),
-        );
+            sync_self_update_skill_for_workspace(resource_dir.as_deref(), &repo_root),
+        ),
+        Ok(None) => {}
+        Err(error) => eprintln!("[bundled-skill:{SELF_UPDATE_SKILL_ID}] {error}; skip workspace sync"),
     }
 }
 
@@ -832,6 +853,80 @@ mod tests {
             skill_source_root(None).expect("bundled skill must resolve from CARGO_MANIFEST_DIR");
         assert!(root.join("SKILL.md").is_file());
         assert!(root.join("references/sdk-api.md").is_file());
+    }
+
+    #[test]
+    fn startup_workspace_is_absent_for_a_fresh_profile() {
+        let scratch = Scratch::new("startup-fresh-profile");
+        assert_eq!(registered_self_update_workspace(&scratch.dir).unwrap(), None);
+        assert!(!scratch.dir.join(".claude").exists());
+        assert!(!scratch.dir.join(".agents").exists());
+    }
+
+    #[test]
+    fn startup_workspace_uses_valid_local_registration() {
+        let scratch = Scratch::new("startup-registered-workspace");
+        let workspace = scratch.dir.join("checkout");
+        std::fs::create_dir_all(workspace.join("scripts")).unwrap();
+        std::fs::create_dir_all(workspace.join("src-tauri")).unwrap();
+        std::fs::write(workspace.join("scripts/self-update-build.mjs"), b"// fixture").unwrap();
+        std::fs::write(workspace.join("src-tauri/tauri.conf.json"), b"{}").unwrap();
+        let profile = scratch.dir.join("profile");
+        std::fs::create_dir_all(&profile).unwrap();
+        assert_eq!(registered_self_update_workspace(&profile).unwrap(), None);
+        std::fs::write(
+            profile.join("runtime-updates/default-source-root.txt"),
+            workspace.to_string_lossy().as_bytes(),
+        ).unwrap();
+        assert_eq!(
+            registered_self_update_workspace(&profile).unwrap(),
+            Some(dunce::canonicalize(workspace).unwrap()),
+        );
+    }
+
+    #[test]
+    fn startup_workspace_ignores_invalid_missing_and_relative_registrations() {
+        let scratch = Scratch::new("startup-invalid-registration");
+        assert_eq!(registered_self_update_workspace(&scratch.dir).unwrap(), None);
+        let unrecognized = scratch.dir.join("other-project");
+        std::fs::create_dir_all(unrecognized.join("src-tauri")).unwrap();
+        std::fs::write(unrecognized.join("src-tauri/tauri.conf.json"), b"{}").unwrap();
+        let missing = scratch.dir.join("missing/ccgui-custom");
+        let values = [
+            String::new(),
+            "relative/ccgui-custom".to_string(),
+            "https://example.invalid/ccgui-custom".to_string(),
+            missing.to_string_lossy().into_owned(),
+            unrecognized.to_string_lossy().into_owned(),
+        ];
+        for value in values {
+            std::fs::write(
+                scratch.dir.join("runtime-updates/default-source-root.txt"),
+                &value,
+            ).unwrap();
+            assert_eq!(registered_self_update_workspace(&scratch.dir).unwrap(), None);
+            // Persisted channels can also carry the optional root directly.
+            std::fs::write(
+                scratch.dir.join("runtime-updates/channel.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "version": 1, "working": [], "ready": [],
+                    "updateRequest": null, "batch": null, "defaultSourceRoot": value,
+                })).unwrap(),
+            ).unwrap();
+            assert_eq!(registered_self_update_workspace(&scratch.dir).unwrap(), None);
+            std::fs::remove_file(scratch.dir.join("runtime-updates/channel.json")).unwrap();
+        }
+    }
+
+    #[test]
+    fn startup_workspace_registration_errors_do_not_expose_paths() {
+        let scratch = Scratch::new("startup-registration-error");
+        assert_eq!(registered_self_update_workspace(&scratch.dir).unwrap(), None);
+        std::fs::write(scratch.dir.join("runtime-updates/channel.json"), b"invalid json").unwrap();
+        assert_eq!(
+            registered_self_update_workspace(&scratch.dir).unwrap_err(),
+            "could not read local self-update registration",
+        );
     }
 
     #[test]

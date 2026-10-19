@@ -1,5 +1,7 @@
 fn main() {
     println!("cargo:rerun-if-env-changed=CCGUI_FRONTEND_FINGERPRINT");
+    println!("cargo:rerun-if-env-changed=USERPROFILE");
+    println!("cargo:rerun-if-env-changed=HOME");
     if let Some(fingerprint) = std::env::var_os("CCGUI_FRONTEND_FINGERPRINT") {
         let fingerprint = fingerprint.to_str().expect("frontend fingerprint must be Unicode");
         assert!(
@@ -26,11 +28,15 @@ fn main() {
                 let runtime_dir = std::path::PathBuf::from(home)
                     .join(".ccgui-next")
                     .join("runtime-updates");
-                let _ = std::fs::create_dir_all(&runtime_dir);
-                let _ = std::fs::write(
-                    runtime_dir.join("default-source-root.txt"),
-                    repo_root.to_string_lossy().as_bytes(),
-                );
+                if std::fs::create_dir_all(&runtime_dir)
+                    .and_then(|()| std::fs::write(
+                        runtime_dir.join("default-source-root.txt"),
+                        repo_root.to_string_lossy().as_bytes(),
+                    ))
+                    .is_err()
+                {
+                    println!("cargo:warning=Self-development workspace registration could not be saved; select your checkout in Settings.");
+                }
             }
         }
     }

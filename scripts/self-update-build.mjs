@@ -104,10 +104,8 @@ function batchSnapshot(filename, root) {
 export function buildEnvironment(base = process.env) {
   const env = {};
   for (const [key, value] of Object.entries(base)) {
-    if (/^(path|systemroot|windir|comspec|pathext|temp|tmp|userprofile|home|localappdata|appdata|programfiles(?:\(x86\))?|programdata|number_of_processors|processor_architecture|cargo_home|rustup_home|rustup_toolchain|rustflags|cargo_encoded_rustflags|cc|cxx|ar|cflags|cxxflags|ldflags|include|lib|libpath|vctoolsinstalldir|vsinstalldir|windowssdkdir|windowssdkversion|perl|source_date_epoch|vite_[a-z0-9_]+)$/i.test(key)) env[key] = value;
+    if (/^(path|systemroot|windir|comspec|pathext|temp|tmp|userprofile|home|localappdata|appdata|programfiles(?:\(x86\))?|programdata|number_of_processors|processor_architecture|cargo_home|rustup_home|rustup_toolchain|rustflags|cargo_encoded_rustflags|cc|cxx|ar|cflags|cxxflags|ldflags|include|lib|libpath|vctoolsinstalldir|vsinstalldir|windowssdkdir|windowssdkversion|perl|source_date_epoch|vite_[a-z0-9_]+|(?:http|https|all|no)_proxy|cargo_http_proxy)$/i.test(key)) env[key] = value;
   }
-  for (const key of ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy', 'CARGO_HTTP_PROXY']) env[key] = 'http://127.0.0.1:7897';
-  env.NO_PROXY = env.no_proxy = 'localhost,127.0.0.1,::1';
   // The native graph is large; bound simultaneous rustc processes while each
   // crate can still use the self-update profile's parallel codegen units.
   const jobs = base.CARGO_BUILD_JOBS ?? '2';

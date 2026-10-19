@@ -5,6 +5,13 @@ import { cleanAnswerState, clearAnswerState, readAnswerState, writeAnswerState }
 import { readFileSync } from "node:fs";
 import path from "node:path";
 
+function readInteractiveExample(file: string, newline: string): string {
+  const markdown = readFileSync(path.resolve(file), "utf8").replace(/\r?\n/g, newline);
+  const match = /^```ccgui-ui\r?\n([\s\S]*?)\r?\n```(?=\r?$)/m.exec(markdown);
+  if (!match) throw new Error(`Expected a complete ccgui-ui fenced example in ${file}`);
+  return match[1];
+}
+
 describe("interactive answer boundary", () => {
   it("accepts a local calculator and preserves finite zero", () => {
     const result = checkInteractiveProgram('root = Stack([Slider($n, "人数", 0, 50), Metric("合计", @Round(total, 2), "元")])\n$n = 0\ntotal = $n * 120');
@@ -51,15 +58,16 @@ describe("interactive answer boundary", () => {
     expect(isClosedInteractiveFence('```ccgui-ui\nroot = Text("x")')).toBe(false);
     expect(isClosedInteractiveFence('````ccgui-ui\nroot = Text("x")\n```')).toBe(false);
   });
-  it("accepts the actual GPT budget answer", () => {
-    const reply = readFileSync(path.resolve("tests/fixtures/interactive-answer/gpt-budget.md"), "utf8");
-    expect(checkInteractiveProgram(reply.split("```ccgui-ui\n")[1].split("\n```")[0]).ok).toBe(true);
-  });
-  it("accepts the example advertised to ordinary Codex chats", () => {
-    const instructions = readFileSync(path.resolve("src/features/interactive-answer/capability-instructions.txt"), "utf8");
-    const source = instructions.split("```ccgui-ui\n")[1].split("\n```")[0];
+  it.each([{ label: "LF", newline: "\n" }, { label: "CRLF", newline: "\r\n" }])("accepts the actual GPT budget answer with $label newlines", ({ newline }) => {
+    const source = readInteractiveExample("tests/fixtures/interactive-answer/gpt-budget.md", newline);
     const result = checkInteractiveProgram(source);
-    expect(result.ok).toBe(true);
+    expect(result.ok, JSON.stringify(result)).toBe(true);
+    if (result.ok) expect(result.defaults).toEqual({ $people: 12, $meal: 120, $venue: 800 });
+  });
+  it.each([{ label: "LF", newline: "\n" }, { label: "CRLF", newline: "\r\n" }])("accepts the example advertised to ordinary Codex chats with $label newlines", ({ newline }) => {
+    const source = readInteractiveExample("src/features/interactive-answer/capability-instructions.txt", newline);
+    const result = checkInteractiveProgram(source);
+    expect(result.ok, JSON.stringify(result)).toBe(true);
     if (result.ok) expect(result.defaults).toEqual({ $n: 12 });
   });
   it.each(["100 / $n", "100 % $n", "@Min(5, 10)", "@Sum(5)", "@Avg([])", '@Round("oops", 2)'])("rejects expressions the upstream runtime would silently coerce: %s", expression => {

@@ -14,6 +14,9 @@ src-tauri/gen
 *.key
 *.p12
 
+# Machine-local source hint; normally stored outside the repository.
+default-source-root.txt
+
 # OS
 .DS_Store
 Thumbs.db

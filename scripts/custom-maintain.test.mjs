@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { safeRef, inside, proxyEnvironment, fixtureMaintenance, git, main } from './custom-maintain.mjs';
+import { safeRef, inside, proxyEnvironment, nativeEnvironment, fixtureMaintenance, git, main, ROOT } from './custom-maintain.mjs';
 test('untrusted refs and paths cannot escape the maintenance workspace', () => {
   for (const ref of ['--force', '../main', 'a//b', 'v1; whoami', 'main/', 'v1.', 'refs/.hidden', 'refs/tag.lock', 'v1@{0}']) assert.throws(() => safeRef(ref));
   assert.equal(safeRef('v1.1.0'), 'v1.1.0');
@@ -251,10 +251,62 @@ test('binary tampering, build path tampering, and verification HEAD mismatch pre
   assert.throws(() => f.api.install(), /exact revision/);
   assert.equal(fs.readFileSync(b.destination, 'utf8'), 'old binary fixture');
 });
-test('proxy environment replaces wildcard bypasses and all proxy variants', () => {
-  const env = proxyEnvironment({ NO_PROXY: '*', HTTPS_PROXY: 'https://other' });
-  assert.equal(env.HTTPS_PROXY, 'http://127.0.0.1:7897');
-  assert.equal(env.https_proxy, env.HTTPS_PROXY);
-  assert.equal(env.NO_PROXY, 'localhost,127.0.0.1,::1');
-  assert.equal(env.no_proxy, env.NO_PROXY);
+test('maintenance leaves direct access and user proxy policy unchanged', () => {
+  assert.deepEqual(proxyEnvironment({}), {}, 'a fresh user must not need a maintainer proxy');
+  const base = {
+    HTTP_PROXY: 'http://proxy.fixture:8080',
+    HTTPS_PROXY: 'http://tls-proxy.fixture:8081',
+    ALL_PROXY: 'socks5://proxy.fixture:1080',
+    http_proxy: 'http://lowercase.fixture:8082',
+    https_proxy: '',
+    all_proxy: 'socks5://lowercase.fixture:1081',
+    CARGO_HTTP_PROXY: 'http://cargo.fixture:8083',
+    NO_PROXY: '*',
+    no_proxy: 'localhost,.fixture',
+    PATH: 'fixture-path',
+  };
+  const env = proxyEnvironment(base);
+  assert.deepEqual(env, base);
+  assert.notEqual(env, base);
+  env.HTTPS_PROXY = 'changed';
+  assert.equal(base.HTTPS_PROXY, 'http://tls-proxy.fixture:8081');
+});
+
+test('native builds default to bounded concurrency and retain an explicit user setting', () => {
+  assert.equal(nativeEnvironment({}).CARGO_BUILD_JOBS, '2');
+  const base = { CARGO_BUILD_JOBS: '4', CARGO_TARGET_DIR: 'outside-fixture', HTTPS_PROXY: 'http://proxy.fixture:8080' };
+  const env = nativeEnvironment(base);
+  assert.equal(env.CARGO_BUILD_JOBS, '4');
+  assert.equal(env.CARGO_TARGET_DIR, path.join(ROOT, 'src-tauri', 'target'));
+  assert.equal(env.HTTPS_PROXY, base.HTTPS_PROXY);
+  assert.equal(base.CARGO_TARGET_DIR, 'outside-fixture');
+});
+
+test('fresh or damaged verification reports give an actionable error without certifying a build', t => {
+  const f = fixture(t);
+  assert.throws(() => f.api.recordBuild('1.1.1+protected.1', Date.now()), /Run pnpm maint:check, then pnpm maint:build/);
+  write(f.root, 'artifacts/custom-verification.json', '{invalid-json');
+  assert.throws(() => f.api.recordBuild('1.1.1+protected.1', Date.now()), /Run pnpm maint:check, then pnpm maint:build/);
+  write(f.root, 'artifacts/custom-verification.json', 'null');
+  assert.throws(() => f.api.recordBuild('1.1.1+protected.1', Date.now()), /exact revision/);
+  assert.equal(fs.existsSync(path.join(f.root, 'artifacts/custom-build.json')), false);
+});
+
+test('build reports reject embedded local checkout or profile paths without echoing them', t => {
+  const f = fixture(t);
+  const b = preparedBuild(f);
+  for (const [localPath, encoding, oddOffset] of [
+    [f.root, 'utf8', false],
+    [f.root.replaceAll(path.sep, '/').toUpperCase(), 'utf8', false],
+    [path.join(f.root, 'profile'), 'utf16le', false],
+    [f.root, 'utf16le', true],
+  ]) {
+    const encoded = Buffer.from(`fixture ${localPath} fixture`, encoding);
+    fs.writeFileSync(b.exe, oddOffset ? Buffer.concat([Buffer.from([0]), encoded]) : encoded);
+    assert.throws(() => f.api.recordBuild('1.1.1+protected.1', Date.now()), error => {
+      assert.match(error.message, /contains a local build path/);
+      assert.equal(error.message.includes(localPath), false);
+      return true;
+    });
+  }
 });

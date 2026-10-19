@@ -4013,8 +4013,9 @@ mod retry_lifecycle_tests {
     }
 
     /// Native claude (session-state protocol) writes `first`, then stays alive
-    /// past LINGER_GRACE, writes `second`, and exits 0. Returns the published
-    /// events, minus usage reports, as `kind@runId` plus the raw events.
+    /// past LINGER_GRACE after its Done is observed, writes `second`, and exits 0.
+    /// Returns the published events, minus usage reports, as `kind@runId` plus
+    /// the raw events.
     async fn replay_native_claude_past_linger(
         first: &[Value],
         second: &[Value],
@@ -4029,9 +4030,30 @@ mod retry_lifecycle_tests {
         };
         let first = write("first.jsonl", first);
         let second = write("second.jsonl", second);
-        let wait_ms = reader::LINGER_GRACE.as_millis() as u64 + 1500;
-        let mut command = staged_output(&first, wait_ms, &second);
+        let release = dir.join("release-second");
+        // A child-side sleep can finish before a loaded test runner starts
+        // reading. Keep the child gated until the reader has seen Done and
+        // then had an entire linger window to handle the still-live process.
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = tokio::process::Command::new("powershell");
+            command.args(["-NoProfile", "-Command", &format!(
+                "[Console]::Out.Write([IO.File]::ReadAllText('{}')); [Console]::Out.Flush(); while (!(Test-Path '{}')) {{ Start-Sleep -Milliseconds 10 }}; [Console]::Out.Write([IO.File]::ReadAllText('{}')); [Console]::Out.Flush()",
+                first.display(), release.display(), second.display(),
+            )]);
+            command
+        };
+        #[cfg(not(windows))]
+        let mut command = {
+            let mut command = tokio::process::Command::new("sh");
+            command.arg("-c").arg(format!(
+                "cat '{}'; while [ ! -f '{}' ]; do sleep 0.01; done; cat '{}'",
+                first.display(), release.display(), second.display(),
+            ));
+            command
+        };
         command
+            .kill_on_drop(true)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null());
@@ -4065,7 +4087,25 @@ mod retry_lifecycle_tests {
             _tree_guard: None,
         };
         let started = std::time::Instant::now();
-        tokio::time::timeout(std::time::Duration::from_secs(30), run_reader(stdout, ctx))
+        let reader = run_reader(stdout, ctx);
+        tokio::pin!(reader);
+        let observed_linger = tokio::select! {
+            _ = &mut reader => false,
+            waited = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                loop {
+                    if emitter.0.lock().unwrap().iter().any(|event|
+                        event["kind"] == "done" && event["runId"] == "run-native") {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                tokio::time::sleep(reader::LINGER_GRACE + std::time::Duration::from_millis(100)).await;
+            }) => waited.is_ok(),
+        };
+        // Release even when the handshake fails, so the fixture child can exit.
+        std::fs::write(&release, "release").unwrap();
+        assert!(observed_linger, "the reader must observe Done and remain live past LINGER_GRACE before releasing the child");
+        tokio::time::timeout(std::time::Duration::from_secs(30), &mut reader)
             .await
             .expect("reader settles once the lingering process exits");
         // The scenario only means something if the process really outlived the

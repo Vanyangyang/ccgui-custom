@@ -100,27 +100,39 @@ This repository is a customized distribution (`custom/protected`) based on upstr
 ## Installing from GitHub & Self-Dev Live Update (`ccgui-custom`)
 
 ### 1. Clone & Build from GitHub
-Prerequisites: **Node.js 20+**, **pnpm 9+**, **Rust (stable)**, and platform Tauri 2 / WebView2 build dependencies.
+Prerequisites: **Node.js 24 LTS** (tested; minimum **22.13**), the pinned **pnpm 11.19.0**, **Git**, and **Rust stable 1.95+** (1.99 tested). On Windows, install the MSVC C++ build tools, Windows SDK and WebView2 described in the [official Tauri prerequisites](https://v2.tauri.app/start/prerequisites/). Windows builds do not require Perl. Other platforms need their own Tauri system dependencies; macOS/Linux installer builds are not verified by this Windows workflow.
 
 ```bash
 # 1. Clone the repository (recommended folder name: ccgui-custom)
 git clone https://github.com/Vanyangyang/ccgui-custom.git ccgui-custom
 cd ccgui-custom
 
-# 2. Install workspace dependencies
-pnpm install
+# 2. Install the pinned package manager and workspace dependencies
+npm install --global pnpm@11.19.0
+pnpm install --frozen-lockfile
 
-# 3. Option A: Build the desktop installer (recommended for daily use)
+# 3. Verify, then build the Windows production installer from the same clean checkout
+pnpm maint:check
 pnpm maint:build
 # Run the generated NSIS installer under src-tauri/target/release/bundle/nsis/
+```
 
-# 3. Option B: Run directly in development mode
+Keep the checkout clean and at the same commit between verification and packaging. If a check fails, fix the cause and rerun it; `maint:build` requires the matching successful check record. The installed production app includes its frontend and does not need a running development server. Packaging checks local source hints and embedded build paths; share the installer, not the local reports, logs or user data directory.
+
+Windows release path sanitization supports spaces and Unicode. The checkout, user home and Cargo home paths must not contain `=` because MSVC would only partially trim those paths; packaging rejects them before compilation.
+
+For optional development after dependency installation:
+
+```bash
 pnpm dev
 ```
 
+Building and opening the app do not require installing optional AI CLIs; configure an engine when you want to use it. Build tools inherit your process environment and Git proxy settings, without requiring a local proxy or fixed endpoint or reading Claude configuration. `maint:integrate` and `maint:install` are legacy maintainer workflows, not prerequisites for GitHub users; no private backup remote or protected launcher is required for the NSIS installation above.
+
 ### 2. Is the `ccgui-custom` Self-Dev Workspace Auto-Generated? Does It Need Manual Building?
-**It is automatically generated after building from `git clone`, and no manual terminal build is needed during daily use:**
-1. **Auto-Generated on First Launch**: Running `pnpm maint:build` or `pnpm dev` automatically records your local Git checkout path; when CC GUI opens, both the sidebar (`ccgui-custom [Self-Dev]`) and **Settings → Workspaces → CC GUI Self-Dev Workspace** are automatically populated without manual folder selection.
+**A local checkout can be registered automatically for subsequent updates from CC GUI:**
+
+1. **Auto-Generated on First Launch**: Running `pnpm maint:build` or `pnpm dev` records your local checkout in `default-source-root.txt`, a machine-local path hint in user app data outside the repository. First launch under the same OS account can populate the sidebar and **Settings → Workspaces → CC GUI Self-Dev Workspace**. Never commit or distribute this hint. An installer copied to another machine cannot discover your clone location; select that machine's checkout in Settings.
 2. **AI-Assisted Live Update**: Ask AI in a `ccgui-custom` chat to customize CC GUI. Once verified, the AI registers the change as ready (`coordinate_self_update(ready)`), and you simply say **"Update"** to build and hot-swap in the background.
 3. **One-Click "Build & Live Update" after `git pull` or Manual Edits**: After pulling updates from GitHub (`git pull`) or editing source files yourself, click **"Build & Live Update"** in **Settings → Workspaces → CC GUI Self-Dev Workspace** (or **Settings → Check for Updates → Update while running**) to trigger an incremental background build and hot-swap without touching the command line.
 

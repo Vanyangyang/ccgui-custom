@@ -198,6 +198,7 @@ fn app_resource_dir(app: &tauri::AppHandle) -> Option<PathBuf> {
     app.path().resource_dir().ok()
 }
 
+#[cfg(any(test, debug_assertions))]
 fn default_catalog_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("resources")
@@ -226,6 +227,7 @@ fn catalog_root_candidates(resource_dir: Option<&Path>) -> Vec<PathBuf> {
             candidates.push(executable_dir.join(CATALOG_DIR).join(PROVIDER_ID));
         }
     }
+    #[cfg(any(test, debug_assertions))]
     candidates.push(default_catalog_root());
     candidates
 }

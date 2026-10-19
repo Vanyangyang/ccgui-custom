@@ -43,6 +43,8 @@
 
 ## 上游升级
 
+本节的 `maint:integrate` 与下节 `maint:install` 是维护者专用的旧式流程，包含本地备份远程与保护启动器约束，不是普通 GitHub 用户的安装步骤。普通用户按 [README 安装说明](../README.zh-CN.md#从-github-安装与自开发热更新ccgui-custom) 在同一干净检出中执行 `pnpm install --frozen-lockfile`、`pnpm maint:check`、`pnpm maint:build`，然后运行生成的 Windows NSIS 安装包。
+
 Windows GUI 启动的单实例围栏位于 `src-tauri/src/single_instance.rs`，入口在 `lib.rs` 的共享启动副作用之前。按 canonical 应用数据目录散列取 Global named mutex，owner guard 绑定主线程；已存对象必须检查实际 ownership/abandoned 状态。只有已发布主窗口标记可激活；退出及重启撤标但不提前放锁。窗口已恢复后的前台权限拒绝只触发有限任务栏提醒，重复进程正常结束，不能误报启动失败；锁访问、恢复和身份错误仍失败退出。`--host-chat-mcp` 与 `--computer-use-mcp` 必须先分流，不能因为复用同一可执行文件被误限制。升级后需回归早期并发、正常/异常退出接替、窗口恢复、应用内重启与两种 MCP 在 GUI 运行时的元数据握手；不要把安装后暂时只有一个进程当成防双开验证。
 
 TPS 是独立元数据链，不能复用旧 `genMs` 或上下文占用直接相除。Claude `result.usage` 为每次主循环回复累计输出，`modelUsage`/cost 为会话累计且可包含子代理，两者不能混用；assistant 快照的输出数是占位值，纯生成计数只接受最终 SSE 用量。Codex 仅以可信启动前基线或新线程零基线做当前 turn 累计差，缺基线、累计回退、身份错配不报数；纯生成还须排除 reasoning、工具、重试和非流式。前端按 run/seq 隔离，所有终态样本先于 terminal 下发。改动时验证重复、恢复、快完成、续轮、取消、异常、历史竞争及统计不修改正文/运行状态；不为显示数值增加轮询或改变现有用量账本。指标定义参见 [NVIDIA AIPerf](https://docs.nvidia.com/aiperf/reference/ai-perf-metrics-reference)，Claude 字段范围参见[官方用量说明](https://code.claude.com/docs/en/agent-sdk/cost-tracking)。
@@ -52,7 +54,7 @@ TPS 是独立元数据链，不能复用旧 `genMs` 或上下文占用直接相�
 本机隐私清理另外在用户数据中禁用了 `auto-title`，并设置 `paused=true`、`config.enabled=false`。这不是安装包内的全局插件封禁；重新启用或重装该插件前，需要重新决定是否允许额外发送近期聊天给命名模型。远程 relay 按用户在设置中的开关启用，安装和诊断不读取或输出用户的中转密钥。
 
 1. 在维护仓库提交并推送当前改动，执行 `pnpm maint:status`。
-2. 执行 `pnpm maint:integrate vX.Y.Z`。工具会经本机代理拉取上游，
+2. 执行 `pnpm maint:integrate vX.Y.Z`。工具沿用用户进程环境与 Git 代理设置拉取上游，
    核对固定官方 upstream 与本地备份 origin，在 `../ccgui-integrations/`
    创建唯一候选工作树和整合分支，不修改当前工作目录。只接受明确的安全 tag/commit；
    已记录或已包含于当前 HEAD 的提交返回 `already_integrated`，不创建候选、不增加修订号。
@@ -243,8 +245,15 @@ Unix 重置时间，样式与配置保留。GUI 沿用这些数据语义和 CLI 
 
 ## 构建环境
 
-Node.js、pnpm 11.19.0、Rust/MSVC、WebView2 及现有 Strawberry Perl。
-脚本沿用本机已配置的 Perl 路径；迁移机器时更新该路径后再检查。
+建议使用已测试的 Node.js 24 LTS（最低 22.13），通过 `npm install --global pnpm@11.19.0` 安装仓库固定版本。Windows 需要 Git、Rust stable 1.95+/MSVC（已测试 1.99）、C++ 构建工具、Windows SDK 与 WebView2，详见 [Tauri 官方环境要求](https://v2.tauri.app/start/prerequisites/)。Windows 不需要 Perl；非 Windows 平台仍保留 vendored OpenSSL 构建及对应工具依赖，macOS/Linux 安装包未由本次 Windows 流程验证。
+
+检查与构建工具继承用户进程环境、`PATH` 和 Git 代理设置，不注入固定代理端点、不读取 Claude 配置，也不要求安装可选 AI CLI。普通用户不需要维护者的私有备份远程或保护启动器。`maint:check` 和 `maint:build` 的同一干净提交验证要求继续生效，检查失败应修复后重跑。
+
+构建或开发启动登记的 `default-source-root.txt` 是用户应用数据目录中、仓库外的本机源码路径提示，不得提交或分发。同一系统账号首次启动可据此添加自开发目录；在其他机器安装二进制后须选择当地的源码目录。本地快照的既有排除规则继续生效，不将本机路径提示、凭据或用户配置加入源码快照。
+正式版资源只从随包目录加载，不回退到构建者的源码路径；启动时同步自更新 skill 使用当前用户的本机登记。`maint:build` 在打包前复查资源隐私，并拒绝为包含本机源码、用户目录或 Cargo 缓存路径的可执行文件生成成功记录。本地 `artifacts` 下的报告和日志用于诊断，不作为公开分发内容。
+正式构建通过本地编译包装器使用 Rust 1.95 的 `--remap-path-scope=object` 脱敏源码、用户目录与 Cargo 缓存路径，保留 Cargo 的依赖元数据和现有编译参数。中间缓存隔离在 `src-tauri/target/release-private-build/<指纹>`，避免复用旧的未脱敏依赖；最终安装包位置不变，不需要日常清理缓存。若自定义编译包装器只写在 Cargo 配置的 `build.rustc-wrapper` 中，请通过 `RUSTC_WRAPPER` 或 `CARGO_BUILD_RUSTC_WRAPPER` 环境变量显式提供，以便与发布包装器串联；`RUSTC_WORKSPACE_WRAPPER` 保持原值。
+维护检查与正式构建默认使用两个 Cargo 并行作业，降低冷构建时的资源峰值；显式 `CARGO_BUILD_JOBS` 设置继续生效。
+Windows 发布构建还通过 MSVC 的 `/d1trimfile` 裁剪 C/C++ 依赖中的 `__FILE__` 路径；保留已有 `CL`、`_CL_`、`CFLAGS`、`CXXFLAGS`，以编译参数摘要让 Cargo 正确重建相关原生依赖。空格与中文路径有真实编译回归。由于 MSVC 会截断带 `=` 的裁剪参数，正式打包会提前拒绝含该字符的源码、用户目录或 Cargo 缓存路径，避免留下部分用户名；请使用不含 `=` 的构建目录。最终可执行文件仍须通过路径扫描。
 保留 `trustPolicy: no-downgrade` 和七天版本成熟期，只有 esbuild 的安装脚本
 被允许。旧 lockfile 保存在忽略目录 `artifacts`；新锁文件随维护提交保存。
 维护回归的 Vitest 最多使用两个并行 worker，减少多个工作树同时构建时的资源争用，

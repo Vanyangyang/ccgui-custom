@@ -767,7 +767,11 @@ it("侧栏分类模式同步写入 settings.json，且在 localStorage 丢失时
     await act(async () => {
       toggle.click();
     });
-    expect(persistedSettings.sidebarChatListMode).toBe("recent");
+    // The click updates React immediately, but persistence runs on the shared
+    // async settings-write queue. Wait for the backend write before remounting.
+    await vi.waitFor(() => {
+      expect(persistedSettings.sidebarChatListMode).toBe("recent");
+    });
     expect(updateSettingsSpy).toHaveBeenCalled();
 
     // Simulate WebView2 Local Storage reset or cross-host launch with empty localStorage.

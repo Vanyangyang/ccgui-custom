@@ -82,12 +82,32 @@ async fn haiku_assist_default_on_off_and_session_isolation_reach_fake_cli() {
     let workspace = fixture.root().join("ws").to_string_lossy().to_string();
     let (app, events) = build_app(&fixture);
     let mut original = Vec::new();
+    let mut original_system = String::new();
     for (index, (enabled, session)) in [(None, "session-a"), (Some(true), "session-a"), (None, "session-b"), (Some(false), "session-a")].into_iter().enumerate() {
         events.lock().unwrap().clear();
         engine::send_message(app.state::<AppState>(), "claude".into(), workspace.clone(), Some(session.into()), "fake task".into(),
             None, Some("opus".into()), Some("high".into()), Some("manual".into()), None, Some(format!("haiku-{index}")), None, None, enabled).await.unwrap();
         wait_for_settlement(&app, &events).await;
         let mut args = haiku_cli_args(&fixture);
+        let prompt_positions: Vec<_> = args.iter().enumerate()
+            .filter_map(|(index, arg)| (arg == "--append-system-prompt-file").then_some(index))
+            .collect();
+        assert_eq!(prompt_positions.len(), 1, "expected exactly one staged system prompt flag");
+        let prompt_index = prompt_positions[0] + 1;
+        let prompt_path = std::path::Path::new(args.get(prompt_index).expect("system prompt flag requires a path"));
+        assert_eq!(prompt_path.parent().unwrap(), fixture.root().join(".ccgui-next/leader-role-staging"),
+            "system prompt must remain in fixture-owned staging");
+        assert_eq!(prompt_path.extension().and_then(|value| value.to_str()), Some("txt"));
+        uuid::Uuid::parse_str(prompt_path.file_stem().unwrap().to_str().unwrap()).expect("staged prompt filename must be a UUID");
+        let system = std::fs::read_to_string(fixture.root().join("ws/claude-system.txt")).unwrap();
+        if index == 0 {
+            assert!(!system.is_empty(), "fake CLI must capture the staged system prompt");
+            original_system = system;
+        } else {
+            assert_eq!(system, original_system, "Haiku toggles and session isolation must preserve system instructions");
+        }
+        // Only the per-send UUID path varies; compare every other argument unchanged.
+        args[prompt_index] = "<fixture-staged-system-prompt>".into();
         assert!(args.windows(2).any(|w| w == ["--model", "opus"]));
         assert!(args.windows(2).any(|w| w == ["--permission-mode", "default"]));
         assert!(args.windows(2).any(|w| w == ["--effort", "high"]));
@@ -881,7 +901,9 @@ async fn first_root_live_case(name: &str, root_engine: &str) {
         let args = claude_args(&fixture);
         let instructions = std::fs::read_to_string(fixture.root().join("ws/claude-system.txt")).unwrap();
         assert!(args.contains("--append-system-prompt-file"), "missing initial root prompt file: {args}");
-        assert_eq!(instructions, ORDINARY_TASK_GUIDANCE, "incomplete initial root system guidance");
+        let expected_instructions = format!("{ORDINARY_TASK_GUIDANCE}\n\n{}",
+            include_str!("../../src/features/interactive-answer/capability-instructions.txt"));
+        assert_eq!(instructions, expected_instructions, "incomplete initial root system guidance");
         let tasks = std::fs::read_to_string(fixture.root().join("ws/claude-tasks.ndjson")).unwrap();
         assert_eq!(tasks.lines().count(), 1);
         assert!(tasks.contains("first root task"));
@@ -1025,7 +1047,9 @@ async fn first_root_command_rejects_nonmain_resumed_remote_and_unregistered() {
     wait_for_settlement(&app, &events).await;
     assert_eq!(state.db.0.lock().query_row("SELECT COUNT(*) FROM leader_roles", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
     assert!(!claude_args(&fixture).contains("You are this chat's Leader"));
-    assert_eq!(std::fs::read_to_string(fixture.root().join("ws/claude-system.txt")).unwrap(), ORDINARY_TASK_GUIDANCE);
+    let expected_instructions = format!("{ORDINARY_TASK_GUIDANCE}\n\n{}",
+        include_str!("../../src/features/interactive-answer/capability-instructions.txt"));
+    assert_eq!(std::fs::read_to_string(fixture.root().join("ws/claude-system.txt")).unwrap(), expected_instructions);
 }
 
 async fn first_root_stop_before_identity_case(name: &str, engine_name: &str) {

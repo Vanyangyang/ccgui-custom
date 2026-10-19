@@ -15,6 +15,29 @@ test('build tools use the configured environment without a sibling project depen
   assert.equal(buildEnvironment({}).PERL, undefined);
 });
 
+test('build proxy inheritance preserves absence, empty values and case without copying private configuration', () => {
+  assert.deepEqual(buildEnvironment({}), { CARGO_BUILD_JOBS: '2' });
+  const proxies = {
+    HTTP_PROXY: 'http://fixture-user:fixture-password@proxy.example.invalid:8080',
+    http_proxy: '', HTTPS_PROXY: '', https_proxy: 'http://secure.example.invalid:8081',
+    ALL_PROXY: 'socks5://all.example.invalid:1080', all_proxy: '',
+    NO_PROXY: '*.example.invalid', no_proxy: '', Http_Proxy: 'http://mixed.example.invalid:8082',
+    CARGO_HTTP_PROXY: '', cargo_http_proxy: 'http://cargo.example.invalid:8083',
+  };
+  assert.deepEqual(buildEnvironment({ ...proxies, ANTHROPIC_AUTH_TOKEN: 'fixture-secret',
+    CLAUDE_CONFIG_DIR: 'fixture-private-config', CCGUI_HOST_CHAT_TOKEN: 'fixture-host-secret',
+    CUSTOM_AUTH: 'fixture-auth', CARGO_REGISTRIES_CRATES_IO_TOKEN: 'fixture-registry-secret',
+  }), { ...proxies, CARGO_BUILD_JOBS: '2' });
+});
+
+test('build job limits retain their default and explicit bounds', () => {
+  assert.equal(buildEnvironment({}).CARGO_BUILD_JOBS, '2');
+  for (const jobs of ['1', '64']) assert.equal(buildEnvironment({ CARGO_BUILD_JOBS: jobs }).CARGO_BUILD_JOBS, jobs);
+  for (const jobs of ['', '0', '65', '-1', '1.5', 'auto']) {
+    assert.throws(() => buildEnvironment({ CARGO_BUILD_JOBS: jobs }), /integer from 1 to 64/);
+  }
+});
+
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'self-update-build-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -48,6 +71,31 @@ function fixture(t) {
   const options = () => ({ sourceRoot: root, mode: 'working-tree', batchFile, output: path.join(root, '.tmp', `package-${++count}`), releaseId: `test-${count}` });
   return { root, put, calls, hooks, options, batchFile };
 }
+test('build metadata hashes inherited proxies without persisting their values', async t => {
+  const f = fixture(t);
+  const proxy = 'http://fixture-user:fixture-password@proxy.example.invalid:8080';
+  f.hooks.env = { HTTPS_PROXY: proxy };
+  const run = f.hooks.run;
+  f.hooks.run = async (command, args, options) => {
+    assert.equal(options.env.HTTPS_PROXY, proxy);
+    return run(command, args, options);
+  };
+  const result = await buildSelfUpdate(f.options(), f.hooks);
+  for (const key of [`native-${result.nativeFingerprint}`, `frontend-${result.frontendFingerprint}`]) {
+    const raw = fs.readFileSync(path.join(f.root, '.artifacts/self-update-cache', key, 'record.json'), 'utf8');
+    const metadata = JSON.parse(raw).metadata;
+    assert.match(metadata.environmentHash, /^[a-f0-9]{64}$/);
+    assert.equal(Object.hasOwn(metadata, 'env'), false);
+    assert.equal(Object.hasOwn(metadata, 'environment'), false);
+    assert.equal(raw.includes(proxy), false);
+    assert.equal(raw.includes('fixture-password'), false);
+  }
+  const report = fs.readFileSync(`${result.packageRoot}.build-report.json`, 'utf8');
+  const provenance = fs.readFileSync(path.join(result.packageRoot, 'build-provenance.json'), 'utf8');
+  assert.equal((report + provenance).includes(proxy), false);
+  assert.equal((report + provenance).includes('fixture-password'), false);
+});
+
 test('verified cache reuses bytes but records the current frozen batch', async t => {
   const f = fixture(t);
   const first = await buildSelfUpdate(f.options(), f.hooks);
