@@ -60,11 +60,13 @@ try {{
     $info.Arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {installer}'
     $info.UseShellExecute = $false
     $info.CreateNoWindow = $true
+    $info.RedirectStandardInput = $true
     $info.RedirectStandardOutput = $true
     $info.RedirectStandardError = $true
     $p = New-Object System.Diagnostics.Process
     $p.StartInfo = $info
     if (-not $p.Start()) {{ throw 'Installer did not start' }}
+    $p.StandardInput.Close()
     $stdout = $p.StandardOutput.BaseStream.CopyToAsync([System.IO.Stream]::Null)
     $stderr = $p.StandardError.BaseStream.CopyToAsync([System.IO.Stream]::Null)
     $remaining = [Math]::Floor(({deadline} - [DateTime]::UtcNow.Ticks) / 10000)
@@ -73,7 +75,10 @@ try {{
 }} catch {{ $result = 1 }} finally {{
     if ($null -ne $p) {{
         try {{
-            if (-not $p.HasExited) {{ $p.Kill(); [void]$p.WaitForExit(2000) }}
+            if (-not $p.HasExited) {{
+                $p.Kill()
+                if (-not $p.WaitForExit(2000)) {{ $result = 1 }}
+            }}
         }} catch {{ $result = 1 }}
         $p.Dispose()
     }}
@@ -209,6 +214,41 @@ mod tests {
         assert_eq!(
             fixture.run("throw 'failed'", Duration::from_secs(5), deadline),
             Err(FAILED)
+        );
+    }
+
+    #[test]
+    fn firewall_installer_has_no_console_and_drains_output() {
+        let fixture = Fixture::new();
+        // Console selection paused the real elevated installer. Exercise the
+        // production supervisor with direct .NET writes (which bypass *> $null)
+        // and check the actual child has no console that could enter selection.
+        let body = r#"
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class InstallerConsole {
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr GetConsoleWindow();
+}
+'@
+if ([InstallerConsole]::GetConsoleWindow() -ne [IntPtr]::Zero) { exit 1 }
+if ([Console]::In.Read() -ne -1) { exit 1 }
+$chunk = 'x' * 8192
+for ($i = 0; $i -lt 128; $i++) {
+    [Console]::Out.Write($chunk)
+    [Console]::Error.Write($chunk)
+    Write-Progress -Activity 'Fake installation' -Status 'Writing output' -PercentComplete ($i % 100)
+}
+exit 0
+"#;
+        assert_eq!(
+            fixture.run(
+                body,
+                Duration::from_secs(10),
+                deadline_after(Duration::from_secs(30))
+            ),
+            Ok(())
         );
     }
 
