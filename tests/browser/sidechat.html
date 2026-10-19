@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Sidechat isolated regression</title></head>
+<body style="margin:0"><div id="fixture"></div>
+<script>
+  const storage = () => { const data = new Map(); return { get length(){return data.size;}, key:i=>[...data.keys()][i]??null,
+    getItem:key=>data.get(String(key))??null,setItem:(key,value)=>data.set(String(key),String(value)),removeItem:key=>data.delete(String(key)),clear:()=>data.clear() }; };
+  Object.defineProperty(window,"localStorage",{value:storage()});
+  Object.defineProperty(window,"sessionStorage",{value:storage()});
+  window.__sidechatCalls=[];
+  let nextId=1;
+  window.__TAURI_INTERNALS__={transformCallback:()=>nextId++,unregisterCallback:()=>{},convertFileSrc:p=>p,
+    metadata:{currentWebview:{label:"main"},currentWindow:{label:"main"}},
+    async invoke(command,args){window.__sidechatCalls.push({command,args});
+      if(command==="get_app_settings")return {};
+      if(command==="plugin:event|listen")return nextId++;
+      if(command==="plugin:event|unlisten"||command==="plugin:clipboard-manager|write_text")return null;
+      throw new Error("Fixture rejects IPC: "+command);
+    }};
+</script>
+<script type="module" src="./sidechat.tsx"></script></body></html>

@@ -1,0 +1,44 @@
+# Dependencies
+node_modules
+
+# Build output
+dist
+*.tsbuildinfo
+src-tauri/target
+src-tauri/gen
+
+# Secrets — never commit
+.env
+.env.*
+*.pem
+*.key
+*.p12
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Plugin development checkouts — plugins are separate GitHub repos under the
+# ccgui-plugin/ container (plan ADR-4); never commit them into this tree.
+/ccgui-plugin/
+/ccgui-plugin-*/
+
+# Local agent / editor tooling
+.claude/
+.agents/
+.omp/
+.omx/
+.omo/
+.playwright-mcp/
+.vscode/
+skills-lock.json
+boardui.dev.env
+CLAUDE.md
+.codegraph
+.workflow
+.idea
+# Local verification artifacts (CI bundles, screenshots) — distribute via
+# CI artifact attachments or release assets, never the git history.
+artifacts/
+.artifacts/
+.tmp/

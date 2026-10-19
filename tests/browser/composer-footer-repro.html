@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>ConversationFooter #/! repro</title>
+</head>
+<body style="margin:0">
+<div id="fixture"></div>
+<script>
+window.__TAURI_INTERNALS__ = {
+  transformCallback() { return 1; },
+  unregisterCallback() {},
+  convertFileSrc: (p) => p,
+  metadata: { currentWebview: { label: "main" }, currentWindow: { label: "main" } },
+  async invoke(cmd) {
+    if (cmd === "agent_list") return [];
+    if (cmd === "prompts_list") return [];
+    if (cmd === "list_slash_commands") return [];
+    if (cmd === "list_built_in_agents") return { provider: { id: "agency-agents", displayName: "Agency Agents", sourceUrl: "", sourceRevision: "459dce83", license: "MIT" }, divisions: [], agents: [] };
+    return null;
+  },
+};
+</script>
+<script type="module" src="./composer-footer-repro.tsx"></script>
+</body>
+</html>

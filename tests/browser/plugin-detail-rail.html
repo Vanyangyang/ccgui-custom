@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Plugin detail rail fixture</title>
+</head>
+<body style="margin:0">
+<div id="root"></div>
+<pre id="result" style="position:fixed;top:0;left:0;z-index:50;max-width:44ch;max-height:34vh;overflow:auto;margin:0;padding:4px;color:#111;background:#ffffffd9;font:10px/1.35 monospace">Running…</pre>
+<script>
+// Minimal Tauri IPC stand-in: the detail page fetches the README through
+// plugin_fetch_market_readme (the real app caches it for an hour).
+window.__TAURI_INTERNALS__ = {
+  transformCallback() { return 1; },
+  unregisterCallback() {},
+  convertFileSrc: (p) => p,
+  metadata: { currentWebview: { label: "main" }, currentWindow: { label: "main" } },
+  async invoke(cmd) {
+    if (cmd === "plugin_fetch_market_readme") return window.__PREVIEW_README__ || "";
+    if (cmd === "plugin_fetch_index") return [];
+    if (cmd === "plugin_list") return [];
+    return null;
+  },
+};
+</script>
+<script type="module" src="./plugin-detail-rail.tsx"></script>
+</body>
+</html>

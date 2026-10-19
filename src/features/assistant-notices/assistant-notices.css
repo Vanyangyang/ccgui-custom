@@ -1,0 +1,51 @@
+.assistant-notices-overlay { padding: 8px; width: 100%; box-sizing: border-box; color: var(--color-text-primary); font: inherit; }
+.assistant-notices-surface { display: flex; flex-direction: column; max-height: calc(100dvh - 16px); border-radius: 12px; background: var(--color-background-primary-default); border: 1px solid var(--color-separator-border); box-shadow: 0 4px 16px #0002; overflow: hidden; }
+.assistant-notices-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 10px; font-size: 12px; color: var(--color-text-secondary); }
+.assistant-notices-stack { overflow: auto; overscroll-behavior: contain; min-height: 0; padding: 0 6px 6px; }
+.assistant-notice { padding: 10px 12px; border: 1px solid var(--color-separator-border); border-radius: 8px; background: var(--color-background-primary-default); animation: assistant-notice-enter 150ms ease-out; }
+.assistant-notice + .assistant-notice { margin-top: 8px; }
+.assistant-notice-source { display: flex; align-items: center; gap: 8px; min-width: 0; font-size: 12px; color: var(--color-text-secondary); }
+.assistant-notice-icon { display: inline-flex; align-items: center; flex-shrink: 0; }
+.assistant-notice-session { flex: 1 1 auto; min-width: 0; font-size: 12px; font-weight: 500; color: var(--color-text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.assistant-notice-kind { flex-shrink: 0; margin-left: auto; padding-left: 8px; color: var(--color-text-tertiary); white-space: nowrap; }
+.assistant-notice-title { font-size: 13px; font-weight: 600; margin: 6px 0; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.assistant-notice-body { margin: 8px 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; line-height: 1.55; text-align: left; }
+.assistant-notice-clamp { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.assistant-notice-tease, .assistant-notice-open { display: block; width: 100%; border: 0; padding: 0; background: transparent; color: inherit; text-align: left; cursor: pointer; font: inherit; overflow-wrap: anywhere; }
+.assistant-notice-tease { margin: 10px 0 8px; font-size: 13px; font-weight: 500; line-height: 1.5; }
+.assistant-notice-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.assistant-notice-error { margin: 6px 10px; font-size: 12px; color: var(--color-text-secondary); }
+.assistant-notices-more { margin: 6px 0; }
+.assistant-notices-recent-list { margin-top: 6px; }
+.assistant-notices-pagination { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 6px; font-size: 12px; color: var(--color-text-secondary); }
+.assistant-notices-bell { display: inline-flex; align-items: center; gap: 4px; }
+.assistant-notices-count { min-width: 16px; padding: 0 3px; border-radius: 8px; font-size: 10px; line-height: 16px; background: var(--color-background-secondary-default); color: var(--color-text-primary); }
+.assistant-notices-inbox { max-height: min(70dvh, 560px); overflow-y: auto; overscroll-behavior: contain; }
+.assistant-notices-section-label { margin: 12px 0 6px; font-size: 12px; font-weight: 500; color: var(--color-text-secondary); }
+.assistant-notices-empty { margin-top: 12px; font-size: 13px; color: var(--color-text-secondary); }
+.assistant-notices-disabled { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 8px; font-size: 12px; color: var(--color-text-secondary); }
+.assistant-notices-inline { display: flex; flex-direction: column; gap: 8px; width: 100%; max-width: 48rem; max-height: min(35dvh, 320px); overflow-y: auto; overscroll-behavior: contain; margin: 8px auto; }
+.assistant-notices-inline .assistant-notice { padding: 10px 14px; margin: 0; background: var(--color-background-secondary-default); }
+.assistant-notices-inline .assistant-notice-source { font-size: 11px; }
+.assistant-notices-stack:focus-visible, .assistant-notice-tease:focus-visible, .assistant-notice-open:focus-visible { outline: 2px solid var(--color-border-focus-ring); outline-offset: -2px; }
+@keyframes assistant-notice-enter { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+@media (prefers-reduced-motion: reduce) { .assistant-notice { animation: none; } }
+
+/* Shared by the desktop overlay, inline asides and bell history. */
+.assistant-notice-title { font-size: calc(13px * var(--notice-title-scale, 1)); }
+.assistant-notice-session { font-size: calc(12px * var(--notice-title-scale, 1)); }
+.assistant-notice-body, .assistant-notice-tease { font-size: calc(13px * var(--notice-body-scale, 1)); }
+.assistant-notices-toolbar, .assistant-notice-source, .assistant-notice-error,
+.assistant-notices-pagination, .assistant-notices-section-label, .assistant-notices-disabled,
+.assistant-notices-empty { font-size: calc(12px * var(--notice-interface-scale, 1)); }
+.assistant-notices-inline .assistant-notice-source { font-size: calc(11px * var(--notice-interface-scale, 1)); }
+.assistant-notices-inline .assistant-notice-session { font-size: calc(12px * var(--notice-title-scale, 1)); }
+.assistant-notice-actions button, .assistant-notices-toolbar button, .assistant-notices-pagination button,
+.assistant-notices-more > button, .assistant-notice-error button { font-size: calc(12px * var(--notice-interface-scale, 1)); }
+.assistant-notices-inbox > h2 { font-size: calc(14px * var(--notice-title-scale, 1)); }
+.assistant-notices-settings [data-setting-anchor="sources"] > div:first-child > p.truncate,
+.assistant-notices-settings [data-setting-anchor="observerModel"] > div:first-child > p.truncate {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+}

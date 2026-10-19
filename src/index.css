@@ -1,0 +1,558 @@
+/* Locally bundled variable fonts (no network fetch): Inter for the UI ramp,
+ * JetBrains Mono for code. Exposed as --font-inter / --font-mono-source in
+ * styles/theme.css. */
+/* Plugin bundle stylesheets (features/plugins/runtime/context.ts
+ * injectBundleCss) mount wrapped in `@layer ccgui-plugins`. The layer sits
+ * AFTER Tailwind's base layer: preflight's `* { margin:0; padding:0;
+ * border:0 solid }` and `button/input/select { background:transparent }`
+ * are resets, and an earlier ccgui-plugins layer would let those resets
+ * erase every border/padding/background a plugin declares (all installed
+ * plugins lost their card borders this way). It stays ahead of
+ * components/utilities so host utilities still win specificity ties and a
+ * plugin shipping its own framework build can't silently restyle the host;
+ * the host's own global rules are unlayered and outrank every layer. */
+@layer theme, base, ccgui-plugins, components, utilities;
+
+@import "@fontsource-variable/inter";
+@import "@fontsource-variable/jetbrains-mono";
+@import "./styles/globals.css";
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  overscroll-behavior: none;
+}
+
+.pet-overlay {
+  position: relative;
+  width: 252px;
+  height: 189px;
+  overflow: visible;
+  cursor: grab;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.pet-overlay:active {
+  cursor: grabbing;
+}
+
+.pet-sprite {
+  background-repeat: no-repeat;
+  image-rendering: auto;
+  /* The sprite is a real <button> for keyboard access to the scale cycle;
+     strip the UA button chrome so only the sprite bitmap shows. */
+  padding: 0;
+  border: 0;
+  background-color: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: inherit;
+  appearance: none;
+}
+
+.pet-bubble {
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  right: 6px;
+  z-index: 2;
+  display: flex;
+  min-height: 50px;
+  box-sizing: border-box;
+  flex-direction: column;
+  justify-content: center;
+  gap: 2px;
+  padding: 8px 16px 9px;
+  border: 1px solid color-mix(in srgb, var(--color-border-button-white, #ffffff) 62%, transparent);
+  border-radius: 26px;
+  background: color-mix(
+    in srgb,
+    var(--color-background-primary-default, #ffffff) 74%,
+    transparent
+  );
+  /* Intentional glass specular highlight (not a themed surface): the bubble
+     floats over arbitrary desktop content, so the inner white edge stays a
+     raw value per the glassmorphism design, same as backdrop-filter. */
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.56);
+  backdrop-filter: blur(18px) saturate(1.25);
+  -webkit-backdrop-filter: blur(18px) saturate(1.25);
+  color: var(--color-text-primary, #172033);
+  font-size: 13px;
+  line-height: 1.25;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+  opacity: 0;
+  transform: translateY(4px) scale(0.97);
+  transform-origin: center bottom;
+  transition:
+    opacity 160ms cubic-bezier(0.23, 1, 0.32, 1),
+    transform 180ms cubic-bezier(0.23, 1, 0.32, 1),
+    filter 180ms ease;
+  filter: blur(1px);
+}
+
+.pet-bubble-visible {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+  filter: blur(0);
+}
+
+.pet-bubble-session,
+.pet-bubble-status {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pet-bubble-session {
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.pet-bubble-status {
+  color: var(--color-text-secondary, #64748b);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pet-bubble {
+    transition: opacity 180ms ease;
+    transform: translateY(0);
+    filter: none;
+  }
+}
+/* 对话内搜索（⌘F / Ctrl+F）命中底色：Custom Highlight API 注册的 Range
+   用 ::highlight 伪元素上色——不动 DOM，选择/复制行为不变。 */
+::highlight(ccgui-chat-search) {
+  background-color: color-mix(in srgb, #eab308 35%, transparent);
+}
+::highlight(ccgui-chat-search-current) {
+  background-color: color-mix(in srgb, #f97316 55%, transparent);
+}
+/* Horizontal scroll strips (tab bar) without a visible scrollbar. */
+.scrollbar-none {
+  scrollbar-width: none;
+}
+.scrollbar-none::-webkit-scrollbar {
+  display: none;
+}
+/* ---------------------------------------------------------------------------
+ * Markdown rendering inside chat bubbles (`.prose-chat`)
+ * Visual parity with desktop-cc-gui's `.markdown`: shadcn-style document
+ * typography — roomy block spacing, heading hairlines, zebra tables, muted
+ * inline-code chips, green dotted file links, and a carded code block with a
+ * language header + copy button. Colors ride BoardUI semantic tokens so dark
+ * mode flips for free; only the md-* accents below are markdown-specific.
+ * ------------------------------------------------------------------------- */
+:root {
+  --md-inline-code-bg: var(--color-background-tertiary-default);
+  --md-codeblock-bg: var(--color-background-tertiary-default);
+  --md-border: var(--color-separator-border);
+  --md-table-border: var(--color-border-button-hover);
+  /* File-link green ported from desktop-cc-gui (itself from
+     idea-claude-code-gui): light #107c10 / dark #a5d6a7. */
+  --md-link-color: #107c10;
+  /* GitHub alert accents (light-theme values; dark overrides below). */
+  --md-alert-note: #0969da;
+  --md-alert-tip: #1a7f37;
+  --md-alert-important: #8250df;
+  --md-alert-warning: #9a6700;
+  --md-alert-caution: #cf222e;
+  /* hljs token palettes live in styles/theme.css (--color-md-token-*). */
+}
+.dark {
+  --md-link-color: #a5d6a7;
+  --md-alert-note: #4493f8;
+  --md-alert-tip: #3fb950;
+  --md-alert-important: #ab7df8;
+  --md-alert-warning: #d29922;
+  --md-alert-caution: #f85149;
+}
+
+.prose-chat {
+  line-height: 1.7;
+  overflow-wrap: break-word;
+  word-break: break-word;
+  min-width: 0;
+}
+
+/* Document-style block rhythm: siblings breathe, first/last stay flush. */
+.prose-chat > * {
+  margin: 0;
+}
+.prose-chat > * + * {
+  margin-top: 1.5em;
+}
+
+.prose-chat :where(strong) {
+  font-weight: 600;
+}
+.prose-chat :where(em) {
+  font-style: italic;
+}
+/* thematic break (---): spacing alone separates blocks, no visible rule. */
+.prose-chat :where(hr) {
+  display: none;
+}
+
+/* ---- Headings: chat-scaled doc hierarchy, h1/h2 get a hairline ---- */
+.prose-chat :where(h1, h2, h3, h4, h5, h6) {
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+  color: var(--color-text-primary);
+}
+.prose-chat :where(h1) {
+  font-size: 1.85em;
+  font-weight: 800;
+  letter-spacing: -0.025em;
+  line-height: 1.15;
+  text-wrap: balance;
+}
+.prose-chat :where(h2) {
+  font-size: 1.4em;
+}
+.prose-chat :where(h3) {
+  font-size: 1.2em;
+  letter-spacing: -0.015em;
+}
+.prose-chat :where(h4) {
+  font-size: 1.05em;
+  letter-spacing: -0.01em;
+}
+.prose-chat :where(h6) {
+  font-size: 0.9em;
+  color: var(--color-text-secondary);
+}
+.prose-chat :where(h1, h2) {
+  padding-bottom: 0.3em;
+  border-bottom: 1px solid var(--md-border);
+}
+.prose-chat > :where(p, ul, ol, pre, blockquote, table, .md-codeblock, .md-codeblock-single-wrap) + :where(h1, h2) {
+  margin-top: 2em;
+}
+.prose-chat > :where(p, ul, ol, pre, blockquote, table, .md-codeblock, .md-codeblock-single-wrap) + :where(h3, h4, h5, h6) {
+  margin-top: 1.6em;
+}
+
+/* ---- Lists ---- */
+.prose-chat ul,
+.prose-chat ol {
+  margin: 1.5em 0;
+  padding-left: 1.5em;
+  max-width: 100%;
+  list-style-position: outside;
+}
+.prose-chat ul {
+  list-style-type: disc;
+}
+.prose-chat ol {
+  list-style-type: decimal;
+}
+.prose-chat li {
+  overflow-wrap: break-word;
+}
+.prose-chat :where(li) + :where(li) {
+  margin-top: 0.5em;
+}
+.prose-chat li > ul,
+.prose-chat li > ol {
+  margin: 0.5em 0;
+}
+.prose-chat li::marker {
+  color: var(--color-text-secondary);
+}
+.prose-chat li p {
+  margin: 0;
+}
+
+/* ---- Quotes stay in the text flow (Codex style, no rail) ---- */
+.prose-chat :where(blockquote) {
+  padding-left: 0;
+  border-left: 0;
+  background: transparent;
+  color: inherit;
+  font-style: normal;
+}
+
+/* ---- GitHub-style alerts (`> [!NOTE]` …) render as a minimal left bar ----
+ * Class beats the `:where(blockquote)` flatten above (0 specificity), and
+ * the accent rides CSS variables so dark mode flips for free. */
+.prose-chat .md-alert {
+  border-left: 2px solid var(--md-alert-accent);
+  padding-left: 12px;
+}
+.prose-chat .md-alert-note {
+  --md-alert-accent: var(--md-alert-note);
+}
+.prose-chat .md-alert-tip {
+  --md-alert-accent: var(--md-alert-tip);
+}
+.prose-chat .md-alert-important {
+  --md-alert-accent: var(--md-alert-important);
+}
+.prose-chat .md-alert-warning {
+  --md-alert-accent: var(--md-alert-warning);
+}
+.prose-chat .md-alert-caution {
+  --md-alert-accent: var(--md-alert-caution);
+}
+.prose-chat .md-alert-title {
+  font-size: 0.8em;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--md-alert-accent);
+  text-transform: uppercase;
+}
+.prose-chat .md-alert > p + p {
+  margin-top: 0.75em;
+}
+.prose-chat .md-alert > .md-alert-title + p {
+  margin-top: 6px;
+}
+
+/* ---- Links: file-link green + dotted underline everywhere ---- */
+.prose-chat a,
+.prose-chat a:visited,
+.prose-chat a code {
+  color: var(--md-link-color);
+}
+.prose-chat a {
+  text-decoration-line: underline;
+  text-decoration-style: dotted;
+  text-decoration-thickness: 1px;
+  text-decoration-color: currentColor;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+.prose-chat a:hover {
+  text-decoration-thickness: 2px;
+  opacity: 0.95;
+}
+
+/* ---- Code ---- */
+.prose-chat code {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-size: 0.875em;
+}
+/* Inline code chip: muted rounded surface, body weight. Inside a file link
+   the green comes from the anchor rule above. */
+.prose-chat :not(pre) > code {
+  background: var(--md-inline-code-bg);
+  border-radius: 0.25rem;
+  padding: 0.2rem 0.3rem;
+  font-weight: 400;
+}
+.prose-chat a code {
+  /* File links read as plain green text — no chip behind them. */
+  background: none;
+  padding: 0;
+}
+/* Code block card: flat bordered card on a muted surface. */
+.md-codeblock {
+  margin: 1.25em 0;
+  border: 1px solid var(--md-border);
+  border-radius: 10px;
+  background: var(--md-codeblock-bg);
+  overflow: hidden;
+}
+.md-codeblock-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 5px 14px;
+  border-bottom: 1px solid var(--md-border);
+  font-size: 13px;
+  color: var(--color-text-secondary);
+}
+.md-codeblock-language {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1;
+}
+.md-codeblock-copy {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.md-codeblock-copy:hover,
+.md-codeblock-copy:focus-visible {
+  background: var(--color-background-secondary-hover);
+  color: var(--color-text-primary);
+}
+.md-codeblock pre {
+  margin: 0;
+  padding: 12px 16px 14px;
+  overflow-x: auto;
+  white-space: pre;
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--color-text-primary);
+}
+.md-codeblock pre code {
+  display: block;
+  min-width: max-content;
+  font-size: inherit;
+}
+
+/* Plugin README fences render as bare <pre>: they don't go through the chat's
+   carded renderer above, so the block itself has to own the horizontal
+   scroll. Without it a single long command painted across the right-hand
+   rail instead of scrolling inside the document column. */
+.prose-plugin-readme pre {
+  max-width: 100%;
+  overflow-x: auto;
+  white-space: pre;
+}
+
+/* Single-line fence: compact card, copy floats top-right. */
+.md-codeblock-single-wrap {
+  position: relative;
+  margin: 1.25em 0;
+}
+.md-codeblock-single-actions {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+}
+.md-codeblock-single {
+  margin: 0;
+  padding: 12px 44px 12px 16px;
+  border: 1px solid var(--md-border);
+  border-radius: 10px;
+  background: var(--md-codeblock-bg);
+  overflow-x: auto;
+  white-space: pre;
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--color-text-primary);
+}
+.md-codeblock-single code {
+  display: block;
+  font-size: inherit;
+}
+
+/* Theme-aware hljs tokens (replaces the always-dark github-dark.css). */
+.prose-chat .hljs-comment,
+.prose-chat .hljs-quote,
+.prose-chat .hljs-meta {
+  color: var(--color-md-token-comment);
+}
+.prose-chat .hljs-punctuation {
+  color: var(--color-md-token-punctuation);
+}
+.prose-chat .hljs-tag,
+.prose-chat .hljs-name,
+.prose-chat .hljs-literal,
+.prose-chat .hljs-symbol,
+.prose-chat .hljs-deletion {
+  color: var(--color-md-token-constant);
+}
+.prose-chat .hljs-number {
+  color: var(--color-md-token-number);
+}
+.prose-chat .hljs-string,
+.prose-chat .hljs-regexp,
+.prose-chat .hljs-addition,
+.prose-chat .hljs-attr,
+.prose-chat .hljs-attribute,
+.prose-chat .hljs-selector-attr,
+.prose-chat .hljs-selector-class,
+.prose-chat .hljs-selector-pseudo,
+.prose-chat .hljs-built_in,
+.prose-chat .hljs-doctag {
+  color: var(--color-md-token-string);
+}
+.prose-chat .hljs-operator,
+.prose-chat .hljs-variable,
+.prose-chat .hljs-template-variable,
+.prose-chat .hljs-link {
+  color: var(--color-md-token-operator);
+}
+.prose-chat .hljs-keyword,
+.prose-chat .hljs-selector-tag,
+.prose-chat .hljs-type,
+.prose-chat .hljs-selector-id {
+  color: var(--color-md-token-keyword);
+}
+.prose-chat .hljs-title,
+.prose-chat .hljs-title.function_,
+.prose-chat .hljs-section {
+  color: var(--color-md-token-function);
+}
+.prose-chat .hljs-title.class_ {
+  color: var(--color-md-token-constant);
+}
+.prose-chat .hljs-emphasis {
+  font-style: italic;
+}
+.prose-chat .hljs-strong {
+  font-weight: 600;
+}
+
+/* ---- Tables: full grid via single-side borders + muted zebra rows ----
+   display:block (for horizontal scroll) breaks border-collapse, so each cell
+   draws only right+bottom and the table adds the top+left frame — adjacent
+   borders never double up. */
+.prose-chat table {
+  width: 100%;
+  margin: 1.5em 0;
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  border-top: 1px solid var(--md-table-border);
+  border-left: 1px solid var(--md-table-border);
+}
+.prose-chat thead,
+.prose-chat tbody,
+.prose-chat tr {
+  display: table;
+  width: 100%;
+  table-layout: fixed;
+}
+.prose-chat tbody tr:nth-child(even) {
+  background: var(--md-inline-code-bg);
+}
+.prose-chat th,
+.prose-chat td {
+  border-right: 1px solid var(--md-table-border);
+  border-bottom: 1px solid var(--md-table-border);
+  padding: 0.5rem 1rem;
+  text-align: left;
+  word-wrap: break-word;
+  overflow-wrap: break-word;
+}
+.prose-chat th {
+  font-weight: 700;
+}
+
+.prose-chat img {
+  display: block;
+  max-width: min(100%, 720px);
+  height: auto;
+  border-radius: 8px;
+}

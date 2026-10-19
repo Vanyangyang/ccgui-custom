@@ -1,0 +1,266 @@
+/* ---------------------------------------------------------------------------
+ * @ccgui/plugin-ui 样式表
+ *
+ * 只消费 src/tokens.ts 契约清单里的宿主语义 token，每条声明带 light
+ * fallback（var(--token, fallback)）：token 缺失时退化为浅色默认外观。
+ * 深浅色不在这里写分支——完全由宿主 .dark 翻转 token 实现。
+ *
+ * 插件接入：入口顶部 `import "@ccgui/plugin-ui/styles.css";`，构建时随
+ * 插件自己的 styles.css 一起进三件套产物（宿主 install-time 审查通道，
+ * 不需要 theme 权限）。
+ * --------------------------------------------------------------------------- */
+
+/* ===== Button =============================================================
+ * primary 的 hover 用宿主同款技巧：default 渐变常驻，hover 渐变叠在
+ * ::before 上淡入（CSS 无法插值 background-image，直接换会闪）。
+ * ======================================================================== */
+.pui-btn {
+  position: relative;
+  isolation: isolate;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 12px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-2lg, 10px);
+  font-family: var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+  transition: background-color 150ms ease, border-color 150ms ease,
+    color 150ms ease, opacity 150ms ease;
+}
+.pui-btn:disabled {
+  cursor: not-allowed;
+}
+.pui-btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.25);
+  box-shadow: 0 0 0 3px
+    color-mix(in srgb, var(--color-border-focus-ring, #3b82f6) 25%, transparent);
+}
+
+.pui-btn-sm {
+  height: 24px;
+  padding: 0 8px;
+  border-radius: 8px;
+  font-size: 12px;
+}
+
+/* --- primary: 宿主 CTA 渐变（accent ramp），跟随主题重着色 ------------- */
+.pui-btn-primary {
+  background-image: var(
+    --gradient-button-primary-default,
+    linear-gradient(180deg, #3b82f6 0%, #2563eb 100%)
+  );
+  color: var(--color-text-white, #ffffff);
+}
+.pui-btn-primary::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  border-radius: inherit;
+  background-image: var(
+    --gradient-button-primary-hover,
+    linear-gradient(180deg, #60a5fa 0%, #3b82f6 100%)
+  );
+  opacity: 0;
+  transition: opacity 150ms ease;
+}
+.pui-btn-primary:hover:not(:disabled)::before {
+  opacity: 1;
+}
+.pui-btn-primary:active:not(:disabled) {
+  background-image: var(
+    --gradient-button-primary-active,
+    linear-gradient(180deg, #2563eb 0%, #1d4ed8 100%)
+  );
+}
+.pui-btn-primary:active:not(:disabled)::before {
+  opacity: 0;
+}
+.pui-btn-primary:disabled {
+  background-image: var(
+    --gradient-button-primary-disabled,
+    linear-gradient(180deg, #ebebeb 0%, #d4d4d4 100%)
+  );
+  color: var(--color-button-primary-disabled-foreground, #a3a3a3);
+}
+.pui-btn-primary:disabled::before {
+  opacity: 0;
+}
+
+/* --- secondary: 描边 + 浅填充，工具栏默认形态 -------------------------- */
+.pui-btn-secondary {
+  border-color: var(--color-border-button-default, #ebebeb);
+  background: var(--color-background-tertiary-default, #ebebeb);
+  color: var(--color-text-primary, #0a0a0a);
+}
+.pui-btn-secondary:hover:not(:disabled) {
+  border-color: var(--color-border-button-hover, #d4d4d4);
+  background: var(--color-background-tertiary-hover, #d4d4d4);
+}
+.pui-btn-secondary:disabled {
+  opacity: 0.45;
+}
+
+/* --- ghost: 无边框，hover 才出底 --------------------------------------- */
+.pui-btn-ghost {
+  background: transparent;
+  color: var(--color-text-secondary, #737373);
+}
+.pui-btn-ghost:hover:not(:disabled) {
+  background: var(--color-background-tertiary-default, #ebebeb);
+  color: var(--color-text-primary, #0a0a0a);
+}
+.pui-btn-ghost:disabled {
+  opacity: 0.45;
+}
+
+/* ===== Input / Textarea / Select ======================================== */
+.pui-input,
+.pui-textarea,
+.pui-select {
+  min-width: 0;
+  border: 1px solid var(--color-separator-border, #ebebeb);
+  border-radius: 8px;
+  background: var(--color-background-primary-default, #ffffff);
+  color: var(--color-text-primary, #0a0a0a);
+  font-family: var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+  font-size: 13px;
+  outline: none;
+  transition: border-color 150ms ease, box-shadow 150ms ease;
+}
+.pui-input {
+  height: 30px;
+  padding: 0 10px;
+}
+.pui-textarea {
+  padding: 7px 10px;
+  line-height: 1.5;
+  resize: vertical;
+}
+.pui-input::placeholder,
+.pui-textarea::placeholder {
+  color: var(--color-text-placeholder, #a3a3a3);
+}
+.pui-input:focus-visible,
+.pui-textarea:focus-visible,
+.pui-select:focus-visible {
+  border-color: var(--color-border-focus-ring, #3b82f6);
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.18);
+  box-shadow: 0 0 0 3px
+    color-mix(in srgb, var(--color-border-focus-ring, #3b82f6) 18%, transparent);
+}
+.pui-input:disabled,
+.pui-textarea:disabled,
+.pui-select:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.pui-input-invalid,
+.pui-input-invalid:focus-visible {
+  border-color: var(--color-border-error-default, #ef4444);
+}
+
+/* 原生 select 去默认箭头，wrapper 挂 chevron（颜色跟三级文本 token） */
+.pui-select-wrap {
+  position: relative;
+  display: inline-flex;
+  min-width: 0;
+}
+.pui-select {
+  width: 100%;
+  height: 30px;
+  padding: 0 26px 0 10px;
+  appearance: none;
+  cursor: pointer;
+}
+.pui-select-chevron {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 14px;
+  height: 14px;
+  color: var(--color-text-tertiary, #a3a3a3);
+  pointer-events: none;
+}
+
+/* ===== Badge ============================================================ */
+.pui-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 20px;
+  padding: 0 8px;
+  border-radius: 999px;
+  font-family: var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+  font-size: 11.5px;
+  font-weight: 500;
+  line-height: 1;
+  white-space: nowrap;
+}
+.pui-badge-neutral {
+  background: var(--color-background-tertiary-default, #ebebeb);
+  color: var(--color-text-secondary, #737373);
+}
+.pui-badge-accent {
+  background: rgba(59, 130, 246, 0.14);
+  background: color-mix(
+    in srgb,
+    var(--color-accent-500, #3b82f6) 14%,
+    transparent
+  );
+  color: var(--color-accent-600, #2563eb);
+}
+.pui-badge-success {
+  background: rgba(101, 163, 13, 0.14);
+  background: color-mix(
+    in srgb,
+    var(--color-notification-success-foreground, #65a30d) 16%,
+    transparent
+  );
+  color: var(--color-notification-success-foreground, #65a30d);
+}
+.pui-badge-error {
+  background: rgba(239, 68, 68, 0.12);
+  background: color-mix(
+    in srgb,
+    var(--color-text-error-primary, #ef4444) 14%,
+    transparent
+  );
+  color: var(--color-text-error-primary, #ef4444);
+}
+
+/* ===== 聊天气泡（可选，插件做对话界面时与宿主同胚） ====================== */
+.pui-bubble-user {
+  align-self: flex-end;
+  max-width: 75%;
+  padding: 8px 14px;
+  border-radius: 14px 14px 4px 14px;
+  background: var(--color-bubble-user, #3b82f6);
+  color: var(--color-text-white, #ffffff);
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.pui-bubble-agent {
+  align-self: flex-start;
+  max-width: 85%;
+  padding: 8px 14px;
+  border-radius: 14px 14px 14px 4px;
+  background: var(--color-background-tertiary-default, #ebebeb);
+  color: var(--color-text-primary, #0a0a0a);
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}

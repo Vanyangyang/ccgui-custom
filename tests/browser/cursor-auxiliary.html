@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>Cursor auxiliary sessions fixture</title></head>
+<body>
+<div id="fixture"></div>
+<script>
+// Document-local storage and IPC only: no saved settings, sessions or models.
+const fixtureStorage = new Map();
+Object.defineProperty(window, "localStorage", { value: {
+  getItem: (key) => fixtureStorage.get(key) ?? null,
+  setItem: (key, value) => fixtureStorage.set(key, String(value)),
+  removeItem: (key) => fixtureStorage.delete(key),
+  clear: () => fixtureStorage.clear(),
+  key: (index) => [...fixtureStorage.keys()][index] ?? null,
+  get length() { return fixtureStorage.size; },
+} });
+Object.defineProperty(window, "sessionStorage", { value: window.localStorage });
+localStorage.setItem("ccgui-next.sidebarChatListMode:v1", new URLSearchParams(location.search).get("mode") === "workspace" ? "workspace" : "recent");
+window.__TAURI_INTERNALS__ = {
+  transformCallback() { return 1; }, unregisterCallback() {}, convertFileSrc: (p) => p,
+  metadata: { currentWebview: { label: "main" }, currentWindow: { label: "main" } },
+  async invoke(cmd) { return cmd === "get_app_settings" ? {} : null; },
+};
+</script>
+<script type="module" src="./cursor-auxiliary.tsx"></script>
+</body>
+</html>

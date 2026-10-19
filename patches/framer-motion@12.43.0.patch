@@ -1,0 +1,36 @@
+diff --git a/dist/cjs/index.js b/dist/cjs/index.js
+index 7ba755a222d33b33148ebf4a4b957ee0ca719860..f0536e14670b49867f40c4e9570c44cd78b288fd 100644
+--- a/dist/cjs/index.js
++++ b/dist/cjs/index.js
+@@ -1012,7 +1012,12 @@ function ReorderItemComponent({ children, style = {}, value, as = "li", onDrag,
+             const offset = point[axis].get();
+             // Always attempt to update order - checkReorder handles the logic
+             updateOrder(value, offset, velocity[axis]);
+-            autoScrollIfNeeded(groupRef.current, pointerPoint[axis], axis, velocity[axis]);
++            // PATCH(ccgui): auto-scroll is opt-in via data-reorder-autoscroll on the
++            // Reorder.Group element; default off — edge scrolling fights the
++            // drag offset and stutters when dragging toward the container top.
++            if (groupRef.current && groupRef.current.hasAttribute("data-reorder-autoscroll")) {
++                autoScrollIfNeeded(groupRef.current, pointerPoint[axis], axis, velocity[axis]);
++            }
+             onDrag && onDrag(event, gesturePoint);
+         }, onDragEnd: (event, gesturePoint) => {
+             resetAutoScrollState();
+diff --git a/dist/es/components/Reorder/Item.mjs b/dist/es/components/Reorder/Item.mjs
+index 8a1f18b7c86bef6bcdcecd7f15368352404ddfca..2ce2ddd89b1a62f4e1a12a92afc23ffacf276f93 100644
+--- a/dist/es/components/Reorder/Item.mjs
++++ b/dist/es/components/Reorder/Item.mjs
+@@ -28,7 +28,12 @@ function ReorderItemComponent({ children, style = {}, value, as = "li", onDrag,
+             const offset = point[axis].get();
+             // Always attempt to update order - checkReorder handles the logic
+             updateOrder(value, offset, velocity[axis]);
+-            autoScrollIfNeeded(groupRef.current, pointerPoint[axis], axis, velocity[axis]);
++            // PATCH(ccgui): auto-scroll is opt-in via data-reorder-autoscroll on the
++            // Reorder.Group element; default off — edge scrolling fights the
++            // drag offset and stutters when dragging toward the container top.
++            if (groupRef.current && groupRef.current.hasAttribute("data-reorder-autoscroll")) {
++                autoScrollIfNeeded(groupRef.current, pointerPoint[axis], axis, velocity[axis]);
++            }
+             onDrag && onDrag(event, gesturePoint);
+         }, onDragEnd: (event, gesturePoint) => {
+             resetAutoScrollState();

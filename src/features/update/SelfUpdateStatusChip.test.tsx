@@ -1,0 +1,120 @@
+import { act } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import i18n from "@/lib/i18n";
+import { SelfUpdateStatusChip } from "./SelfUpdateStatusChip";
+import { useLiveUpdateStore } from "./live-update";
+
+globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+
+describe("self-update status action", () => {
+  let container: HTMLDivElement;
+  let root: Root;
+  const initial = useLiveUpdateStore.getState();
+  const requestUpdate = vi.fn(async () => {});
+  const change = { id: "c1", changeId: "fix", summary: "Verified fix", sourceRoot: "G:/source" };
+  const active = { manifestSha256: "a".repeat(64), channel: "protected-custom" as const, releaseId: "auto-one", version: "1.1.1+protected.34", workerProtocol: 1, checkpointSchema: 1, schemaHash: "b".repeat(64), executable: "ccgui-next.exe" };
+  const transaction = { id: "tx1", phase: "Committed" as const, candidate: active, previous: null };
+  const batch = { id: "b1", requestId: "r1", sourceRoot: "G:/source", phase: "Committed", changes: [change], transactionId: "tx1", manifestSha256: active.manifestSha256 };
+  beforeEach(async () => {
+    requestUpdate.mockClear();
+    useLiveUpdateStore.setState({ ...initial, support: "supported", channel: { version: 1, ready: [change] }, requestUpdate });
+    container = document.createElement("div"); document.body.append(container); root = createRoot(container);
+    await act(async () => { root.render(<SelfUpdateStatusChip />); });
+  });
+  afterEach(async () => {
+    await act(async () => { root.unmount(); }); container.remove(); useLiveUpdateStore.setState(initial, true);
+  });
+  const button = () => container.querySelector<HTMLButtonElement>("button")!;
+
+  it("requests real registered changes without navigating away", async () => {
+    const hash = window.location.hash;
+    expect(button().textContent).toContain(i18n.t("statusbar.selfUpdateActionCount", { count: 1 }));
+    expect(button().title).toContain("Verified fix");
+    await act(async () => { button().click(); });
+    expect(requestUpdate).toHaveBeenCalledOnce(); expect(window.location.hash).toBe(hash);
+  });
+
+  it("keeps the empty action visible with a reason and hides unsupported clients", async () => {
+    await act(async () => { useLiveUpdateStore.setState({ channel: null }); });
+    expect(button().disabled).toBe(true); expect(button().title).toBe(i18n.t("statusbar.selfUpdateEmpty"));
+    for (const support of ["web", "not-custom", "unsupported", "checking"] as const) {
+      await act(async () => { useLiveUpdateStore.setState({ support }); });
+      expect(container.querySelector("button")).toBeNull();
+    }
+  });
+
+  it("disables submitting and retains failed request details for retry", async () => {
+    await act(async () => { useLiveUpdateStore.setState({ requesting: true }); });
+    expect(button().disabled).toBe(true); expect(button().getAttribute("aria-busy")).toBe("true");
+    await act(async () => { button().click(); }); expect(requestUpdate).not.toHaveBeenCalled();
+    await act(async () => { useLiveUpdateStore.setState({ requesting: false, requestError: "Could not persist request" }); });
+    expect(button().textContent).toContain(i18n.t("statusbar.selfUpdateRequestFailed"));
+    expect(button().title).toContain("Could not persist request"); expect(button().disabled).toBe(false);
+    await act(async () => { button().click(); }); expect(requestUpdate).toHaveBeenCalledOnce();
+  });
+
+  it("opens active request details instead of creating another request", async () => {
+    await act(async () => { useLiveUpdateStore.setState({ channel: { version: 1, ready: [change],
+      updateRequest: { id: "r1", requestId: "r1", sourceRoot: "G:/source", targetChangeIds: ["fix", "working"], waitingFor: ["working"] } } }); });
+    expect(button().textContent).toContain(i18n.t("statusbar.selfUpdateWaitingTasks", { done: 1, total: 2 }));
+    await act(async () => { button().click(); });
+    expect(window.location.hash).toBe("#/settings?page=update"); expect(requestUpdate).not.toHaveBeenCalled();
+  });
+
+  it("keeps the committed result and its changes reachable after the queue drains", async () => {
+    await act(async () => { useLiveUpdateStore.setState({ active, transaction, channel: { version: 1, ready: [], batch } }); });
+    expect(button().disabled).toBe(false);
+    expect(button().dataset.selfUpdateKind).toBe("committed");
+    expect(button().textContent).toContain(i18n.t("statusbar.selfUpdateCommitted"));
+    expect(button().title).toContain("auto-one");
+    expect(button().title).toContain("Verified fix");
+    await act(async () => { button().click(); });
+    expect(window.location.hash).toBe("#/settings?page=update");
+    expect(requestUpdate).not.toHaveBeenCalled();
+  });
+
+  it.each(["active-mismatch", "missing-active", "different-transaction"])("does not claim success for %s", async (reason) => {
+    await act(async () => { useLiveUpdateStore.setState({
+      active: reason === "missing-active" ? null : reason === "active-mismatch" ? { ...active, manifestSha256: "c".repeat(64) } : active,
+      transaction: reason === "different-transaction" ? { ...transaction, id: "old-tx" } : transaction,
+      channel: { version: 1, ready: [], batch },
+    }); });
+    expect(button().dataset.selfUpdateKind).toBe("unverified");
+    expect(button().disabled).toBe(false);
+    expect(button().textContent).not.toContain(i18n.t("statusbar.selfUpdateCommitted"));
+  });
+
+  it("shows rollback with the original reason and the version still running", async () => {
+    await act(async () => { useLiveUpdateStore.setState({
+      active: { ...active, releaseId: "auto-previous", manifestSha256: "c".repeat(64) },
+      transaction: { ...transaction, phase: "RolledBack", failureReason: "CandidateHealthTimeout" },
+      channel: { version: 1, ready: [], batch: { ...batch, phase: "RolledBack", error: "CandidateHealthTimeout" } },
+      stage: "error", errorCode: "previousFailed", error: "CandidateHealthTimeout",
+    }); });
+    expect(button().dataset.selfUpdateKind).toBe("rolled-back");
+    expect(button().title).toContain("CandidateHealthTimeout");
+    expect(button().title).toContain("auto-previous");
+    expect(button().disabled).toBe(false);
+  });
+
+  it("allows inspecting queued changes without submitting them", async () => {
+    await act(async () => { useLiveUpdateStore.setState({ active, transaction, channel: { version: 1, ready: [change], batch } }); });
+    const details = container.querySelector<HTMLButtonElement>('[data-testid="statusbar-self-update-details"]');
+    expect(details).not.toBeNull();
+    await act(async () => { details!.click(); });
+    expect(window.location.hash).toBe("#/settings?page=update");
+    expect(requestUpdate).not.toHaveBeenCalled();
+    await act(async () => { button().click(); });
+    expect(requestUpdate).toHaveBeenCalledOnce();
+  });
+
+  it("keeps a persisted request visible before its batch freezes", async () => {
+    await act(async () => { useLiveUpdateStore.setState({ channel: { version: 1, ready: [],
+      updateRequest: { id: "r1", requestId: "r1", sourceRoot: "G:/source", targetChangeIds: ["fix"], waitingFor: [] } } }); });
+    expect(button().textContent).toContain(i18n.t("statusbar.selfUpdateRequested"));
+    expect(button().disabled).toBe(false);
+    await act(async () => { button().click(); });
+    expect(requestUpdate).not.toHaveBeenCalled();
+  });
+});

@@ -1,0 +1,7 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="ccgui-native-fixture-source" content="assistant-notices-native.tsx"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CCGUI 原生提醒独立测试</title></head>
+<body style="margin:0"><div id="root">正在加载原生测试页…</div><pre id="fixture-error" role="alert" style="white-space:pre-wrap;color:#b91c1c"></pre><script>
+  const showFixtureError = value => { document.getElementById('fixture-error').textContent = String(value?.message ?? value); };
+  window.addEventListener('error', event => showFixtureError(event.error ?? event.message));
+  window.addEventListener('unhandledrejection', event => showFixtureError(event.reason));
+</script><script type="module" src="./assistant-notices-native.tsx"></script></body></html>

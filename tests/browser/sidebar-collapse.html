@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Sidebar worktree collapse fixture</title>
+</head>
+<body>
+<div id="fixture"></div>
+<script>
+// Minimal Tauri IPC stand-in (plugin-sdk / workspace stores touch it on load).
+window.__TAURI_INTERNALS__ = {
+  transformCallback() { return 1; },
+  unregisterCallback() {},
+  convertFileSrc: (p) => p,
+  metadata: { currentWebview: { label: "main" }, currentWindow: { label: "main" } },
+  async invoke() { return null; },
+};
+</script>
+<script type="module" src="./sidebar-collapse.tsx"></script>
+</body>
+</html>

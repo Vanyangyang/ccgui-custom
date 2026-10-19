@@ -1,0 +1,134 @@
+import { convertFileSrc, invoke as tauriInvoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
+import { isWeb, serverVersion, webToken } from "./transport";
+import i18n from "./i18n";
+import { relayProfilePath } from "./relay-profile";
+
+export { isWeb } from "./transport";
+
+/** Windows desktop: 唯一有「原生标题栏 / 仿 mac」切换的平台。 */
+export const IS_WINDOWS =
+  typeof navigator !== "undefined" && /windows/i.test(navigator.userAgent);
+/** macOS desktop: overlay titlebar 下系统红绿灯悬浮在内容左上。 */
+export const IS_MAC =
+  typeof navigator !== "undefined" && /macintosh|mac os x/i.test(navigator.userAgent);
+
+/**
+ * Platform shims for the few places that touch native APIs outside the
+ * invoke/listen surface. Each has a browser fallback used in web-access mode.
+ */
+
+/** Open a URL in the system browser (new tab in web mode). */
+export function openExternal(url: string) {
+  if (isWeb) {
+    window.open(url, "_blank", "noopener,noreferrer");
+    return;
+  }
+  void tauriInvoke("plugin:opener|open_url", { url }).catch((error) => {
+    console.error("[openExternal] failed to open", url, error);
+  });
+}
+
+/** App version: bundle metadata natively, bridge hello frame on web. */
+export function getAppVersion(): Promise<string | null> {
+  if (isWeb) return serverVersion();
+  return getVersion().catch(() => null);
+}
+
+/**
+ * Absolute filesystem path → URL loadable by an <img>. Native uses the asset
+ * protocol; web mode uses the bridge's scoped /file route (same $HOME scope,
+ * see web.rs).
+ */
+export function fileUrl(path: string): string {
+  if (isWeb) {
+    return `${relayProfilePath("/file")}?path=${encodeURIComponent(path)}&token=${encodeURIComponent(webToken ?? "")}`;
+  }
+  return convertFileSrc(path);
+}
+
+/** Webview zoom is a no-op on web — browsers have native pinch/⌘± zoom. */
+export function setWebviewZoom(fraction: number) {
+  if (isWeb) return;
+  // getCurrentWebview throws synchronously outside a Tauri webview; the bar
+  // still renders, zoom just stays inert.
+  try {
+    void getCurrentWebview()
+      .setZoom(fraction)
+      .catch(() => {});
+  } catch {}
+}
+
+/**
+ * Directory picker: native dialog on desktop; on web there is no filesystem
+ * dialog, so fall back to typing the absolute path.
+ */
+export async function pickDirectory(title: string): Promise<string | null> {
+  if (isWeb) {
+    const entered = window.prompt(title);
+    const trimmed = entered?.trim();
+    return trimmed ? trimmed : null;
+  }
+  const selected = await openDialog({ directory: true, multiple: false, title });
+  const path = Array.isArray(selected) ? selected[0] : selected;
+  return path ?? null;
+}
+
+/**
+ * File picker: native dialog on desktop; on web there is no filesystem
+ * dialog, so fall back to typing the absolute path (same as pickDirectory).
+ */
+export async function pickFile(
+  title: string,
+  filters: { name: string; extensions: string[] }[],
+): Promise<string | null> {
+  if (isWeb) {
+    const entered = window.prompt(title);
+    const trimmed = entered?.trim();
+    return trimmed ? trimmed : null;
+  }
+  const selected = await openDialog({ multiple: false, title, filters });
+  const path = Array.isArray(selected) ? selected[0] : selected;
+  return path ?? null;
+}
+
+/**
+ * Save on the host: native dialog on desktop, explicit absolute host path
+ * and overwrite confirmation from the browser.
+ */
+export async function pickSavePath(title: string, defaultPath: string): Promise<string | null> {
+  if (isWeb) {
+    while (true) {
+      const entered = window.prompt(`${title}\n\n${i18n.t("settings.remoteSavePathPrompt", { filename: defaultPath })}`, defaultPath);
+      const path = entered?.trim();
+      if (!path) return null;
+      const absolute = /^[A-Za-z]:[\\/]/.test(path) || path.startsWith("/") || /^\\\\[^\\/]+[\\/][^\\/]+/.test(path);
+      if (!absolute || /[\u0000\r\n]/.test(path) || /[\\/]$/.test(path)) {
+        window.alert(i18n.t("settings.remoteSavePathInvalid"));
+        continue;
+      }
+      return window.confirm(i18n.t("settings.remoteSavePathConfirm", { path })) ? path : null;
+    }
+  }
+  return (await saveDialog({ title, defaultPath })) ?? null;
+}
+/**
+ * Multi-file picker: native dialog on desktop; on web there is no filesystem
+ * dialog, so fall back to typing one absolute path (same as pickFile). A
+ * cancelled dialog resolves to an empty list.
+ */
+export async function pickFiles(
+  title: string,
+  filters?: { name: string; extensions: string[] }[],
+): Promise<string[]> {
+  if (isWeb) {
+    const entered = window.prompt(title);
+    const trimmed = entered?.trim();
+    return trimmed ? [trimmed] : [];
+  }
+  const selected = await openDialog({ multiple: true, title, filters });
+  if (!selected) return [];
+  return Array.isArray(selected) ? selected : [selected];
+}

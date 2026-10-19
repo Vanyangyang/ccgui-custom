@@ -1,0 +1,664 @@
+name: Release
+
+# Manual-only: run after bumping `version` in src-tauri/tauri.conf.json (and
+# package.json). Produces signed updater artifacts (same minisign key as the
+# 0.9.x line, so old clients accept the update) and publishes a GitHub release
+# whose latest.json feeds every installed client's background check.
+on:
+  workflow_dispatch:
+    # Required gate: the run only proceeds when the typed version matches
+    # tauri.conf.json. A bare "Run workflow" click fails fast in preflight
+    # instead of publishing whatever version main happens to carry.
+    inputs:
+      version:
+        description: "要发布的版本号，须与 src-tauri/tauri.conf.json 一致（如 1.0.1）"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  preflight:
+    name: verify version input
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Validate requested version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$INPUT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::版本号格式应为 X.Y.Z，收到: '$INPUT_VERSION'"
+            exit 1
+          fi
+          CONFIG_VERSION=$(python3 -c "import json,pathlib;print(json.loads(pathlib.Path('src-tauri/tauri.conf.json').read_text())['version'])")
+          if [ "$INPUT_VERSION" != "$CONFIG_VERSION" ]; then
+            echo "::error::输入版本 ($INPUT_VERSION) 与 tauri.conf.json ($CONFIG_VERSION) 不一致，终止发版"
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/v${INPUT_VERSION}" > /dev/null 2>&1; then
+            echo "::error::tag v${INPUT_VERSION} 已存在，说明该版本已发布过，终止发版"
+            exit 1
+          fi
+          echo "version check ok: v${INPUT_VERSION}"
+
+  build_macos:
+    name: macos (${{ matrix.arch }})
+    runs-on: ${{ matrix.platform }}
+    environment: release
+    needs: preflight
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            arch: aarch64
+          - platform: macos-15-intel
+            arch: x86_64
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "10.13"
+      CODESIGN_IDENTITY: ${{ vars.CODESIGN_IDENTITY }}
+      NOTARY_PROFILE_NAME: ${{ vars.NOTARY_PROFILE_NAME }}
+      APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+          cache-bin: false
+          shared-key: v1-macos-${{ matrix.arch == 'aarch64' && 'arm64' || 'x64' }}-rust
+          cache-on-failure: true
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Import signing certificate
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN=build.keychain
+          CERT_PATH=cert.p12
+
+          echo "$APPLE_CERTIFICATE_P12" | base64 --decode > "$CERT_PATH" 2>/dev/null || \
+            echo "$APPLE_CERTIFICATE_P12" | base64 -D > "$CERT_PATH"
+
+          security create-keychain -p "" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "" "$KEYCHAIN"
+          security import "$CERT_PATH" -k "$KEYCHAIN" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security list-keychains -d user -s "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "" "$KEYCHAIN"
+
+      - name: Configure notarytool credentials
+        env:
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_PRIVATE_KEY_B64: ${{ secrets.APPLE_API_PRIVATE_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          mkdir -p private_keys
+          echo "$APPLE_API_PRIVATE_KEY_B64" | base64 --decode > private_keys/AuthKey.p8
+          xcrun notarytool store-credentials "$NOTARY_PROFILE_NAME" \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER_ID" \
+            --key "private_keys/AuthKey.p8"
+
+      # Single-binary app (openssl vendored, no daemon subcomponent), so Tauri
+      # can codesign mid-bundle — unlike the 0.9.x flow that re-signed after.
+      # With TAURI_SIGNING_PRIVATE_KEY set, `createUpdaterArtifacts` also emits
+      # "CC GUI.app.tar.gz" + .sig for the updater channel.
+      - name: Build app bundle (signed)
+        env:
+          NODE_OPTIONS: "--max-old-space-size=8192"
+          APPLE_SIGNING_IDENTITY: ${{ vars.CODESIGN_IDENTITY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_B64 }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        # bundle_dmg.sh (AppleScript/Finder + hdiutil) is known-flaky on
+        # headless runners — tauri recommends retrying rather than failing
+        # the whole build. cargo reuse keeps a retry cheap (~16 min compile
+        # is incremental on the second attempt).
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if pnpm exec tauri build --bundles app,dmg; then
+              exit 0
+            fi
+            echo "::warning::tauri build attempt $attempt failed; retrying"
+          done
+          echo "::error::tauri build failed after 3 attempts"
+          exit 1
+
+      - name: Notarize and staple DMG
+        run: |
+          set -euo pipefail
+          DMG=$(find src-tauri/target/release/bundle/dmg -maxdepth 1 -name '*.dmg' | head -n 1)
+          test -n "$DMG"
+          xcrun notarytool submit "$DMG" \
+            --keychain-profile "$NOTARY_PROFILE_NAME" \
+            --wait
+          xcrun stapler staple "$DMG"
+
+      - name: Package artifacts
+        run: |
+          set -euo pipefail
+          VERSION=$(python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          config = json.loads(Path("src-tauri/tauri.conf.json").read_text())
+          print(config["version"])
+          PY
+          )
+          ARCH="${{ matrix.arch }}"
+          mkdir -p release-artifacts
+
+          mv src-tauri/target/release/bundle/dmg/*.dmg \
+            "release-artifacts/ccgui_${VERSION}_${ARCH}.dmg"
+          mv "src-tauri/target/release/bundle/macos/CC GUI.app.tar.gz" \
+            "release-artifacts/ccgui_${ARCH}.app.tar.gz"
+          mv "src-tauri/target/release/bundle/macos/CC GUI.app.tar.gz.sig" \
+            "release-artifacts/ccgui_${ARCH}.app.tar.gz.sig"
+
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: |
+            release-artifacts/ccgui_*_${{ matrix.arch }}.dmg
+            release-artifacts/ccgui_${{ matrix.arch }}.app.tar.gz
+            release-artifacts/ccgui_${{ matrix.arch }}.app.tar.gz.sig
+          if-no-files-found: error
+
+  build_linux:
+    name: linux (x86_64)
+    runs-on: ubuntu-24.04
+    environment: release
+    needs: preflight
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies (linux only)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf libfuse2 xdg-utils libasound2-dev libpipewire-0.3-dev libgbm-dev
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+          cache-bin: false
+          shared-key: v1-linux-x64-rust
+          cache-on-failure: true
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      # Compile once, unbundled, so a cold Rust build is never killed by the
+      # bundling timeouts below.
+      - name: Build application
+        env:
+          NODE_OPTIONS: "--max-old-space-size=8192"
+        run: pnpm exec tauri build --no-bundle
+
+      # AppImage and RPM are separate invocations. tauri-bundler restores the
+      # unpatched binary after each package type (tauri-bundler/src/bundle.rs),
+      # so a later run starts from the `..._UNK` token again and patches
+      # cleanly.
+      - name: Bundle AppImage
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_B64 }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: pnpm exec tauri bundle --bundles appimage
+
+      # Bundled Wayland client libs crash the AppImage on hosts whose system
+      # libwayland differs; prune and repack, then the build-time .sig is
+      # stale and must be re-created against the pruned image.
+      - name: Prune bundled Wayland libraries from AppImage
+        run: |
+          set -euo pipefail
+          mkdir -p .tools
+          # Pinned to appimagetool 1.9.1 (AppImage/appimagetool releases) and
+          # verified against a pinned SHA-256 before execution — the old
+          # unpinned "continuous" AppImageKit build had no integrity check.
+          curl --fail --show-error --location \
+            -o .tools/appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
+          echo "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0  .tools/appimagetool" \
+            | sha256sum --check
+          chmod +x .tools/appimagetool
+          APPIMAGE=$(find src-tauri/target/release/bundle/appimage -maxdepth 1 -name '*.AppImage' | head -n 1)
+          test -n "$APPIMAGE"
+          node scripts/prune-appimage-wayland-libs.mjs \
+            --appimage "$APPIMAGE" \
+            --appimagetool "$PWD/.tools/appimagetool" \
+            --arch x86_64
+          rm -f "${APPIMAGE}.sig"
+
+      - name: Sign pruned AppImage
+        env:
+          TAURI_SIGNING_PRIVATE_KEY_B64: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_B64 }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          APPIMAGE=$(find src-tauri/target/release/bundle/appimage -maxdepth 1 -name '*.AppImage' | head -n 1)
+          test -n "$APPIMAGE"
+          mkdir -p "$HOME/.tauri"
+          printf '%s' "$TAURI_SIGNING_PRIVATE_KEY_B64" > "$HOME/.tauri/ccgui.key"
+          pnpm exec tauri signer sign \
+            -f "$HOME/.tauri/ccgui.key" \
+            -p "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" \
+            "$APPIMAGE"
+
+      # The RPM bundler's in-process rpm-rs compression is known to
+      # occasionally stall on CI (tauri-apps/tauri#11478, #15698) and the
+      # stall never self-resolves, so cap each attempt and retry instead of
+      # letting the job hang for hours.
+      - name: Bundle RPM
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_B64 }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if timeout --kill-after=30s 25m \
+              pnpm exec tauri bundle --bundles rpm; then
+              exit 0
+            fi
+            echo "::warning::rpm bundling attempt $attempt failed; retrying"
+          done
+          echo "::error::rpm bundling failed after 3 attempts"
+          exit 1
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: appimage-x86_64
+          path: src-tauri/target/release/bundle/appimage/*.AppImage*
+          if-no-files-found: error
+
+      - name: Upload RPM
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpm-x86_64
+          path: src-tauri/target/release/bundle/rpm/*.rpm*
+          if-no-files-found: error
+
+  build_windows:
+    name: windows (x64)
+    runs-on: windows-latest
+    environment: release
+    needs: preflight
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+          cache-bin: false
+          shared-key: v1-win-x64-rust
+          cache-on-failure: true
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      # Fail the release instead of shipping a broken installer: the built-in
+      # agent catalog hash check (agent_catalog::resolve_prompt) rejects any
+      # prompt whose bytes drifted — e.g. a CRLF checkout when .gitattributes
+      # is missing — and the user-facing fallback ("copy as custom") goes
+      # through the same check, so there is no runtime workaround.
+      - name: Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib
+
+      # tauri.windows.conf.json merges in the embedded WebView2 bootstrapper,
+      # matching what 0.9.x installers shipped. The NSIS upgrade code derives
+      # from the bundle identifier, which is unchanged — installed 0.9.x
+      # copies are replaced in place by this installer and by the updater.
+      - name: Build Windows installer
+        shell: pwsh
+        env:
+          NODE_OPTIONS: "--max-old-space-size=8192"
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_B64 }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: pnpm exec tauri build --config src-tauri/tauri.windows.conf.json --bundles nsis
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/nsis/*.exe.sig
+          if-no-files-found: error
+
+  release:
+    runs-on: ubuntu-latest
+    environment: release
+    needs:
+      - build_macos
+      - build_linux
+      - build_windows
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: macos-*
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: Download Linux AppImage
+        uses: actions/download-artifact@v4
+        with:
+          name: appimage-x86_64
+          path: release-artifacts
+
+      - name: Download Linux RPM
+        uses: actions/download-artifact@v4
+        with:
+          name: rpm-x86_64
+          path: release-artifacts
+
+      - name: Download Windows installer
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-x64
+          path: release-artifacts
+
+      # latest.json schema is the Tauri v2 updater manifest — the same shape
+      # the 0.9.x clients already poll, keyed by platform triple.
+      - name: Build latest.json and release notes
+        run: |
+          set -euo pipefail
+          VERSION=$(python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          data = json.loads(Path("src-tauri/tauri.conf.json").read_text())
+          print(data["version"])
+          PY
+          )
+
+          SIGNATURE_AARCH64=$(cat release-artifacts/ccgui_aarch64.app.tar.gz.sig)
+          SIGNATURE_X86_64=$(cat release-artifacts/ccgui_x86_64.app.tar.gz.sig)
+          LAST_TAG=$(git tag --sort=-version:refname \
+            | grep -v "^v${VERSION}$" \
+            | head -n 1 || true)
+          RANGE_END="${GITHUB_SHA}"
+          if [ -n "$LAST_TAG" ]; then
+            git log "${LAST_TAG}..${RANGE_END}" --pretty=format:"%s" > release-artifacts/release-commits.txt
+          else
+            git log "${RANGE_END}" --pretty=format:"%s" > release-artifacts/release-commits.txt
+          fi
+
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          lines = Path("release-artifacts/release-commits.txt").read_text().splitlines()
+          pattern = re.compile(r"^(feat|fix|perf)(?:\([^)]*\))?:\s*(.+)$", re.IGNORECASE)
+          groups = {"feat": [], "fix": [], "perf": []}
+          for line in lines:
+              match = pattern.match(line.strip())
+              if not match:
+                  continue
+              kind = match.group(1).lower()
+              message = match.group(2).strip()
+              if message:
+                  groups[kind].append(message)
+
+          sections = [
+              ("## New Features", "feat"),
+              ("## Fixes", "fix"),
+              ("## Performance Improvements", "perf"),
+          ]
+          output = []
+          for title, key in sections:
+              items = groups[key]
+              if not items:
+                  continue
+              output.append(title)
+              output.extend([f"- {item}" for item in items])
+              output.append("")
+
+          notes = "\n".join(output).strip()
+          if not notes:
+              notes = "- No user-facing changes."
+
+          Path("release-artifacts/release-notes.md").write_text(notes + "\n")
+          PY
+
+          python3 - <<PY
+          import json
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          notes = Path("release-artifacts/release-notes.md").read_text().strip()
+          artifacts_dir = Path("release-artifacts")
+
+          platforms = {
+            "darwin-aarch64": {
+              "url": "https://github.com/zhukunpenglinyutong/desktop-cc-gui/releases/download/v${VERSION}/ccgui_aarch64.app.tar.gz",
+              "signature": "${SIGNATURE_AARCH64}",
+            },
+            "darwin-x86_64": {
+              "url": "https://github.com/zhukunpenglinyutong/desktop-cc-gui/releases/download/v${VERSION}/ccgui_x86_64.app.tar.gz",
+              "signature": "${SIGNATURE_X86_64}",
+            }
+          }
+
+          appimages = list(artifacts_dir.rglob("*.AppImage"))
+
+          # GitHub sanitizes uploaded asset names (spaces become dots — e.g.
+          # "CC GUI_1.0.1_x64-setup.exe" is stored as "CC.GUI_..."), while
+          # tauri emits bundles with the literal productName ("CC GUI").
+          # latest.json must point at the sanitized name or the updater's
+          # download step 404s (v1.0.0/v1.0.1 Windows+Linux hit this).
+          def asset_name(name):
+            return name.replace(" ", ".")
+
+          def detect_arch(name):
+            lowered = name.lower()
+            if "aarch64" in lowered or "arm64" in lowered:
+              return "aarch64"
+            if "x86_64" in lowered or "amd64" in lowered:
+              return "x86_64"
+            return None
+
+          for appimage in appimages:
+            arch = detect_arch(appimage.name)
+            if not arch:
+              continue
+            sig_path = appimage.with_suffix(appimage.suffix + ".sig")
+            if sig_path.exists():
+              platforms[f"linux-{arch}"] = {
+                "url": f"https://github.com/zhukunpenglinyutong/desktop-cc-gui/releases/download/v${VERSION}/{asset_name(appimage.name)}",
+                "signature": sig_path.read_text().strip(),
+              }
+
+          nsis_exes = [f for f in artifacts_dir.rglob("*-setup.exe") if not f.name.endswith(".sig")]
+          for nsis_exe in nsis_exes:
+            sig_path = Path(str(nsis_exe) + ".sig")
+            if sig_path.exists():
+              platforms["windows-x86_64"] = {
+                "url": f"https://github.com/zhukunpenglinyutong/desktop-cc-gui/releases/download/v${VERSION}/{asset_name(nsis_exe.name)}",
+                "signature": sig_path.read_text().strip(),
+              }
+              break
+
+          payload = {
+            "version": "${VERSION}",
+            "notes": notes,
+            "pub_date": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "platforms": platforms,
+          }
+
+          Path("release-artifacts/latest.json").write_text(json.dumps(payload, indent=2) + "\n")
+          PY
+
+      - name: Create GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION=$(python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          data = json.loads(Path("src-tauri/tauri.conf.json").read_text())
+          print(data["version"])
+          PY
+          )
+
+          ASSETS=()
+          for pattern in \
+            "release-artifacts/ccgui_${VERSION}_aarch64.dmg" \
+            "release-artifacts/ccgui_${VERSION}_x86_64.dmg" \
+            "release-artifacts/ccgui_aarch64.app.tar.gz" \
+            "release-artifacts/ccgui_aarch64.app.tar.gz.sig" \
+            "release-artifacts/ccgui_x86_64.app.tar.gz" \
+            "release-artifacts/ccgui_x86_64.app.tar.gz.sig" \
+            "release-artifacts/*.AppImage" \
+            "release-artifacts/*.AppImage.sig" \
+            "release-artifacts/*.rpm" \
+            "release-artifacts/*.rpm.sig" \
+            "release-artifacts/*-setup.exe" \
+            "release-artifacts/*-setup.exe.sig" \
+            "release-artifacts/latest.json"
+          do
+            for f in $pattern; do
+              [ -e "$f" ] && ASSETS+=("$f")
+            done
+          done
+
+          gh release create "v${VERSION}" \
+            --title "v${VERSION}" \
+            --notes-file release-artifacts/release-notes.md \
+            --target "$GITHUB_SHA" \
+            "${ASSETS[@]}"
+
+      - name: Bump version and open PR
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION=$(python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          data = json.loads(Path("src-tauri/tauri.conf.json").read_text())
+          print(data["version"])
+          PY
+          )
+
+          # Decimal rollover: patch rolls 1.0.9 -> 1.1.0, minor rolls
+          # 1.9.9 -> 2.0.0 (each segment carries at 10).
+          NEXT_VERSION=$(python3 - <<'PY' "$VERSION"
+          import sys
+
+          version = sys.argv[1]
+          parts = version.split(".")
+          if len(parts) != 3:
+              raise SystemExit("Expected version like X.Y.Z")
+
+          major, minor, patch = (int(p) for p in parts)
+          patch += 1
+          if patch >= 10:
+              patch = 0
+              minor += 1
+          if minor >= 10:
+              minor = 0
+              major += 1
+          print(f"{major}.{minor}.{patch}")
+          PY
+          )
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          python3 - <<PY
+          import json
+          from pathlib import Path
+
+          pkg = Path("package.json")
+          data = json.loads(pkg.read_text())
+          data["version"] = "$NEXT_VERSION"
+          pkg.write_text(json.dumps(data, indent=2) + "\n")
+
+          conf = Path("src-tauri/tauri.conf.json")
+          data = json.loads(conf.read_text())
+          data["version"] = "$NEXT_VERSION"
+          conf.write_text(json.dumps(data, indent=2) + "\n")
+
+          cargo = Path("src-tauri/Cargo.toml")
+          text = cargo.read_text()
+          text = text.replace('version = "$VERSION"', 'version = "$NEXT_VERSION"', 1)
+          cargo.write_text(text)
+          PY
+
+          git checkout -b "v${NEXT_VERSION}"
+          git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml
+          git commit -m "chore: bump version to ${NEXT_VERSION}"
+          git push origin "v${NEXT_VERSION}"
+
+          gh pr create \
+            --title "chore: bump version to ${NEXT_VERSION}" \
+            --body "Post-release version bump to ${NEXT_VERSION}." \
+            --base main \
+            --head "v${NEXT_VERSION}"

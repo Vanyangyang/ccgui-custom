@@ -1,0 +1,118 @@
+import { useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { Button as AriaButton, Dialog, DialogTrigger, Popover } from "react-aria-components";
+import { Button } from "@/components/base/buttons/button";
+import { ActionFeedbackIcon } from "@/components/base/action-feedback";
+import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw";
+import ExternalLink from "lucide-react/dist/esm/icons/external-link";
+import type { AgyQuotaSnapshot } from "@/lib/ipc";
+import { openExternal } from "@/lib/platform";
+import { AGY_VERTEX_LINKS, useAgyVertexCredits } from "@/features/settings/agy-vertex-guardrail";
+import { useDismissOnOutsidePress, useTriggerToggle } from "@/utils/use-dismiss-on-outside-press";
+import { QuotaFact, QuotaMeter } from "./quota-meter";
+import { agyQuotaModelGroup, compactQuotaReset, quotaResetCountdown, validAgyQuotaSnapshot } from "../agy-quota";
+
+export function AgyQuotaStatus({ snapshot, model, loading, refresh, now = Date.now() / 1000 }: {
+  snapshot?: AgyQuotaSnapshot; model?: string; loading: boolean; refresh: () => Promise<void>; now?: number;
+}) {
+  const { t, i18n } = useTranslation();
+  const [open, setOpen] = useState(false);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const popoverRef = useRef<HTMLElement>(null);
+  useDismissOnOutsidePress(open, () => setOpen(false), [triggerRef, popoverRef]);
+  const allowOpenChange = useTriggerToggle(open, triggerRef);
+  const { credits: vertexCredits, sync: syncVertexCredits } = useAgyVertexCredits();
+  const quota = snapshot ? validAgyQuotaSnapshot(snapshot, now) : undefined;
+  const activeId = agyQuotaModelGroup(model);
+  const active = quota?.groups.find(group => group.id === activeId);
+  const percentage = (used: number | undefined) => used === undefined ? "—" : `${new Intl.NumberFormat(i18n.language, { maximumFractionDigits: 2 }).format(100 - used)}%`;
+  const summary = activeId ? t("chat.agyQuotaRemainingSummary", { fiveHour: percentage(active?.windows.fiveHour?.usedPercentage), sevenDay: percentage(active?.windows.sevenDay?.usedPercentage) }) : t("chat.agyQuotaViewUsage");
+  const resets = (["fiveHour", "sevenDay"] as const).flatMap(name => {
+    const at = active?.windows[name]?.resetsAt;
+    const time = compactQuotaReset(at, name, i18n.language, now);
+    return at === undefined || time === undefined ? [] : [{ name, at, label: t(name === "fiveHour" ? "chat.quotaFiveHourResetShort" : "chat.quotaSevenDayResetShort", { time }) }];
+  });
+  const stale = quota?.status === "stale";
+  const error = quota?.errorCode;
+  const errorKey = error === "quota_expired" ? "chat.agyQuotaExpired" : error === "refresh_cooldown" ? "chat.agyQuotaCooldown" : error && /query_|read_failed|cli_unavailable/.test(error) ? "chat.agyQuotaQueryFailed" : "chat.agyQuotaUnavailable";
+  const collectedAt = quota?.collectedAt;
+  const validTime = quota?.status !== "unavailable" && collectedAt !== undefined && Number.isFinite(collectedAt) && collectedAt > 0 && collectedAt <= now && Number.isFinite(new Date(collectedAt * 1000).getTime());
+  return <DialogTrigger isOpen={open} onOpenChange={next => { if (allowOpenChange(next)) setOpen(next); }}>
+    <AriaButton ref={triggerRef} aria-label={`${t("chat.agyQuotaPlan")} · ${summary}${resets.length ? ` · ${resets.map(reset => reset.label).join(" · ")}` : ""}${stale ? ` · ${t("chat.quotaStaleShort")}` : ""}`}
+      className="flex min-w-0 max-w-full cursor-pointer flex-wrap items-center justify-end gap-x-3 rounded-full bg-background-secondary-default px-2.5 py-1 text-caption-1-regular text-text-tertiary outline-none transition-colors duration-150 hover:bg-background-tertiary-default active:bg-background-tertiary-default focus-visible:ring-2 focus-visible:ring-border-focus-ring motion-reduce:transition-none">
+      <span>{summary}{stale && <span className="text-text-warning-primary" aria-hidden> · {t("chat.quotaStaleShort")}</span>}</span>
+    </AriaButton>
+    <Popover ref={popoverRef} isNonModal placement="top end" offset={8}
+      className="max-h-[calc(100dvh-2rem)] w-72 max-w-[calc(100vw-2rem)] origin-bottom-right overflow-y-auto rounded-xl border border-border-button-default bg-background-primary-default p-3 shadow-dropdown outline-none transition duration-150 ease-out data-[entering]:scale-95 data-[entering]:opacity-0 data-[exiting]:scale-95 data-[exiting]:opacity-0 motion-reduce:transition-none">
+      <Dialog aria-label={t("chat.agyQuotaDetails")} className="flex flex-col gap-3 outline-none">
+        <h3 className="text-body-2-medium text-text-secondary">{t("chat.agyQuotaPlan")}</h3>
+        {(["gemini", "third_party"] as const).map(id => {
+          const group = quota?.groups.find(value => value.id === id);
+          return <section key={id} className="flex flex-col gap-2" aria-label={t(id === "gemini" ? "chat.agyQuotaGemini" : "chat.agyQuotaThirdParty")}>
+            <h4 className="text-caption-1-medium text-text-secondary">{t(id === "gemini" ? "chat.agyQuotaGemini" : "chat.agyQuotaThirdParty")}</h4>
+            <dl className="flex flex-col gap-2">{(["fiveHour", "sevenDay"] as const).map(name => {
+              const window = group?.windows[name];
+              return <div key={name} className="flex flex-col gap-1">
+                <div className="flex items-center justify-between gap-3 text-caption-1-regular text-text-secondary">
+                  <dt>{t(name === "fiveHour" ? "chat.quotaFiveHour" : "chat.quotaSevenDay")}</dt>
+                  <dd>{t("chat.agyQuotaRemaining", { percentage: percentage(window?.usedPercentage) })}</dd>
+                </div>
+                <QuotaMeter usedPercentage={window?.usedPercentage} remaining />
+                <p className="text-caption-1-regular text-text-tertiary">
+                  {window?.resetsAt === undefined ? t("chat.quotaResetUnknown") : <>{t("chat.quotaResetAt", { time: new Date(window.resetsAt * 1000).toLocaleString(i18n.language) })} · {t("chat.quotaResetCountdown", quotaResetCountdown(window.resetsAt, now))}</>}
+                </p>
+              </div>;
+            })}</dl>
+          </section>;
+        })}
+        {quota && quota.status !== "unavailable" && quota.credits && <dl><QuotaFact label={t("chat.agyQuotaCredits")}
+          value={new Intl.NumberFormat(i18n.language, { maximumFractionDigits: 2 }).format(quota.credits.remaining)} /></dl>}
+        <div role="status" className="flex flex-col gap-1 text-caption-1-regular text-text-tertiary">
+          {stale && <p>{t("chat.quotaStale")}</p>}
+          {(!quota || quota.status === "unavailable" || error) && <p>{t(errorKey)}</p>}
+          {validTime && <p>{t("chat.agyQuotaUpdated", { time: new Date(collectedAt * 1000).toLocaleString(i18n.language) })}</p>}
+        </div>
+        <div className="flex items-center justify-between gap-2 border-t border-border-button-default pt-2">
+          <span className="text-caption-1-regular text-text-tertiary">{t("chat.agyQuotaSource")}</span>
+          <Button size="xs" disabled={loading} onClick={() => { void refresh(); void syncVertexCredits(); }}>
+            <ActionFeedbackIcon icon={RefreshCw} feedback={loading ? "running" : "idle"} spin iconClassName="size-3" />
+            {t(loading ? "chat.quotaRefreshing" : "chat.quotaRefresh")}
+          </Button>
+        </div>
+        <section aria-label={t("chat.agyVertexCredits")} className="flex flex-col gap-2 border-t border-border-button-default pt-3">
+          <div className="flex items-center justify-between gap-2">
+            <h4 className="text-caption-1-medium text-text-secondary">{t("chat.agyVertexCredits")}</h4>
+            <span className="text-caption-1-regular text-text-tertiary">
+              {t("chat.agyQuotaPromoGuardrail")}
+            </span>
+          </div>
+          <dl className="flex flex-col gap-2">
+            <div className="flex flex-col gap-1">
+              <div className="flex items-center justify-between gap-3 text-caption-1-regular text-text-secondary">
+                <dt>{t("chat.agyQuotaPromoTrial")}</dt>
+                <dd className="font-mono text-text-primary">
+                  {vertexCredits.freeTrialCredit} / {vertexCredits.freeTrialOriginalCredit} ({vertexCredits.freeTrialRemainingPercent}%)
+                </dd>
+              </div>
+              <QuotaMeter usedPercentage={100 - vertexCredits.freeTrialRemainingPercent} remaining />
+            </div>
+            <div className="flex flex-col gap-1">
+              <div className="flex items-center justify-between gap-3 text-caption-1-regular text-text-secondary">
+                <dt>{t("chat.agyQuotaPromoGdp")}</dt>
+                <dd className="font-mono text-text-primary">
+                  {vertexCredits.gdpMonthlyCredit} ({vertexCredits.gdpMonthlyRemainingPercent}%)
+                </dd>
+              </div>
+              <QuotaMeter usedPercentage={100 - vertexCredits.gdpMonthlyRemainingPercent} remaining />
+            </div>
+          </dl>
+          <p className="text-caption-1-regular text-text-tertiary">{t("chat.agyVertexCreditsNote")}</p>
+          <Button size="xs" onClick={() => openExternal(AGY_VERTEX_LINKS.credits)}>
+            <ExternalLink className="size-3" aria-hidden />
+            {t("settings.agyVertexGuardrailOpenCredits")}
+          </Button>
+        </section>
+      </Dialog>
+    </Popover>
+  </DialogTrigger>;
+}

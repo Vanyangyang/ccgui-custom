@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Auto-title manual QA — mocked IPC</title>
+</head>
+<body style="margin:0">
+  <div id="fixture"></div>
+  <script>
+    // Replace storage in this document before loading production modules. All
+    // preferences and history stay in memory, including GeneralSection's mirrors.
+    const preferences = new Map();
+    preferences.set("ccgui-next.language", new URLSearchParams(location.search).get("lang") === "en" ? "en" : "zh");
+    Object.defineProperty(window, "localStorage", { value: {
+      get length() { return preferences.size; },
+      key: (index) => [...preferences.keys()][index] ?? null,
+      getItem: (key) => preferences.get(String(key)) ?? null,
+      setItem: (key, value) => preferences.set(String(key), String(value)),
+      removeItem: (key) => preferences.delete(String(key)),
+      clear: () => preferences.clear(),
+    } });
+
+    const state = {
+      settings: {
+        theme: "light", titlebar: "native", language: preferences.get("ccgui-next.language"),
+        sidebarThreadLimit: 5, fontFamily: "", fontFile: "", codeFontFamily: "", codeFontFile: "",
+        composerSendShortcut: "enter", thinkingAutoCollapse: true, customModels: {},
+        autoTitleEnabled: false, autoTitleEngine: "claude", autoTitleModel: "sonnet", autoTitleEffort: "low",
+      },
+      session: {
+        engine: "claude", sessionId: "fixture-auto-title", workspacePath: "/fixture",
+        filePath: "/fixture/session.jsonl", fileSize: 1, fileMtimeMs: 1,
+        title: "🧩 邮箱验证码｜过期修复", customTitle: null, preview: "",
+        createdAt: null, updatedAt: null, messageCount: 4, pinned: false,
+      },
+      outcome: "changed", delayMs: 5000, calls: [], suggestions: 0, renames: 0,
+    };
+    const notify = () => window.dispatchEvent(new Event("auto-title-fixture:change"));
+    const log = (kind, detail) => {
+      state.calls.push({ kind, detail });
+      if (state.calls.length > 30) state.calls.shift();
+      notify();
+    };
+    const callbacks = new Map();
+    let nextCallback = 1;
+    window.__TAURI_INTERNALS__ = {
+      transformCallback(callback) { const id = nextCallback++; callbacks.set(id, callback); return id; },
+      unregisterCallback(id) { callbacks.delete(id); },
+      convertFileSrc: (path) => path,
+      metadata: { currentWebview: { label: "main" }, currentWindow: { label: "main" } },
+      async invoke(command, args = {}) {
+        switch (command) {
+          case "get_app_settings": return structuredClone(state.settings);
+          case "auto_title_models": return [
+            { id: "sonnet", name: "Sonnet", resolvedModel: "sonnet", supportsEffort: true },
+            { id: "opus", name: "Opus", resolvedModel: "opus", supportsEffort: true },
+            { id: "fable", name: "Fable", resolvedModel: "fable", supportsEffort: true },
+            { id: "haiku", name: "Haiku", resolvedModel: "haiku", supportsEffort: false },
+            { engine: "codex", provider: "OpenAI", id: "gpt-6.1-sol", name: "GPT-6.1 Sol", resolvedModel: "gpt-6.1-sol", supportsEffort: true },
+          ];
+          case "update_app_settings":
+            Object.assign(state.settings, args.settings);
+            log(command, { autoTitleEnabled: state.settings.autoTitleEnabled, autoTitleEngine: state.settings.autoTitleEngine, autoTitleModel: state.settings.autoTitleModel, autoTitleEffort: state.settings.autoTitleEffort });
+            return null;
+          case "suggest_session_title": {
+            const outcome = state.outcome;
+            const delay = state.delayMs;
+            const title = state.session.customTitle || state.session.title;
+            state.suggestions += 1;
+            log(command, { engine: args.engine, sessionId: args.sessionId, outcome, delay });
+            await new Promise((resolve) => setTimeout(resolve, delay));
+            log("suggestion_finished", { outcome });
+            if (outcome === "timeout") throw "timeout";
+            return { title: outcome === "keep" ? title : "🧩 登录会话｜修复过期验证码", changed: outcome !== "keep" };
+          }
+          case "rename_session":
+            state.session.customTitle = String(args.title).trim() || null;
+            state.renames += 1;
+            log(command, { title: args.title });
+            return null;
+          case "plugin:window|is_decorated": return true;
+          case "plugin:event|listen": return 1;
+          case "plugin:event|unlisten": return null;
+          default: return null;
+        }
+      },
+    };
+    window.__autoTitleFixture = { state, notify, log };
+  </script>
+  <script type="module" src="./auto-title.tsx"></script>
+</body>
+</html>

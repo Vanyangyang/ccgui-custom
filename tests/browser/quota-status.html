@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>Quota status layout</title></head>
+<body style="margin:0">
+<div id="fixture"></div>
+<script>
+window.__TAURI_INTERNALS__ = {
+  transformCallback() { return 1; }, unregisterCallback() {}, convertFileSrc: p => p,
+  metadata: { currentWebview: { label: "main" }, currentWindow: { label: "main" } },
+  async invoke(cmd) {
+    if (cmd === "get_app_settings") return { systemProxyEnabled: true, systemProxyUrl: "http://127.0.0.1:7897" };
+    return null;
+  },
+};
+</script>
+<script type="module" src="./quota-status.tsx"></script>
+</body>
+</html>

@@ -1,0 +1,755 @@
+import { supportsOmpFastMode, type OmpServiceTier } from "@/lib/omp-service-tier";
+"use client";
+
+import { Fragment, useEffect, useRef, useState } from "react";
+import type { Ref } from "react";
+import { useTranslation } from "react-i18next";
+import ChevronRight from "lucide-react/dist/esm/icons/chevron-right";
+import {
+  Button as AriaButton,
+  Dialog as AriaDialog,
+  DialogTrigger as AriaDialogTrigger,
+  Popover as AriaPopover,
+} from "react-aria-components";
+import { menuPopoverSurface } from "@/components/base/dropdown/menu-styles";
+import { ModalShell } from "@/components/dialogs";
+import { CLI_DISPLAY_NAMES } from "@/components/foundations/icons/engine-brands";
+import { EngineIcon } from "@/components/foundations/icons/engine-icon";
+import { MOBILE_MEDIA, useMediaQuery } from "@/hooks/use-media-query";
+import { cx } from "@/utils/cx";
+import { usePopoverState } from "@/utils/use-dismiss-on-outside-press";
+import { EFFORT_LABEL_KEYS, getDefaultEffort, getEffortLevels, normalizeEffortLevel, supportsEffort, type EffortLevel } from "./effort-levels";
+import { EngineFlyout, EngineModelPanel, type ChannelOption } from "./engine-model-panel";
+import { cursorTriggerLabel, useCursorModelPrefs } from "./cursor-model-picker";
+import type { CursorModel } from "./cursor-models";
+import { encodedModelEffort, modelBaseLabel } from "./model-effort";
+
+export type { EffortLevel } from "./effort-levels";
+
+/**
+ * Board UI → "ai_chat" dropdowns (nodes 4035:6313 / 4035:6925), adapted to
+ * live data. Same react-aria non-modal popover recipe as the template;
+ * contents are props-driven:
+ * - CliMenu — CLI + model switcher opened from the composer's engine
+ *   button: each engine row flies out a model + effort panel to the right
+ *   (search field over a "Models" radio group over the effort choices,
+ *   Board UI node 4035:6925). */
+
+/** CLI picker panel: shadcn-style menu (reference: desktop-cc-gui's
+ *  ModelSelect) — 8px radius, 4px padding, hairline separators between rows,
+ *  no header label. Distinct from the other ai_chat popovers above. */
+const CLI_POPOVER_CLASSES = menuPopoverSurface({
+  width: "w-64",
+  origin: "origin-bottom-left",
+  radius: "rounded-lg",
+  padding: "p-1",
+});
+
+/* ------------------------------------------------------------- engine picker */
+
+export interface MenuOption {
+  id: string;
+  label: string;
+  /** Engine is installed and spawnable — drives the status dot. */
+  available?: boolean;
+  disabled?: boolean;
+  disabledReason?: string;
+}
+
+export interface ModelOption {
+  /** "" selects the CLI/provider default model. */
+  id: string;
+  label: string;
+  /** Secondary line under the label (e.g. "Custom Opus model"). */
+  description?: string;
+  /** Catalog provider ("kimi-code"); derived from the "provider/model" id
+   *  when the catalog entry is missing. Two or more distinct providers turn
+   *  the flyout list into labeled sections. */
+  provider?: string;
+}
+
+/** Hover-intent delay before a row hover opens its model flyout. */
+const HOVER_INTENT_MS = 200;
+
+type CliMenuOpenListener = () => void;
+const cliMenuOpenListeners = new Set<CliMenuOpenListener>();
+
+/** Programmatically open the active composer's CLI / provider / model picker panel. */
+export function requestCliMenuOpen(): void {
+  for (const listener of cliMenuOpenListeners) {
+    listener();
+  }
+}
+
+/* -------------------------------------------------------------- engine row */
+
+/** One engine row in the CLI list: brand mark, name, selection dot (active
+ *  engine only) and the chevron that hints at the flyout. */
+function EngineRow({
+  option,
+  selected,
+  flyoutOpen,
+  onSelect,
+  onHover,
+  onHoverEnd,
+  onFocusEngine,
+}: {
+  option: MenuOption;
+  selected: boolean;
+  /** This engine's flyout is currently open. */
+  flyoutOpen: boolean;
+  /** Row click: show this engine's model list (the engine itself switches
+   *  when a model is picked there). */
+  onSelect: () => void;
+  /** Pointer enters the row: schedule this engine's flyout after the
+   *  hover-intent delay (desktop only; mobile passes nothing). */
+  onHover?: () => void;
+  /** Pointer leaves the row: cancel a pending hover-open. */
+  onHoverEnd?: () => void;
+  /** Keyboard focus lands on the row: open the flyout immediately — Tab
+   *  is deliberate, no intent delay needed. */
+  onFocusEngine?: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      aria-disabled={option.disabled || undefined}
+      title={option.disabled ? option.disabledReason : undefined}
+      aria-pressed={selected}
+      onClick={onSelect}
+      onMouseEnter={onHover}
+      onMouseLeave={onHoverEnd}
+      onFocus={onFocusEngine}
+      className={cx(
+        "flex w-full cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 outline-none transition-colors",
+        selected || flyoutOpen
+          ? "bg-background-primary-hover"
+          : "hover:bg-background-primary-hover focus-visible:bg-background-primary-hover",
+        option.disabled && "cursor-not-allowed opacity-40",
+      )}
+    >
+      <EngineIcon
+        engine={option.id}
+        size={18}
+        className="shrink-0 text-foreground-icon-primary"
+      />
+      <span className="text-body-medium text-text-primary">
+        {CLI_DISPLAY_NAMES[option.id] ?? option.label}
+      </span>
+      <span className="ml-auto flex shrink-0 items-center gap-1.5">
+        {selected && (
+          <span
+            aria-hidden
+            className="size-1.5 rounded-full bg-notification-success-foreground"
+          />
+        )}
+        <ChevronRight
+          className="size-4 text-foreground-icon-secondary"
+          aria-hidden
+        />
+      </span>
+    </button>
+  );
+}
+
+/** Trigger min-width lock while the popover is open: snapshot on open, clear
+ *  on close, so shorter model labels can't shrink the trigger mid-session
+ *  and slide the top-end popover. Adjusted during render (prev-prop pattern)
+ *  so every open/close path — trigger press, outside press, Esc — flips it,
+ *  not just onOpenChange. */
+function useLockedMinWidth(isOpen: boolean, triggerRef: Ref<HTMLButtonElement>) {
+  const [lockedMinWidth, setLockedMinWidth] = useState<number | undefined>();
+  const [prevIsOpen, setPrevIsOpen] = useState(isOpen);
+  if (prevIsOpen !== isOpen) {
+    setPrevIsOpen(isOpen);
+    if (!isOpen) {
+      setLockedMinWidth(undefined);
+    } else {
+      const node =
+        triggerRef && typeof triggerRef !== "function" ? triggerRef.current : null;
+      if (node) setLockedMinWidth(node.offsetWidth);
+    }
+  }
+  return lockedMinWidth;
+}
+
+/** Borderless trigger carrying the whole selection at a glance:
+ *  "{CLI} / {model} · {effort}" (CLI name / model / effort). The model
+ *  part only drops out when the engine has no model list at all.
+ *  min-w-0 lets the trigger shrink instead of pushing the send button out
+ *  of the composer on narrow widths; below md it collapses to icon +
+ *  truncated model (aria-label carries the full selection). */
+function CliMenuTrigger({
+  triggerRef,
+  engine,
+  engineName,
+  model,
+  effort,
+  claudeUltracode,
+  ompServiceTier,
+  codexServiceTier,
+  modelId,
+  isOpen,
+}: {
+  triggerRef: Ref<HTMLButtonElement>;
+  engine: string;
+  /** Display name of the active engine. */
+  engineName: string;
+  /** Selected model of the active engine, when it has a model list. */
+  model: ModelOption | undefined;
+  effort: EffortLevel;
+  claudeUltracode?: boolean;
+  ompServiceTier: OmpServiceTier;
+  codexServiceTier: OmpServiceTier;
+  modelId: string;
+  /** While open, lock the trigger's min-width so model picks don't shrink it
+   *  and nudge the top-end popover. */
+  isOpen: boolean;
+}) {
+  const { t } = useTranslation();
+  const showFast =
+    (engine === "omp" && supportsOmpFastMode(modelId) && ompServiceTier === "priority") ||
+    (engine === "codex" && codexServiceTier === "priority");
+  // Snapshot width on open; clear on close. Shorter model labels then can't
+  // shrink the trigger mid-session and slide the popover.
+  const lockedMinWidth = useLockedMinWidth(isOpen, triggerRef);
+  const hasEffort = supportsEffort(engine);
+  const encodedEffort = encodedModelEffort(engine, modelId);
+  const displayEffort = encodedEffort ?? normalizeEffortLevel(engine, effort);
+  const modelLabel = model ? modelBaseLabel(engine, model) : undefined;
+  const showUltracode = engine === "claude" && claudeUltracode;
+  return (
+    <AriaButton
+      ref={triggerRef}
+      aria-label={`${engineName}${modelLabel ? ` / ${modelLabel}` : ""}${hasEffort ? ` · ${t(EFFORT_LABEL_KEYS[displayEffort])}` : ""}${showUltracode ? ` · ${t("chat.ultracode")}` : ""}`}
+      style={lockedMinWidth ? { minWidth: lockedMinWidth } : undefined}
+      className="group flex min-w-0 cursor-pointer items-center gap-1.5 rounded-md px-1.5 py-1 outline-none focus-visible:ring-2 focus-visible:ring-border-focus-ring"
+    >
+      <EngineIcon engine={engine} size={16} className="shrink-0 text-foreground-icon-secondary" />
+      <span className="flex min-w-0 items-center gap-1 text-body-2-medium whitespace-nowrap text-text-secondary transition-colors duration-150 ease group-hover:text-text-primary">
+        <span className="shrink-0 max-md:hidden">{engineName}</span>
+        {model && (
+          <>
+            <span aria-hidden className="shrink-0 text-text-tertiary max-md:hidden">
+              /
+            </span>
+            <span className="max-w-44 truncate max-md:max-w-28">{modelLabel}</span>
+          </>
+        )}
+        {hasEffort && (
+          <>
+            <span aria-hidden className={cx("shrink-0 text-text-tertiary", !encodedEffort && "max-md:hidden")}>
+              ·
+            </span>
+            {/* Reserve the widest localized level so the right-aligned popover stays put. */}
+            <span className={cx("inline-grid shrink-0", !encodedEffort && "max-md:hidden")}>
+              {getEffortLevels(engine).map(level => (
+                <span key={level} aria-hidden={level !== displayEffort} className={cx("col-start-1 row-start-1", level !== displayEffort && "invisible")}>
+                  {t(EFFORT_LABEL_KEYS[level])}
+                </span>
+              ))}
+            </span>
+          </>
+        )}
+        {(engine === "omp" && supportsOmpFastMode(modelId)) || engine === "codex" ? (
+          <span aria-hidden={!showFast} className={cx("w-7 shrink-0 text-center text-text-primary", !showFast && "invisible")}>Fast</span>
+        ) : null}
+        {showUltracode && (
+          <span className="shrink-0 text-caption-1-medium text-text-primary max-md:hidden">
+            {t("chat.ultracode")}
+          </span>
+        )}
+      </span>
+    </AriaButton>
+  );
+}
+
+/** Popover body: the hairline-separated engine rows and, on desktop, the
+ *  hovered engine's model flyout floating to the right. Row hover opens
+ *  the flyout after the parent's hover-intent delay; keyboard focus opens
+ *  it immediately. */
+function EngineMenuBody({
+  options,
+  value,
+  openEngine,
+  modelsByEngine,
+  models,
+  efforts,
+  query,
+  onQueryChange,
+  isMobile,
+  onSelectEngine,
+  onHoverEngine,
+  onHoverEngineEnd,
+  onFocusEngine,
+  onPickModel,
+  onEffortChange,
+  claudeUltracode,
+  onClaudeUltracodeChange,
+  channelsByEngine,
+  selectedChannels,
+  onPickChannel,
+  ompServiceTier,
+  onOmpServiceTierChange,
+  codexServiceTier,
+  onCodexServiceTierChange,
+  onRefreshModels,
+  loadingEngines,
+  cursorModels,
+}: {
+  options: MenuOption[];
+  value: string;
+  /** Engine whose model flyout is open, null when closed. */
+  openEngine: string | null;
+  modelsByEngine: Record<string, ModelOption[]>;
+  models: Record<string, string>;
+  efforts: Record<string, EffortLevel>;
+  query: string;
+  onQueryChange: (value: string) => void;
+  isMobile: boolean;
+  onSelectEngine: (option: MenuOption) => void;
+  /** Row hover: pre-open this engine's model flyout. */
+  onHoverEngine: (option: MenuOption) => void;
+  /** Row hover end: cancel a pending hover-open. */
+  onHoverEngineEnd: () => void;
+  /** Row keyboard focus: open this engine's flyout immediately. */
+  onFocusEngine: (option: MenuOption) => void;
+  onPickModel: (engine: string, id: string) => void;
+  onEffortChange: (engine: string, level: EffortLevel) => void;
+  claudeUltracode?: boolean;
+  onClaudeUltracodeChange?: (enabled: boolean) => void;
+  channelsByEngine?: Record<string, ChannelOption[]>;
+  selectedChannels?: Record<string, string>;
+  onPickChannel?: (engine: string, id: string) => void;
+  ompServiceTier: OmpServiceTier;
+  onOmpServiceTierChange: (tier: OmpServiceTier) => Promise<void>;
+  codexServiceTier: OmpServiceTier;
+  onCodexServiceTierChange: (tier: OmpServiceTier) => Promise<void>;
+  onRefreshModels?: () => void | Promise<void>;
+  /** Engine ids whose catalog probe has not returned yet. */
+  loadingEngines?: readonly string[];
+  cursorModels?: CursorModel[];
+}) {
+  const flyoutOption = options.find((o) => o.id === openEngine);
+  return (
+    <div className="flex w-full flex-col">
+      <div className="relative">
+        <div className="flex w-full flex-col">
+          {options.map((option, index) => (
+            <Fragment key={option.id}>
+              {index > 0 && (
+                <div
+                  aria-hidden
+                  className="-mx-1 my-1 border-t border-separator-border"
+                />
+              )}
+              {/* Not `disabled`: that attribute would swallow the click that
+                  switches the panel. */}
+              <EngineRow
+                option={option}
+                selected={option.id === value}
+                flyoutOpen={option.id === openEngine}
+                onSelect={() => onSelectEngine(option)}
+                onHover={isMobile ? undefined : () => onHoverEngine(option)}
+                onHoverEnd={isMobile ? undefined : onHoverEngineEnd}
+                onFocusEngine={isMobile ? undefined : () => onFocusEngine(option)}
+              />
+            </Fragment>
+          ))}
+        </div>
+
+        {!isMobile && flyoutOption && (
+          <EngineFlyout
+            // Remount per engine: the panel's channel filter is local state
+            // and must not leak into the next engine's flyout.
+            key={flyoutOption.id}
+            option={flyoutOption}
+            models={modelsByEngine[flyoutOption.id] ?? []}
+            selectedModelId={models[flyoutOption.id] ?? ""}
+            query={query}
+            onQueryChange={onQueryChange}
+            effort={efforts[flyoutOption.id] ?? getDefaultEffort(flyoutOption.id)}
+            onPickModel={onPickModel}
+            onEffortChange={onEffortChange}
+            claudeUltracode={claudeUltracode}
+            onClaudeUltracodeChange={onClaudeUltracodeChange}
+            channels={channelsByEngine?.[flyoutOption.id]}
+            selectedChannelId={selectedChannels?.[flyoutOption.id]}
+            onPickChannel={onPickChannel}
+            ompServiceTier={ompServiceTier}
+            onOmpServiceTierChange={onOmpServiceTierChange}
+            codexServiceTier={codexServiceTier}
+            onCodexServiceTierChange={onCodexServiceTierChange}
+            onRefresh={onRefreshModels}
+            loading={loadingEngines?.includes(flyoutOption.id)}
+            cursorModels={flyoutOption.id === "cursor" ? cursorModels : undefined}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** Mobile second-level model dialog: touch has no hover flyout, so tapping
+ *  an engine row opens the same EngineModelPanel in a modal instead. */
+function EngineModelDialog({
+  option,
+  modelsByEngine,
+  models,
+  efforts,
+  query,
+  onQueryChange,
+  onPickModel,
+  onEffortChange,
+  claudeUltracode,
+  onClaudeUltracodeChange,
+  channelsByEngine,
+  selectedChannels,
+  onPickChannel,
+  ompServiceTier,
+  onOmpServiceTierChange,
+  codexServiceTier,
+  onCodexServiceTierChange,
+  onRefreshModels,
+  onClose,
+  cursorModels,
+}: {
+  /** Engine being configured; undefined when the dialog is closed. */
+  option: MenuOption | undefined;
+  modelsByEngine: Record<string, ModelOption[]>;
+  models: Record<string, string>;
+  efforts: Record<string, EffortLevel>;
+  query: string;
+  onQueryChange: (value: string) => void;
+  onPickModel: (engine: string, id: string) => void;
+  onEffortChange: (engine: string, level: EffortLevel) => void;
+  claudeUltracode?: boolean;
+  onClaudeUltracodeChange?: (enabled: boolean) => void;
+  channelsByEngine?: Record<string, ChannelOption[]>;
+  selectedChannels?: Record<string, string>;
+  onPickChannel?: (engine: string, id: string) => void;
+  ompServiceTier: OmpServiceTier;
+  onOmpServiceTierChange: (tier: OmpServiceTier) => Promise<void>;
+  codexServiceTier: OmpServiceTier;
+  onCodexServiceTierChange: (tier: OmpServiceTier) => Promise<void>;
+  onRefreshModels?: () => void | Promise<void>;
+  onClose: () => void;
+  cursorModels?: CursorModel[];
+}) {
+  const { t } = useTranslation();
+  if (!option) return null;
+  return (
+    <ModalShell
+      onClose={onClose}
+      label={t("chat.engineHeader", { name: CLI_DISPLAY_NAMES[option.id] ?? option.label })}
+      className="max-w-[calc(100vw-32px)]"
+    >
+      <EngineModelPanel
+        option={option}
+        models={modelsByEngine[option.id] ?? []}
+        selectedModelId={models[option.id] ?? ""}
+        query={query}
+        onQueryChange={onQueryChange}
+        effort={efforts[option.id] ?? getDefaultEffort(option.id)}
+        onPickModel={onPickModel}
+        onEffortChange={onEffortChange}
+        claudeUltracode={claudeUltracode}
+        onClaudeUltracodeChange={onClaudeUltracodeChange}
+        channels={option ? channelsByEngine?.[option.id] : undefined}
+        selectedChannelId={option ? selectedChannels?.[option.id] : undefined}
+        onPickChannel={onPickChannel}
+        ompServiceTier={ompServiceTier}
+        onOmpServiceTierChange={onOmpServiceTierChange}
+        codexServiceTier={codexServiceTier}
+        onCodexServiceTierChange={onCodexServiceTierChange}
+        onRefresh={onRefreshModels}
+        onClose={onClose}
+        cursorModels={option.id === "cursor" ? cursorModels : undefined}
+      />
+    </ModalShell>
+  );
+}
+
+/**
+ * CLI + model switcher, visually mirroring the reference ModelSelect
+ * (desktop-cc-gui): a borderless trigger showing the full selection —
+ * "{CLI} / {model} · {effort}" — hairline-separated engine rows where
+ * only the active engine carries a status dot, and a per-engine flyout.
+ * Picking a model in another engine's flyout switches to that engine (when
+ * installed) and keeps the panel open for Fast / effort.
+ */
+export function CliMenu({
+  options,
+  value,
+  onChange,
+  modelsByEngine,
+  models,
+  onModelChange,
+  efforts,
+  onEffortChange,
+  claudeUltracode,
+  onClaudeUltracodeChange,
+  channelsByEngine,
+  selectedChannels,
+  onChannelChange,
+  ompServiceTier,
+  onOmpServiceTierChange,
+  codexServiceTier,
+  onCodexServiceTierChange,
+  onRefreshModels,
+  loadingEngines,
+  cursorModels,
+}: {
+  options: MenuOption[];
+  value: string;
+  onChange: (id: string) => void;
+  /** Per-engine model lists; concrete ids only, CLI default first. */
+  modelsByEngine: Record<string, ModelOption[]>;
+  /** Selected model id per engine. */
+  models: Record<string, string>;
+  onModelChange: (engine: string, id: string) => void;
+  /** Per-engine reasoning effort, rendered under each flyout's model list. */
+  efforts: Record<string, EffortLevel>;
+  onEffortChange: (engine: string, level: EffortLevel) => void;
+  /** Claude's dynamic workflow setting, independent of reasoning effort. */
+  claudeUltracode?: boolean;
+  onClaudeUltracodeChange?: (enabled: boolean) => void;
+  channelsByEngine?: Record<string, ChannelOption[]>;
+  selectedChannels?: Record<string, string>;
+  onChannelChange?: (engine: string, id: string) => void;
+  ompServiceTier: OmpServiceTier;
+  onOmpServiceTierChange: (tier: OmpServiceTier) => Promise<void>;
+  codexServiceTier: OmpServiceTier;
+  onCodexServiceTierChange: (tier: OmpServiceTier) => Promise<void>;
+  /** Re-probe provider configs and model catalogs (flyout refresh button). */
+  onRefreshModels?: () => void | Promise<void>;
+  /** Engine ids whose catalog probe has not returned yet (loading hint). */
+  loadingEngines?: readonly string[];
+  cursorModels?: CursorModel[];
+}) {
+  const { t } = useTranslation();
+  const { isOpen, triggerRef, popoverRef, close, setOpen } = usePopoverState();
+  const current = options.find((o) => o.id === value);
+
+  // Trigger carries the whole selection at a glance:
+  // "Claude Code / 默认 · 高" (CLI name / model / effort). The model part
+  // only drops out when the engine has no model list at all.
+  const selectedModelId = models[value] ?? "";
+  const selectedModel = (modelsByEngine[value] ?? []).find((m) => m.id === selectedModelId);
+  const cursorPrefs = useCursorModelPrefs();
+  const cursorLabel = value === "cursor" && cursorModels ? cursorTriggerLabel(cursorModels, selectedModelId, cursorPrefs.params) : undefined;
+  // 【cursor模型】摘要用基础模型名加推理档和 Fast，即使当前记下的还是旧后缀 id。
+  const triggerModel = cursorLabel
+    ? { ...(selectedModel ?? { id: selectedModelId, label: cursorLabel }), label: cursorLabel }
+    : selectedModel;
+  const engineName = CLI_DISPLAY_NAMES[value] ?? current?.label ?? value;
+  const triggerEffort: EffortLevel = efforts[value] ?? getDefaultEffort(value);
+
+  // Which engine's model flyout is open. Pre-opens on the active engine so
+  // the current selection is visible the moment the menu opens.
+  const [openEngine, setOpenEngine] = useState<string | null>(null);
+  // Mobile has no hover, so the flyout never renders there; tapping an
+  // engine row opens the same panel as a second-level modal instead.
+  const isMobile = useMediaQuery(MOBILE_MEDIA);
+  const [dialogEngine, setDialogEngine] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
+
+  // The filter belongs to the search, not to one engine: switching the flyout
+  // must not wipe what the user typed.
+  useEffect(() => {
+    setQuery("");
+  }, [dialogEngine]);
+
+  const handleOpenChange = (o: boolean) => {
+    if (!setOpen(o)) return;
+    clearHoverTimer();
+    setOpenEngine(o ? value : null);
+    if (!o) setQuery("");
+  };
+
+  useEffect(() => {
+    const openPanel = () => {
+      clearHoverTimer();
+      if (setOpen(true)) {
+        setOpenEngine(value);
+        setQuery("");
+      }
+    };
+    cliMenuOpenListeners.add(openPanel);
+    return () => {
+      cliMenuOpenListeners.delete(openPanel);
+    };
+  });
+
+  const dialogOption = options.find((o) => o.id === dialogEngine);
+  // Hover pre-opens the row's flyout after a short intent delay: long
+  // enough that a pointer crossing rows on its way into the panel's own
+  // controls never swaps the panel (the diagonal-path bug that once
+  // removed hover), short enough to feel instant when dwelling on a row.
+  // Keyboard focus opens immediately — Tab is already deliberate. Either
+  // path skips engines without a catalog (nothing to preview) and, at
+  // fire time, stays put while the user is typing in the panel's search
+  // or channel filter; a click still switches outright.
+  const hoverTimerRef = useRef<number | null>(null);
+  const clearHoverTimer = () => {
+    if (hoverTimerRef.current !== null) {
+      window.clearTimeout(hoverTimerRef.current);
+      hoverTimerRef.current = null;
+    }
+  };
+  useEffect(() => clearHoverTimer, []);
+
+  const hoverEngine = (option: MenuOption) => {
+    clearHoverTimer();
+    if (option.disabled) return;
+    if ((modelsByEngine[option.id] ?? []).length === 0) return;
+    if (option.id === openEngine) return;
+    hoverTimerRef.current = window.setTimeout(() => {
+      hoverTimerRef.current = null;
+      const active = document.activeElement;
+      if (
+        active instanceof HTMLElement &&
+        active.closest("[data-engine-flyout]") !== null &&
+        (active instanceof HTMLInputElement ||
+          active instanceof HTMLTextAreaElement ||
+          active.isContentEditable)
+      ) {
+        return;
+      }
+      setOpenEngine(option.id);
+    }, HOVER_INTENT_MS);
+  };
+
+  const focusEngine = (option: MenuOption) => {
+    clearHoverTimer();
+    if (option.disabled) return;
+    if ((modelsByEngine[option.id] ?? []).length === 0) return;
+    setOpenEngine(option.id);
+  };
+
+  // Keep the menu open after a model pick so Fast / effort can be adjusted in
+  // the same panel (Codex desktop behavior). Switch the active CLI first when
+  // picking on another installed engine so pending/handoff tabs retarget and
+  // stamp the chosen model/channel in sync.
+  const pickModel = (engine: string, id: string) => {
+    const target = options.find((o) => o.id === engine);
+    if (engine !== value && target && !target.disabled) onChange(engine);
+    onModelChange(engine, id);
+    if (!isMobile) setOpenEngine(engine);
+  };
+
+  const pickChannel = (engine: string, id: string) => {
+    const target = options.find((o) => o.id === engine);
+    if (engine !== value && target && !target.disabled) onChange(engine);
+    onChannelChange?.(engine, id);
+    if (!isMobile) setOpenEngine(engine);
+  };
+
+  const selectEngine = (option: MenuOption) => {
+    clearHoverTimer();
+    // Mobile: the row tap drills into the second-level model dialog instead
+    // of switching engines outright — the engine switches when a model is
+    // picked there.
+    if (isMobile) {
+      setDialogEngine(option.id);
+      close();
+      return;
+    }
+    if (option.disabled) return;
+    // Desktop: the row switches WHICH model list is shown, nothing more. The
+    // engine itself changes when a model is picked from that list (see
+    // pickModel), so browsing another CLI can never switch the active engine.
+    // An engine with no catalog has nothing to browse: keep the old
+    // behaviour of switching outright.
+    if ((modelsByEngine[option.id] ?? []).length === 0) {
+      onChange(option.id);
+      close();
+      return;
+    }
+    setOpenEngine(option.id);
+  };
+
+
+
+  return (
+    <>
+    <AriaDialogTrigger isOpen={isOpen} onOpenChange={handleOpenChange}>
+      <CliMenuTrigger
+        triggerRef={triggerRef}
+        engine={value}
+        engineName={engineName}
+        model={triggerModel}
+        effort={triggerEffort}
+        claudeUltracode={claudeUltracode}
+        ompServiceTier={ompServiceTier}
+        codexServiceTier={codexServiceTier}
+        modelId={selectedModelId}
+        isOpen={isOpen}
+      />
+
+      <AriaPopover
+        ref={popoverRef}
+        isNonModal
+        placement="top end"
+        offset={8}
+        className={CLI_POPOVER_CLASSES}
+      >
+        <AriaDialog aria-label={t("chat.cliPicker")} className="outline-none">
+          <EngineMenuBody
+            options={options}
+            value={value}
+            openEngine={openEngine}
+            modelsByEngine={modelsByEngine}
+            models={models}
+            efforts={efforts}
+            query={query}
+            onQueryChange={setQuery}
+            isMobile={isMobile}
+            onSelectEngine={selectEngine}
+            onHoverEngine={hoverEngine}
+            onHoverEngineEnd={clearHoverTimer}
+            onFocusEngine={focusEngine}
+            onPickModel={pickModel}
+            onEffortChange={onEffortChange}
+            claudeUltracode={claudeUltracode}
+            onClaudeUltracodeChange={onClaudeUltracodeChange}
+            channelsByEngine={channelsByEngine}
+            selectedChannels={selectedChannels}
+            onPickChannel={pickChannel}
+            ompServiceTier={ompServiceTier}
+            onOmpServiceTierChange={onOmpServiceTierChange}
+            codexServiceTier={codexServiceTier}
+            onCodexServiceTierChange={onCodexServiceTierChange}
+            onRefreshModels={onRefreshModels}
+            loadingEngines={loadingEngines}
+            cursorModels={cursorModels}
+          />
+        </AriaDialog>
+      </AriaPopover>
+    </AriaDialogTrigger>
+
+    <EngineModelDialog
+      option={dialogOption}
+      modelsByEngine={modelsByEngine}
+      models={models}
+      efforts={efforts}
+      query={query}
+      onQueryChange={setQuery}
+      onPickModel={pickModel}
+      onEffortChange={onEffortChange}
+      claudeUltracode={claudeUltracode}
+      onClaudeUltracodeChange={onClaudeUltracodeChange}
+      channelsByEngine={channelsByEngine}
+      selectedChannels={selectedChannels}
+      onPickChannel={pickChannel}
+      ompServiceTier={ompServiceTier}
+      onOmpServiceTierChange={onOmpServiceTierChange}
+      codexServiceTier={codexServiceTier}
+      onCodexServiceTierChange={onCodexServiceTierChange}
+      onRefreshModels={onRefreshModels}
+      onClose={() => setDialogEngine(null)}
+      cursorModels={cursorModels}
+    />
+    </>
+  );
+}

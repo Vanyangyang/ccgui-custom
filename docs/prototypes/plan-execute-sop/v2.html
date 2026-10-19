@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CC GUI · 接力对话 / 第二版交互稿</title>
+<style>
+:root{--bg:#fff;--rail:#f6f7f9;--ink:#2a2e36;--muted:#838995;--line:#e9ebef;--accent:#5368cd;--soft:#f0f3ff;--green:#2b806c;--warn:#926d38;--red:#b94b49;--radius:12px;--shadow:0 12px 48px #25314619}
+*{box-sizing:border-box}body{margin:0;font:13px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif;color:var(--ink);background:var(--bg)}button,input,select,textarea{font:inherit;color:inherit}button{cursor:pointer;border:1px solid var(--line);background:white;border-radius:7px;padding:7px 12px;min-height:34px;line-height:1.4}button:hover:not(:disabled){background:var(--rail)}button:disabled{opacity:.45;cursor:not-allowed}button:focus-visible,select:focus-visible,textarea:focus-visible,input:focus-visible,summary:focus-visible{outline:2px solid var(--accent);outline-offset:3px}button.primary{background:var(--accent);border-color:var(--accent);color:white}button.primary:hover:not(:disabled){background:#4358bd}.quiet{background:transparent;border-color:transparent;color:var(--muted)}.small{font-size:11px;min-height:28px;padding:4px 9px}.row{display:flex;align-items:center;gap:10px}.between{justify-content:space-between}.muted{color:var(--muted)}.tiny{font-size:11px}.badge{font-size:10px;padding:3px 7px;white-space:nowrap;border-radius:5px;background:var(--rail);color:var(--muted)}.badge.blue{background:var(--soft);color:var(--accent)}.badge.green{color:var(--green);background:#edf7f3}h1,h2,h3,p{margin:0}h1{font-size:14px;font-weight:600}h2{font-size:14px;font-weight:600}h3{font-size:12px;font-weight:600}[hidden]{display:none!important}.shell{display:grid;grid-template-columns:192px minmax(0,1fr);height:100dvh;min-height:620px}.sidebar{background:var(--rail);border-right:1px solid var(--line);padding:23px 14px;display:flex;flex-direction:column;gap:24px}.brand{font-size:16px;font-weight:700;padding:0 9px;letter-spacing:-.5px}.brand-mark{display:inline-grid;place-items:center;background:#303640;color:white;border-radius:7px;width:26px;height:26px;font-size:11px;margin-right:8px}.nav-label{padding:0 12px;color:#a1a6af;font-size:10px;letter-spacing:1.2px;margin:0 0 9px}.nav-row{padding:9px 12px;color:#737b88;font-size:12px}.nav-row.active{background:white;border-radius:7px;box-shadow:0 1px 3px #29394f08;color:var(--ink)}.nav-row .dot{color:var(--green);margin-right:7px}.side-bottom{margin-top:auto;padding:12px;border-top:1px solid var(--line)}.screen{min-width:0;display:flex;flex-direction:column;overflow:hidden}.topbar{height:58px;flex-shrink:0;padding:0 28px;border-bottom:1px solid var(--line)}.top-actions{display:flex;align-items:center;gap:9px}.top-actions select{font-size:11px;border:1px solid var(--line);border-radius:6px;background:white;padding:5px;max-width:130px}.demo-label{font-size:10px;background:#faf6ec;color:var(--warn);border:1px solid #f0e8d7;border-radius:5px;padding:3px 7px}.stagebar{flex-shrink:0;padding:12px 30px;border-bottom:1px solid #f1f2f5}.stages{display:flex;align-items:center;gap:11px;font-size:11px;color:var(--muted)}.stage{display:flex;align-items:center;gap:6px}.stage b{font-weight:500}.stage-number{width:18px;height:18px;display:grid;place-items:center;border:1px solid var(--line);border-radius:50%;font-size:9px}.stage.current{color:var(--accent)}.stage.current .stage-number{background:var(--soft);border-color:#dce2fc}.stage.finished{color:var(--green)}.stage.finished .stage-number{background:#edf7f3;border-color:#dcefe7}.stage-divider{width:35px;height:1px;background:var(--line)}.chat-scroll{flex:1;overflow:auto;overscroll-behavior:contain;min-height:0;scrollbar-width:thin}.chat{max-width:840px;margin:0 auto;padding:26px 28px 22px}.session-note{text-align:center;color:#a4a9b3;font-size:10px;margin-bottom:25px;letter-spacing:.3px}.user-message{margin-left:auto;max-width:82%;background:var(--rail);border:1px solid #eff0f3;padding:12px 16px;border-radius:12px 12px 3px 12px;line-height:1.9;font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere}.user-meta{text-align:right;font-size:10px;color:#aaaeb7;margin:7px 0 20px}.assistant-head{display:flex;align-items:center;gap:9px;margin-bottom:10px;font-size:11px}.avatar{width:23px;height:23px;display:grid;place-items:center;background:var(--soft);color:var(--accent);border-radius:6px;font-size:11px}.assistant-head strong{font-weight:600}.old-summary{margin:0 0 22px 32px;font-size:12px;color:var(--muted)}.old-summary summary{cursor:pointer}.old-summary p{padding:10px 0;white-space:pre-wrap}.reply{font-size:12px;line-height:1.9;margin:0 0 13px 32px}.plan-card{margin-left:32px;border:1px solid #dfe5f6;border-radius:var(--radius);background:white;overflow:hidden}.plan-header{padding:15px 18px;background:#fafbff;border-bottom:1px solid #edf0f9}.plan-title{font-size:13px;font-weight:600;margin-top:5px}.plan-body{padding:14px 18px}.plan-step{display:grid;grid-template-columns:23px 1fr;gap:9px;padding:8px 0}.step-index{font-size:10px;color:#97a3c4;margin-top:2px;font-family:ui-monospace,monospace}.plan-step p{font-size:11px;color:var(--muted);margin-top:3px;line-height:1.75}.acceptance{border-top:1px solid var(--line);margin-top:9px;padding-top:11px;font-size:11px;color:#677084}.feedback-list{white-space:pre-wrap;overflow-wrap:anywhere;font-size:11px;color:#65708b;border-top:1px solid var(--line);margin-top:11px;padding-top:11px;max-height:150px;overflow:auto}.plan-actions{padding:13px 18px;border-top:1px solid #edf0f9;background:#fdfdff;display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap}.plan-actions .destination{font-size:10px;color:var(--muted);margin-bottom:7px}.plan-actions button{font-size:12px}.planning-note{font-size:10px;color:var(--muted);margin:10px 0 0 34px;line-height:1.7}.live-note{border-left:2px solid #c9d3f4;padding:10px 14px;margin:18px 0 0 32px;background:#fbfcff;font-size:12px;white-space:pre-wrap}.execution{margin:20px 0 0 32px;border:1px solid var(--line);border-radius:10px;padding:17px}.execution h2{margin-bottom:10px}.execution-list{list-style:none;margin:0;padding:0;color:#758090;font-size:12px}.execution-list li{padding:7px 0}.execution-list li.done{color:var(--green)}.execution-foot{margin-top:12px;border-top:1px solid var(--line);padding-top:12px;display:flex;gap:8px;flex-wrap:wrap}.composer-area{flex-shrink:0;width:100%;max-width:880px;margin:0 auto;padding:0 28px 16px;position:relative;background:white}.suggestions{display:flex;align-items:center;gap:7px;margin:7px 0 10px;flex-wrap:wrap}.suggestions span{font-size:10px;color:var(--muted)}.suggestions button{font-size:10px;background:white;border-color:#eceef3;color:#798191;border-radius:16px;min-height:25px;padding:3px 10px}.composer{border:1px solid #dce2f2;box-shadow:0 3px 15px #2e456507;border-radius:15px;background:white}.composer:focus-within{border-color:#aab7e9}.composer textarea{border:0;background:transparent;outline:none;resize:none;width:100%;min-height:70px;height:70px;padding:15px 17px 5px;line-height:1.8;font-size:13px}.composer textarea:focus-visible{outline:none}.composer-bottom{display:flex;align-items:center;justify-content:space-between;gap:9px;padding:9px 11px 11px}.composer-controls{display:flex;align-items:center;gap:6px;min-width:0}.relay-trigger{display:flex;align-items:center;gap:7px;border-color:transparent;background:var(--soft);color:var(--accent);border-radius:16px;padding:5px 10px;font-size:11px;min-height:30px}.relay-trigger.off{background:var(--rail);color:var(--ink)}.relay-symbol{font-size:16px;line-height:1}.permission-label{font-size:10px;color:var(--muted);display:flex;gap:5px;align-items:center}.permission-label select{background:transparent;border:0;padding:4px 0;font-size:11px;color:#7c8491;max-width:88px}.send{border-radius:50%;min-height:31px;width:31px;padding:0;font-size:18px;flex-shrink:0}.composer-context{font-size:10px;color:var(--muted);margin:8px 3px 0;display:flex;align-items:center;justify-content:space-between;gap:12px}.composer-context .route-hint{color:#7885b0}.notice{font-size:11px;color:var(--warn);padding:6px 3px;white-space:pre-wrap}.config-panel{position:absolute;bottom:122px;left:38px;width:min(408px,calc(100% - 58px));z-index:4;background:white;border:1px solid #e3e6ed;border-radius:14px;box-shadow:var(--shadow);padding:18px;max-height:min(610px,calc(100dvh - 180px));overflow:auto}.config-head{margin-bottom:13px}.segmented{display:flex;padding:3px;background:var(--rail);border-radius:7px;margin-bottom:17px;gap:3px}.segmented button{flex:1;font-size:11px;min-height:30px;border:0;background:transparent}.segmented button[aria-pressed=true]{background:white;box-shadow:0 1px 3px #29394f12;color:var(--accent)}.node-row{display:grid;grid-template-columns:28px 1fr;gap:10px;margin:13px 0}.node-bullet{width:24px;height:24px;background:var(--soft);color:var(--accent);border-radius:7px;text-align:center;line-height:24px;font-size:10px;margin-top:2px}.node-bullet.green{background:#edf7f3;color:var(--green)}.node-row label{font-size:11px;font-weight:550}.node-row select{display:block;width:100%;border:1px solid var(--line);border-radius:6px;background:#fcfcfd;padding:9px 8px;font-size:11px;margin-top:6px}.connector-note{margin:-3px 0 -3px 38px;font-size:10px;color:#929cad}.config-rule{font-size:11px;padding:11px;border:1px solid #e8edf8;background:#fafbff;border-radius:7px;margin:14px 0;color:#6f7da4}.config-foot{display:flex;justify-content:space-between;align-items:center;border-top:1px solid var(--line);padding-top:13px;font-size:10px;color:var(--muted)}dialog{width:min(690px,calc(100vw - 30px));max-height:85dvh;overflow:auto;padding:0;border:1px solid var(--line);border-radius:14px;color:var(--ink);box-shadow:var(--shadow)}dialog::backdrop{background:#29334945}.dialog-head{padding:18px 21px;border-bottom:1px solid var(--line);position:sticky;top:0;background:white}.dialog-body{padding:20px}.dialog-body select{font-size:12px;border:1px solid var(--line);border-radius:6px;padding:6px;background:var(--rail)}.dialog-body textarea{display:block;width:100%;min-height:290px;border:1px solid var(--line);border-radius:8px;padding:14px;background:#fcfcfd;font:12px/1.9 ui-monospace,"PingFang SC",sans-serif;resize:vertical;margin-top:14px}.dialog-foot{padding:14px 20px;border-top:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;gap:12px}.dialog-note{font-size:11px;color:var(--muted);margin-top:10px}.packet{white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.9 inherit;background:var(--rail);border-radius:8px;padding:16px}.visually-hidden{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}@media(min-width:1600px){.chat{max-width:930px;padding-top:36px}.composer-area{max-width:970px}.sidebar{padding-top:28px}.shell{grid-template-columns:215px 1fr}}@media(max-width:850px){.shell{grid-template-columns:155px 1fr}.topbar{padding:0 18px}.chat{padding:22px 18px}.composer-area{padding:0 18px 13px}.demo-label{display:none}.top-actions{gap:4px}.stagebar{padding:11px 20px}.plan-actions{align-items:flex-start}.permission-label>span{display:none}}@media(max-width:620px){.shell{display:block;height:100dvh;min-height:650px}.screen{height:100%}.sidebar{display:none}.topbar{height:55px;padding:0 14px}.top-actions select{max-width:95px}.chat{padding:19px 14px}.plan-card,.execution,.live-note{margin-left:0}.reply{margin-left:0}.old-summary{margin-left:0}.stagebar{padding:11px 14px}.stages{gap:7px}.stage-divider{width:16px}.stagebar>.tiny{display:none}.user-message{max-width:92%}.composer-area{padding:0 12px 12px}.composer-context>span:last-child{display:none}.relay-trigger{font-size:10px;padding:5px 8px}.permission-label select{max-width:63px;font-size:10px}.composer-controls{gap:3px}.config-panel{left:16px;width:calc(100% - 32px);bottom:120px}.plan-actions{padding:12px}.plan-body{padding:12px 15px}.suggestions button{padding:3px 8px}.dialog-foot{flex-wrap:wrap}.composer-context{font-size:9px}}@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto}}
+</style>
+</head>
+<body>
+<div class="shell">
+  <aside class="sidebar" aria-label="侧栏环境示意">
+    <div class="brand"><span class="brand-mark">cc</span> CC GUI</div>
+    <div><p class="nav-label">WORKSPACE</p><div class="nav-row">▱ &nbsp; desktop-cc-gui</div><div class="nav-row">＋ &nbsp; 新建对话 <span class="tiny muted">· 示意</span></div></div>
+    <div><p class="nav-label">TODAY</p><div class="nav-row active"><span class="dot">•</span> 设置页搜索功能</div><div class="nav-row">消息渲染优化</div></div>
+    <div class="side-bottom"><div class="row between"><span class="tiny">⇄ &nbsp; 接力插件</span><span class="badge green">已安装</span></div><p class="tiny muted" style="margin-top:8px">入口就在输入框里</p></div>
+  </aside>
+  <main class="screen">
+    <header class="topbar row between"><div><h1>设置页搜索功能</h1><span class="tiny muted">desktop-cc-gui</span></div><div class="top-actions"><span class="demo-label">交互稿 v2 · 所有回复均为模拟</span><select id="scene" aria-label="演示场景"><option value="success">正常执行</option><option value="planFail">规划失败一次</option><option value="actFail">执行失败一次</option></select><button id="reset" class="quiet small">重置演示</button></div></header>
+    <div class="stagebar row between"><div class="stages" aria-label="流程阶段"><span id="stagePlan" class="stage current"><span class="stage-number">1</span><b>规划</b></span><span class="stage-divider"></span><span id="stageApprove" class="stage"><span class="stage-number">2</span><b>确认交接</b></span><span class="stage-divider"></span><span id="stageAct" class="stage"><span class="stage-number">3</span><b>执行</b></span></div><span class="tiny muted">两个 Agent 节点 · 中间由你确认</span></div>
+    <div id="chatScroll" class="chat-scroll"><div class="chat">
+      <div class="session-note">接力已开启 · 多轮讨论，直到你满意为止</div>
+      <div class="user-message">为设置页增加搜索功能，支持按设置名称筛选。保留现有分组，不增加新依赖。</div><div class="user-meta">你 · 规划第 1 轮</div>
+      <div class="assistant-head"><span class="avatar">C</span><strong>规划 Agent</strong><span id="plannerLabel" class="muted">Codex · 高能力模型</span></div>
+      <details class="old-summary"><summary>计划 v1 · 已被新版替代</summary><p>增加搜索框，按设置名称筛选并保持分组。补充搜索结果和清空行为的回归测试。</p></details>
+      <div class="user-message">再补充一下：也要能搜描述；没有结果时给一个清空搜索的入口。</div><div class="user-meta">你 · 规划第 2 轮</div>
+      <div id="discussion"></div>
+      <div class="assistant-head"><span class="avatar">C</span><strong id="replyHeading">规划 Agent</strong><span id="roundLabel" class="badge blue">第 2 轮 · 已更新</span></div>
+      <p id="reply" class="reply">已把「描述匹配」和「无结果引导」补进计划。你可以继续提意见；我会留在规划阶段，不会自行开始写代码。</p>
+      <article class="plan-card" aria-labelledby="planTitle">
+        <div class="plan-header row between"><div><div class="row"><span class="badge blue" id="versionBadge">计划 v2</span><span class="tiny muted" id="planState">待你确认，不会自动执行</span></div><div id="planTitle" class="plan-title">设置页搜索 · 实施计划</div></div><button id="history" class="quiet small">版本记录</button></div>
+        <div class="plan-body"><div id="planOverview"><div class="plan-step"><span class="step-index">01</span><div><h3>先明确范围</h3><p>复用现有设置数据；同时匹配名称与描述，保留分组及顺序。</p></div></div><div class="plan-step"><span class="step-index">02</span><div><h3>再完成交互</h3><p>支持清空搜索；无结果时展示说明和清空入口，不改动设置值。</p></div></div><div class="plan-step"><span class="step-index">03</span><div><h3>验证与交付</h3><p>补充中英文匹配、空结果和清空恢复用例，报告实际验证结果。</p></div></div><div class="acceptance">边界：不新增依赖，不覆盖已有修改，不自动提交代码。</div></div><pre id="customOverview" class="packet" style="max-height:220px;overflow:auto;margin:0" hidden></pre><div id="feedbackList" class="feedback-list" hidden></div></div>
+        <div class="plan-actions"><div><div id="destination" class="destination">确认后交给 Pi CLI / DeepSeek · 示例</div><div class="row"><button id="approve" class="primary">确认 v2 并执行 →</button><button id="keepDiscussing" class="quiet small">继续修改</button></div></div><button id="viewPlan" class="small">查看 / 编辑完整计划</button></div>
+      </article>
+      <p id="planHint" class="planning-note">回答结束 ≠ 规划完成。只有你确认的版本，才会交给执行 Agent。</p>
+      <div id="liveNote" class="live-note" role="status" aria-live="polite" hidden></div>
+      <section id="execution" class="execution" aria-labelledby="executionTitle" hidden><div class="row between"><h2 id="executionTitle">执行 Agent · Pi</h2><span id="executionBadge" class="badge green">执行中 · 模拟</span></div><p id="executionSummary" class="tiny muted"></p><ul class="execution-list"><li id="execCheck">○ 接收已确认计划</li><li id="execWork">○ 按计划实施</li><li id="execVerify">○ 汇报验证结果</li></ul><div class="execution-foot"><button id="packet" class="small">查看本次交接包</button><button id="stop" class="small">停止执行</button><button id="retry" class="primary small" hidden>重试执行</button><button id="backToPlan" class="small" hidden>回到规划继续讨论</button></div></section>
+    </div></div>
+    <footer class="composer-area">
+      <div id="suggestions" class="suggestions"><span>继续打磨</span><button data-suggestion="先别执行，再补充一下边界条件和失败场景。">补充边界条件</button><button data-suggestion="把验收标准写得更具体，列出需要验证的场景。">细化验收标准</button><button data-suggestion="缩小第一版范围，只保留名称和描述搜索。">缩小首版范围</button></div>
+      <div id="configPanel" class="config-panel" role="dialog" aria-labelledby="configTitle" hidden>
+        <div class="config-head row between"><div><h2 id="configTitle">多 Agent 接力</h2><p class="tiny muted">让合适的模型，负责合适的阶段</p></div><button id="closeConfig" class="quiet small" aria-label="关闭接力配置">✕</button></div>
+        <div class="segmented" aria-label="执行方式"><button id="relayMode" aria-pressed="true">接力模式</button><button id="singleMode" aria-pressed="false">单 Agent</button></div>
+        <div id="nodeSettings"><div class="node-row"><span class="node-bullet">01</span><label for="planRoute">规划 · 可多轮讨论<select id="planRoute"><option value="codex-strong">Codex CLI / OpenAI / 高能力模型 · 示例</option><option value="pi-strong">Pi CLI / OpenAI / 高能力模型 · 示例</option></select></label></div><div class="connector-note">↓ 你确认最新版后，才交接</div><div class="node-row"><span class="node-bullet green">02</span><label for="actRoute">执行 · 按已确认计划落地<select id="actRoute"><option value="pi-deepseek">Pi CLI / DeepSeek / 执行模型 · 示例</option><option value="pi-fast">Pi CLI / OpenAI / 快速模型 · 示例</option><option value="codex-fast">Codex CLI / OpenAI / 快速模型 · 示例</option></select></label></div><div class="config-rule"><strong>先讨论，后执行</strong><br>每次回复后都可以继续修改。不会根据“回答结束”或一句“好的”自动切换。</div><p class="tiny muted" id="routeKind">跨引擎 · 新执行会话 + 已确认交接包</p></div>
+        <p id="singleHint" class="tiny muted" hidden>恢复原来的单 Agent 对话方式；已有计划保留，但不会自动交接。普通模型沿用 Pi / DeepSeek（演示）。</p>
+        <div class="config-foot" style="margin-top:15px"><span>仅应用于当前演示会话</span><button id="applyConfig" class="primary small">应用配置</button></div>
+      </div>
+      <div class="composer"><textarea id="message" aria-label="消息" placeholder="继续告诉规划 Agent 你的想法… Enter 发送，Shift+Enter 换行"></textarea><div class="composer-bottom"><div class="composer-controls"><button id="relayTrigger" class="relay-trigger" aria-haspopup="dialog" aria-expanded="false" aria-controls="configPanel"><span class="relay-symbol">⇄</span><span id="routeSummary">接力：Codex → Pi</span><span aria-hidden="true">⌄</span></button><label class="permission-label"><span>执行权限</span><select id="permission" aria-label="执行权限"><option value="auto">自动询问</option><option value="manual">逐项确认</option></select></label></div><button id="send" class="primary send" aria-label="发送给规划 Agent" title="发送给规划 Agent" disabled>↑</button></div></div>
+      <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+      <div class="composer-context"><span id="composerState" class="route-hint">● 规划中 · 消息只发给规划 Agent</span><span>原型演示 · 不调用模型 / 不修改文件 / 不产生费用</span></div>
+    </footer>
+  </main>
+</div>
+<dialog id="planDialog" aria-labelledby="planDialogTitle"><div class="dialog-head row between"><div><h2 id="planDialogTitle">完整计划与版本</h2><p class="tiny muted">每次修改都留痕，只有最新版本可以确认</p></div><button id="closePlan" class="small">关闭</button></div><div class="dialog-body"><div class="row between"><label class="tiny muted">查看版本 <select id="versionSelect" aria-label="计划版本"></select></label><span id="versionLabel" class="badge blue">当前版本</span></div><textarea id="planEditor" aria-label="完整计划"></textarea><p id="editorNote" class="dialog-note">编辑后保存为新版本，再回到对话确认执行。</p><p id="editorError" class="notice" role="alert" hidden></p></div><div class="dialog-foot"><span class="tiny muted">历史只读，不覆盖已经产生的版本</span><button id="savePlan" class="primary">保存为新版本</button></div></dialog>
+<dialog id="packetDialog" aria-labelledby="packetTitle"><div class="dialog-head row between"><h2 id="packetTitle">已冻结的交接包</h2><button id="closePacket" class="small">关闭</button></div><div class="dialog-body"><pre id="packetText" class="packet"></pre><p class="dialog-note">这是确认时的快照。后续讨论或改配置，不会悄悄修改已经启动的任务。</p></div></dialog>
+<script>
+const get = (name) => document.getElementById(name);
+const routes = {
+  'codex-strong': { engine:'codex', provider:'OpenAI', model:'高能力模型（示例）', short:'Codex' },
+  'pi-strong': { engine:'pi', provider:'OpenAI', model:'高能力模型（示例）', short:'Pi' },
+  'pi-deepseek': { engine:'pi', provider:'DeepSeek', model:'执行模型（示例）', short:'Pi' },
+  'pi-fast': { engine:'pi', provider:'OpenAI', model:'快速模型（示例）', short:'Pi' },
+  'codex-fast': { engine:'codex', provider:'OpenAI', model:'快速模型（示例）', short:'Codex' }
+};
+const basePlan = '目标：为设置页增加搜索功能，保留现有分组。\n\n实施步骤\n1. 阅读设置数据与渲染入口，确认可检索字段。\n2. 同时匹配名称和描述，保持分组顺序。\n3. 增加清空入口；无结果时给出说明与恢复操作。\n4. 验证中英文匹配、空结果和清空恢复，报告实际测试结果。\n\n约束：不增加依赖，不覆盖用户已有修改，不自动提交代码。\n验收：筛选行为正确、分组不变、设置值不受搜索影响、相关回归通过。';
+const state = { phase:'ready', round:2, versions:[], enabled:true, draftEnabled:true, planRoute:'codex-strong', actRoute:'pi-deepseek', timer:null, generation:0, snapshot:null, failedPlan:false, failedAct:false, unresolved:false, lastFeedback:'', feedback:[], pendingFeedback:[] };
+function latest(){ return state.versions[state.versions.length-1]; }
+function busy(){ return ['planning','handoff','executing','cancelling','singleReply'].includes(state.phase); }
+function locked(){ return busy() || ['failedAct','cancelled','done'].includes(state.phase); }
+function notice(text){get('notice').textContent=text;get('notice').hidden=!text;}
+function clearTimer(){state.generation+=1;clearTimeout(state.timer);state.timer=null;}
+function schedule(callback, delay=850){const generation=state.generation;state.timer=setTimeout(()=>{if(generation===state.generation)callback();},delay);}
+function announce(text){get('liveNote').textContent=text;get('liveNote').hidden=!text;}
+function appendMessage(text,meta){const bubble=document.createElement('div');bubble.className='user-message';bubble.textContent=text;const caption=document.createElement('div');caption.className='user-meta';caption.textContent=meta;get('discussion').append(bubble,caption);}
+function scrollToLatest(){get('chatScroll').scrollTop=get('chatScroll').scrollHeight;}
+function routeName(key){const value=routes[key];return `${value.short} CLI / ${value.provider} / ${value.model}`;}
+function render(){
+  const current=latest();
+  const hasDraft=Boolean(get('message').value.trim());
+  get('versionBadge').textContent=`计划 v${current.number}`;
+  get('planState').textContent=state.snapshot?`v${state.snapshot.version} 已确认 · 本卡片仅供查看`:state.unresolved?'还有修改意见未完成处理':'待你确认，不会自动执行';
+  get('approve').textContent=state.snapshot?`已确认 v${state.snapshot.version}`:`确认 v${current.number} 并执行 →`;
+  get('approve').disabled=!state.enabled||state.phase!=='ready'||hasDraft||state.unresolved;
+  get('keepDiscussing').disabled=locked()||!state.enabled;
+  get('planHint').textContent=hasDraft?'输入框还有未发送的意见。请先发送或清空，再确认计划。':state.unresolved?'上一条修改意见还未完成处理。重试或重新发送后，才能确认。':'回答结束 ≠ 规划完成。只有你确认的版本，才会交给执行 Agent。';
+  get('routeSummary').textContent=state.enabled?`接力：${routes[state.planRoute].short} → ${routes[state.actRoute].short}`:'Pi CLI / DeepSeek · 接力未启用';
+  get('relayTrigger').classList.toggle('off',!state.enabled);
+  get('relayTrigger').disabled=locked();get('permission').disabled=locked();get('scene').disabled=locked();
+  get('destination').textContent=`确认后交给 ${routeName(state.actRoute)}`;
+  get('plannerLabel').textContent=`${routes[state.planRoute].short} · ${routes[state.planRoute].model}`;
+  get('roundLabel').textContent=`第 ${state.round} 轮 · ${state.phase==='planning'?'思考中':'已更新'}`;
+  get('message').disabled=['handoff','executing','cancelling','done','cancelled','failedAct'].includes(state.phase);
+  get('message').placeholder=state.phase==='planning'?'正在完善计划… 可先写好下一条意见':!state.enabled?'发送普通消息（仅演示）…':'继续告诉规划 Agent 你的想法… Enter 发送，Shift+Enter 换行';
+  get('send').disabled=!hasDraft||busy()||get('message').disabled;
+  get('send').setAttribute('aria-label',state.enabled?'发送给规划 Agent':'发送普通消息');get('send').title=state.enabled?'发送给规划 Agent':'发送普通消息';
+  get('suggestions').hidden=!state.enabled||locked();
+  const executing=['handoff','executing','cancelling','failedAct','cancelled','done'].includes(state.phase);
+  get('stagePlan').className='stage '+(executing?'finished':'current');
+  get('stageApprove').className='stage '+(state.phase==='handoff'?'current':executing?'finished':'');
+  get('stageAct').className='stage '+(state.phase==='done'?'finished':executing&&state.phase!=='handoff'?'current':'');
+  const descriptions={ready:'● 规划中 · 消息只发给规划 Agent',planning:'● 规划 Agent 正在思考 · 不会自动交接',failedPlan:'● 规划未完成 · 请重试上一条意见',handoff:'● 已确认 · 正在交接',executing:'● 执行中 · 已锁定计划与模型',cancelling:'● 正在停止 · 等待退出确认',failedAct:'● 执行失败 · 已保留交接包',cancelled:'● 已停止 · 已有文件改动不会自动撤销',done:'● 演示结束 · 未实际写入文件',singleReply:'● 普通对话 · 模拟回复中'};
+  get('composerState').textContent=state.enabled?descriptions[state.phase]:'● 普通对话 · 接力未启用';
+  get('planOverview').hidden=Boolean(current.custom);
+  get('customOverview').hidden=!current.custom;
+  get('customOverview').textContent=current.custom?current.text:'';
+  get('feedbackList').hidden=Boolean(current.custom)||state.feedback.length===0;
+  get('feedbackList').textContent=state.feedback.length?'本轮及此前补充\n'+state.feedback.map((text,index)=>`${index+1}. ${text}`).join('\n'):'';
+}
+function setPhase(phase){state.phase=phase;render();}
+function addVersion(text,reason,custom=Boolean(latest().custom)){const number=latest().number+1;state.versions.push({number,text,reason,custom});}
+function submitFeedback(retry=false){
+  if(busy()||locked()||(retry&&state.phase!=='failedPlan'))return;
+  const text=retry?state.lastFeedback:get('message').value.trim();
+  if(!text)return;
+  if(!retry){state.lastFeedback=text;appendMessage(text,state.enabled?`你 · 规划第 ${state.round+1} 轮`:'你 · 普通对话');get('message').value='';}
+  notice('');
+  if(!state.enabled){setPhase('singleReply');announce('普通 Agent 正在回复（模拟）…');schedule(()=>{announce('普通对话示例：已收到消息。接力未启用，没有创建执行任务。');setPhase('ready');});return;}
+  if(!retry)state.pendingFeedback.push(text);
+  state.unresolved=true;setPhase('planning');announce('正在结合已有计划和你的补充意见完善下一版（模拟）…');get('reply').textContent='继续沿用当前规划上下文，不重新开始任务。';
+  schedule(()=>{
+    if(get('scene').value==='planFail'&&!state.failedPlan){state.failedPlan=true;setPhase('failedPlan');announce('模拟规划请求失败。已保留上一个版本，但它还没有包含这条意见。');notice('点击“重试上一条意见”，或在输入框重新发送补充要求。');get('retryPlanning').hidden=false;return;}
+    const resolvedFeedback=state.pendingFeedback.splice(0);
+    state.round+=1;state.feedback.push(...resolvedFeedback);addVersion(latest().text+`\n\n第 ${state.round} 轮补充（用户原文；正式版由规划 Agent 整合）：\n${resolvedFeedback.join('\n\n')}`,'对话修改');state.unresolved=false;
+    get('reply').textContent=`已记录你的补充，生成计划 v${latest().number}。这只是一次规划回复；你仍可继续讨论，或确认这一版交给执行 Agent。`;
+    get('retryPlanning').hidden=true;announce('');setPhase('ready');scrollToLatest();
+  });
+  scrollToLatest();
+}
+function confirmPlan(){
+  if(!state.enabled||state.phase!=='ready'||state.unresolved||get('message').value.trim())return;
+  closeConfig(false);notice('');
+  state.snapshot=Object.freeze({version:latest().number,plan:latest().text,planner:routeName(state.planRoute),executor:routeName(state.actRoute),permission:get('permission').value,feedback:[...state.feedback],strategy:'新执行会话 + 已确认交接包',confirmedAt:new Date().toISOString()});
+  get('execution').hidden=false;get('executionTitle').textContent=`执行 Agent · ${routes[state.actRoute].short}`;get('executionSummary').textContent=`只执行已确认的 v${state.snapshot.version}，包含此前全部补充要求。`;
+  get('executionBadge').textContent='交接中 · 模拟';get('execCheck').textContent=`✓ 计划 v${state.snapshot.version} 与目的模型已冻结`;get('execCheck').className='done';
+  announce('你已确认当前版本。正在创建执行会话并传递交接包（模拟）…');setPhase('handoff');scrollToLatest();schedule(startExecution);
+}
+function startExecution(){
+  setPhase('executing');get('executionBadge').textContent='执行中 · 模拟';get('execWork').textContent='◌ 按冻结计划实施（模拟）';announce('执行 Agent 已接手。同一个对话里继续展示进度，无需手工复制计划。');
+  schedule(()=>{
+    if(get('scene').value==='actFail'&&!state.failedAct){state.failedAct=true;setPhase('failedAct');get('executionBadge').textContent='连接失败 · 模拟';get('execWork').textContent='! 执行未完成；保留已确认版本';get('retry').hidden=false;get('stop').hidden=true;get('backToPlan').hidden=false;announce('模拟执行失败。不会偷偷换模型，也不会回头重新规划。');return;}
+    get('execWork').textContent='✓ 实施步骤演示完成（无真实文件变更）';get('execWork').className='done';get('execVerify').textContent='✓ 验证流程演示完成（未运行项目测试）';get('execVerify').className='done';get('executionBadge').textContent='已完成 · 模拟';get('stop').hidden=true;get('backToPlan').hidden=false;announce('本次演示结束。真实代码、测试与费用均未产生。');setPhase('done');scrollToLatest();
+  },1600);
+}
+function stopExecution(){
+  if(!['handoff','executing'].includes(state.phase))return;
+  clearTimer();setPhase('cancelling');get('stop').disabled=true;announce('正在停止当前轮次，等待退出确认（模拟）…');
+  schedule(()=>{setPhase('cancelled');get('stop').hidden=true;get('stop').disabled=false;get('backToPlan').hidden=false;get('executionBadge').textContent='已停止';announce('已停止；不会再启动后续工作。停止不等于回滚文件。');},450);
+}
+function backToPlanning(){
+  if(!['done','cancelled','failedAct'].includes(state.phase))return;
+  clearTimer();state.snapshot=null;state.unresolved=true;get('execution').hidden=true;get('retry').hidden=true;get('backToPlan').hidden=true;get('stop').hidden=false;get('stop').disabled=false;
+  setPhase('ready');get('message').value='请基于当前工作区重新核对计划，先说明已有改动，再调整下一步。';render();notice('已回到规划，旧确认已失效。先发送意见并形成新版，再确认执行。');announce('');get('message').focus();
+}
+function openConfig(){
+  if(locked())return;
+  state.draftEnabled=state.enabled;get('planRoute').value=state.planRoute;get('actRoute').value=state.actRoute;renderConfig();get('configPanel').hidden=false;get('relayTrigger').setAttribute('aria-expanded','true');get('relayMode').focus();
+}
+function closeConfig(focus=true){get('configPanel').hidden=true;get('relayTrigger').setAttribute('aria-expanded','false');if(focus)get('relayTrigger').focus();}
+function renderConfig(){
+  get('relayMode').setAttribute('aria-pressed',String(state.draftEnabled));get('singleMode').setAttribute('aria-pressed',String(!state.draftEnabled));get('nodeSettings').hidden=!state.draftEnabled;get('singleHint').hidden=state.draftEnabled;
+  get('routeKind').textContent=routes[get('planRoute').value].engine===routes[get('actRoute').value].engine?'同引擎换模型 · 首版仍用新会话交接，不假定支持续接':'跨引擎 · 新执行会话 + 已确认交接包';
+}
+function applyConfig(){
+  if(locked())return;
+  const plannerChanged=state.planRoute!==get('planRoute').value;
+  state.enabled=state.draftEnabled;state.planRoute=get('planRoute').value;state.actRoute=get('actRoute').value;
+  closeConfig();render();notice(!state.enabled?'已恢复单 Agent；规划历史保留，不会自动执行。':plannerChanged?'规划模型已更换。正式版将携带已有计划与讨论摘要继续规划，而非强行复用不兼容会话。':'配置已应用；下一次确认将使用面板中展示的执行模型。');
+}
+function loadVersion(){
+  const selected=state.versions.find(version=>version.number===Number(get('versionSelect').value));
+  const editable=selected.number===latest().number&&state.phase==='ready'&&state.enabled&&!state.unresolved;
+  get('planEditor').value=selected.text;get('planEditor').readOnly=!editable;get('savePlan').disabled=!editable;get('versionLabel').textContent=selected.number===latest().number?'当前版本':'历史 · 只读';get('editorError').hidden=true;
+}
+function showPlan(){
+  get('versionSelect').replaceChildren(...state.versions.map(version=>{const option=document.createElement('option');option.value=String(version.number);option.textContent=`v${version.number} · ${version.reason}`;return option;}));get('versionSelect').value=String(latest().number);loadVersion();get('planDialog').showModal();
+}
+function saveEditedPlan(){
+  if(get('planEditor').readOnly||state.phase!=='ready'||!state.enabled||state.unresolved)return;
+  const text=get('planEditor').value.trim();
+  if(!text){get('editorError').hidden=false;get('editorError').textContent='计划不能为空。';return;}
+  if(text!==latest().text){addVersion(text,'手动编辑',true);get('reply').textContent=`你已手动更新计划 v${latest().number}。尚未执行，请确认新版本。`;get('planHint').textContent='手动保存不等于批准执行。';}
+  get('planDialog').close();render();notice('完整计划已保存，卡片已同步更新。保存不代表授权执行。');
+}
+function reset(){
+  clearTimer();state.phase='ready';state.round=2;state.versions=[{number:1,text:'为设置页增加名称搜索，保留分组，不增加依赖。',reason:'初稿'},{number:2,text:basePlan,reason:'补充描述匹配与空结果'}];state.enabled=true;state.draftEnabled=true;state.planRoute='codex-strong';state.actRoute='pi-deepseek';state.snapshot=null;state.failedPlan=false;state.failedAct=false;state.unresolved=false;state.feedback=[];state.pendingFeedback=[];state.lastFeedback='';get('message').value='';get('discussion').replaceChildren();get('permission').value='auto';get('scene').value='success';
+  get('reply').textContent='已把「描述匹配」和「无结果引导」补进计划。你可以继续提意见；我会留在规划阶段，不会自行开始写代码。';
+  get('execution').hidden=true;get('stop').hidden=false;get('stop').disabled=false;get('retry').hidden=true;get('backToPlan').hidden=true;get('retryPlanning').hidden=true;
+  for(const name of ['execCheck','execWork','execVerify'])get(name).className='';get('execCheck').textContent='○ 接收已确认计划';get('execWork').textContent='○ 按计划实施';get('execVerify').textContent='○ 汇报验证结果';
+  closeConfig(false);get('planDialog').close();get('packetDialog').close();announce('');notice('');render();
+}
+const retryPlanning=document.createElement('button');retryPlanning.id='retryPlanning';retryPlanning.textContent='重试上一条意见';retryPlanning.className='small';retryPlanning.hidden=true;get('suggestions').append(retryPlanning);retryPlanning.onclick=()=>submitFeedback(true);
+get('send').onclick=()=>submitFeedback();get('message').addEventListener('input',render);get('message').addEventListener('keydown',event=>{if(event.key==='Enter'&&!event.shiftKey&&!event.isComposing){event.preventDefault();submitFeedback();}});
+get('approve').onclick=confirmPlan;get('keepDiscussing').onclick=()=>{get('message').focus();notice('直接在这里说要改什么。你可以讨论任意多轮，不需要先点“拒绝计划”。');};
+document.querySelectorAll('[data-suggestion]').forEach(button=>button.onclick=()=>{if(get('message').value.trim()){notice('输入框已有内容，未覆盖。请先发送或清空。');get('message').focus();return;}get('message').value=button.dataset.suggestion;render();get('message').focus();});
+get('relayTrigger').onclick=()=>get('configPanel').hidden?openConfig():closeConfig();get('closeConfig').onclick=()=>closeConfig();get('relayMode').onclick=()=>{state.draftEnabled=true;renderConfig();};get('singleMode').onclick=()=>{state.draftEnabled=false;renderConfig();};get('planRoute').onchange=renderConfig;get('actRoute').onchange=renderConfig;get('applyConfig').onclick=applyConfig;
+document.addEventListener('keydown',event=>{if(event.key==='Escape'&&!get('configPanel').hidden){event.preventDefault();closeConfig();}});document.addEventListener('click',event=>{if(!get('configPanel').hidden&&!get('configPanel').contains(event.target)&&!get('relayTrigger').contains(event.target))closeConfig(false);});
+get('viewPlan').onclick=showPlan;get('history').onclick=showPlan;get('closePlan').onclick=()=>get('planDialog').close();get('versionSelect').onchange=loadVersion;get('savePlan').onclick=saveEditedPlan;
+get('stop').onclick=stopExecution;get('retry').onclick=()=>{if(state.phase!=='failedAct')return;get('retry').hidden=true;get('backToPlan').hidden=true;get('stop').hidden=false;notice('正式版须先核对上次改动；本原型无文件副作用，直接演示重试。');startExecution();};get('backToPlan').onclick=backToPlanning;
+get('packet').onclick=()=>{if(!state.snapshot)return;const packet=state.snapshot;get('packetText').textContent=`已确认版本：v${packet.version}\n规划：${packet.planner}\n执行：${packet.executor}\n执行权限：${packet.permission==='auto'?'自动询问':'逐项确认'}（仅演示，未接入宿主权限）\n会话：${packet.strategy}\n确认时间：${packet.confirmedAt}\n工作区：当前工作区（示意，未读取）\n\n确认后的完整计划\n${packet.plan}\n\n不传递密钥、隐藏推理或无关的完整日志。`;get('packetDialog').showModal();};get('closePacket').onclick=()=>get('packetDialog').close();get('reset').onclick=reset;
+window.addEventListener('pagehide',clearTimer);reset();
+</script>
+</body>
+</html>

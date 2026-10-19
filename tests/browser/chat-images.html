@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chat image fixture</title></head>
+<body style="margin:0">
+  <div id="fixture"></div>
+  <script>
+    const memoryStorage = () => {
+      const values = new Map();
+      return { get length() { return values.size; }, key: i => [...values.keys()][i] ?? null,
+        getItem: k => values.get(String(k)) ?? null, setItem: (k, v) => values.set(String(k), String(v)),
+        removeItem: k => values.delete(String(k)), clear: () => values.clear() };
+    };
+    Object.defineProperty(window, "localStorage", { value: memoryStorage() });
+    Object.defineProperty(window, "sessionStorage", { value: memoryStorage() });
+    localStorage.setItem("ccgui-next.language", new URLSearchParams(location.search).get("lang") === "en" ? "en" : "zh");
+    window.__TAURI_INTERNALS__ = {
+      transformCallback() { return 1; }, unregisterCallback() {}, convertFileSrc: p => p,
+      metadata: { currentWebview: { label: "main" }, currentWindow: { label: "main" } },
+      async invoke(command) {
+        if (command === "get_app_settings") return {};
+        if (command === "plugin:event|listen") return 1;
+        if (command === "plugin:event|unlisten") return null;
+        throw new Error("Fixture blocked unexpected IPC: " + command);
+      },
+    };
+  </script>
+  <script type="module" src="./chat-images.tsx"></script>
+</body></html>

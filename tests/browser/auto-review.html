@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Auto-review isolated browser acceptance</title>
+</head>
+<body style="margin:0">
+  <div id="fixture"></div>
+  <script>
+    // Document-local storage and IPC: no native application, model, configuration,
+    // session history, or real browser preferences are read or changed.
+    const memoryStorage = () => {
+      const values = new Map();
+      return { get length() { return values.size; }, key: i => [...values.keys()][i] ?? null,
+        getItem: k => values.get(String(k)) ?? null, setItem: (k, v) => values.set(String(k), String(v)),
+        removeItem: k => values.delete(String(k)), clear: () => values.clear() };
+    };
+    Object.defineProperty(window, "localStorage", { value: memoryStorage() });
+    Object.defineProperty(window, "sessionStorage", { value: memoryStorage() });
+    localStorage.setItem("ccgui-next.language", new URLSearchParams(location.search).get("lang") === "en" ? "en" : "zh");
+    const state = { calls: [], failures: 0, completed: 0, failNext: false, delayMs: 800 };
+    const notify = () => window.dispatchEvent(new Event("auto-review-fixture:change"));
+    window.__autoReviewFixture = { state, notify };
+    window.__TAURI_INTERNALS__ = {
+      transformCallback() { return 1; }, unregisterCallback() {}, convertFileSrc: p => p,
+      metadata: { currentWebview: { label: "main" }, currentWindow: { label: "main" } },
+      async invoke(command, args = {}) {
+        if (command === "answer_question") {
+          const fail = state.failNext; state.failNext = false;
+          state.calls.push({ command, args: structuredClone(args), fail }); notify();
+          await new Promise(resolve => setTimeout(resolve, state.delayMs));
+          if (fail) { state.failures++; notify(); throw "模拟提交失败 / Simulated write failure"; }
+          state.completed++; notify(); return null;
+        }
+        if (command === "get_app_settings") return {};
+        if (command === "plugin:event|listen") return 1;
+        if (command === "plugin:event|unlisten") return null;
+        throw new Error("Fixture blocked unexpected IPC: " + command);
+      },
+    };
+  </script>
+  <script type="module" src="./auto-review.tsx"></script>
+</body>
+</html>

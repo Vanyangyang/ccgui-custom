@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Assistant notices browser fixture</title></head>
+<body style="margin:0"><div id="root"></div>
+<script>
+  const memoryStorage=()=>{const values=new Map();return{get length(){return values.size},key:i=>[...values.keys()][i]??null,getItem:k=>values.get(String(k))??null,setItem:(k,v)=>values.set(String(k),String(v)),removeItem:k=>values.delete(String(k)),clear:()=>values.clear()}};
+  Object.defineProperty(window,"localStorage",{value:memoryStorage()});
+  Object.defineProperty(window,"sessionStorage",{value:memoryStorage()});
+  const params=new URLSearchParams(location.search);
+  localStorage.setItem("ccgui-next.language",params.get("lang")==="en"?"en":"zh");
+  document.documentElement.classList.toggle("dark",params.get("theme")==="dark");
+  const source={engine:"codex",sessionId:"fixture-native-session",workspacePath:"C:/fixture-only",label:"中文项目 🧑‍💻🚀 超长来源标题用于检查换行、按钮可达性与完整文本 — "+"长标题".repeat(18)};
+  const now=Date.now();
+  const notice=(id,kind,index)=>({id,kind,source,turnId:"turn-"+index,createdAtMs:now-index,startedAtMs:now-10000,tease:kind==="aside"?"旁白 "+index+"：这里有一个可以继续讨论的方向 💡":"",body:kind==="aside"?"这是一段中文旁白，包含 emoji 🧑‍💻。展开后可以完整阅读；带入草稿仅记录模拟 IPC。\n原始文本 <script>不会执行<\/script>。":"已完成对话工作 ✅。这是模拟完成摘要，长内容应当正常截断，仍可通过打开对话操作访问来源。".repeat(4),pinned:false,expiresAtMs:kind==="aside"?now+36000:null,read:false});
+  const count=params.get("count")==="one"?1:12;
+  const models=[
+    {engine:"claude",id:"sonnet",name:"Claude Sonnet",provider:"Fixture Claude provider",resolvedModel:"fixture-sonnet",supportsEffort:true,effortLevels:["low","medium","high","xhigh"]},
+    {engine:"claude",id:"haiku",name:"Claude Haiku",provider:"Fixture Claude provider",resolvedModel:"fixture-haiku",supportsEffort:false},
+    {engine:"codex",id:"astra",name:"Codex Astra",provider:"Fixture Codex provider",resolvedModel:"fixture-astra",supportsEffort:true,effortLevels:["low","medium","high","xhigh","max","ultra"]},
+  ];
+  const cliConfig={claude:{current:"fixture-claude",providers:{"fixture-claude":{name:"Fixture Claude provider"}}},codex:{current:"fixture-codex",providers:{"fixture-codex":{name:"Fixture Codex provider"}}},agy:{current:"fixture-vertex",providers:{"fixture-vertex":{name:"Fixture Vertex"}}},cursor:{current:"fixture-cursor",providers:{"fixture-cursor":{name:"Fixture Cursor"}}}};
+  const state={calls:[],failOpen:false,failRead:false,status:{enabled:true,observerEnabled:true,paused:false,focusMode:false,voiceEnabled:true,displayTarget:{mode:"active"},bodyTextPercent:100,titleTextPercent:100,interfaceTextPercent:100,observerEngine:"agy_vertex",observerModel:"gemini-4-argon",observerEffort:"medium",voiceAvailable:true,sourceEngines:["codex","cursor"],revision:1,available:true,observerAvailable:true,reason:"",model:"gemini-4-argon",effort:"medium",provider:"vertex"},notices:[...Array.from({length:count},(_,i)=>notice("completion-"+i,"completion",i)),notice("aside-1","aside",20),notice("aside-2","aside",21)]};
+  state.status.sourceEngines=["claude","codex","agy","cursor"];
+  const displays=[{id:"fixture-display",label:"Main display",width:1920,height:1080,primary:true},{id:"fixture-secondary",label:"Secondary display",width:2560,height:1440,primary:false}];
+  let nextId=1;const callbacks=new Map(),listeners=new Map();
+  const emit=(event,payload=null)=>{for(const[id,l]of listeners)if(l.event===event)callbacks.get(l.handler)?.({event,id,payload})};
+  const updateMetadata=()=>{
+    const engine=state.status.observerEngine;
+    const provider=cliConfig[engine];
+    state.status.model=state.status.observerModel||models.find(item=>item.engine===engine)?.id||"";
+    state.status.effort=state.status.observerEffort;
+    state.status.provider=engine==="agy_vertex"?"Vertex":provider?.providers[provider.current]?.name||engine;
+  };
+  if(params.get("generator")==="default"){state.status.observerEngine="codex";state.status.observerModel="";state.status.observerEffort="high";updateMetadata()}
+  const concurrentSettings=()=>{
+    Object.assign(state.status,{voiceEnabled:!state.status.voiceEnabled,displayTarget:{mode:"fixed",id:displays[1].id,label:displays[1].label},observerEngine:"codex",observerModel:"",observerEffort:"high",revision:state.status.revision+1});
+    updateMetadata();emit("assistant-notices://status",structuredClone(state.status));
+  };
+  const changeProvider=()=>{
+    cliConfig.codex.providers["fixture-codex"].name="Fixture Codex provider B";
+    for(const model of models)if(model.engine==="codex")model.provider="Fixture Codex provider B";
+    updateMetadata();emit("engine-config://changed");
+  };
+  window.__assistantNoticesFixture={state,source,emit,concurrentSettings,changeProvider};
+  window.__TAURI_EVENT_PLUGIN_INTERNALS__={unregisterListener:id=>listeners.delete(id)};
+  window.__TAURI_INTERNALS__={transformCallback:cb=>{const id=nextId++;callbacks.set(id,cb);return id},unregisterCallback:id=>callbacks.delete(id),convertFileSrc:p=>p,metadata:{currentWebview:{label:"main"},currentWindow:{label:"main"}},async invoke(command,args={}){
+    if(command==="plugin:event|listen"){const id=nextId++;listeners.set(id,args);return id}
+    if(command==="plugin:event|unlisten"){listeners.delete(args.eventId);return null}
+    state.calls.push({command,args:structuredClone(args)});
+    if(command==="get_app_settings")return {};
+    if(command==="assistant_notices_status")return structuredClone(state.status);
+    if(command==="assistant_notices_configure"){if(args.expectedRevision!==state.status.revision)throw new Error("config_conflict");Object.assign(state.status,args.config);state.status.revision++;updateMetadata();emit("assistant-notices://status",structuredClone(state.status));return structuredClone(state.status)}
+    if(command==="assistant_notices_displays")return structuredClone(displays);
+    if(command==="auto_title_models")return structuredClone(models);
+    if(command==="get_cli_config")return structuredClone(cliConfig);
+    if(command==="assistant_notices_list"||command==="assistant_notices_history"){
+      if(state.failRead)throw new Error("Fixture feed failure");
+      return structuredClone(state.notices.filter(n=>command.endsWith("history")||!n.read));
+    }
+    if(command==="assistant_notices_open"){
+      if(state.failOpen){state.failOpen=false;throw new Error("Fixture focus failure")}
+      const n=state.notices.find(n=>n.id===args.id);if(!n)throw new Error("Fixture missing id");n.read=true;emit("assistant-notices://changed");return;
+    }
+    if(command==="assistant_notices_pin"||command==="assistant_notices_read"){
+      const n=state.notices.find(n=>n.id===args.id);if(!n)return false;
+      if(command.endsWith("pin")){n.pinned=args.pinned;n.expiresAtMs=args.pinned?null:Date.now()+18000}else n.read=true;
+      emit("assistant-notices://changed");return true;
+    }
+    if(["assistant_notices_hold","assistant_notices_drag","assistant_notices_size","assistant_notices_pointer"].includes(command))return;
+    throw new Error("Unexpected fixture IPC: "+command);
+  }};
+</script><script type="module" src="./assistant-notices.tsx"></script></body></html>

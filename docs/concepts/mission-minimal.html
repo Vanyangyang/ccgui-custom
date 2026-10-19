@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>任务工作台 · 极简交互概念 / CC GUI</title>
+<style>
+:root{font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;color:#292d33;background:#fff;font-size:13px;--blue:#2d7bdc;--line:#e9ebee;--muted:#8c929b;--soft:#f7f8fa;--green:#398263;--amber:#98702a}
+*{box-sizing:border-box}body{margin:0}button,input,textarea{font:inherit}button{cursor:pointer;border:1px solid var(--line);border-radius:8px;background:#fff;color:inherit;padding:9px 13px;line-height:1.4;transition:background .15s,border-color .15s}button:hover{background:#f7f9fc;border-color:#c5d6ec}button:focus-visible,textarea:focus-visible,input:focus-visible,summary:focus-visible{outline:3px solid #a8cdf8;outline-offset:3px}button:disabled{opacity:.4;cursor:not-allowed}.primary{background:var(--blue);border-color:var(--blue);color:white}.primary:hover{background:#246bc2;border-color:#246bc2}.quiet{background:transparent;border-color:transparent;color:var(--muted)}.small{font-size:11px;padding:6px 10px}.hidden{display:none!important}.muted{color:var(--muted)}.mono{font:10px ui-monospace,SFMono-Regular,Consolas,monospace;letter-spacing:.25px}.row{display:flex;align-items:center;gap:9px}.spread{display:flex;align-items:center;justify-content:space-between;gap:16px}.app{display:grid;grid-template-columns:224px minmax(0,1fr);min-height:100dvh}.sidebar{background:#f7f7f7;border-right:1px solid var(--line);padding:0 12px 16px;display:flex;flex-direction:column;position:sticky;top:0;height:100dvh}.window-bar{height:47px;display:flex;align-items:center;justify-content:space-between;padding:0 8px;color:#999}.traffic{display:flex;gap:8px}.traffic i{width:11px;height:11px;background:#ff6158;border-radius:50%}.traffic i:nth-child(2){background:#ffbf2f}.traffic i:nth-child(3){background:#2ac940}.brand{display:flex;align-items:center;gap:9px;padding:13px 9px 23px;font-size:17px;font-weight:600}.brand-mark{width:27px;height:27px;display:grid;place-items:center;border:1px solid #dce2e8;border-radius:8px;background:#fff;font-size:11px;letter-spacing:-1px;color:#4a6176}.nav{display:flex;flex-direction:column;gap:4px}.nav-row{display:flex;align-items:center;gap:9px;padding:9px 11px;min-height:37px;font-size:12px;color:#858585;border:0;border-radius:9px;text-align:left;width:100%}.nav-row svg{width:16px;height:16px;stroke:currentColor;fill:none;stroke-width:1.5;flex-shrink:0}.nav-row.active{background:#eaf1fb;color:#3678cc;font-weight:550}.nav-row.placeholder{opacity:.45}.section-caption{margin:31px 10px 15px;font-size:10px;color:#a2a2a2}.folder{font-size:11px;padding:0 10px 12px;display:flex;gap:8px;align-items:center;color:#62676d}.thread{font-size:10px;padding:9px 10px 9px 31px;color:#979797}.sidebar-bottom{margin-top:auto;padding:20px 10px 0;display:flex;align-items:center;gap:9px;font-size:11px;color:#939393}.sidebar-bottom .mono{margin-left:auto;font-size:9px}.main{min-width:0;display:flex;flex-direction:column}.host-tabs{height:41px;border-bottom:1px solid var(--line);display:flex;align-items:stretch;padding:0 8px;flex-shrink:0;font-size:10px;color:#aaa}.host-tab{padding:0 16px;display:flex;align-items:center;gap:9px;border-right:1px solid var(--line);white-space:nowrap}.host-tab.active{color:#565e69;background:#fafbfc;border-bottom:2px solid #8bb6ec}.host-tab .x{margin-left:28px;color:#aaa}.host-placeholder{padding:0 12px;display:flex;align-items:center;font-size:16px;color:#b4b4b4}.topbar{height:65px;padding:0 34px;display:flex;align-items:center;justify-content:space-between;gap:12px}.topbar-title{font-size:13px;font-weight:550;display:flex;gap:10px;align-items:center}.topbar-title svg{width:17px;height:17px;stroke:#5c8ec7;fill:none;stroke-width:1.5}.topbar .plugin{font-size:9px;font-weight:400;color:#a0a5ad;border:1px solid var(--line);padding:2px 5px;border-radius:4px}.topbar-right{display:flex;align-items:center;gap:7px}.content{width:min(920px,100%);padding:30px 38px 50px;margin:0 auto;flex:1}.intro{padding-top:clamp(45px,10vh,120px);max-width:650px;margin:0 auto}.eyebrow{font-size:10px;font-weight:550;letter-spacing:1.7px;color:#98a1ae}.intro h1{font-size:32px;font-weight:550;letter-spacing:-1.1px;line-height:1.5;margin:15px 0 10px}.intro>p{font-size:13px;line-height:1.9;color:#949aa3;margin:0 0 31px}.goal-box{border:1px solid #dfe5ec;border-radius:13px;padding:18px 18px 13px;background:white;box-shadow:0 4px 15px #253c5904}.goal-box:focus-within{border-color:#a1c0e7;box-shadow:0 0 0 3px #eff5fd}textarea{width:100%;border:0;outline:none;background:transparent;color:#3f4957;line-height:1.9;font-size:13px;resize:vertical;min-height:102px;max-height:260px;padding:0}textarea::placeholder{color:#b0b6c0}textarea:focus-visible{outline:0}.goal-footer{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:11px}.goal-footer span{font-size:10px;color:#a1a7af}.goal-footer .primary{font-size:11px;padding:9px 14px}.examples{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:16px}.examples>span{font-size:10px;color:#aaaeb6;margin-right:2px}.example{font-size:10px;border-color:#eef0f3;color:#8993a1;padding:6px 10px;border-radius:6px}.intro-note{margin-top:43px;display:flex;align-items:center;gap:7px;color:#a8aeb7;font-size:10px}.intro-note svg{width:12px;height:12px;stroke:#9cabb8;fill:none;stroke-width:1.5}.task-heading{margin:12px 0 29px}.task-heading .eyebrow{font-size:9px}.task-heading h1{font-size:25px;font-weight:550;letter-spacing:-.7px;line-height:1.5;margin:11px 0 9px;overflow-wrap:anywhere}.task-heading>p{font-size:11px;color:#929ba7;line-height:1.9;margin:0;white-space:pre-wrap;overflow-wrap:anywhere}.phase{font-size:10px;color:#7e91a7;display:flex;align-items:center;gap:6px}.phase-dot{width:5px;height:5px;border-radius:50%;background:currentColor}.phase.waiting{color:#a5813f}.phase.done{color:#448b6b}.phase.stopped{color:#999}.flow-label{margin-bottom:13px;color:#909aaa;font-size:10px}.flow-label .small{font-size:10px}.flow{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:22px;margin:0 0 12px}.step{position:relative;background:#fff;border:1px solid #e0e5eb;border-radius:9px;padding:15px 13px;min-height:130px;display:flex;flex-direction:column;justify-content:flex-start}.step:not(:last-child):after{content:"";position:absolute;width:23px;height:1px;background:#d4dce6;right:-24px;top:50%}.step:not(:last-child):before{content:"";position:absolute;width:5px;height:5px;border-top:1px solid #c8d3e0;border-right:1px solid #c8d3e0;transform:rotate(45deg);right:-23px;top:calc(50% - 2px)}.step-num{font:10px ui-monospace,monospace;color:#a2adb9;margin-bottom:17px}.step-title{font-size:12px;line-height:1.6;color:#5e6b7c;font-weight:500;overflow-wrap:anywhere}.step-status{font-size:9px;color:#a4adba;margin-top:9px;line-height:1.6}.step.running{border-color:#81afe7;background:#f8fbff}.step.running .step-num,.step.running .step-status{color:#498edc}.step.done{border-color:#d6e6dd}.step.done .step-num,.step.done .step-status{color:#6f9e84}.step.waiting{border-color:#ddc68c;background:#fffefa}.step.waiting .step-num,.step.waiting .step-status{color:#ab8744}.step.stopped{background:#f9fafb;border-style:dashed}.flow-note{font-size:10px;color:#a0a8b4;line-height:1.8;margin:12px 0 23px}.plan-details{padding:17px 0 20px;border-bottom:1px solid var(--line);margin-bottom:19px;display:grid;grid-template-columns:55px 1fr;gap:10px 13px;font-size:11px;line-height:1.8}.plan-details dt{color:#a4acb8}.plan-details dd{margin:0;color:#778394;overflow-wrap:anywhere}.section-action{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap}.section-action p{font-size:10px;color:#a2a9b3;line-height:1.8;margin:0}.section-action .primary{font-size:11px;padding:10px 16px}.edit-panel{border:1px solid #e4e9f0;border-radius:10px;padding:18px;margin-top:15px;background:#fcfdfe}.edit-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}.edit-grid label{font-size:10px;color:#95a1b0;display:flex;flex-direction:column;gap:7px}.edit-grid input{width:100%;padding:9px 10px;border:1px solid #dde5ee;border-radius:6px;background:#fff;color:#5b6e86;font-size:12px}.edit-actions{margin-top:15px;display:flex;justify-content:flex-end;gap:7px}.work-status{border-top:1px solid var(--line);margin-top:26px;padding-top:25px}.work-status h2{font-size:16px;font-weight:500;color:#596b81;margin:0 0 8px}.work-status p{font-size:11px;color:#9aa4b0;line-height:1.9;margin:0}.activity-dot{display:inline-block;height:6px;width:6px;background:#6d9fd9;border-radius:50%;margin-right:8px}.run-details{margin-top:20px;border:1px solid var(--line);border-radius:8px;padding:12px 15px;font-size:11px;color:#8291a3}.run-details summary{cursor:pointer;list-style:none}.run-details summary::-webkit-details-marker{display:none}.run-details summary:before{content:'›';margin-right:8px;color:#8b9fb7}.run-details[open] summary:before{content:'⌄'}.subtasks{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:13px}.subtask{padding:12px;border:1px solid #e1e9f3;border-radius:7px;background:#fafcff;line-height:1.8;font-size:10px}.subtask span{display:block;color:#a1afbf;font-size:9px}.stop-row{margin-top:22px;display:flex;justify-content:flex-end}.decision-card{border:1px solid #e9debd;border-radius:11px;padding:24px;background:#fffefa;margin-top:26px}.decision-eyebrow{font-size:10px;color:#b09559;display:flex;align-items:center;gap:7px}.decision-card h2{font-size:19px;color:#655b45;font-weight:550;margin:13px 0 10px;line-height:1.5}.decision-card p{font-size:12px;line-height:1.9;color:#958974;margin:0 0 16px}.evidence{padding:13px 15px;border:1px solid #eee7d7;border-radius:7px;background:#fff;font-size:11px;color:#8e8470;line-height:1.9;margin-bottom:18px}.decision-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.decision-actions button{font-size:11px}.feedback-editor{margin-top:20px;border-top:1px solid #eee5d1;padding-top:17px}.feedback-editor label{font-size:11px;color:#9c8c6c;display:block;margin-bottom:10px}.feedback-editor textarea{font-size:12px;min-height:78px;border:1px solid #e8ddc5;border-radius:7px;background:white;padding:10px 12px}.feedback-editor textarea:focus-visible{outline:3px solid #a8cdf8;outline-offset:2px}.feedback-scope{font-size:10px;color:#b0a184;margin:9px 0 13px}.feedback-record{padding:13px 15px;margin-top:17px;border-left:2px solid #b3cdec;background:#f8fbff;font-size:11px;line-height:1.9;color:#7e93ac;overflow-wrap:anywhere;white-space:pre-wrap}.result-card{border:1px solid #dce9e1;border-radius:11px;padding:24px;margin-top:26px;background:#fcfefd}.result-eyebrow{font-size:10px;color:#86a393;display:flex;align-items:center;gap:7px}.result-card h2{font-size:20px;font-weight:550;color:#4f7261;margin:13px 0 9px}.result-card>p{font-size:12px;color:#92a298;line-height:1.9}.result-preview{background:#fff;border:1px solid #e3eae6;border-radius:8px;padding:18px;margin:20px 0;white-space:pre-wrap;overflow-wrap:anywhere;color:#798f83;font-size:12px;line-height:2}.result-actions{display:flex;gap:8px;flex-wrap:wrap}.result-actions button{font-size:11px}.fine-print{font-size:10px!important;color:#a8b6ad!important;margin:16px 0 0;line-height:1.8}.empty-result{padding:24px 0;border-top:1px solid var(--line);margin-top:27px}.empty-result h2{font-size:18px;font-weight:500;color:#79828c}.empty-result p{font-size:12px;color:#a3aab3;line-height:1.9}.demo-footer{border-top:1px solid var(--line);min-height:45px;display:flex;align-items:center;justify-content:space-between;padding:9px 24px;gap:12px;background:#fafbfc;color:#a5adb9;font-size:9px}.demo-footer button{font-size:10px;padding:5px 9px;border-color:#dfe7f0;background:#fff;color:#8198b3}.demo-footer .row{flex-wrap:wrap}.foot-mark{width:5px;height:5px;border-radius:50%;background:#c4cedb}.toast{position:fixed;left:50%;bottom:65px;transform:translateX(-50%);padding:12px 18px;background:#344a63;color:#fff;border-radius:9px;font-size:11px;max-width:min(520px,90vw);box-shadow:0 6px 25px #263d5a18;z-index:20;line-height:1.8}dialog{max-width:570px;width:calc(100% - 36px);max-height:85dvh;padding:26px;border:1px solid #e1e7ef;border-radius:13px;box-shadow:0 30px 100px #293e5820;color:#48596f}dialog::backdrop{background:#243b533d}dialog h2{font-size:21px;font-weight:550;margin:5px 0 17px}dialog p,dialog li{font-size:12px;color:#8796a8;line-height:1.95}dialog ul{padding-left:18px}dialog strong{font-weight:550;color:#63778f}dialog .dialog-actions{display:flex;justify-content:flex-end;gap:9px;margin-top:22px}.error{font-size:11px;color:#b76565;margin:12px 0 0;line-height:1.8}.mobile-brand{display:none}
+@media(min-width:1500px){.content{padding-top:42px}.intro{padding-top:100px}.task-heading{margin-top:23px}}
+@media(max-width:1100px){.app{grid-template-columns:190px minmax(0,1fr)}.content{padding:22px 27px 40px}.topbar{padding:0 25px}.flow{gap:15px}.step{padding:13px 10px}.step:not(:last-child):after{width:16px;right:-17px}.step:not(:last-child):before{right:-16px}.task-heading h1{font-size:23px}.thread{padding-left:20px}.brand{font-size:16px}}
+@media(max-width:760px){.app{grid-template-columns:1fr}.sidebar{display:none}.host-tabs{height:38px;font-size:9px}.host-tab{padding:0 12px}.host-tab .x{margin-left:16px}.topbar{height:59px;padding:0 19px}.topbar .plugin{display:none}.content{padding:15px 20px 35px}.intro{padding-top:42px}.intro h1{font-size:28px}.intro>p{font-size:12px}.goal-box{padding:15px}.goal-footer{align-items:flex-end}.goal-footer span{max-width:150px;font-size:9px;line-height:1.8}.intro-note{margin-top:29px;font-size:9px}.task-heading h1{font-size:22px}.task-heading{margin:6px 0 23px}.flow{grid-template-columns:1fr 1fr;gap:18px 22px}.step{min-height:116px;padding:13px}.step:nth-child(2):after{right:auto;left:50%;top:100%;height:19px;width:1px}.step:nth-child(2):before{right:auto;left:calc(50% - 2px);top:calc(100% + 13px);transform:rotate(135deg)}.step:nth-child(3){grid-column:2;grid-row:2}.step:nth-child(4){grid-column:1;grid-row:2}.step:nth-child(3):after{right:auto;left:-23px;width:22px}.step:nth-child(3):before{right:auto;left:-22px;transform:rotate(-135deg)}.flow-note{font-size:9px}.decision-card,.result-card{padding:19px}.decision-card h2{font-size:18px}.demo-footer{padding:9px 15px;align-items:flex-start;line-height:1.7;font-size:8px}.demo-footer .row{gap:6px}.demo-footer button{font-size:9px;white-space:nowrap}.edit-grid{grid-template-columns:1fr}.subtasks{grid-template-columns:1fr}.section-action{gap:16px}.section-action p{font-size:9px}.task-heading .spread{align-items:flex-start}.phase{font-size:9px}.topbar-right{gap:2px}}
+@media(prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar" aria-label="CC GUI 宿主侧栏示意">
+    <div class="window-bar"><span class="traffic" aria-hidden="true"><i></i><i></i><i></i></span><span aria-hidden="true">◧</span></div>
+    <div class="brand"><span class="brand-mark">CC</span>CC GUI</div>
+    <nav class="nav" aria-label="宿主导航示意">
+      <div class="nav-row"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M11 3H4a1 1 0 0 0-1 1v11l4-3h8a1 1 0 0 0 1-1V9M15 2v6M12 5h6"/></svg>新建会话</div>
+      <div class="nav-row" id="host-browser"><svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7"/><ellipse cx="10" cy="10" rx="3" ry="7"/><path d="M3 10h14"/></svg>新建浏览器</div>
+      <button class="nav-row active" id="plugin-entry" aria-current="page"><svg viewBox="0 0 20 20" aria-hidden="true"><rect x="2" y="2" width="5" height="5" rx="1"/><rect x="12" y="12" width="5" height="5" rx="1"/><path d="M4.5 7v7.5H12M7 4.5h7.5V12"/></svg>任务工作台</button>
+      <div class="nav-row placeholder"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m11 2-7 9h5l-1 7 8-10h-6z"/></svg>自动化</div>
+    </nav>
+    <div class="section-caption">工作空间</div>
+    <div class="folder"><span>⌄</span><span>▱</span>desktop-cc-gui</div>
+    <div class="thread">修复流式消息回退</div><div class="thread">插件 SDK 接入讨论</div><div class="thread">版本发布检查</div>
+    <div class="sidebar-bottom"><span>⚙</span>设置<span class="mono">v1.0.6</span></div>
+  </aside>
+  <main class="main">
+    <div class="host-tabs" aria-label="宿主页签示意"><span class="host-tab">▤　插件 SDK 接入讨论</span><span class="host-tab active">⌘　任务工作台<span class="x" aria-hidden="true">×</span></span><span class="host-placeholder" aria-hidden="true">＋</span></div>
+    <header class="topbar"><div class="topbar-title"><svg viewBox="0 0 20 20" aria-hidden="true"><rect x="2" y="2" width="5" height="5" rx="1"/><rect x="12" y="12" width="5" height="5" rx="1"/><path d="M4.5 7v7.5H12M7 4.5h7.5V12"/></svg>任务工作台<span class="plugin">插件</span></div><div class="topbar-right"><button class="quiet small hidden" id="new-task">＋ 新任务</button><button class="quiet small" id="about" aria-label="查看极简设计说明">ⓘ</button></div></header>
+    <div class="content">
+      <section id="create-view" class="intro" aria-labelledby="create-title">
+        <div class="eyebrow">START WITH A GOAL</div>
+        <h1 id="create-title">你想完成什么？</h1>
+        <p>先说目标。我们一起确认怎么做，需要你时再找你。</p>
+        <form id="goal-form">
+          <div class="goal-box"><label for="goal" class="hidden">描述你的目标</label><textarea id="goal" maxlength="1200" placeholder="例如：审查项目里的所有 PR，整理风险，把需要我决定的地方提出来。" aria-label="描述你的目标" required></textarea><div class="goal-footer"><span>先形成流程，确认后才开始。</span><button class="primary" type="submit" id="generate">整理为流程　↗</button></div></div>
+          <p id="goal-error" class="error hidden" role="alert"></p>
+        </form>
+        <div class="examples"><span>试一个目标</span><button class="example" data-example="pr">审查项目 PR</button><button class="example" data-example="feedback">整理客户反馈</button><button class="example" data-example="general">准备一份调研报告</button></div>
+        <div class="intro-note"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.5 13 4v4c0 3-5 5.5-5 5.5S3 11 3 8V4zM5.5 7.5 7 9l3.5-3.5"/></svg>你确认流程，AI 推进工作，重要决定仍由你来做。</div>
+      </section>
+      <section id="task-view" class="hidden" aria-labelledby="task-title">
+        <div class="task-heading"><div class="spread"><span class="eyebrow">ONE GOAL / ONE FLOW</span><span class="phase" id="phase" role="status" aria-live="polite"></span></div><h1 id="task-title"></h1><p id="original-goal"></p></div>
+        <div class="flow-label spread"><span id="flow-caption">建议流程 · 4 个步骤</span><button class="quiet small" id="edit-plan">修改步骤</button></div>
+        <div class="flow" id="flow" role="list" aria-label="任务流程"></div>
+        <p class="flow-note" id="flow-note"></p>
+        <section id="draft-panel">
+          <dl class="plan-details"><dt>范围</dt><dd id="scope-text"></dd><dt>交付</dt><dd id="deliverable-text"></dd><dt>边界</dt><dd>仅处理与产出草稿；需要你确认时暂停，不自动发布、创建外部任务或合并代码。</dd></dl>
+          <section id="edit-panel" class="edit-panel hidden" aria-label="修改流程步骤"><form id="edit-form"><div class="edit-grid" id="edit-grid"></div><p id="edit-error" class="error hidden" role="alert"></p><div class="edit-actions"><button class="quiet small" id="cancel-edit" type="button">取消</button><button class="small" type="submit">保存步骤</button></div></form></section>
+          <div class="section-action" id="start-actions"><p>本稿使用示例材料，不读取真实仓库或文件。</p><button class="primary" id="start">按这个流程开始　→</button></div>
+        </section>
+        <section id="running-panel" class="hidden"><div class="work-status"><h2><span class="activity-dot"></span><span id="running-title">正在按流程推进</span></h2><p id="running-copy"></p></div><details class="run-details" id="run-details"><summary id="run-summary">查看本步正在处理的内容</summary><div class="subtasks" id="subtasks"></div></details><div id="running-feedback" class="feedback-record hidden"></div></section>
+        <section id="decision-panel" class="decision-card hidden" aria-labelledby="decision-title"><div class="decision-eyebrow">◇　需要你的一次决定</div><h2 id="decision-title"></h2><p id="decision-copy"></p><div class="evidence" id="decision-evidence"></div><div class="decision-actions" id="decision-actions"><button class="primary" id="approve">按建议完成</button><button id="request-changes">提出修改</button></div><form id="feedback-form" class="feedback-editor hidden"><label for="feedback">哪里需要调整？</label><textarea id="feedback" maxlength="1000" placeholder="直接说你的要求，例如：把这一项单独保留，其他部分继续。" required></textarea><p id="feedback-error" class="error hidden" role="alert"></p><div class="feedback-scope">仅作用于本次任务 · 补充处理后会再请你确认</div><div class="decision-actions"><button class="primary" type="submit">反馈并继续处理</button><button class="quiet" id="cancel-feedback" type="button">取消</button></div></form><div id="decision-feedback" class="feedback-record hidden"></div></section>
+        <section id="result-panel" class="result-card hidden" aria-labelledby="result-title"><div class="result-eyebrow">✓　这件事完成了</div><h2 id="result-title"></h2><p id="result-description"></p><div id="result-text" class="result-preview"></div><div class="result-actions"><button class="primary" id="download-result">下载示例结果</button><button id="another-task">开始另一件事</button></div><p class="fine-print">这是概念稿生成的模拟结果，不是真实审查、真实分析或已执行的外部操作。</p></section>
+        <section id="stopped-panel" class="empty-result hidden"><h2>任务已停止。</h2><p>没有继续执行后续步骤。目标和流程仍然保留，你可以重新确认后开始。</p><button id="back-to-draft">回到流程</button></section>
+        <div class="stop-row hidden" id="stop-row"><button class="quiet small" id="stop">停止这次任务</button></div>
+      </section>
+    </div>
+    <footer class="demo-footer"><div class="row"><i class="foot-mark"></i><span id="demo-note">极简交互原型 · 预设流程，无真实 AI、联网或后台执行</span></div><div class="row"><button id="next-event" class="hidden">演示下一步 →</button><span class="mono">V0.1</span></div></footer>
+  </main>
+</div>
+<dialog id="about-dialog"><div class="spread"><span class="eyebrow">FIRST PRINCIPLES / MVP</span><button class="quiet small" data-close aria-label="关闭设计说明">✕</button></div><h2>只留下完成一件事的最短路径。</h2><p><strong>目标 → 流程 → 执行 → 决定 → 结果。</strong><br>不是五个模块，而是同一页的五个状态。</p><ul><li>创作只需一句目标与四步流程，不要求用户学习节点配置。</li><li>执行时保留可见的流程状态；子任务收在一步里，按需展开。</li><li>需要反馈时，把决定、依据和操作直接带到用户面前，不另建通知中心。</li><li>反馈只改变本次任务；再次确认后才完成，不静默修改长期 SOP。</li><li>第一版不做流程库、定时任务、多人协作、自动发布与复杂权限设置。</li></ul><p><strong>演示边界：</strong>PR、反馈与通用目标映射到预设示例，任意输入不代表 AI 已理解。下方“演示下一步”模拟执行事件；没有定时器推进或真实后台任务。反馈内容会完整保留，但不会被模型解析。</p><p><strong>项目边界：</strong>侧栏、会话列表与窗口页签为宿主外观示意，只有任务插件交互可用。现有 SDK 支持侧栏入口、中心页签和 Agent 轮次；紧邻“新建浏览器”的位置仍需调整宿主排序。本文件不是已安装插件。</p><p><strong>真实产品启动前：</strong>必须补齐数据来源、处理范围与权限校验。本稿以明确的示例材料代替，不把输入一句话等同于已经取得数据授权。</p><div class="dialog-actions"><button data-close class="primary">继续体验</button></div></dialog>
+<dialog id="confirm-dialog"><h2>开始一件新的事？</h2><p>此极简原型只保留当前任务。继续会清空本次模拟流程、反馈与结果；真实应用应保留运行记录。</p><div class="dialog-actions"><button data-close>保留当前任务</button><button class="primary" id="confirm-new">清空并新建</button></div></dialog>
+<div class="toast hidden" id="toast" role="status" aria-live="polite"></div>
+<script>
+const find = id => document.getElementById(id);
+const examples = {
+  pr: '审查项目里的所有 PR，整理风险，把需要我决定的地方提出来。',
+  feedback: '整理本周的客户反馈，合并重复问题，选出最值得优先处理的三项，让我确认。',
+  general: '整理已有资料，准备一份新功能调研报告，把结论与待确认的问题分开。'
+};
+const presets = {
+  pr: {
+    title: '把 PR 审查清楚', steps: ['读取 PR', '逐项审查', '请你确认', '交付审查结果'],
+    scope: '演示仓库的 3 个 PR（固定示例，不读取真实 GitHub）', deliverable: '一份风险摘要，以及需要人工复核的 PR 清单',
+    items: ['PR #241 · 消息渲染', 'PR #242 · 补充测试', 'PR #243 · 权限调整'],
+    decision: '这项权限变更，建议保留人工复核。', copy: '其余两项在示例审查中未发现阻断问题。PR #243 涉及权限范围，建议单独列出，不自动合并。',
+    evidence: '依据：PR #243 改变了权限判断路径。建议将其标为“需人工复核”，而不是直接给出可合并结论。',
+    resultTitle: 'PR 审查摘要', result: '已审查 3 个示例 PR。\n\n• PR #241：示例审查未发现阻断问题。\n• PR #242：示例审查未发现阻断问题。\n• PR #243：权限变更，保留人工复核。\n\n未合并任何 PR，未向 GitHub 发送评论。'
+  },
+  feedback: {
+    title: '让客户反馈变成清晰的优先项', steps: ['读取反馈', '归类与排序', '请你确认', '交付问题清单'],
+    scope: '本周 12 条示例反馈（固定示例，不连接真实客户数据）', deliverable: '一份去重分类与三项优先问题草案',
+    items: ['分组 A · 使用体验', '分组 B · 稳定性', '分组 C · 新需求'],
+    decision: '这两类反馈，要合并看待吗？', copy: '“输出卡顿”和“滚动不跟随”在描述上相似，但可能是不同问题。建议先分别保留，避免过早合并。',
+    evidence: '依据：两组示例反馈的触发条件不同。分别保留后，输出卡顿、滚动跟随、历史检索列为前三项。',
+    resultTitle: '客户反馈优先清单', result: '已整理 12 条示例反馈。\n\n1. 输出卡顿：优先补充复现条件。\n2. 滚动不跟随：单独保留并核查。\n3. 历史检索：整理需求范围。\n\n以上为草案，未创建或发布任何外部任务。'
+  },
+  general: {
+    title: '把目标整理成可交付的结果', steps: ['明确材料与范围', '整理与处理', '请你确认', '交付结果'],
+    scope: '通用演示材料 A、B、C（没有读取你未提供的资料）', deliverable: '结构化结果草案、依据与待确认项',
+    items: ['材料 A · 现状', '材料 B · 对比', '材料 C · 待验证信息'],
+    decision: '这一条信息尚未验证，先标明不确定性？', copy: '示例材料中有一条依据不足。建议将它与已确认内容分开，不替你补成确定结论。',
+    evidence: '依据：材料 C 缺少来源。建议保留“待验证”标记，其他内容继续形成草案。',
+    resultTitle: '结构化结果草案', result: '示例材料已按三部分整理。\n\n• 已确认内容：归纳材料 A、B。\n• 待验证信息：材料 C 缺少来源，单独标记。\n• 下一步：补齐来源后再形成正式结论。\n\n此内容是通用流程示意，不是对你的目标的真实研究结果。'
+  }
+};
+let state = { phase: 'create', kind: 'general', goal: '', steps: [], progress: 0, feedback: [], revision: false };
+let toastTimer;
+function hide(id, value) { find(id).classList.toggle('hidden', value); }
+function message(text) { clearTimeout(toastTimer); find('toast').textContent = text; hide('toast', false); toastTimer = setTimeout(() => hide('toast', true), 4000); }
+function selectedPreset() { return presets[state.kind]; }
+function inferKind(goal) { return /\bpr\b|拉取请求|合并请求/i.test(goal) ? 'pr' : /反馈|客户|用户意见/.test(goal) ? 'feedback' : 'general'; }
+function setPhase(phase) { state.phase = phase; render(); }
+function setError(id, text) { find(id).textContent = text; hide(id, !text); }
+function phaseLabel() { return { create: '', draft: '等你确认流程', running: state.revision ? '按反馈补充处理' : '正在执行', waiting: '需要你 · 1', finishing: '正在整理结果', done: '已完成', stopped: '已停止' }[state.phase]; }
+function stepState(index) {
+  if (state.phase === 'draft') return 'pending';
+  if (state.phase === 'done') return 'done';
+  if (state.phase === 'stopped') return index < state.progress ? 'done' : 'stopped';
+  const current = state.phase === 'waiting' ? 2 : state.phase === 'finishing' ? 3 : state.progress;
+  return index < current ? 'done' : index === current ? state.phase === 'waiting' ? 'waiting' : 'running' : 'pending';
+}
+function renderFlow() {
+  find('flow').replaceChildren();
+  state.steps.forEach((title, index) => {
+    const status = stepState(index);
+    const card = document.createElement('div'); card.className = `step ${status}`; card.setAttribute('role', 'listitem');
+    const number = document.createElement('span'); number.className = 'step-num'; number.textContent = status === 'done' ? '✓' : String(index + 1).padStart(2, '0');
+    const heading = document.createElement('div'); heading.className = 'step-title'; heading.textContent = title;
+    const caption = document.createElement('span'); caption.className = 'step-status'; caption.textContent = { pending: state.phase === 'draft' ? index === 2 ? '人工确认点' : 'AI 处理' : '等待前序步骤', running: '正在处理', done: '已完成', waiting: '等待你的反馈', stopped: '未继续执行' }[status];
+    card.append(number, heading, caption); find('flow').append(card);
+  });
+}
+function resultText() {
+  if (state.feedback.length) return `补充反馈已记录，流程演示已完成。\n\n你的目标：\n${state.goal}\n\n你的反馈：\n${state.feedback.map((text, index) => `${index + 1}. ${text}`).join('\n')}\n\n原始建议：\n${selectedPreset().evidence}\n\n这份原型没有真实模型，未根据反馈重新分析材料。正式结果需要接入 AI 和真实数据后生成；此处仅交付反馈记录，不将旧的示例结论冒充修改后的成果。`;
+  return selectedPreset().result;
+}
+function render() {
+  const preset = selectedPreset();
+  hide('create-view', state.phase !== 'create'); hide('task-view', state.phase === 'create'); hide('new-task', state.phase === 'create');
+  find('task-title').textContent = preset.title; find('original-goal').textContent = state.goal;
+  find('phase').textContent = `● ${phaseLabel()}`; find('phase').className = `phase ${state.phase}`;
+  hide('draft-panel', state.phase !== 'draft'); hide('edit-plan', state.phase !== 'draft');
+  hide('running-panel', !['running', 'finishing'].includes(state.phase)); hide('decision-panel', state.phase !== 'waiting');
+  hide('result-panel', state.phase !== 'done'); hide('stopped-panel', state.phase !== 'stopped');
+  hide('stop-row', !['running', 'waiting', 'finishing'].includes(state.phase));
+  hide('next-event', !['running', 'finishing'].includes(state.phase));
+  find('flow-caption').textContent = state.phase === 'draft' ? '建议流程 · 4 个步骤' : '本次运行';
+  find('flow-note').textContent = state.phase === 'draft' ? '这是预设示例，不代表 AI 已理解目标。你可以先修改步骤名称；执行逻辑仍为示例。' : '同一份流程，只更新状态。需要你时，决定会直接出现在这里。';
+  find('scope-text').textContent = preset.scope; find('deliverable-text').textContent = preset.deliverable;
+  find('running-title').textContent = state.phase === 'finishing' ? '正在整理最终交付' : state.revision ? '已收到反馈，正在补充处理' : state.progress === 0 ? '正在读取示例材料' : '正在逐项处理';
+  find('running-copy').textContent = state.phase === 'finishing' ? '你的决定已记录，下一步交付结果。此处为手动推进的演示。' : state.revision ? '仅调整本次任务；补充处理后再次请你确认。本稿不会真实解析反馈。' : '暂时不需要你操作。真实产品在需要你时通知；本稿可用下方按钮推进演示。';
+  hide('run-details', state.phase === 'finishing'); find('subtasks').replaceChildren();
+  preset.items.forEach(title => { const item = document.createElement('div'); item.className = 'subtask'; item.textContent = title; const status = document.createElement('span'); status.textContent = state.progress === 0 ? '等待读取' : '示例处理中'; item.append(status); find('subtasks').append(item); });
+  hide('running-feedback', !state.feedback.length); find('running-feedback').textContent = state.feedback.length ? `你的补充要求：\n${state.feedback.at(-1)}` : '';
+  find('decision-title').textContent = state.revision ? '已走到再次确认这一步。' : preset.decision;
+  find('decision-copy').textContent = state.revision ? '真实产品会在这里展示依据反馈修改后的草稿。本稿只保留了你的反馈，用于体验“修改 → 再处理 → 再确认”的交互，不伪造新的分析结论。' : preset.copy;
+  find('decision-evidence').textContent = state.revision ? '本轮可确认：反馈已记录，演示流程可结束。真实内容修订仍需接入模型后完成。' : preset.evidence;
+  find('approve').textContent = state.revision ? '确认，完成演示' : '按建议完成';
+  hide('decision-feedback', !state.feedback.length); find('decision-feedback').textContent = state.feedback.length ? `本次反馈：\n${state.feedback.at(-1)}` : '';
+  find('result-title').textContent = state.feedback.length ? '本次目标与反馈记录' : preset.resultTitle;
+  find('result-description').textContent = state.feedback.length ? '已走完反馈闭环。以下保留你的真实输入，不把模拟处理当作真实成果。' : '流程与决定已经收敛。结果留在这里，不用回到对话里翻找。';
+  find('result-text').textContent = resultText(); renderFlow();
+}
+function reset() {
+  state = { phase: 'create', kind: 'general', goal: '', steps: [], progress: 0, feedback: [], revision: false };
+  find('goal').value = ''; find('feedback').value = ''; hide('feedback-form', true); hide('decision-actions', false); hide('edit-panel', true); hide('start-actions', false);
+  for (const id of ['goal-error', 'edit-error', 'feedback-error']) setError(id, '');
+  find('run-details').open = false; clearTimeout(toastTimer); hide('toast', true); render(); find('goal').focus();
+}
+function requestNew() { if (state.phase === 'create') { find('goal').focus(); return; } find('confirm-dialog').showModal(); }
+function advance() {
+  if (state.phase === 'finishing') { setPhase('done'); find('result-title').setAttribute('tabindex', '-1'); find('result-title').focus(); return; }
+  if (state.phase !== 'running') return;
+  if (state.progress === 0) { state.progress = 1; render(); return; }
+  state.progress = 2; hide('feedback-form', true); hide('decision-actions', false); setPhase('waiting'); find('approve').focus();
+}
+find('goal-form').addEventListener('submit', event => {
+  event.preventDefault(); const goal = find('goal').value.trim();
+  if (!goal) { setError('goal-error', '先写下你想完成的事情。'); return; }
+  if (state.phase !== 'create') return;
+  setError('goal-error', ''); state.goal = goal; state.kind = inferKind(goal); state.steps = [...selectedPreset().steps]; setPhase('draft'); find('start').focus();
+});
+document.querySelectorAll('[data-example]').forEach(button => button.addEventListener('click', () => { find('goal').value = examples[button.dataset.example]; setError('goal-error', ''); find('goal').focus(); }));
+find('edit-plan').addEventListener('click', () => {
+  find('edit-grid').replaceChildren();
+  state.steps.forEach((title, index) => { const label = document.createElement('label'); label.textContent = `步骤 ${index + 1}${index === 2 ? ' · 人工确认点保留' : ''}`; const input = document.createElement('input'); input.value = title; input.id = `step-input-${index}`; input.maxLength = 32; input.required = true; label.append(input); find('edit-grid').append(label); });
+  hide('edit-panel', false); hide('start-actions', true); find('step-input-0').focus();
+});
+find('edit-form').addEventListener('submit', event => { event.preventDefault(); const titles = Array.from(find('edit-grid').querySelectorAll('input'), input => input.value.trim()); if (titles.some(title => !title)) { setError('edit-error', '每个步骤都需要一个名称。'); return; } state.steps = titles; setError('edit-error', ''); hide('edit-panel', true); hide('start-actions', false); render(); find('start').focus(); message('步骤名称已更新，演示逻辑不变。'); });
+find('cancel-edit').addEventListener('click', () => { hide('edit-panel', true); hide('start-actions', false); setError('edit-error', ''); find('edit-plan').focus(); });
+find('start').addEventListener('click', () => { if (state.phase !== 'draft') return; state.progress = 0; state.feedback = []; state.revision = false; setPhase('running'); find('next-event').focus(); });
+find('next-event').addEventListener('click', advance);
+find('request-changes').addEventListener('click', () => { hide('decision-actions', true); hide('feedback-form', false); find('feedback').focus(); });
+find('cancel-feedback').addEventListener('click', () => { hide('decision-actions', false); hide('feedback-form', true); setError('feedback-error', ''); find('request-changes').focus(); });
+find('feedback-form').addEventListener('submit', event => {
+  event.preventDefault(); const feedback = find('feedback').value.trim(); if (!feedback) { setError('feedback-error', '写下需要调整的地方，或取消返回。'); return; } if (state.phase !== 'waiting') return;
+  state.feedback.push(feedback); state.revision = true; state.progress = 1; find('feedback').value = ''; setError('feedback-error', ''); hide('feedback-form', true); hide('decision-actions', false); setPhase('running'); find('next-event').focus();
+});
+find('approve').addEventListener('click', () => { if (state.phase !== 'waiting') return; state.progress = 3; setPhase('finishing'); find('next-event').focus(); });
+find('stop').addEventListener('click', () => { if (!['running', 'waiting', 'finishing'].includes(state.phase)) return; setPhase('stopped'); hide('feedback-form', true); hide('decision-actions', false); find('back-to-draft').focus(); });
+find('back-to-draft').addEventListener('click', () => { if (state.phase !== 'stopped') return; state.progress = 0; hide('edit-panel', true); hide('start-actions', false); setPhase('draft'); find('start').focus(); });
+for (const id of ['new-task', 'another-task']) find(id).addEventListener('click', requestNew);
+find('plugin-entry').addEventListener('click', () => { if (state.phase === 'create') find('goal').focus(); else find('task-title').scrollIntoView({ block: 'start' }); });
+find('confirm-new').addEventListener('click', () => { find('confirm-dialog').close(); reset(); });
+find('about').addEventListener('click', () => find('about-dialog').showModal());
+document.querySelectorAll('[data-close]').forEach(button => button.addEventListener('click', () => button.closest('dialog').close()));
+find('download-result').addEventListener('click', () => {
+  if (state.phase !== 'done') return;
+  const result = `概念稿模拟结果 · 非真实执行\n\n目标：${state.goal}\n\n${resultText()}`;
+  const url = URL.createObjectURL(new Blob([result], { type: 'text/plain;charset=utf-8' })); const link = document.createElement('a'); link.href = url; link.download = `任务工作台-${state.kind}-模拟结果.txt`; document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+});
+window.addEventListener('pagehide', () => clearTimeout(toastTimer));
+render();
+</script>
+</body>
+</html>

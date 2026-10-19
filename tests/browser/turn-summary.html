@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Turn summary visual regression</title></head>
+<body style="margin:0">
+<div id="fixture"></div>
+<script>
+  const values = new Map();
+  Object.defineProperty(window, "localStorage", { value: {
+    getItem: key => values.get(String(key)) ?? null,
+    setItem: (key, value) => values.set(String(key), String(value)),
+    removeItem: key => values.delete(String(key)), clear: () => values.clear(),
+  } });
+</script>
+<script type="module" src="./turn-summary.tsx"></script>
+</body>
+</html>

@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>FileSearchOverlay fixture</title>
+</head>
+<body style="margin:0;background:#0b0b0b">
+<div id="fixture"></div>
+<script>
+// Stands in for the Tauri IPC surface. The index rows below are the shape the
+// backend returns from `list_file_index`: workspace-relative paths with "/"
+// separators, dirs flagged. `src-extra/` exists specifically because the
+// folder scope must NOT sweep it in when the user searches `src/`.
+const WORKSPACE = "S:/AIWorker/proj";
+const INDEX = [
+  { rel: "README.md", isDir: false },
+  { rel: "docs/readme.md", isDir: false },
+  { rel: "docs/guide/setup.md", isDir: false },
+  { rel: "src", isDir: true },
+  { rel: "src/App.tsx", isDir: false },
+  { rel: "src/features", isDir: true },
+  { rel: "src/features/files/store.ts", isDir: false },
+  { rel: "src/features/files/FileSearchOverlay.tsx", isDir: false },
+  { rel: "src/features/files/deep/nested/Panel.tsx", isDir: false },
+  { rel: "src-extra/sibling.ts", isDir: false },
+  { rel: "src-extra/other.ts", isDir: false },
+];
+const state = { invokes: [] };
+let nextId = 1;
+window.__TAURI_INTERNALS__ = {
+  transformCallback(cb) {
+    return nextId++;
+  },
+  unregisterCallback() {},
+  convertFileSrc: (p) => p,
+  metadata: { currentWebview: { label: "main" }, currentWindow: { label: "main" } },
+  async invoke(cmd, args) {
+    state.invokes.push({ cmd, args });
+    switch (cmd) {
+      case "list_file_index":
+        return structuredClone(INDEX);
+      case "read_file":
+        return { content: "// fixture", language: "ts", truncated: false };
+      default:
+        return null;
+    }
+  },
+};
+window.__fixture = { state, WORKSPACE, INDEX };
+</script>
+<script type="module" src="./file-search-overlay.tsx"></script>
+</body>
+</html>

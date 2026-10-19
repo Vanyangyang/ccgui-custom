@@ -1,0 +1,34 @@
+{
+  "zh": {
+    "singleInstanceErrorTitle": "CC GUI 启动受阻",
+    "singleInstanceError": "单实例检查或已有窗口激活失败，本次启动无法继续。请查看原因并重试。\n\n{{error}}",
+    "launchProtectionTitle": "CC GUI 无法在保护边界内启动",
+    "launchProtectionBody": "启动保护未通过，本次不会打开窗口，也不会改走直连。\n\n{{error}}",
+    "proxy_not_approved": "网络代理未启用，或地址不是 http://127.0.0.1:7897。",
+    "claude_bin_not_approved": "Claude 路径不是已审核的本机程序。",
+    "settings_unreadable": "无法读取本机代理设置。",
+    "protection_script_missing": "保护脚本不存在。",
+    "proxy_preflight_failed": "本机代理预检未通过。",
+    "claude_firewall_not_ready": "Claude 防火墙边界未就绪。",
+    "gui_firewall_not_ready": "CC GUI 防火墙边界未就绪。",
+    "webview_proxy_not_ready": "WebView2 代理策略未就绪。",
+    "protection_timeout": "保护检查超时。",
+    "protection_check_failed": "保护检查无法完成。"
+  },
+  "en": {
+    "singleInstanceErrorTitle": "CC GUI could not start",
+    "singleInstanceError": "The single-instance check or activation of the existing window failed. This launch cannot continue. Review the cause and retry.\n\n{{error}}",
+    "launchProtectionTitle": "CC GUI could not start inside its protection boundary",
+    "launchProtectionBody": "Launch protection did not pass. This start will not open a window or fall back to a direct connection.\n\n{{error}}",
+    "proxy_not_approved": "The network proxy is off, or its address is not http://127.0.0.1:7897.",
+    "claude_bin_not_approved": "The Claude path is not the reviewed local program.",
+    "settings_unreadable": "The local proxy settings could not be read.",
+    "protection_script_missing": "A protection script is missing.",
+    "proxy_preflight_failed": "The local proxy preflight did not pass.",
+    "claude_firewall_not_ready": "The Claude firewall boundary is not ready.",
+    "gui_firewall_not_ready": "The CC GUI firewall boundary is not ready.",
+    "webview_proxy_not_ready": "The WebView2 proxy policy is not ready.",
+    "protection_timeout": "A protection check timed out.",
+    "protection_check_failed": "A protection check could not finish."
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "name": "@ccgui/plugin-sdk",
+  "version": "0.3.16",
+  "description": "CC GUI 插件系统契约包：PluginContext/manifest/扩展点注册表/版本握手。宿主与插件仓共享的单一事实源。",
+  "type": "module",
+  "private": true,
+  "exports": {
+    ".": "./src/index.ts",
+    "./plugin": {
+      "types": "./plugin.d.ts"
+    }
+  },
+  "types": "./src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "react": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "react": "^18.3.1",
+    "react-markdown": "^9",
+    "typescript": "^5.6.2"
+  }
+}

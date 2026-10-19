@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>cu-cursor</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        width: 64px;
+        height: 64px;
+        background: transparent;
+        overflow: hidden;
+      }
+      /* Soft halo breathing behind the pointer so the user can track it. */
+      .halo {
+        position: absolute;
+        left: 8px;
+        top: 8px;
+        width: 40px;
+        height: 40px;
+        border-radius: 50%;
+        background: rgba(59, 130, 246, 0.18);
+        border: 1.5px solid rgba(59, 130, 246, 0.45);
+        animation: breathe 1.6s ease-in-out infinite;
+      }
+      @keyframes breathe {
+        0%,
+        100% {
+          transform: scale(0.85);
+          opacity: 0.7;
+        }
+        50% {
+          transform: scale(1.08);
+          opacity: 1;
+        }
+      }
+      .pointer {
+        position: absolute;
+        left: 20px;
+        top: 16px;
+        filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.35));
+      }
+    </style>
+  </head>
+  <body>
+    <div class="halo"></div>
+    <svg class="pointer" width="22" height="26" viewBox="0 0 22 26" aria-hidden="true">
+      <path
+        d="M2 1 L2 21 L7.2 16.8 L10.4 24 L13.4 22.4 L10.2 15.2 L17 15 Z"
+        fill="#3b82f6"
+        stroke="#ffffff"
+        stroke-width="1.6"
+        stroke-linejoin="round"
+      />
+    </svg>
+  </body>
+</html>

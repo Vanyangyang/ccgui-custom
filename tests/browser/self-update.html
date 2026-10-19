@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Self-update tracking fixture</title></head>
+<body style="margin:0">
+  <div id="fixture"></div>
+  <script>
+    const memoryStorage = () => { const data = new Map(); return { get length() { return data.size; }, key: i => [...data.keys()][i] ?? null, getItem: k => data.get(k) ?? null, setItem: (k, v) => data.set(k, String(v)), removeItem: k => data.delete(k), clear: () => data.clear() }; };
+    Object.defineProperty(window, "localStorage", { value: memoryStorage() });
+    Object.defineProperty(window, "sessionStorage", { value: memoryStorage() });
+  </script>
+  <script type="module" src="./self-update.tsx"></script>
+</body>
+</html>

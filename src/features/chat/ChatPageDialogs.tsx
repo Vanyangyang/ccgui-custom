@@ -1,0 +1,297 @@
+import { useState } from "react";
+import { useTranslation } from "react-i18next";
+import { useShallow } from "zustand/react/shallow";
+import { ConfirmDialog, ConfirmPopover, PromptDialog } from "@/components/dialogs";
+import { fileName, useFilesStore } from "@/features/files/store";
+import { writeStoredSelfDevWorkspacePath } from "@/features/update/self-dev-workspace";
+import { useSelfDevWorkspace } from "@/features/update/use-self-dev-workspace";
+import { WorktreeCreateDialog } from "@/features/worktree/WorktreeCreateDialog";
+import { DeleteWorktreeDialog } from "@/features/worktree/DeleteWorktreeDialog";
+import { useTerminalStore } from "@/features/terminal/store";
+import { worktreeMetaOf, type SessionMeta, type Workspace } from "@/lib/ipc";
+import { RenameSessionDialog } from "./RenameSessionDialog";
+import { useChatStore } from "./store";
+
+/** Modal dialogs owned by the chat page. */
+export type ChatPageDialog =
+  | { kind: "rename"; session: SessionMeta }
+  // anchor: pointer position of the delete click — the confirmation opens
+  // next to the cursor (ConfirmPopover) instead of screen center; absent
+  // (keyboard/no recent pointer) falls back to the centered ConfirmDialog.
+  | { kind: "delete"; session: SessionMeta; anchor?: { x: number; y: number } }
+  | { kind: "removeWorkspace"; workspaceId: string }
+  | { kind: "workspaceAlias"; workspaceId: string }
+  /** 新建 worktree（目标是该 id 对应的父仓库工作区）。 */
+  | { kind: "createWorktree"; workspaceId: string }
+  /** 删除 worktree 子工作区的分级确认。 */
+  | { kind: "deleteWorktree"; workspaceId: string }
+  /** 归档带 worktree 子项的父工作区时的级联确认。 */
+  | { kind: "archiveWorkspace"; workspaceId: string }
+  | { kind: "closeFile"; path: string };
+
+/** Session rename/delete, dirty-file close, and workspace removal
+ * confirmations, rendered above the chat page. */
+export function ChatPageDialogs({
+  dialog,
+  onClose,
+}: {
+  dialog: ChatPageDialog | null;
+  onClose: () => void;
+}) {
+  const { t } = useTranslation();
+  const { renameSession, removeWorkspace, setWorkspaceAlias, setWorkspaceArchived } = useChatStore(
+    useShallow((s) => ({
+      renameSession: s.renameSession,
+      removeWorkspace: s.removeWorkspace,
+      setWorkspaceAlias: s.setWorkspaceAlias,
+      setWorkspaceArchived: s.setWorkspaceArchived,
+    })),
+  );
+  const workspaces = useChatStore((s) => s.workspaces);
+  const workspaceAliases = useChatStore((s) => s.workspaceAliases);
+  const closeFile = useFilesStore((s) => s.closeFile);
+  const removeTerminalWorkspace = useTerminalStore((s) => s.removeWorkspace);
+  const selfDev = useSelfDevWorkspace();
+
+  return (
+    <>
+      {dialog?.kind === "rename" && (
+        <RenameSessionDialog
+          // A rename opened for another session starts fresh (draft,
+          // in-flight suggestion) instead of inheriting this one's state.
+          key={`${dialog.session.engine}:${dialog.session.sessionId}`}
+          session={dialog.session}
+          onRename={(title) =>
+            void renameSession(dialog.session.engine, dialog.session.sessionId, title)
+          }
+          onClose={onClose}
+        />
+      )}
+      {dialog?.kind === "delete" && (
+        <DeleteSessionConfirm dialog={dialog} onClose={onClose} />
+      )}
+      {dialog?.kind === "closeFile" && (
+        <ConfirmDialog
+          danger
+          message={t("files.confirmCloseDirty", { name: fileName(dialog.path) })}
+          onConfirm={() => {
+            closeFile(dialog.path);
+            onClose();
+          }}
+          onCancel={onClose}
+        />
+      )}
+      {dialog?.kind === "workspaceAlias" && (
+        <PromptDialog
+          allowEmpty
+          title={t("chat.workspaceAliasTitle")}
+          hint={t("chat.workspaceAliasHint")}
+          placeholder={t("chat.workspaceAliasPlaceholder")}
+          initial={workspaceAliases[dialog.workspaceId] ?? ""}
+          onSubmit={(alias) => {
+            onClose();
+            void setWorkspaceAlias(dialog.workspaceId, alias);
+          }}
+          onCancel={onClose}
+        />
+      )}
+      {dialog?.kind === "createWorktree" &&
+        (() => {
+          const parent = workspaces.find((w) => w.id === dialog.workspaceId);
+          return parent ? (
+            <WorktreeCreateDialog parent={parent} onClose={onClose} />
+          ) : null;
+        })()}
+      {dialog?.kind === "deleteWorktree" &&
+        (() => {
+          const workspace = workspaces.find((w) => w.id === dialog.workspaceId);
+          return workspace ? (
+            <DeleteWorktreeDialog workspace={workspace} onClose={onClose} />
+          ) : null;
+        })()}
+      {dialog?.kind === "removeWorkspace" &&
+        (() => {
+          const parent = workspaces.find((w) => w.id === dialog.workspaceId);
+          const children = workspaces.filter((w) => w.parentId === dialog.workspaceId);
+          const removeOne = async (id: string) => {
+            const target = workspaces.find((w) => w.id === id);
+            if (target) removeTerminalWorkspace(target.path);
+            await removeWorkspace(id);
+          };
+          // 自开发工程目录受保护：移除前展示「须知」并要求勾选知情同意。
+          if (parent && selfDev.workspace?.id === parent.id) {
+            return (
+              <RemoveSelfDevWorkspaceConfirm
+                key={parent.id}
+                workspace={parent}
+                childrenWorkspaces={children}
+                onConfirm={() => {
+                  writeStoredSelfDevWorkspacePath(parent.path);
+                  onClose();
+                  void (async () => {
+                    await children.reduce(
+                      (chain, child) => chain.then(() => removeOne(child.id)),
+                      Promise.resolve(),
+                    );
+                    await removeOne(parent.id);
+                  })();
+                }}
+                onCancel={onClose}
+              />
+            );
+          }
+          // 级联提示（确认决策）：父行带 worktree 子项时列出受影响分支，
+          // 确认后先移除子项登记再移除父行；磁盘目录不动。
+          if (parent && children.length > 0) {
+            return (
+              <ConfirmDialog
+                danger
+                confirmLabel={t("worktree.cascadeConfirm")}
+                message={t("worktree.cascadeMessage", {
+                  name: parent.name,
+                  count: children.length,
+                })}
+                onConfirm={() => {
+                  onClose();
+                  void (async () => {
+                    // 顺序执行（非并行）：每次 removeWorkspace 都会整体刷新工作区
+                    // 列表，并行的刷新可能乱序返回，把已注销的兄弟行又写回 state。
+                    await children.reduce(
+                      (chain, child) => chain.then(() => removeOne(child.id)),
+                      Promise.resolve(),
+                    );
+                    await removeOne(parent.id);
+                  })();
+                }}
+                onCancel={onClose}
+              >
+                <ul className="mt-2 flex flex-col gap-0.5 text-caption-1-regular text-text-secondary">
+                  {children.map((child) => (
+                    <li key={child.id}>{worktreeMetaOf(child)?.branch ?? child.name}</li>
+                  ))}
+                </ul>
+              </ConfirmDialog>
+            );
+          }
+          return (
+            <ConfirmDialog
+              message={t("chat.confirmRemoveWorkspace")}
+              onConfirm={() => {
+                onClose();
+                void removeOne(dialog.workspaceId);
+              }}
+              onCancel={onClose}
+            />
+          );
+        })()}
+      {dialog?.kind === "archiveWorkspace" &&
+        (() => {
+          const parent = workspaces.find((w) => w.id === dialog.workspaceId);
+          const children = workspaces.filter((w) => w.parentId === dialog.workspaceId);
+          if (!parent || children.length === 0) return null;
+          return (
+            <ConfirmDialog
+              confirmLabel={t("worktree.cascadeArchiveConfirm")}
+              message={t("worktree.cascadeArchiveMessage", {
+                name: parent.name,
+                count: children.length,
+              })}
+              onConfirm={() => {
+                onClose();
+                for (const child of children) void setWorkspaceArchived(child.id, true);
+                void setWorkspaceArchived(parent.id, true);
+              }}
+              onCancel={onClose}
+            />
+          );
+        })()}
+    </>
+  );
+}
+/** Session delete confirmation: pointer-anchored popover when the delete
+ *  came from a pointer click (the cursor is already there), centered modal
+ *  as the keyboard/no-anchor fallback. */
+function DeleteSessionConfirm({
+  dialog,
+  onClose,
+}: {
+  dialog: Extract<ChatPageDialog, { kind: "delete" }>;
+  onClose: () => void;
+}) {
+  const { t } = useTranslation();
+  const deleteSession = useChatStore((s) => s.deleteSession);
+  const props = {
+    danger: true,
+    message: t("chat.confirmDeleteSession"),
+    onConfirm: () => {
+      onClose();
+      void deleteSession(dialog.session.engine, dialog.session.sessionId);
+    },
+    onCancel: onClose,
+  };
+  return dialog.anchor ? (
+    <ConfirmPopover anchor={dialog.anchor} {...props} />
+  ) : (
+    <ConfirmDialog {...props} />
+  );
+}
+
+/**
+ * 自开发工程目录移除确认：显示「须知」说明（专属工程目录用途、不会删除本地文件、
+ * 下次可在「设置 → 工作区 → CC GUI 自开发工程目录」重新打开），并要求用户勾选同意后才可移除。
+ */
+function RemoveSelfDevWorkspaceConfirm({
+  workspace,
+  childrenWorkspaces,
+  onConfirm,
+  onCancel,
+}: {
+  workspace: Workspace;
+  childrenWorkspaces: Workspace[];
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  const { t } = useTranslation();
+  const [consented, setConsented] = useState(false);
+
+  return (
+    <ConfirmDialog
+      danger
+      className="w-104"
+      confirmLabel={t("chat.confirmRemoveSelfDevWorkspaceConfirm")}
+      confirmDisabled={!consented}
+      message={t("chat.confirmRemoveSelfDevWorkspaceTitle", { name: workspace.name })}
+      onConfirm={onConfirm}
+      onCancel={onCancel}
+    >
+      <div
+        className="mt-3 rounded-lg border border-status-purple-border bg-status-purple-bg p-3 text-body-2-regular text-text-primary"
+        data-testid="self-dev-remove-notice"
+      >
+        <p className="text-body-2-medium text-status-purple-text">
+          {t("chat.confirmRemoveSelfDevWorkspaceNotice")}
+        </p>
+        <p className="mt-1.5 break-all font-mono text-caption-1-regular text-text-secondary">
+          {workspace.path}
+        </p>
+      </div>
+      {childrenWorkspaces.length > 0 && (
+        <ul className="mt-2 flex flex-col gap-0.5 text-caption-1-regular text-text-secondary">
+          {childrenWorkspaces.map((child) => (
+            <li key={child.id}>{worktreeMetaOf(child)?.branch ?? child.name}</li>
+          ))}
+        </ul>
+      )}
+      <label className="mt-3 flex cursor-pointer select-none items-start gap-2 rounded-lg border border-border-default bg-background-secondary px-3 py-2 text-body-2-regular text-text-primary">
+        <input
+          type="checkbox"
+          checked={consented}
+          onChange={(e) => setConsented(e.target.checked)}
+          className="mt-0.5 size-4 shrink-0 rounded border-border-button-default accent-brand-primary"
+          data-testid="self-dev-remove-consent-checkbox"
+        />
+        <span>{t("chat.confirmRemoveSelfDevWorkspaceConsent")}</span>
+      </label>
+    </ConfirmDialog>
+  );
+}

@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/png" href="/app-icon.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>CC GUI</title>
+    <!-- Boot styles are a linked file (public/boot.css), NOT inline, and the
+     * same goes for any future script. Tauri's build step tags every inline
+     * <style>/<script> in this file with a __TAURI_*_NONCE__ token and appends
+     * that nonce to style-src / script-src at runtime. A nonce cancels
+     * 'unsafe-inline' in the same directive, so one inline <style> here makes
+     * the packaged webview refuse every stylesheet created at runtime — which
+     * is exactly how plugins ship CSS (styles.css bundles, ctx.theme.injectCss)
+     * and why v1.0.9 lost all plugin styling while the app itself kept running.
+     * tests/platform-build.test.ts guards this. -->
+    <link rel="stylesheet" href="/boot.css" />
+  </head>
+  <body>
+    <!-- Startup placeholder. React replaces everything inside #root on a
+     * successful mount and sets data-app-mounted. boot-watchdog.js (loaded
+     * before the module bundle) shows the crash reason instead of a silent
+     * white screen if the app never gets there. See src/lib/crash.ts for the
+     * report format and the other two defence layers. -->
+    <div id="root">
+      <div id="boot-splash">
+        <div class="boot-spinner" aria-hidden="true"></div>
+        <span>正在启动 CC GUI…</span>
+      </div>
+    </div>
+    <script src="./boot-watchdog.js"></script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
