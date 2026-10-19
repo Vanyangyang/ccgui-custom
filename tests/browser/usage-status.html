@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Subscription quota and TPS statistics</title></head>
+<body style="margin:0">
+<div id="fixture"></div>
+<script>
+  const memoryStorage = () => {
+    const values = new Map();
+    return { get length() { return values.size; }, key: i => [...values.keys()][i] ?? null,
+      getItem: k => values.get(String(k)) ?? null, setItem: (k, v) => values.set(String(k), String(v)),
+      removeItem: k => values.delete(String(k)), clear: () => values.clear() };
+  };
+  Object.defineProperty(window, "localStorage", { value: memoryStorage() });
+  Object.defineProperty(window, "sessionStorage", { value: memoryStorage() });
+  localStorage.setItem("ccgui-next.language", new URLSearchParams(location.search).get("lang") === "en" ? "en" : "zh");
+  let nextId = 1;
+  const callbacks = new Map();
+  const listeners = new Map();
+  const total = (outputTokens, elapsedMs, completedTurns, excludedTurns) => ({outputTokens, elapsedMs, completedTurns, excludedTurns});
+  const state = { calls: [], failStats: false, quotaLoaded: false,
+    global: total(900, 30000, 4, 2), a: total(100, 10000, 1, 1), b: total(800, 20000, 3, 1) };
+  window.__usageStatusFixture = {
+    state,
+    emit(event) { for (const [id, listener] of listeners) if (listener.event === event) callbacks.get(listener.handler)?.({event, id, payload:null}); },
+  };
+  window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener(id) { listeners.delete(id); } };
+  window.__TAURI_INTERNALS__ = {
+    transformCallback(callback) { const id = nextId++; callbacks.set(id, callback); return id; },
+    unregisterCallback(id) { callbacks.delete(id); }, convertFileSrc: p => p,
+    metadata: { currentWebview: { label: "main" }, currentWindow: { label: "main" } },
+    async invoke(command, args = {}) {
+      if (command === "plugin:event|listen") { const id = nextId++; listeners.set(id,args); return id; }
+      if (command === "plugin:event|unlisten") { listeners.delete(args.eventId); return null; }
+      if (command === "get_app_settings") return {systemProxyEnabled:true,systemProxyUrl:"http://127.0.0.1:7897"};
+      state.calls.push({command,args:structuredClone(args)});
+      if (command === "codex_quota_read") {
+        if (!state.quotaLoaded && args.cacheOnly) return {status:"unavailable",windows:{},errorCode:"not_loaded"};
+        await new Promise(resolve => setTimeout(resolve, 300));
+        state.quotaLoaded = true;
+        const now = Date.now()/1000;
+        return {status:"ready",source:"codex_app_server",collectedAt:now,
+          account:{email:"long.subscription.account.for.layout@example.test",plan:"Pro"},
+          windows:{sevenDay:{usedPercentage:47,resetsAt:Math.floor(now+3*86400)}}};
+      }
+      if (command === "throughput_stats_read") {
+        await new Promise(resolve => setTimeout(resolve, 80));
+        if (state.failStats) { state.failStats = false; throw "Fixture statistics read failed"; }
+        return structuredClone({global:state.global,session:args.sessionId === "fixture-b" ? state.b : state.a,
+          byEngine:{codex:state.global},startedAt:Date.now()-86400000});
+      }
+      throw new Error("Unexpected fixture IPC: " + command);
+    },
+  };
+</script>
+<script type="module" src="./usage-status.tsx"></script>
+</body>
+</html>

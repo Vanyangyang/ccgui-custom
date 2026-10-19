@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Handoff fixture — mocked IPC</title>
+</head>
+<body style="margin:0">
+  <div id="fixture"></div>
+  <script>
+    // Install document-local storage BEFORE any production module executes.
+    for (const name of ["localStorage", "sessionStorage"]) {
+      const values = new Map();
+      if (name === "localStorage") values.set("ccgui-next.language", new URLSearchParams(location.search).get("lang") === "en" ? "en" : "zh");
+      Object.defineProperty(window, name, { value: {
+        get length() { return values.size; },
+        key: index => [...values.keys()][index] ?? null,
+        getItem: key => values.get(String(key)) ?? null,
+        setItem: (key, value) => values.set(String(key), String(value)),
+        removeItem: key => values.delete(String(key)),
+        clear: () => values.clear(),
+      } });
+    }
+    const callbacks = new Map();
+    let callbackId = 0;
+    window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener() {} };
+    window.__TAURI_INTERNALS__ = {
+      transformCallback(callback) { const id = ++callbackId; callbacks.set(id, callback); return id; },
+      unregisterCallback(id) { callbacks.delete(id); },
+      convertFileSrc: path => path,
+      metadata: { currentWebview: { label: "main" }, currentWindow: { label: "main" } },
+      async invoke(command, args) { return window.__HANDOFF_INVOKE__ ? window.__HANDOFF_INVOKE__(command, args) : null; },
+    };
+  </script>
+  <script type="module" src="./handoff.tsx"></script>
+</body>
+</html>

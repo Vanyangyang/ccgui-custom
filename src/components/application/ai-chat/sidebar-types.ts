@@ -1,0 +1,77 @@
+export type ThreadAction = "pin" | "rename" | "archive" | "delete";
+
+export interface AiChatThread {
+  auxiliaryKind?: "cursor_cce" | "cursor_do" | null;
+  id?: string;
+  label: string;
+  /** CLI engine id — brand mark rendered left of the label. */
+  engine?: string;
+  /** Exact workspace identity for session-scoped activity. */
+  workspacePath?: string;
+  /** Relative-time chip (e.g. "34m"). */
+  time: string;
+  /** 【最后对话时间】毫秒时间戳。全部会话视图用它排序；相对时间文案不能比较先后。 */
+  updatedAt?: number | null;
+  promptCache?: import("@/lib/ipc").PromptCacheWindow | null;
+  /** 【全部会话】这一行所属工作区名称，只在跨工作区列表里显示。 */
+  workspaceLabel?: string;
+  isSelected?: boolean;
+  pinned?: boolean;
+  /** A turn is streaming in this session — breathing blue dot unless retrying. */
+  streaming?: boolean;
+  /** Provider backoff is active; keep the running dot visible but static. */
+  retrying?: boolean;
+  unseen?: boolean;
+  /** Pending tab: first message not sent, so pin/rename/copy-id do not apply. */
+  isDraft?: boolean;
+  children?: AiChatThread[];
+  /** Has created child tasks; derived from branch relationships, not a mode. */
+  isLeader?: boolean;
+  leaderBranch?: import("@/features/leader/types").LeaderBranch;
+  protectedFromDeletion?: boolean;
+  selectable?: boolean;
+  leaderParentFallback?: boolean;
+}
+
+export interface AiChatRepo {
+  id?: string;
+  /** Workspace path — the git store's status cache is keyed by it (worktree
+   *  child rows read dirty counts through this). */
+  path?: string;
+  label: string;
+  /** Original workspace folder name when `label` is a user-set alias
+   *  (surfaced as the row tooltip). */
+  originalLabel?: string;
+  /** Recent chats listed when the repo is expanded. */
+  threads: AiChatThread[];
+  /** Max threads listed before collapsing behind a "show more" row. */
+  threadLimit?: number;
+  /** Plugin-provided badge text (e.g. "WSL") rendered as a chip after the
+   *  label; styling comes from the plugin's injected CSS. */
+  labelSuffix?: string;
+  /** True when this workspace is CC GUI's dedicated self-development directory. */
+  isSelfDev?: boolean;
+  /** Expanded on first render (folder-open icon + visible threads). */
+  defaultOpen?: boolean;
+  /** Worktree child workspaces attached under this repo, each carrying its
+   *  own threads; rendered as a WORKTREES group inside the expanded area. */
+  worktrees?: AiChatRepo[];
+  /** Set on a repo that IS a worktree child row. */
+  worktree?: AiChatWorktreeMeta;
+}
+
+/** Worktree child metadata on a repo row (set when this repo IS a worktree
+ *  child): branch label + PR badge data, from workspace meta. */
+export interface AiChatWorktreeMeta {
+  branch: string;
+  prNumber?: number;
+}
+
+/** A workspace group section (工作区二级分类): named groups render with a
+ *  collapsible header; the single `id: null` section is ungrouped repos
+ *  rendered flat, exactly as before groups existed. */
+export interface AiChatRepoSection {
+  id: string | null;
+  name: string;
+  repos: AiChatRepo[];
+}

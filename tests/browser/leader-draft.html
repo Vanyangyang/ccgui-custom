@@ -1,0 +1,12 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>First-message Leader fixture</title></head>
+<body style="margin:0"><div id="fixture"></div>
+<script>
+window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener() {} };
+window.__TAURI_INTERNALS__ = {
+  transformCallback() { return 1; }, unregisterCallback() {}, convertFileSrc: p => p,
+  metadata: { currentWebview: { label: "main" }, currentWindow: { label: "main" } },
+  async invoke(command, args) { return window.__DRAFT_INVOKE__ ? window.__DRAFT_INVOKE__(command, args) : null; },
+};
+</script>
+<script type="module" src="./leader-draft.tsx"></script></body></html>

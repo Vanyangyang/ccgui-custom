@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>UsageSection fixture</title>
+</head>
+<body style="margin:0;background:#0b0b0b">
+<div id="fixture"></div>
+<script>
+// Stands in for the Tauri IPC surface. The ledger rows below are the shape
+// the backend returns: one row per (day, engine, model), with a relay setup
+// recording both the provider-qualified launch slug and the engine's plain id.
+const pad = (n) => String(n).padStart(2, "0");
+const now = new Date();
+const dayOf = (offset) => {
+  const d = new Date(now);
+  d.setDate(d.getDate() - offset);
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+};
+const today = dayOf(0);
+const yesterday = dayOf(1);
+const twoDaysAgo = dayOf(2);
+const state = {
+  rows: [
+    { day: today, engine: "omp", model: "agentrouter qunyou/deepseek-v4-flash", input: 12000, output: 3000, cacheRead: 0, cacheWrite: 0, requests: 4 },
+    { day: today, engine: "omp", model: "deepseek-v4-flash", input: 8000, output: 2000, cacheRead: 0, cacheWrite: 0, requests: 2 },
+    { day: today, engine: "claude", model: "claude-opus-5", input: 5000, output: 1000, cacheRead: 0, cacheWrite: 0, requests: 1 },
+    // Cache-heavy turn: the four ledger parts are non-overlapping, so the
+    // summary must read 累计 = 输入 + 输出 with 输入 = fresh + cache.
+    { day: today, engine: "codex", model: "gpt-5-codex", input: 9000, output: 500, cacheRead: 7000, cacheWrite: 500, requests: 3 },
+    // Earlier days: the axis tooltip's 区间合计 must cover the whole selected
+    // range, so 今日 and 本周 have to disagree.
+    { day: yesterday, engine: "claude", model: "claude-opus-5", input: 40000, output: 8000, cacheRead: 0, cacheWrite: 0, requests: 5 },
+    { day: twoDaysAgo, engine: "codex", model: "gpt-5-codex", input: 30000, output: 2000, cacheRead: 0, cacheWrite: 0, requests: 2 },
+  ],
+  listeners: new Map(),
+};
+let nextId = 1;
+window.__TAURI_INTERNALS__ = {
+  transformCallback(cb) {
+    const id = nextId++;
+    state.listeners.set(id, cb);
+    return id;
+  },
+  unregisterCallback(id) {
+    state.listeners.delete(id);
+  },
+  convertFileSrc: (p) => p,
+  metadata: { currentWebview: { label: "main" }, currentWindow: { label: "main" } },
+  async invoke(cmd, args) {
+    switch (cmd) {
+      case "usage_summary":
+        return structuredClone(state.rows);
+      case "usage_clear":
+        state.rows = [];
+        return null;
+      case "plugin:event|listen":
+      case "plugin:event|unlisten":
+        return 1;
+      default:
+        return null;
+    }
+  },
+};
+window.__fixture = {
+  state,
+  /** Ledger a fresh report the way the backend would. */
+  addRow(engine, model, input, output) {
+    state.rows.push({ day: today, engine, model, input, output, cacheRead: 0, cacheWrite: 0, requests: 1 });
+  },
+  emit(name) {
+    for (const cb of state.listeners.values()) cb({ event: name, id: 0, payload: null });
+  },
+};
+</script>
+<script type="module" src="./usage-pane.tsx"></script>
+</body>
+</html>

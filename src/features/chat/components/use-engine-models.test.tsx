@@ -1,0 +1,410 @@
+import { act, StrictMode } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { CliConfig, EngineCatalog, EngineInfo, ProviderSection } from "@/lib/ipc";
+import { ipc } from "@/lib/ipc";
+import "@/lib/i18n";
+import i18n from "@/lib/i18n";
+import { useEngineModels, type EngineModelsState } from "./use-engine-models";
+import { CLI_CONFIG_CHANGED_EVENT } from "@/features/settings/providers";
+
+vi.mock("@/lib/ipc", () => ({
+  ipc: {
+    getCliConfig: vi.fn(async () => ({})),
+    getAppSettings: vi.fn(async () => ({})),
+    listEngineModels: vi.fn(async () => ({ models: [], authoritative: false })),
+  },
+}));
+
+Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+
+const ENGINE = { id: "omp", enabled: true, available: true } as EngineInfo;
+// 模块级稳定引用:与应用内 zustand 提供的 engines 同形。探针记录存在 ref
+// 里,数组身份抖动不再引发重复探测(见 use-engine-models 的探针 effect)。
+const ENGINES = [ENGINE];
+const WS_REMOTE = "//wsl$/Ubuntu/home/u/proj";
+
+let container: HTMLDivElement;
+let root: Root;
+// 当前 render 的 engines(默认稳定引用;探针类用例按需替换)。
+let engines: EngineInfo[] = ENGINES;
+let latest: EngineModelsState;
+
+const engineInfo = (id: string, available: boolean): EngineInfo => ({
+  id,
+  available,
+  enabled: true,
+  supportsImages: false,
+  permissions: [],
+});
+
+const noopPin = async () => {};
+
+beforeEach(() => {
+  container = document.createElement("div");
+  document.body.appendChild(container);
+  root = createRoot(container);
+  engines = ENGINES;
+});
+
+afterEach(async () => {
+  await act(async () => root.unmount());
+  container.remove();
+  vi.mocked(ipc.listEngineModels).mockReset();
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+});
+
+function Harness({
+  models,
+  pinModels,
+  workspacePath,
+  providers = {},
+}: {
+  models: Record<string, string>;
+  pinModels: (updates: Record<string, string>, persist?: boolean) => Promise<void>;
+  workspacePath?: string;
+  /** Session-resolved channel per engine (what the picker refreshes on). */
+  providers?: Record<string, string>;
+}) {
+  latest = useEngineModels(engines, models, pinModels, providers, workspacePath);
+  return null;
+}
+
+async function render(props: Parameters<typeof Harness>[0]) {
+  await act(async () => {
+    root.render(<Harness {...props} />);
+    // 探针 promise 落地 + catalog 入 store 后的二次 effect 都跑完。
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+}
+
+/** 让队列中的 promise 回调与随后的 re-render 全部落定:失控的探针循环
+ *  会在这么长的窗口里打出成百上千次调用。 */
+const settle = () =>
+  act(async () => {
+    const { promise, resolve } = Promise.withResolvers<void>();
+    setTimeout(resolve, 80);
+    await promise;
+  });
+
+/** 探针类用例的渲染入口:可换 engines,渲染后等窗口落定。 */
+async function show(
+  next: EngineInfo[] | null,
+  workspacePath?: string,
+  providers?: Record<string, string>,
+) {
+  if (next) engines = next;
+  await render({ models: {}, pinModels: noopPin, workspacePath, providers });
+  await settle();
+}
+
+describe("useEngineModels channel models", () => {
+  const EMPTY_SECTION: ProviderSection = { providers: {}, current: null };
+  const cliConfigWith = (claude: ProviderSection): CliConfig => ({
+    claude,
+    kimi: EMPTY_SECTION,
+    grok: EMPTY_SECTION,
+    codex: EMPTY_SECTION,
+    pi: EMPTY_SECTION,
+    omp: EMPTY_SECTION,
+    dsh: EMPTY_SECTION,
+    agy: EMPTY_SECTION,
+    opencode: EMPTY_SECTION,
+    qoder: EMPTY_SECTION,
+    "qoder-cn": EMPTY_SECTION,
+    cursor: EMPTY_SECTION,
+  });
+
+  it("切换渠道后别名行改指该渠道映射的模型", async () => {
+    // 报告的问题:选中渠道 ss2a 后模型列表仍是官方 settings.json 解析出的行
+    // （后端 catalog 只认 CLI 自己的配置）。渠道自己的 ANTHROPIC_DEFAULT_*_MODEL
+    // 才是这次选择真正会跑的 id，切渠道必须让别名行跟着换。
+    vi.mocked(ipc.getCliConfig).mockResolvedValue(
+      cliConfigWith({
+        current: "c1",
+        providers: {
+          c1: {
+            name: "one",
+            settingsConfig: { env: { ANTHROPIC_DEFAULT_OPUS_MODEL: "one-opus" } },
+          },
+          c2: {
+            name: "two",
+            settingsConfig: { env: { ANTHROPIC_DEFAULT_OPUS_MODEL: "two-opus" } },
+          },
+        },
+      }),
+    );
+    vi.mocked(ipc.listEngineModels).mockResolvedValue({
+      models: [
+        { id: "default", name: "Default", description: "Use the default model" },
+        { id: "opus", name: "official-opus", description: "Custom Opus model" },
+      ],
+      authoritative: true,
+    } as unknown as EngineCatalog);
+
+    await show([engineInfo("claude", true)], undefined, { claude: "c1" });
+    const opusLabel = () =>
+      latest.modelsByEngine.claude?.find((model) => model.id === "opus")?.label;
+    expect(opusLabel()).toBe("one-opus");
+    // The remapped row carries the CLI menu's own subtitle, translated.
+    expect(
+      latest.modelsByEngine.claude?.find((model) => model.id === "opus")?.description,
+    ).toBe(i18n.t("chat.customFamilyModel", { family: "Opus" }));
+
+    await show(null, undefined, { claude: "c2" });
+    expect(opusLabel()).toBe("two-opus");
+  });
+});
+
+describe("useEngineModels pin effect", () => {
+  it("远端(remote)catalog 只做展示:永不触发 pin,不污染全局 models / persisted 默认", async () => {
+    vi.mocked(ipc.listEngineModels).mockResolvedValue({
+      models: [{ id: "remote-m1", name: "Remote M1" }],
+      authoritative: true,
+      remote: true,
+    } as unknown as EngineCatalog);
+    const pinModels = vi.fn(async () => {});
+    // stored 与远端 catalog 不相交 —— 修复前这里会 volatile pin,进而在
+    // 切回本地工作区时被 persisted pin 覆盖用户保存的默认模型。
+    await render({ models: { omp: "user-pick" }, pinModels, workspacePath: WS_REMOTE });
+    expect(pinModels).not.toHaveBeenCalled();
+  });
+
+  it("本地 authoritative catalog 仍重置过期 stored pick(persist 默认值不变)", async () => {
+    vi.mocked(ipc.listEngineModels).mockResolvedValue({
+      models: [{ id: "m1", name: "M1" }],
+      authoritative: true,
+    } as unknown as EngineCatalog);
+    const pinModels = vi.fn(async () => {});
+    await render({ models: { omp: "stale-id" }, pinModels });
+    expect(pinModels).toHaveBeenCalledWith({ omp: "m1" });
+  });
+});
+
+describe("useEngineModels probe dispatch", () => {
+  it("StrictMode effect replay replaces invalidated probes and settles the spinner", async () => {
+    const old = Promise.withResolvers<EngineCatalog>();
+    vi.mocked(ipc.listEngineModels)
+      .mockReturnValueOnce(old.promise)
+      .mockResolvedValue({ models: [{ id: "fresh", provider: "pi" }], authoritative: true });
+    await act(async () => {
+      root.render(<StrictMode><Harness models={{}} pinModels={noopPin} /></StrictMode>);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(ipc.listEngineModels).toHaveBeenCalledTimes(2);
+    expect(latest.catalogs.omp.models[0].id).toBe("fresh");
+    expect(latest.pendingEngines).toEqual({});
+    await act(async () => { old.resolve({ models: [{ id: "stale", provider: "pi" }], authoritative: true }); });
+    expect(latest.catalogs.omp.models[0].id).toBe("fresh");
+    expect(latest.pendingEngines).toEqual({});
+  });
+
+  it("探针失败只派发一次:不会被 pending 抖动反复重发", async () => {
+    vi.mocked(ipc.listEngineModels).mockRejectedValue(new Error("DSH host 未运行"));
+    await show([engineInfo("dsh", true)]);
+    expect(ipc.listEngineModels).toHaveBeenCalledTimes(1);
+    expect(latest.pendingEngines).toEqual({});
+  });
+
+  it("另一引擎的 catalog 落地不会连带重试失败引擎", async () => {
+    vi.mocked(ipc.listEngineModels).mockImplementation(async (id: string) => {
+      if (id === "dsh") throw new Error("DSH host 未运行");
+      return { models: [{ id: "pi/m1", provider: "pi" }], authoritative: true };
+    });
+    await show([engineInfo("dsh", true), engineInfo("pi", true)]);
+    expect(ipc.listEngineModels).toHaveBeenCalledTimes(2);
+    expect(latest.catalogs.pi?.models[0]?.id).toBe("pi/m1");
+    await settle();
+    expect(ipc.listEngineModels).toHaveBeenCalledTimes(2);
+  });
+
+  it("refresh 重探所有引擎(失败者也算)", async () => {
+    vi.mocked(ipc.listEngineModels).mockRejectedValue(new Error("down"));
+    await show([engineInfo("dsh", true)]);
+    expect(ipc.listEngineModels).toHaveBeenCalledTimes(1);
+    vi.mocked(ipc.listEngineModels).mockResolvedValue({
+      models: [{ id: "deepseek/x", provider: "deepseek" }],
+      authoritative: true,
+    });
+    await act(async () => {
+      await latest.refresh();
+    });
+    expect(ipc.listEngineModels).toHaveBeenCalledTimes(2);
+    expect(latest.catalogs.dsh?.models[0]?.id).toBe("deepseek/x");
+  });
+
+  it("引擎可用性翻转后允许再探一次", async () => {
+    vi.mocked(ipc.listEngineModels).mockRejectedValue(new Error("missing CLI"));
+    await show([engineInfo("dsh", false)]);
+    expect(ipc.listEngineModels).toHaveBeenCalledTimes(1);
+    await show([engineInfo("dsh", true)]);
+    expect(ipc.listEngineModels).toHaveBeenCalledTimes(2);
+  });
+
+  it("探针记录按工作区隔离", async () => {
+    vi.mocked(ipc.listEngineModels).mockRejectedValue(new Error("down"));
+    await show([engineInfo("dsh", true)], "/ws-a");
+    expect(ipc.listEngineModels).toHaveBeenCalledTimes(1);
+    await show(null, "/ws-b");
+    expect(ipc.listEngineModels).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(ipc.listEngineModels).mock.calls.map((call) => call[1])).toEqual([
+      "/ws-a",
+      "/ws-b",
+    ]);
+  });
+});
+
+describe("useEngineModels refresh scope", () => {
+  it("刷新模型全局生效:本地工作区共用一份目录,刷新后切到别的工作区也是新目录", async () => {
+    vi.mocked(ipc.listEngineModels).mockResolvedValue({
+      models: [{ id: "stale-m", provider: "pi" }],
+      authoritative: true,
+    } as unknown as EngineCatalog);
+    // 两个本地工作区各探一次(靠首次应答认定是本地上下文),之后共用同一份目录。
+    await show([engineInfo("omp", true)], "/ws-a");
+    await show(null, "/ws-b");
+    expect(latest.catalogs.omp?.models[0]?.id).toBe("stale-m");
+
+    vi.mocked(ipc.listEngineModels).mockClear();
+    vi.mocked(ipc.listEngineModels).mockResolvedValue({
+      models: [{ id: "fresh-m", provider: "pi" }],
+      authoritative: true,
+    } as unknown as EngineCatalog);
+    // 在 /ws-b 刷新 —— 修复前这里只更新当前工作区的桶,/ws-a 会一直停在旧目录。
+    await act(async () => {
+      await latest.refresh();
+    });
+    expect(latest.catalogs.omp?.models[0]?.id).toBe("fresh-m");
+
+    // 回到另一个本地工作区读到的也是刷新后的目录。
+    await show(null, "/ws-a");
+    expect(latest.catalogs.omp?.models[0]?.id).toBe("fresh-m");
+  });
+
+  it("远端(发行版)目录独立成桶,刷新时两个上下文一并更新", async () => {
+    const catalogFor = (ws?: string): EngineCatalog =>
+      ws === WS_REMOTE
+        ? ({ models: [{ id: "distro-m", provider: "pi" }], authoritative: true, remote: true } as EngineCatalog)
+        : ({ models: [{ id: "local-m", provider: "pi" }], authoritative: true } as EngineCatalog);
+    vi.mocked(ipc.listEngineModels).mockImplementation(async (_engine, ws) => catalogFor(ws));
+    await show([engineInfo("omp", true)], "/ws-local");
+    expect(latest.catalogs.omp?.models[0]?.id).toBe("local-m");
+
+    await show(null, WS_REMOTE);
+    expect(latest.catalogs.omp?.models[0]?.id).toBe("distro-m");
+
+    // 刷新:本地上下文 + 已缓存的远端上下文都在范围内。
+    vi.mocked(ipc.listEngineModels).mockImplementation(async (_engine, ws) =>
+      ws === WS_REMOTE
+        ? ({ models: [{ id: "distro-new", provider: "pi" }], authoritative: true, remote: true } as EngineCatalog)
+        : ({ models: [{ id: "local-new", provider: "pi" }], authoritative: true } as EngineCatalog),
+    );
+    await act(async () => {
+      await latest.refresh();
+    });
+    expect(latest.catalogs.omp?.models[0]?.id).toBe("distro-new");
+
+    // 回到本地工作区:本地目录同样刷新过,且没有被发行版目录污染。
+    await show(null, "/ws-other");
+    expect(latest.catalogs.omp?.models[0]?.id).toBe("local-new");
+  });
+});
+
+describe("AGY model catalog synchronization", () => {
+  const catalog = (id: string, authoritative = true): EngineCatalog => ({
+    models: [{ id, name: id, provider: "google", contextWindow: null }],
+    authoritative,
+  });
+
+  beforeEach(() => {
+    engines = [engineInfo("agy", true)];
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-12T10:00:00Z"));
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+  });
+
+  it("refreshes the visible catalog periodically and on focus, but pauses while hidden", async () => {
+    vi.mocked(ipc.listEngineModels)
+      .mockResolvedValueOnce(catalog("first"))
+      .mockResolvedValueOnce(catalog("second"))
+      .mockResolvedValue(catalog("third"));
+    await render({ models: { agy: "first" }, pinModels: noopPin });
+    expect(ipc.listEngineModels).toHaveBeenCalledTimes(1);
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+    expect(latest.catalogs.agy.models[0].id).toBe("second");
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+    await act(async () => { await vi.advanceTimersByTimeAsync(120_000); });
+    expect(ipc.listEngineModels).toHaveBeenCalledTimes(2);
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    await act(async () => { document.dispatchEvent(new Event("visibilitychange")); });
+    expect(latest.catalogs.agy.models[0].id).toBe("third");
+    await act(async () => { window.dispatchEvent(new Event("focus")); });
+    expect(ipc.listEngineModels).toHaveBeenCalledTimes(3);
+  });
+
+  it("reprobes immediately after CLI configuration changes and coalesces automatic requests", async () => {
+    vi.mocked(ipc.listEngineModels).mockResolvedValueOnce(catalog("old"));
+    await render({ models: { agy: "old" }, pinModels: noopPin });
+    const pending = Promise.withResolvers<EngineCatalog>();
+    vi.mocked(ipc.listEngineModels).mockReturnValue(pending.promise);
+    await act(async () => { window.dispatchEvent(new Event(CLI_CONFIG_CHANGED_EVENT)); });
+    expect(ipc.listEngineModels).toHaveBeenCalledTimes(2);
+    await act(async () => { await vi.advanceTimersByTimeAsync(120_000); });
+    expect(ipc.listEngineModels).toHaveBeenCalledTimes(2);
+    await act(async () => { pending.resolve(catalog("updated")); });
+    expect(latest.catalogs.agy.models[0].id).toBe("updated");
+    expect(latest.pendingEngines).toEqual({});
+  });
+
+  it("does not reset a stored model from an offline snapshot", async () => {
+    const pin = vi.fn(async () => {});
+    vi.mocked(ipc.listEngineModels).mockResolvedValue(catalog("snapshot", false));
+    await render({ models: { agy: "account-only-model" }, pinModels: pin });
+    expect(pin).not.toHaveBeenCalled();
+    expect(latest.modelsByEngine.agy.map((model) => model.id)).toContain("account-only-model");
+  });
+
+  it("an older probe cannot replace a newer manual refresh or clear its pending state", async () => {
+    const old = Promise.withResolvers<EngineCatalog>();
+    const fresh = Promise.withResolvers<EngineCatalog>();
+    vi.mocked(ipc.listEngineModels).mockReturnValueOnce(old.promise).mockReturnValueOnce(fresh.promise);
+    await render({ models: {}, pinModels: noopPin });
+    let refreshed: Promise<void>;
+    await act(async () => { refreshed = latest.refresh(); await Promise.resolve(); });
+    expect(ipc.listEngineModels).toHaveBeenCalledTimes(2);
+    await act(async () => { old.resolve(catalog("stale")); });
+    expect(latest.catalogs.agy).toBeUndefined();
+    expect(latest.pendingEngines).toEqual({ agy: true });
+    await act(async () => { fresh.resolve(catalog("fresh")); await refreshed!; });
+    expect(latest.catalogs.agy.models[0].id).toBe("fresh");
+    expect(latest.pendingEngines).toEqual({});
+  });
+
+  it("late local workspace answers cannot overwrite the shared newer catalog", async () => {
+    const old = Promise.withResolvers<EngineCatalog>();
+    vi.mocked(ipc.listEngineModels).mockReturnValueOnce(old.promise).mockResolvedValue(catalog("fresh"));
+    await render({ models: {}, pinModels: noopPin, workspacePath: "/ws-a" });
+    await render({ models: {}, pinModels: noopPin, workspacePath: "/ws-b" });
+    expect(latest.catalogs.agy.models[0].id).toBe("fresh");
+    await act(async () => { old.resolve(catalog("stale")); });
+    await render({ models: {}, pinModels: noopPin, workspacePath: "/ws-a" });
+    expect(latest.catalogs.agy.models[0].id).toBe("fresh");
+  });
+
+  it("removes automatic synchronization when AGY becomes unavailable", async () => {
+    vi.mocked(ipc.listEngineModels).mockResolvedValue(catalog("current"));
+    await render({ models: {}, pinModels: noopPin });
+    engines = [engineInfo("agy", false)];
+    await render({ models: {}, pinModels: noopPin });
+    vi.mocked(ipc.listEngineModels).mockClear();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(120_000);
+      window.dispatchEvent(new Event("focus"));
+      window.dispatchEvent(new Event(CLI_CONFIG_CHANGED_EVENT));
+    });
+    expect(ipc.listEngineModels).not.toHaveBeenCalled();
+  });
+});

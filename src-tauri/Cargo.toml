@@ -1,0 +1,136 @@
+# Keep this desktop application an independent Cargo workspace.
+[workspace]
+
+[package]
+name = "ccgui-next"
+default-run = "ccgui-next"
+version = "1.1.1"
+description = "CC GUI - multi-CLI AI chat desktop"
+edition = "2021"
+rust-version = "1.77.2"
+
+[lib]
+name = "ccgui_next_lib"
+crate-type = ["rlib"]
+
+[features]
+# Explicit opt-in for hermetic integration fixtures; forbidden in release builds.
+test-harness = []
+
+[[bin]]
+name = "assistant-notices-fixture"
+path = "src/bin/assistant_notices_fixture.rs"
+required-features = ["test-harness"]
+
+[[test]]
+name = "send_path"
+path = "tests/send_path.rs"
+required-features = ["test-harness"]
+
+[[test]]
+name = "dev_profile_runtime"
+path = "tests/dev_profile_runtime.rs"
+required-features = ["test-harness"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["protocol-asset", "unstable", "macos-private-api"] }
+# macos-private-api: WebviewWindowBuilder::transparent on macOS (cursor
+# overlay window, src/cu_overlay.rs) is gated behind it.
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
+regex = "1"
+toml = "0.8"
+toml_edit = "0.22"
+rusqlite = { version = "0.32", features = ["bundled"] }
+tokio = { version = "1", features = ["rt", "macros", "net", "process", "time", "sync", "io-util"] }
+sha2 = "0.10"
+dirs = "6"
+dunce = "1"
+git2 = "0.20"
+# Feature-unify openssl-sys to "vendored": git2 → libgit2-sys/libssh2-sys otherwise
+# dynamically links Homebrew's libssl/libcrypto (e.g. libssl.4.dylib), which crashes
+# the shipped .app at launch on any machine without that exact Homebrew install.
+openssl-sys = { version = "0.9", features = ["vendored"] }
+trash = "5"
+# .gitignore-aware directory walking for the @-mention file index.
+ignore = "0.4"
+uuid = { version = "1", features = ["v4"] }
+parking_lot = "0.12"
+base64 = "0.22"
+zstd = "0.13"
+which = "7"
+# PTY for the integrated terminal panel.
+portable-pty = "0.8"
+# Computer use (src/computer_use.rs): xcap captures the screen, enigo injects
+# mouse/keyboard input; rmcp serves both as an stdio MCP server
+# (`--computer-use-mcp`) that engine CLIs spawn as a child process.
+xcap = "0.9"
+enigo = "0.6"
+image = "0.25"
+rmcp = { version = "3.4", features = ["server", "macros", "transport-io"] }
+# Global Esc-to-stop while a computer-use run is active; registered only for
+# the run's lifetime so Esc is never stolen outside a session.
+tauri-plugin-global-shortcut = "2"
+sysinfo = "0.36.1"
+libc = "0.2"
+# LAN web access: serves the built frontend and bridges the command/event
+# surface over a token-authenticated WebSocket (see src/web.rs).
+axum = { version = "0.8", features = ["ws"] }
+futures-util = "0.3"
+# DSH host session streams (ws:// loopback mux) plus the outbound relay, which
+# dials the Cloudflare Worker over wss:// — hence the TLS feature.
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+serde_yaml = "0.9"
+# Native HTTP for provider APIs, explicit downloads and granted plugin requests.
+# Use rustls independently of the vendored-openssl stack.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "multipart", "json", "blocking", "socks"] }
+
+[target.'cfg(windows)'.dependencies]
+# Live User/Machine PATH for CLI discovery: a GUI process inherits the PATH
+# snapshot of its launcher, so engine::resolve re-reads the registry at
+# detection time to see CLIs installed while the app is running.
+winreg = "0.55"
+# Job Objects (engine/job.rs): kill-on-close membership for spawned CLIs so
+# an orphaned grandchild (a CLI's pwsh.exe and its hidden conhost.exe) dies
+# with the run. taskkill /T can only walk a tree whose root is still alive,
+# which is exactly what an orphan no longer has.
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+tauri = { version = "2", features = ["test"] }
+# `start_paused`/`time::advance` in the relay retry tests: their backoff is
+# real time, and a test that has to wait it out is a test nobody runs.
+tokio = { version = "1", features = ["test-util"] }
+
+[profile.release]
+# Unwind (not abort): a panicking thread must still run destructors so engine
+# child processes get reaped instead of leaked.
+codegen-units = 1
+lto = "thin"
+opt-level = "z"
+strip = true
+
+# Local self-update builds retain release unwind semantics while accelerating
+# incremental LLVM codegen. The distributable release profile is unchanged.
+[profile.self-update]
+inherits = "release"
+opt-level = 1
+codegen-units = 64
+lto = "off"
+incremental = true

@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>Leader conversation tree fixture</title></head>
+<body><div id="fixture"></div>
+<script>
+// Document-local storage: this fixture never changes saved sidebar/settings state.
+for (const name of ["localStorage", "sessionStorage"]) {
+  const values = new Map();
+  Object.defineProperty(window, name, { configurable: true, value: {
+    getItem: key => values.get(String(key)) ?? null,
+    setItem: (key, value) => values.set(String(key), String(value)),
+    removeItem: key => values.delete(String(key)), clear: () => values.clear(),
+    key: index => [...values.keys()][index] ?? null, get length() { return values.size; },
+  } });
+}
+localStorage.setItem("ccgui-next.sidebarChatListMode:v1", new URLSearchParams(location.search).get("mode") === "recent" ? "recent" : "workspace");
+window.__LEADER_FIXTURE_DELETES__ = [];
+let fixtureSettings = { sidebarChatListMode: localStorage.getItem("ccgui-next.sidebarChatListMode:v1") };
+let fixtureCallbackId = 0;
+const fixtureCallbacks = new Map();
+const fixtureListeners = new Map();
+window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener() {} };
+function fixtureChanged() {
+  for (const [id, listener] of fixtureListeners) {
+    if (!["task://changed", "sessions://changed"].includes(listener.event)) continue;
+    queueMicrotask(() => fixtureCallbacks.get(listener.handler)?.({ event: listener.event, id, payload: null }));
+  }
+}
+window.__TAURI_INTERNALS__ = {
+  transformCallback(callback) { const id = ++fixtureCallbackId; fixtureCallbacks.set(id, callback); return id; },
+  unregisterCallback(id) { fixtureCallbacks.delete(id); }, convertFileSrc: p => p,
+  metadata: { currentWebview: { label: "main" }, currentWindow: { label: "main" } },
+  async invoke(command, args) {
+    if (command.startsWith("leader_")) throw new Error("Retired task entry is unavailable");
+    const snapshot = window.__LEADER_FIXTURE__;
+    if (command === "get_app_settings") return structuredClone(fixtureSettings);
+    if (command === "update_app_settings") { fixtureSettings = structuredClone(args.settings); return null; }
+    if (command === "official_config_read") return [{ path: "G:/fixture/.claude/settings.json", exists: true, content: '{"autoCompactWindow":750000}' }];
+    if (command === "load_session_page") {
+      const usage = window.__LEADER_FIXTURE_USAGE__?.[`${args.engine}/${args.sessionId}`];
+      return { messages: usage === undefined ? [] : [{ role: "assistant", text: "Fixture occupancy snapshot", usage, ts: new Date().toISOString(), model: args.engine === "claude" ? "opus" : "gpt-6.1-sol" }], nextBefore: null, subagentHistory: [] };
+    }
+    if (command === "task_snapshot") return structuredClone(snapshot);
+    if (command === "list_archived_sessions") return structuredClone(window.__LEADER_FIXTURE_ARCHIVES__ ?? []);
+    if (command === "list_sessions") {
+      const archived = new Set((window.__LEADER_FIXTURE_ARCHIVES__ ?? []).map(s => `${s.engine}/${s.sessionId}`));
+      return structuredClone((window.__LEADER_FIXTURE_SESSIONS__ ?? []).filter(s => !archived.has(`${s.engine}/${s.sessionId}`)));
+    }
+    if (command === "rescan_sessions") return null;
+    if (command === "task_delete_branch") {
+      const target = snapshot.branches.find(b => b.id === args.branchId && b.state !== "reclaimed");
+      if (!target || target.parentEngine !== args.parentEngine || target.parentSessionId !== args.parentSessionId || target.workspacePath !== args.workspacePath) throw new Error("Direct parent required");
+      const branches = [target];
+      for (let i = 0; i < branches.length; i++) {
+        const parent = branches[i];
+        for (const child of snapshot.branches) {
+          if (child.state !== "reclaimed" && parent.sessionId && child.parentEngine === parent.engine && child.parentSessionId === parent.sessionId && child.workspacePath === parent.workspacePath && !branches.includes(child)) branches.push(child);
+        }
+      }
+      const ids = new Set(branches.map(b => b.id));
+      if (!args.expectedBranchIds || args.expectedBranchIds.length !== ids.size || args.expectedBranchIds.some(id => !ids.has(id))) throw new Error("Fixture: branch scope changed; review again");
+      if (branches.some(b => ["starting", "running", "waiting", "reclaiming", "stopping"].includes(b.state))) throw new Error("Fixture: branch must be idle");
+      if (window.__LEADER_FIXTURE_FAIL__) throw new Error("Fixture: branch deletion failed; records retained");
+      window.__LEADER_FIXTURE_DELETES__.push(structuredClone(args));
+      const keys = new Set(branches.filter(b => b.sessionId).map(b => `${b.engine}/${b.sessionId}`));
+      window.__LEADER_FIXTURE_SESSIONS__ = window.__LEADER_FIXTURE_SESSIONS__.filter(s => !keys.has(`${s.engine}/${s.sessionId}`));
+      snapshot.leaders = snapshot.leaders.filter(p => !keys.has(`${p.engine}/${p.sessionId}`));
+      for (const branch of branches) { branch.state = "reclaimed"; branch.task = ""; branch.result = ""; }
+      fixtureChanged();
+      return structuredClone(snapshot);
+    }
+    if (command === "task_group_action") {
+      if (args.engine !== "claude" || args.sessionId !== "fixture-leader" || args.workspacePath !== "G:/fixture") throw new Error("Whole-group actions require the root");
+      if (window.__LEADER_FIXTURE_FAIL__) throw new Error("Fixture: group action failed; records retained");
+      if (snapshot.branches.some(b => ["starting", "running", "waiting", "reclaiming"].includes(b.state))) throw new Error("Fixture: wait or stop the unfinished tasks first");
+      if (args.action === "archive") {
+        const members = [{ engine: args.engine, sessionId: args.sessionId, workspacePath: args.workspacePath },
+          ...snapshot.branches.filter(b => b.state !== "reclaimed" && b.sessionId).map(b => ({ engine: b.engine, sessionId: b.sessionId, workspacePath: b.workspacePath }))];
+        snapshot.archivedGroups = [{ root: members[0], title: window.__LEADER_FIXTURE_SESSIONS__[0].title, archivedAt: Date.now(), members, branchIds: snapshot.branches.filter(b => b.state !== "reclaimed").map(b => b.id) }];
+        const memberKeys = new Set(members.map(m => `${m.engine}/${m.sessionId}`));
+        window.__LEADER_FIXTURE_ARCHIVES__ = structuredClone(window.__LEADER_FIXTURE_SESSIONS__.filter(s => memberKeys.has(`${s.engine}/${s.sessionId}`)));
+      } else if (args.action === "restore") {
+        snapshot.archivedGroups = [];
+        window.__LEADER_FIXTURE_ARCHIVES__ = [];
+      } else if (args.action === "delete") {
+        window.__LEADER_FIXTURE_SESSIONS__ = [];
+        window.__LEADER_FIXTURE_ARCHIVES__ = [];
+        snapshot.leaders = []; snapshot.branches = []; snapshot.archivedGroups = [];
+      } else throw new Error("Unknown group action");
+      fixtureChanged();
+      return structuredClone(snapshot);
+    }
+    if (command === "task_branch_action") {
+      const branch = snapshot.branches.find(b => b.id === args.branchId);
+      if (!branch || branch.parentEngine !== args.parentEngine || branch.parentSessionId !== args.parentSessionId || branch.workspacePath !== args.workspacePath) throw new Error("Direct parent required");
+      if (args.action === "renew") { branch.deadlineAt = Date.now() + (args.ttlSeconds ?? (branch.engine === "claude" ? 3600 : 1800)) * 1000; branch.expired = false; }
+      if (args.action === "stop") branch.state = "stopped";
+      if (args.action === "reclaim") throw new Error("Single-branch deletion is disabled; use whole-group management");
+      return structuredClone(branch);
+    }
+    if (command === "remote_control_active") return false;
+    if (command === "plugin:event|listen") { const id = ++fixtureCallbackId; fixtureListeners.set(id, args); return id; }
+    if (command === "plugin:event|unlisten") { fixtureListeners.delete(args.eventId); return null; }
+    return null;
+  },
+};
+</script>
+<script type="module" src="./leader-tree.tsx"></script></body></html>

@@ -1,0 +1,27 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Effort layout regression</title></head>
+<body style="margin:0"><div id="root"></div>
+<script>
+  // Install isolated storage and IPC before production module imports.
+  const preferences = new Map([["ccgui-next.language", new URLSearchParams(location.search).get("lang") === "en" ? "en" : "zh"]]);
+  Object.defineProperty(window, "localStorage", { value: {
+    get length() { return preferences.size; }, key: (index) => [...preferences.keys()][index] ?? null,
+    getItem: (key) => preferences.get(String(key)) ?? null,
+    setItem: (key, value) => preferences.set(String(key), String(value)),
+    removeItem: (key) => preferences.delete(String(key)), clear: () => preferences.clear(),
+  } });
+  const callbacks = new Map(); let nextCallback = 1;
+  window.__effortFixtureIpc = [];
+  window.__TAURI_INTERNALS__ = {
+    transformCallback(callback) { const id = nextCallback++; callbacks.set(id, callback); return id; },
+    unregisterCallback(id) { callbacks.delete(id); }, convertFileSrc: (path) => path,
+    metadata: { currentWebview: { label: "main" }, currentWindow: { label: "main" } },
+    async invoke(command) {
+      window.__effortFixtureIpc.push(command);
+      if (command === "plugin:event|listen") return nextCallback++;
+      if (command === "plugin:event|unlisten" || command === "set_browser_occluded") return null;
+      throw new Error("Unexpected mocked IPC: " + command);
+    },
+  };
+</script>
+<script type="module" src="./effort-layout.tsx"></script></body></html>

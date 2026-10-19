@@ -1,0 +1,84 @@
+{
+  "$comment": "插件权限与能力授权的单一事实源（single source of truth）。消费方：@ccgui/plugin-sdk（TS 实现 + 测试）、src-tauri（Rust include_str! 测试向量 + KNOWN_PERMISSIONS）、插件模板 validate-manifest.mjs。修改本文件 = 修改安全边界，三处实现跑同一组向量，漂移会在 CI 暴露。",
+  "knownPermissions": [
+    "storage",
+    "ui:settings-section",
+    "ui:add-menu",
+    "ui:composer-status",
+    "ui:panel-tab",
+    "ui:status-bar",
+    "ui:command",
+    "ui:markdown",
+    "ui:page",
+    "ui:timeline-row",
+    "ui:session-menu",
+    "ui:sidebar-entry",
+    "ui:center-tab",
+    "ui:conversation-mode",
+    "agent",
+    "theme",
+    "i18n",
+    "events",
+    "network:none",
+    "composer:draft",
+    "host:session",
+    "host:chat",
+    "host:workspace",
+    "host:workspace:remote"
+  ],
+  "networkGrantShapes": {
+    "$comment": "完整权限字符串（含 network: 前缀）的形状校验。network:none 是基座权限，永远不是授权。host 精确匹配（大小写不敏感，无通配/子域）；端口 1..=65535，区间含端点且不可倒置。",
+    "valid": [
+      "network:127.0.0.1",
+      "network:api.example.com",
+      "network:EXAMPLE.com",
+      "network:api.example.com:8443",
+      "network:127.0.0.1:7680-7690",
+      "network:host:1-65535"
+    ],
+    "invalid": [
+      "network:none",
+      "network:",
+      "network:bad host",
+      "network:*.example.com",
+      "network:host:abc",
+      "network:host:99999",
+      "network:host:65536",
+      "network:host:0",
+      "network:host:0-80",
+      "network:host:90-80",
+      "network:host:1-2-3",
+      "network:host:"
+    ]
+  },
+  "networkAllow": [
+    { "$comment": "不带端口的授权覆盖任意端口", "grants": ["network:api.example.com"], "url": "https://api.example.com/x", "allowed": true },
+    { "grants": ["network:api.example.com"], "url": "https://api.example.com:8443", "allowed": true },
+    { "$comment": "host 精确匹配：子域不命中", "grants": ["network:api.example.com"], "url": "https://sub.api.example.com", "allowed": false },
+    { "$comment": "host 大小写不敏感", "grants": ["network:api.example.com"], "url": "https://API.example.com", "allowed": true },
+    { "$comment": "仅 http/https", "grants": ["network:api.example.com"], "url": "ftp://api.example.com", "allowed": false },
+    { "grants": ["network:api.example.com:8443"], "url": "https://api.example.com:8443/a", "allowed": true },
+    { "$comment": "授权带端口时 url 缺省端口（https=443）须落入", "grants": ["network:api.example.com:8443"], "url": "https://api.example.com", "allowed": false },
+    { "grants": ["network:api.example.com:8443"], "url": "http://api.example.com:8443", "allowed": true },
+    { "grants": ["network:h:7680-7690"], "url": "http://h:7680", "allowed": true },
+    { "grants": ["network:h:7680-7690"], "url": "http://h:7685", "allowed": true },
+    { "grants": ["network:h:7680-7690"], "url": "http://h:7690", "allowed": true },
+    { "grants": ["network:h:7680-7690"], "url": "http://h:7691", "allowed": false },
+    { "grants": ["network:h:7680-7690"], "url": "http://h", "allowed": false },
+    { "$comment": "缺省端口按协议 80/443", "grants": ["network:example.com:443"], "url": "https://example.com", "allowed": true },
+    { "grants": ["network:example.com:443"], "url": "http://example.com", "allowed": false },
+    { "$comment": "network:none 授权体无效，不产生任何放行", "grants": ["network:none"], "url": "http://none", "allowed": false },
+    { "grants": ["network:api.example.com"], "url": "not a url", "allowed": false }
+  ],
+  "execGrantShapes": {
+    "$comment": "exec: 授权的二进制名：裸名（^[A-Za-z0-9._-]+$），禁路径分隔符。",
+    "valid": ["exec:git", "exec:node", "exec:my-cli.v2", "exec:my_cli"],
+    "invalid": ["exec:", "exec:a/b", "exec:../x", "exec:x y", "exec:a\\b"]
+  },
+  "execAllow": [
+    { "grants": ["exec:git"], "bin": "git", "allowed": true },
+    { "$comment": "精确匹配", "grants": ["exec:git"], "bin": "git-lfs", "allowed": false },
+    { "grants": ["exec:git"], "bin": "/usr/bin/git", "allowed": false },
+    { "$comment": "大小写敏感", "grants": ["exec:git"], "bin": "Git", "allowed": false }
+  ]
+}

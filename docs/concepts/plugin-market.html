@@ -1,0 +1,864 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>插件市场 · 三个交互方案 / CC GUI</title>
+<style>
+/* ---------- 文档层：设计 token 与宿主界面保持一致（light/dark 两套变量） ---------- */
+:root{
+  --ink:#0a0a0a;--ink2:#737373;--ink3:#a3a3a3;--line:#ebebeb;--line2:#e0e0e0;
+  --surface:#fff;--soft:#f7f7f7;--hover:#f7f7f7;--app:#fff;--page:#f2f3f5;
+  --accent:#2b7fff;--accent2:#155dfc;--accent-soft:#eaf2ff;--accent-text:#155dfc;
+  --ok:#15803d;--ok-soft:#e8f7ee;--warn:#b45309;--danger:#e7000b;--danger-soft:#fef2f2;
+  --r:10px;--shadow:0 1px 2px #00000012;
+}
+[data-theme=dark]{
+  --ink:#e5e5e5;--ink2:#a3a3a3;--ink3:#737373;--line:#262626;--line2:#333;
+  --surface:#171717;--soft:#111;--hover:#1f1f1f;--app:#0d0d0d;--page:#050505;
+  --accent-soft:#14253d;--accent-text:#79b3ff;--ok:#7bd88f;--ok-soft:#10231a;--danger:#ff6467;--danger-soft:#2a1414;
+  --shadow:0 1px 2px #0008;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--page);color:var(--ink);font:13px/1.6 Inter,-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;-webkit-font-smoothing:antialiased}
+button{font:inherit;color:inherit;cursor:pointer}
+button:focus-visible,select:focus-visible,input:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+.grow{flex:1;min-width:0}
+.spin{width:12px;height:12px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;display:inline-block;animation:spin .6s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* ---------- 方案切换条（文档控件，不属于 App UI） ---------- */
+.pitch{position:sticky;top:0;z-index:40;display:flex;align-items:center;gap:14px;padding:9px 18px;background:var(--surface);border-bottom:1px solid var(--line);flex-wrap:wrap}
+.pitch h1{font-size:13px;font-weight:600;margin:0;letter-spacing:-.1px}
+.seg{display:inline-flex;gap:2px;padding:2px;background:var(--soft);border-radius:10px}
+.seg button{border:0;background:transparent;border-radius:8px;padding:6px 12px;font-size:12.5px;color:var(--ink2)}
+.seg button[aria-selected=true]{background:var(--surface);color:var(--ink);font-weight:550;box-shadow:var(--shadow)}
+.legend{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;color:var(--ink2);white-space:nowrap}
+.dot{width:8px;height:8px;border-radius:50%;display:inline-block}
+.dot-new{background:transparent;border:1.5px dashed var(--warn)}
+.dot-local{background:transparent;border:1.5px solid var(--accent)}
+.caption{max-width:1260px;margin:0 auto;padding:14px 22px 0;color:var(--ink2);font-size:12.5px;line-height:1.8}
+.caption b{color:var(--ink);font-weight:550}
+
+/* ---------- 宿主外壳（参考 docs/concepts 既有稿的窗口示意） ---------- */
+.app{display:grid;grid-template-columns:218px minmax(0,1fr);max-width:1280px;margin:12px auto 0;border:1px solid var(--line);border-radius:14px;background:var(--app);overflow:hidden;box-shadow:0 10px 40px #00000012}
+.sidebar{background:var(--soft);border-right:1px solid var(--line);padding:0 12px 16px;display:flex;flex-direction:column;min-height:640px}
+.brand{display:flex;align-items:center;gap:9px;padding:14px 9px 18px;font-size:15px;font-weight:600}
+.brand-mark{width:26px;height:26px;display:grid;place-items:center;border:1px solid var(--line2);border-radius:8px;background:var(--surface);font-size:10px;color:var(--ink2)}
+.nav-row{display:flex;align-items:center;gap:9px;padding:8px 10px;min-height:34px;font-size:12.5px;color:var(--ink2);border:0;background:transparent;border-radius:9px;text-align:left;width:100%}
+.nav-row:hover{background:var(--hover);color:var(--ink)}
+.nav-row[aria-current=page]{background:var(--accent-soft);color:var(--accent-text);font-weight:550}
+.side-cap{margin:22px 10px 8px;font-size:10.5px;color:var(--ink3)}
+.thread{padding:6px 10px 6px 12px;font-size:11.5px;color:var(--ink3);border-radius:8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.main{min-width:0;display:flex;flex-direction:column;background:var(--app)}
+.host-tabs{height:38px;border-bottom:1px solid var(--line);display:flex;align-items:stretch;padding:0 8px;font-size:11.5px;color:var(--ink3);flex:none}
+.host-tab{padding:0 16px;display:flex;align-items:center;gap:8px;border-right:1px solid var(--line);white-space:nowrap}
+.host-tab.active{color:var(--ink);background:var(--surface);border-bottom:2px solid var(--accent)}
+.host-tab .x{color:var(--ink3)}
+
+/* ---------- Hub 外壳：页签 + 右侧动作 ---------- */
+.hub-head{height:48px;display:flex;align-items:center;gap:12px;padding:0 20px;border-bottom:1px solid var(--line);flex:none}
+.hub-head h2{margin:0;font-size:15px;font-weight:600;letter-spacing:-.2px}
+.pills{display:inline-flex;gap:2px;padding:2px;background:var(--soft);border-radius:9px}
+.pill{border:0;background:transparent;border-radius:7px;padding:5px 12px;font-size:12.5px;color:var(--ink2)}
+.pill[aria-selected=true]{background:var(--surface);color:var(--ink);font-weight:550;box-shadow:var(--shadow)}
+
+/* ---------- 通用控件 ---------- */
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:5px;border:1px solid var(--line);background:var(--surface);border-radius:8px;padding:5px 11px;font-size:12.5px;color:var(--ink);transition:background .15s,border-color .15s,box-shadow .15s;white-space:nowrap}
+.btn:hover{background:var(--hover);border-color:var(--line2)}
+.btn-primary{border-color:transparent;background-image:linear-gradient(180deg,var(--accent),var(--accent2));color:#fff;box-shadow:0 1px 2px #00000014}
+.btn-primary:hover{background-image:linear-gradient(180deg,#3392ff,var(--accent));border-color:transparent}
+.btn-quiet{background:transparent;border-color:transparent;color:var(--ink2)}
+.btn-quiet:hover{background:var(--hover);color:var(--ink)}
+.btn-quiet[aria-pressed=true],.btn-quiet.ok{color:var(--ok);background:var(--ok-soft)}
+.btn-danger{color:var(--danger)}
+.btn-danger:hover{background:var(--danger-soft);border-color:var(--danger-soft)}
+.btn:disabled{cursor:default;opacity:.75}
+.btn[aria-pressed=true].fav{color:var(--accent-text);background:var(--accent-soft)}
+.bdg{display:inline-flex;align-items:center;gap:3px;border-radius:6px;background:var(--soft);padding:2px 6px;font-size:11px;color:var(--ink2);white-space:nowrap}
+.bdg-ok{background:var(--ok-soft);color:var(--ok)}
+.bdg-accent{background:var(--accent-soft);color:var(--accent-text)}
+.bdg-new{border:1px dashed var(--warn);background:transparent;color:var(--warn)}
+.av{width:36px;height:36px;flex:none;border-radius:9px;display:grid;place-items:center;color:#fff;font-size:14px;font-weight:600;background-image:linear-gradient(135deg,var(--g1),var(--g2))}
+.av-s{width:20px;height:20px;border-radius:50%;font-size:10px}
+.av-l{width:56px;height:56px;border-radius:14px;font-size:22px}
+.author{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--ink2);min-width:0}
+.author span:last-child{overflow:hidden;text-overflow:ellipsis}
+.sel{appearance:none;border:1px solid var(--line);border-radius:9px;background:var(--surface) no-repeat right 9px center;background-image:url("data:image/svg+xml;charset=utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 10 10'%3E%3Cpath d='M2 4l3 3 3-3' fill='none' stroke='%23888' stroke-width='1.4' stroke-linecap='round'/%3E%3C/svg%3E");padding:6px 26px 6px 11px;font-size:12.5px;color:var(--ink);background-position:right 9px center}
+.search{display:flex;align-items:center;gap:7px;border:1px solid var(--line);border-radius:9px;padding:6px 10px;background:var(--surface);min-width:200px}
+.search svg{flex:none;color:var(--ink3)}
+.search input{border:0;outline:0;background:transparent;font:inherit;font-size:12.5px;width:100%;color:var(--ink);min-width:0}
+.search:focus-within{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+
+/* ---------- 页面主体容器 ---------- */
+.body{padding:18px 20px 40px}
+.body-wide{max-width:1090px;margin:0 auto}
+.body-split{max-width:1240px;margin:0 auto;padding:18px 20px 40px}
+.toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px}
+.chips{display:flex;align-items:center;gap:2px;flex-wrap:wrap}
+.chip{border:1px solid transparent;background:transparent;border-radius:999px;padding:5px 11px;font-size:12.5px;color:var(--ink2)}
+.chip:hover{background:var(--hover);color:var(--ink)}
+.chip[aria-pressed=true]{background:var(--surface);border-color:var(--line);color:var(--ink);font-weight:550;box-shadow:var(--shadow)}
+.chip .n{color:var(--ink3);font-size:11px;margin-left:3px;font-weight:400}
+.tools{display:flex;align-items:center;gap:8px;margin-left:auto;flex-wrap:wrap}
+.vswitch{display:inline-flex;gap:2px;padding:2px;background:var(--soft);border-radius:9px}
+.vswitch button{border:0;background:transparent;border-radius:7px;padding:5px 8px;color:var(--ink2);display:grid;place-items:center}
+.vswitch button[aria-pressed=true]{background:var(--surface);color:var(--ink);box-shadow:var(--shadow)}
+.sec-title{display:flex;align-items:baseline;gap:8px;margin:18px 2px 10px}
+.sec-title h3{margin:0;font-size:13.5px;font-weight:550}
+.sec-title span{font-size:11.5px;color:var(--ink3)}
+.empty{padding:44px 16px;text-align:center;color:var(--ink3);font-size:12.5px}
+.foot-hint{margin:14px 2px 0;font-size:11.5px;color:var(--ink3);line-height:1.8}
+
+/* ---------- 方案 A：表格 ---------- */
+.tablewrap{border:1px solid var(--line);border-radius:14px;background:var(--surface);overflow:hidden}
+table.table{width:100%;border-collapse:collapse;table-layout:fixed}
+.table th{text-align:left;font-size:11.5px;font-weight:500;color:var(--ink2);padding:10px 14px;border-bottom:1px solid var(--line);background:var(--surface);position:sticky;top:0;z-index:2}
+.table td{padding:11px 14px;border-bottom:1px solid var(--line);vertical-align:middle}
+.table tr:last-child td{border-bottom:0}
+.table tbody tr{cursor:pointer;transition:background .12s}
+.table tbody tr:hover{background:var(--hover)}
+.table .w-author{width:170px}
+.table .w-num{width:96px;text-align:right;font-variant-numeric:tabular-nums;color:var(--ink2)}
+.table .w-act{width:140px;text-align:right}
+.ident{display:flex;align-items:center;gap:11px;min-width:0}
+.ident-text{display:flex;flex-direction:column;gap:1px;min-width:0}
+.ident-line{display:flex;align-items:center;gap:6px;min-width:0}
+.pname{font-size:13px;font-weight:550;color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pdesc{font-size:11.5px;color:var(--ink2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.avatar-cell{display:flex;align-items:center;gap:7px;min-width:0;font-size:12px;color:var(--ink2)}
+.avatar-cell span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* ---------- 方案 A 卡片视图 / 方案 B 画廊 ---------- */
+.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}
+.card{border:1px solid var(--line);border-radius:14px;background:var(--surface);overflow:hidden;display:flex;flex-direction:column;transition:box-shadow .18s,transform .18s}
+.card:hover{box-shadow:0 8px 26px #0a0a0a16;transform:translateY(-2px)}
+.cover{position:relative;width:100%;aspect-ratio:16/9;border:0;padding:0;display:block;overflow:hidden;background-image:linear-gradient(135deg,var(--g1),var(--g2));text-align:left}
+.cover-ghost{position:absolute;right:10px;top:2px;font-size:74px;font-weight:700;color:#ffffff2e;line-height:1;letter-spacing:-2px}
+.cover-name{position:absolute;left:12px;bottom:10px;z-index:2;color:#fff;font-size:12.5px;font-weight:550;text-shadow:0 1px 3px #0004}
+.cover:after{content:"";position:absolute;left:0;right:0;bottom:0;height:46px;z-index:1;background:linear-gradient(180deg,transparent,#00000059)}
+.cover-badge{position:absolute;left:12px;top:10px}
+.card-body{padding:12px 13px 13px;display:flex;flex-direction:column;gap:7px;flex:1}
+.card-titlerow{display:flex;align-items:center;gap:6px;min-width:0}
+.card-name{border:0;background:transparent;padding:0;font-size:13px;font-weight:550;color:var(--ink);text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.card-name:hover{text-decoration:underline}
+.card-desc{margin:0;font-size:11.5px;line-height:1.65;color:var(--ink2);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;min-height:38px}
+.card-foot{display:flex;align-items:center;gap:8px;margin-top:auto;padding-top:2px}
+.dl{display:inline-flex;align-items:center;gap:4px;font-size:11.5px;color:var(--ink3);font-variant-numeric:tabular-nums}
+.hero{display:grid;grid-template-columns:1.06fr 1fr;border:1px solid var(--line);border-radius:16px;overflow:hidden;background:var(--surface);margin-bottom:22px}
+.hero-cover{position:relative;min-height:230px;background-image:linear-gradient(135deg,var(--g1),var(--g2));overflow:hidden}
+.hero-body{padding:20px 22px;display:flex;flex-direction:column;gap:9px}
+.hero-body h3{margin:0;font-size:19px;font-weight:600;letter-spacing:-.3px}
+.hero-body p{margin:0;font-size:12.5px;line-height:1.75;color:var(--ink2)}
+.hero-actions{display:flex;align-items:center;gap:8px;margin-top:auto}
+.mockwin{position:absolute;left:11%;right:11%;top:15%;bottom:-4%;border-radius:10px 10px 0 0;background:#ffffffF2;box-shadow:0 10px 30px #00000026;display:flex;flex-direction:column;overflow:hidden}
+.mockbar{height:15px;background:#00000010;display:flex;align-items:center;gap:4px;padding:0 7px}
+.mockbar i{width:5px;height:5px;border-radius:50%;background:#00000026}
+.mockcols{flex:1;display:grid;grid-template-columns:1.15fr 1fr .75fr;gap:6px;padding:8px}
+.mockcols span{background:linear-gradient(180deg,#00000012,#00000005);border-radius:4px}
+[data-theme=dark] .mockwin{background:#1c1c1cf5}
+[data-theme=dark] .mockbar{background:#ffffff14}
+[data-theme=dark] .mockbar i{background:#ffffff2e}
+[data-theme=dark] .mockcols span{background:linear-gradient(180deg,#ffffff14,#ffffff08)}
+
+/* ---------- 方案 C：三栏 ---------- */
+.split{display:grid;grid-template-columns:190px 336px minmax(0,1fr);border:1px solid var(--line);border-radius:16px;background:var(--surface);overflow:hidden}
+.split-rail{border-right:1px solid var(--line);background:var(--soft);padding:12px 10px}
+.rail-cap{margin:8px 9px 6px;font-size:10.5px;color:var(--ink3)}
+.rail-item{display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;border:0;background:transparent;border-radius:8px;padding:7px 9px;font-size:12.5px;color:var(--ink2);text-align:left}
+.rail-item:hover{background:var(--hover);color:var(--ink)}
+.rail-item[aria-current=true]{background:var(--surface);color:var(--ink);font-weight:550;box-shadow:inset 0 0 0 1px var(--line)}
+.rail-item .n{font-size:11px;color:var(--ink3);font-weight:400}
+.split-list{border-right:1px solid var(--line);display:flex;flex-direction:column;min-width:0}
+.split-list-head{display:flex;gap:8px;align-items:center;padding:10px;border-bottom:1px solid var(--line)}
+.split-list-head .search{min-width:0;flex:1}
+.srows{display:flex;flex-direction:column;min-width:0}
+.srow{display:flex;align-items:center;gap:10px;width:100%;border:0;border-left:2px solid transparent;background:transparent;padding:10px 12px;text-align:left;min-width:0;transition:background .12s}
+.srow:hover{background:var(--hover)}
+.srow[aria-selected=true]{background:var(--accent-soft);border-left-color:var(--accent)}
+.srow-main{display:flex;flex-direction:column;gap:1px;min-width:0;flex:1}
+.srow-name{font-size:12.5px;font-weight:550;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.srow-sub{font-size:11px;color:var(--ink3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.split-hint{margin:auto 12px 10px;font-size:10.5px;color:var(--ink3)}
+.split-preview{padding:18px 20px;min-width:0}
+.preview-stage{position:relative;border:1px solid var(--line);border-radius:12px;background:var(--soft);aspect-ratio:16/8.4;overflow:hidden;display:grid;place-items:center}
+.preview-empty{display:flex;flex-direction:column;align-items:center;gap:6px;color:var(--ink3);font-size:11.5px}
+.meta{display:grid;grid-template-columns:76px minmax(0,1fr);gap:7px 10px;font-size:12px;margin:0}
+.meta dt{color:var(--ink3)}
+.meta dd{margin:0;color:var(--ink);min-width:0;overflow-wrap:anywhere}
+.perm{display:flex;flex-wrap:wrap;gap:6px}
+.perm span{font-size:11px;background:var(--soft);border-radius:6px;padding:3px 7px;color:var(--ink2)}
+
+/* ---------- 详情页 ---------- */
+.crumbar{display:flex;align-items:center;gap:10px;padding:10px 20px;border-bottom:1px solid var(--line)}
+.crumb{font-size:12px;color:var(--ink3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.detail-inner{max-width:1120px;margin:0 auto;padding:22px 24px 56px}
+.detail-top{display:flex;align-items:flex-start;gap:16px;margin-bottom:20px}
+.detail-top h2{margin:0 0 4px;font-size:22px;font-weight:600;letter-spacing:-.4px}
+.detail-desc{margin:0;font-size:12.5px;line-height:1.8;color:var(--ink2);max-width:56em}
+.badges{display:flex;flex-wrap:wrap;gap:6px;margin-top:9px}
+.detail-actions{display:flex;align-items:center;gap:8px;flex:none;padding-top:4px}
+.detail-cols{display:grid;grid-template-columns:minmax(0,1fr) 272px;gap:28px;align-items:start}
+.detail-main{min-width:0;display:flex;flex-direction:column;gap:18px}
+.stage{position:relative;border:1px solid var(--line);border-radius:14px;background:var(--soft);aspect-ratio:16/9;overflow:hidden;display:grid;place-items:center}
+.stage.is-empty{aspect-ratio:auto;min-height:0;padding:22px 18px;border-style:dashed;gap:8px;display:flex;flex-direction:column;align-items:center;justify-content:center}
+.stage .mockwin{left:8%;right:8%;top:11%}
+.stage-tag{position:absolute;left:10px;top:10px;z-index:2}
+.thumbs{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+.thumb{position:relative;aspect-ratio:16/9;border-radius:10px;border:1px solid var(--line);overflow:hidden;background-image:linear-gradient(135deg,var(--g1),var(--g2));padding:0}
+.thumb[aria-current=true]{outline:2px solid var(--accent);outline-offset:1px}
+.thumb span{position:absolute;left:7px;bottom:5px;color:#fff;font-size:10px;text-shadow:0 1px 2px #0004}
+.detail-rail{position:sticky;top:14px;display:flex;flex-direction:column;gap:16px;border-left:1px solid var(--line);padding-left:20px}
+.rail-block{display:flex;flex-direction:column;gap:7px}
+.rail-block h4{margin:0;font-size:11.5px;font-weight:500;color:var(--ink3)}
+.rail-block .v{font-size:12.5px;color:var(--ink)}
+.rail-link{display:inline-flex;align-items:center;gap:5px;border:0;background:transparent;padding:0;font-size:12.5px;color:var(--accent-text);text-align:left}
+.rail-link:hover{text-decoration:underline}
+details.more{margin-top:2px}
+details.more summary{font-size:11.5px;color:var(--ink2);cursor:pointer;list-style:none}
+details.more summary::-webkit-details-marker{display:none}
+details.more summary:hover{color:var(--ink)}
+.perm-full{display:flex;flex-direction:column;gap:4px;margin-top:8px;font-size:11.5px;color:var(--ink2);max-height:210px;overflow:auto}
+.readme{font-size:12.5px;line-height:1.9;color:var(--ink2)}
+.readme h3{font-size:15px;color:var(--ink);margin:24px 0 8px;font-weight:600}
+.readme h3:first-child{margin-top:4px}
+.readme h4{font-size:12.5px;color:var(--ink);margin:16px 0 6px}
+.readme p{margin:0 0 10px}
+.readme ul{margin:0 0 12px;padding-left:20px}
+.readme li{margin-bottom:4px}
+.readme code{font:11.5px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:var(--soft);border:1px solid var(--line);border-radius:4px;padding:1px 4px}
+.readme pre{background:var(--soft);border:1px solid var(--line);border-radius:10px;padding:12px 14px;overflow:auto;font:11.5px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--ink2);margin:0 0 12px}
+
+/* ---------- 已安装 ---------- */
+.inst-title{display:flex;align-items:center;gap:10px;margin:0 2px 12px}
+.inst-title h3{margin:0;font-size:13.5px;font-weight:550}
+.src{font-size:11px;color:var(--ink3)}
+
+/* ---------- Toast ---------- */
+.toast{position:fixed;left:50%;bottom:28px;transform:translate(-50%,8px);background:var(--ink);color:var(--app);padding:9px 15px;border-radius:10px;font-size:12.5px;box-shadow:0 8px 30px #0003;opacity:0;pointer-events:none;transition:opacity .18s,transform .18s;z-index:60}
+.toast.show{opacity:1;transform:translate(-50%,0)}
+
+/* ---------- 文档页尾：对比与取舍 ---------- */
+.notes{max-width:1280px;margin:26px auto 60px;padding:0 22px}
+.notes h2{font-size:15px;font-weight:600;margin:0 0 4px}
+.notes .lede{color:var(--ink2);font-size:12.5px;line-height:1.8;margin:0 0 16px}
+.cmp{width:100%;border-collapse:collapse;background:var(--surface);border:1px solid var(--line);border-radius:14px;overflow:hidden;font-size:12.5px}
+.cmp th,.cmp td{padding:10px 14px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+.cmp thead th{font-size:11.5px;font-weight:500;color:var(--ink2);background:var(--soft)}
+.cmp tbody th{font-weight:500;color:var(--ink3);font-size:11.5px;width:110px;white-space:nowrap}
+.cmp tr:last-child th,.cmp tr:last-child td{border-bottom:0}
+.cmp b{font-weight:550;color:var(--ink)}
+.cols2{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:18px}
+.note-card{border:1px solid var(--line);border-radius:14px;background:var(--surface);padding:16px 18px}
+.note-card h3{margin:0 0 8px;font-size:13px;font-weight:550}
+.note-card ol,.note-card ul{margin:0;padding-left:19px;color:var(--ink2);font-size:12.5px;line-height:1.95}
+.note-card b{color:var(--ink);font-weight:550}
+.rec{margin-top:18px;border:1px solid var(--line);border-radius:14px;background:var(--surface);padding:16px 18px;font-size:12.5px;line-height:1.9;color:var(--ink2)}
+.rec b{color:var(--ink)}
+
+@media (max-width:1180px){
+  .app{grid-template-columns:1fr;margin:12px 12px 0}
+  .sidebar{display:none}
+  .grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .split{grid-template-columns:170px 300px minmax(0,1fr)}
+  .detail-cols{grid-template-columns:minmax(0,1fr) 240px;gap:20px}
+}
+@media (max-width:900px){
+  .split{grid-template-columns:1fr}
+  .split-rail,.split-list{border-right:0;border-bottom:1px solid var(--line)}
+  .split-preview{border-top:0}
+  .grid{grid-template-columns:1fr}
+  .hero{grid-template-columns:1fr}
+  .detail-cols{grid-template-columns:1fr}
+  .detail-rail{position:static;border-left:0;padding-left:0;border-top:1px solid var(--line);padding-top:16px}
+  .cols2{grid-template-columns:1fr}
+  .detail-top{flex-wrap:wrap}
+}
+@media (prefers-reduced-motion:reduce){*{transition:none!important;animation-duration:2.4s!important}}
+</style>
+</head>
+<body>
+<!-- ===================== 文档控件：方案切换 ===================== -->
+<div class="pitch">
+  <h1>插件市场 · 交互方案</h1>
+  <div class="seg" role="tablist" aria-label="方案切换">
+    <button role="tab" aria-selected="true"  data-variant="a">方案 A · 密集表格</button>
+    <button role="tab" aria-selected="false" data-variant="b">方案 B · 卡片画廊</button>
+    <button role="tab" aria-selected="false" data-variant="c">方案 C · 分栏快速浏览</button>
+  </div>
+  <span class="grow"></span>
+  <span class="legend"><span class="dot dot-new"></span>需要新增索引字段/后端能力</span>
+  <span class="legend"><span class="dot dot-local"></span>本机就能实现</span>
+  <button class="btn btn-quiet" id="theme" aria-label="切换深浅色">◐ 深色</button>
+</div>
+<p class="caption" id="caption"></p>
+
+<!-- ===================== 宿主窗口示意 ===================== -->
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand"><span class="brand-mark">CC</span>CC GUI</div>
+    <button class="nav-row">＋ 新建会话</button>
+    <button class="nav-row">◇ 新建浏览器</button>
+    <button class="nav-row" aria-current="page">▦ 插件</button>
+    <p class="side-cap">工作空间</p>
+    <div class="thread">▱ desktop-cc-gui</div>
+    <div class="thread">修复流式消息回退</div>
+    <div class="thread">插件 SDK 接入讨论</div>
+  </aside>
+  <div class="main">
+    <div class="host-tabs">
+      <span class="host-tab">修复流式消息回退</span>
+      <span class="host-tab active">▦　插件<span class="x">　×</span></span>
+    </div>
+    <div id="hub"></div>
+  </div>
+</div>
+
+<!-- ===================== 文档页尾：对比与取舍 ===================== -->
+<section class="notes">
+  <h2>三个方案怎么选</h2>
+  <p class="lede">三个方案共用同一套数据、同一份详情页与「已安装」页；差异在浏览形态。切换上方页签即可对比，安装/更新/收藏/分类/搜索/排序都是可点的。</p>
+  <table class="cmp">
+    <thead>
+      <tr><th></th><th>A 密集表格</th><th>B 卡片画廊</th><th>C 分栏快速浏览</th></tr>
+    </thead>
+    <tbody>
+      <tr><th>浏览形态</th><td>表头固定：名称 / 开发者 / 安装量 / 版本 / 操作</td><td>精选大图 + 三列卡片墙</td><td>左分类栏 / 中列表 / 右实时预览</td></tr>
+      <tr><th>一屏可见</th><td><b>约 8–10 个</b></td><td>约 3–6 个</td><td>列表约 7 个 + 1 个预览</td></tr>
+      <tr><th>进详情</th><td>点整行 / 点名称</td><td>点封面 / 点标题</td><td>右栏直接看；「查看完整详情」进整页</td></tr>
+      <tr><th>主要优点</th><td>信息可比、扫描快、<b>改写现有行组件成本最低</b></td><td>商店氛围、能给截图上场、发现性强</td><td><b>浏览→决策链路最短</b>，分类沉淀、适合重度用户</td></tr>
+      <tr><th>主要代价</th><td>视觉偏工具，截图无处发挥</td><td>没有截图时封面雷同；实现成本最高</td><td>三栏在 1100px 窗口偏挤；实现成本中高</td></tr>
+      <tr><th>依赖新数据</th><td>无</td><td>建议插件补截图（索引字段已有，只是没人提供）</td><td>无</td></tr>
+      <tr><th>适合</th><td>默认形态，插件 15+ 仍成立</td><td>有截图、有运营位时</td><td>插件 30+ 的重度场景</td></tr>
+    </tbody>
+  </table>
+
+  <div class="cols2">
+    <div class="note-card">
+      <h3>三个方案都会做的改动（参考稿里确实更好的地方）</h3>
+      <ol>
+        <li>分类从下拉框换成<b>带计数的 chips</b>，一屏可点，少一次展开。</li>
+        <li>列表右侧从圆形图标改成<b>带文字的「安装 / 更新到 x.y.z / 已安装」</b>，可点面积和状态都更清楚。</li>
+        <li>补齐<b>排序</b>（综合 / 安装量 / 名称）与下载量格式化（万）。</li>
+        <li>详情页改为<b>左正文 + 右信息栏</b>：动作挪到标题行右侧，右栏 sticky 常驻。</li>
+        <li>详情页给截图<b>缩略图条</b>，README 进正文；没截图时给明确空状态，不留白框。</li>
+        <li>列表与详情<b>统一标注更新状态</b>（可更新 → 更新到 x.y.z）。</li>
+      </ol>
+    </div>
+    <div class="note-card">
+      <h3>参考稿里有、我们暂时没有的（先不做，避免假数据）</h3>
+      <ul>
+        <li><b>获赞量 / 收藏总数</b>（♥633）：需要后端全局统计 + 索引字段。个人收藏可以纯本机做（方案里已标蓝点），但没有总数就没有参考稿那种社交证明。</li>
+        <li><b>最近更新日期</b>：索引 <code>plugins/&lt;id&gt;.json</code> 里没有时间字段；要这列就得加。</li>
+        <li><b>开发者主页 / 关注</b>：索引只有 author 字符串，没有主页链接与关注关系。</li>
+        <li><b>试用</b>：插件没有"不安装就能试"的形态，装了就在跑，所以不做。</li>
+        <li>我们的「安装量」来自 <code>download-counts.json</code>（安装 + 更新次数），文案沿用「安装量」即可，但含义要在文案里说清。</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="rec">
+    <b>我的建议：</b>A 作为默认浏览形态（改动最小、和现有行组件最接近、表格在插件变多后依然成立）；B 的「精选 + 封面」可以先缩成 A 顶部的一行，等插件普遍提供截图后再升级成完整卡片墙；C 等插件数量到 30+ 再评估——那之前三栏会在 1100px 窗口下把名称和描述都截断。<br>
+    详情页（右信息栏 + 缩略图条）三个方案共用，建议先落地，它和列表形态不冲突。
+  </div>
+</section>
+
+<script>
+/* =======================================================================
+ * 模拟数据：全部来自线上索引 community-plugins.json + plugins/<id>.json，
+ * 只有 installed / 更新关系是人为设定的演示状态（已在界面上标注）。
+ * ======================================================================= */
+const PLUGINS = [
+  { id:"model-switcher", name:"模型与供应商助手", author:"Guardian-J", version:"1.0.29", tier:"js", downloads:290, cat:"integration", shots:4,
+    minApp:"1.0.5", sdk:"^0.3.11",
+    desc:"模型与 CLI 选择、供应商渠道切换、独立渠道管理、全局主题、会话模型显示、幕布链接跳转，以及可选的 Claude Agent SDK 提示词清洗。",
+    repo:"Guardian-J/ccgui-plugin-model-switcher",
+    perms:["storage","host:session","ui:composer-status","ui:markdown","ui:settings-section","ui:status-bar","ui:command","theme","i18n","events","exec:node","network:api.deepseek.com","network:openrouter.ai","network:api.openai.com","network:api.anthropic.com","network:api.siliconflow.cn","network:dashscope.aliyuncs.com","network:ark.cn-beijing.volces.com","network:api.minimax.chat","network:api.groq.com"] },
+  { id:"composer-rainbow-border", name:"彩虹跑马灯边界线", author:"libo-zhou", version:"1.1.0", tier:"declarative", downloads:258, cat:"appearance", shots:0,
+    minApp:"1.0.0", sdk:null,
+    desc:"对话运行中为聊天输入框添加沿边界持续流动的彩虹跑马灯效果，空闲时恢复常规边框。",
+    repo:"libo-zhou/ccgui-plugin-composer-rainbow-border", perms:[] },
+  { id:"auto-title", name:"会话自动命名", author:"zhukunpenglinyutong", version:"0.7.0", tier:"js", downloads:240, cat:"productivity", shots:0,
+    minApp:"1.0.2", sdk:">=0.3.7",
+    desc:"每轮对话结束后用本机 CLI 或 DeepSeek 生成「emoji + 对象｜目标」式会话标题，支持 codex / omp / pi / claude；不覆盖手动改名，可暂停、可只命名一次。",
+    repo:"zhukunpenglinyutong/ccgui-plugin-auto-title",
+    perms:["events","storage","ui:status-bar","ui:settings-section","ui:command","ui:session-menu","host:session","exec:python3","exec:claude","exec:codex","exec:gemini","exec:omp","exec:pi","network:api.deepseek.com"] },
+  { id:"token-meter", name:"Token 速度表", author:"zhukunpenglinyutong", version:"0.1.2", tier:"js", downloads:187, cat:"productivity", shots:0,
+    minApp:"1.0.4", sdk:"^0.3",
+    desc:"composer 状态行实时显示 token 输出速度与缓存命中率，支持全部 11 个 CLI 引擎。",
+    repo:"zhukunpenglinyutong/ccgui-plugin-token-meter",
+    perms:["events","ui:composer-status","storage"] },
+  { id:"react-doctor", name:"React Doctor", author:"zhukunpenglinyutong", version:"0.3.0", tier:"js", downloads:170, cat:"dev", shots:0,
+    minApp:"1.0.0", sdk:"^0.3",
+    desc:"一键运行 npx react-doctor@latest 代码体检：评分环、错误/警告统计、按文件分组的问题列表与修复建议、原始输出，结果本地持久化；非满分时可「一键修复」把问题清单填入聊天输入框。",
+    repo:"zhukunpenglinyutong/ccgui-plugin-react-doctor",
+    perms:["ui:panel-tab","storage","composer:draft","exec:npx","exec:node"] },
+  { id:"wsl", name:"WSL 管理器", author:"chenxiangning", version:"0.4.6", tier:"js", downloads:100, cat:"dev", shots:2,
+    minApp:"1.0.2", sdk:">=0.3.4",
+    desc:"WSL 发行版管理器：本机诊断与设默认、引擎探针、远程宿主（密码 / key）、WSL 工作区登记、发行版内文件面板，claude / codex / omp 会话列表与历史回放。",
+    repo:"chenxiangning/ccgui-plugin-wsl",
+    perms:["ui:settings-section","ui:panel-tab","storage","theme","exec:wsl.exe","exec:ssh","exec:expect","host:workspace","host:workspace:remote","host:session","ui:add-menu","ui:page"] },
+  { id:"balance-meter", name:"余额与余量", author:"zhujiuyi", version:"0.2.0", tier:"js", downloads:59, cat:"integration", shots:0,
+    minApp:"1.0.5", sdk:"^0.3",
+    desc:"按当前引擎实际在用的网关识别供应商与计费方式：API 查余额、订阅查余量；已支持 ChatGPT、Claude、OpenCode Go、Kimi、智谱、MiniMax、Grok 等订阅渠道，没有可用接口时明确提示；支持手动刷新与每轮对话后自动刷新。",
+    repo:"zhujiuyi/ccgui-plugin-balance-meter",
+    perms:["storage","events","ui:status-bar","ui:settings-section","ui:command","theme","exec:curl","exec:cmd","exec:powershell.exe","exec:sh"] },
+];
+
+const CATS = [
+  { id:"all",  label:"全部" },
+  { id:"dev",  label:"开发工具" },
+  { id:"productivity", label:"效率工具" },
+  { id:"integration",  label:"集成与渠道" },
+  { id:"appearance",   label:"界面外观" },
+  { id:"other",        label:"其他" },
+];
+
+/* 演示状态：已安装 / 可更新 / 收藏 / 本地插件 */
+const state = {
+  variant:"a",
+  view:"market",              // market | installed | detail
+  layout:"table",             // 方案 A 里 table | grid
+  category:"all",
+  query:"",
+  sort:"smart",
+  onlyInstalled:false,
+  onlyUpdates:false,
+  selected:"model-switcher",
+  detailId:null,
+  favorites:new Set(),
+  installed:{ wsl:"0.4.6", "token-meter":"0.1.2", "auto-title":"0.6.0" },
+  installing:null,
+  focus:null,
+};
+const LOCAL_PLUGIN = { id:"demo-local", name:"我的本地插件（示意）", desc:"从本地目录安装，用来演示 source=local 的行样式。", version:"0.1.0", author:"本机" };
+
+/* 与 src/features/plugins/hub/catalog.ts 同一套确定性头像 */
+const PALETTE = [["#60a5fa","#2563eb"],["#34d399","#059669"],["#fbbf24","#d97706"],["#f472b6","#db2777"],["#a78bfa","#7c3aed"],["#22d3ee","#0891b2"],["#fb7185","#e11d48"],["#f97316","#ea580c"]];
+function grad(seed){ let h=0; for(const ch of seed) h=(h*31+ch.charCodeAt(0))|0; const [a,b]=PALETTE[Math.abs(h)%PALETTE.length]; return "--g1:"+a+";--g2:"+b; }
+function initial(name){ const c=Array.from(String(name).trim())[0]||"?"; return /[a-z]/i.test(c)?c.toUpperCase():c; }
+function esc(s){ return String(s).replace(/[&<>"]/g, c=>({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c])); }
+function fmt(n){ if(n==null) return "—"; if(n>=10000){ const w=n/10000; return (w>=10?Math.round(w):w.toFixed(1)).toString().replace(/\.0$/,"")+" 万"; } return n.toLocaleString("zh-CN"); }
+function byId(id){ return PLUGINS.find(p=>p.id===id); }
+function hasUpdate(id){ const inst=state.installed[id]; const p=byId(id); return !!(inst&&p&&inst!==p.version); }
+
+const PERM_LABELS = {
+  storage:"读写插件本地存储", events:"订阅宿主事件", theme:"读取与跟随主题", i18n:"读取界面语言", agent:"调用 Agent 能力",
+  "composer:draft":"读写聊天输入框草稿", "host:session":"读写会话", "host:workspace":"读写本机工作区", "host:workspace:remote":"读写远程工作区",
+  "ui:settings-section":"在设置里增加区块", "ui:add-menu":"在添加菜单里增加入口", "ui:composer-status":"在输入框状态行显示信息",
+  "ui:panel-tab":"增加侧边面板页签", "ui:status-bar":"在状态栏显示信息", "ui:command":"注册命令", "ui:markdown":"扩展 Markdown 渲染",
+  "ui:page":"注册整页界面", "ui:timeline-row":"在时间线里增加行", "ui:session-menu":"在会话菜单里增加入口",
+};
+function permLabel(id){
+  if(PERM_LABELS[id]) return PERM_LABELS[id];
+  if(id.startsWith("exec:")) return "运行命令 " + id.slice(5);
+  if(id.startsWith("network:")) return "访问 " + id.slice(8);
+  if(id.startsWith("ui:")) return "扩展界面 " + id.slice(3);
+  return id;
+}
+
+/* ============================ 过滤 / 排序 ============================ */
+function countOf(cat){ return PLUGINS.filter(p=>cat==="all"||p.cat===cat).length; }
+function visible(){
+  let list = PLUGINS.filter(p=>(state.category==="all"||p.cat===state.category))
+                    .filter(p=>!state.query.trim() || (p.id+"\n"+p.name+"\n"+p.desc+"\n"+p.author).toLowerCase().includes(state.query.trim().toLowerCase()));
+  if(state.onlyInstalled) list = list.filter(p=>state.installed[p.id]);
+  if(state.onlyUpdates) list = list.filter(p=>hasUpdate(p.id));
+  const zh=(a,b)=>a.localeCompare(b,"zh");
+  if(state.sort==="downloads") list = list.slice().sort((a,b)=>b.downloads-a.downloads||zh(a.name,b.name));
+  else if(state.sort==="name") list = list.slice().sort((a,b)=>zh(a.name,b.name));
+  else list = list.slice().sort((a,b)=>b.downloads-a.downloads||zh(a.name,b.name));
+  return list;
+}
+function currentPlugins(){ const l=visible(); return l.length?l:PLUGINS; }
+function selectedPlugin(){ const p=byId(state.selected); return p && visible().some(v=>v.id===p.id) ? p : (visible()[0]||PLUGINS[0]); }
+function installedCount(){ return Object.keys(state.installed).length; }
+function updateCount(){ return PLUGINS.filter(p=>hasUpdate(p.id)).length; }
+
+/* ============================ 通用片段 ============================ */
+const ICON = {
+  search:'<svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="7" cy="7" r="4.4"/><path d="m10.4 10.4 3 3" stroke-linecap="round"/></svg>',
+  dl:'<svg width="11" height="11" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M7 2v7m0 0 2.8-2.8M7 9 4.2 6.2" stroke-linecap="round"/><path d="M2.6 11.4h8.8" stroke-linecap="round"/></svg>',
+  check:'<svg width="13" height="13" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="m2.8 7.4 2.8 2.8 5.6-6" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  list:'<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M2 4h12M2 8h12M2 12h12" stroke-linecap="round"/></svg>',
+  grid:'<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="2.4" y="2.4" width="4.6" height="4.6" rx="1.2"/><rect x="9" y="2.4" width="4.6" height="4.6" rx="1.2"/><rect x="2.4" y="9" width="4.6" height="4.6" rx="1.2"/><rect x="9" y="9" width="4.6" height="4.6" rx="1.2"/></svg>',
+};
+function actionHtml(p){
+  const ins=state.installed[p.id], upd=hasUpdate(p.id), inst=state.installing&&state.installing.id===p.id;
+  if(inst) return '<button class="btn" disabled><span class="spin"></span>安装中 '+Math.round(state.installing.pct)+'%</button>';
+  if(ins&&upd) return '<button class="btn btn-primary" data-act="install" data-id="'+p.id+'">更新到 '+p.version+'</button>';
+  if(ins) return '<button class="btn btn-quiet ok" data-act="detail" data-id="'+p.id+'" title="已安装，点开查看设置">'+ICON.check+'已安装</button>';
+  return '<button class="btn btn-primary" data-act="install" data-id="'+p.id+'">安装</button>';
+}
+function chipsHtml(){
+  return CATS.map(c=>{
+    const n=countOf(c.id);
+    if(c.id!=="all"&&n===0) return "";
+    return '<button class="chip" aria-pressed="'+(state.category===c.id)+'" data-act="cat" data-cat="'+c.id+'">'+c.label+'<span class="n">'+n+'</span></button>';
+  }).join("");
+}
+function toolbarHtml(withSwitch){
+  return '<div class="toolbar">'
+    + '<div class="chips" role="group" aria-label="分类">'+chipsHtml()+'</div>'
+    + '<div class="tools">'
+    +   '<label class="sr" for="sort">排序</label>'
+    +   '<select class="sel" id="sort" data-act="sort" aria-label="排序方式">'
+    +     '<option value="smart"'+(state.sort==="smart"?" selected":"")+'>综合排序</option>'
+    +     '<option value="downloads"'+(state.sort==="downloads"?" selected":"")+'>安装量最多</option>'
+    +     '<option value="name"'+(state.sort==="name"?" selected":"")+'>名称 A→Z</option>'
+    +     '<option value="updated" disabled>最近更新（缺索引字段）</option>'
+    +   '</select>'
+    +   '<div class="search">'+ICON.search+'<input id="q" type="search" value="'+esc(state.query)+'" placeholder="搜索插件、作者…" aria-label="搜索插件" data-act="query"></div>'
+    +   (withSwitch ? '<div class="vswitch" role="group" aria-label="视图"><button aria-pressed="'+(state.layout==="table")+'" data-act="layout" data-layout="table" title="表格视图" aria-label="表格视图">'+ICON.list+'</button><button aria-pressed="'+(state.layout==="grid")+'" data-act="layout" data-layout="grid" title="卡片视图" aria-label="卡片视图">'+ICON.grid+'</button></div>' : '')
+    + '</div></div>';
+}
+function emptyHtml(){
+  return '<div class="empty">没有匹配的插件。'
+    + (state.query.trim()?' 试着换个关键词，或':'')
+    + ' <button class="btn btn-quiet" data-act="reset">清除筛选</button></div>';
+}
+function mockwin(){ return '<span class="mockwin" aria-hidden="true"><span class="mockbar"><i></i><i></i><i></i></span><span class="mockcols"><span></span><span></span><span></span></span></span>'; }
+
+/* ============================ 方案 A：表格 / 卡片 ============================ */
+function rowHtml(p){
+  const ins=state.installed[p.id], upd=hasUpdate(p.id);
+  return '<tr data-act="detail" data-id="'+p.id+'">'
+    + '<td><span class="ident"><span class="av" style="'+grad(p.id)+'">'+initial(p.name)+'</span><span class="ident-text">'
+    +   '<span class="ident-line"><span class="pname">'+esc(p.name)+'</span>'
+    +     (p.tier==="declarative"?'<span class="bdg">声明式</span>':'')
+    +     (ins?(upd?'<span class="bdg bdg-accent">可更新</span>':'<span class="bdg bdg-ok">已安装</span>'):'')
+    +   '</span>'
+    +   '<span class="pdesc">'+esc(p.desc)+'</span>'
+    + '</span></span></td>'
+    + '<td><span class="avatar-cell"><span class="av av-s" style="'+grad(p.author)+'">'+initial(p.author)+'</span><span>'+esc(p.author)+'</span></span></td>'
+    + '<td class="w-num" style="text-align:right">'+fmt(p.downloads)+'</td>'
+    + '<td style="text-align:right;font-variant-numeric:tabular-nums;color:var(--ink2)">v'+p.version+'</td>'
+    + '<td style="text-align:right">'+actionHtml(p)+'</td>'
+    + '</tr>';
+}
+function tableHtml(){
+  const list=visible();
+  return '<div class="body body-wide">'
+    + toolbarHtml(true)
+    + (list.length
+      ? '<div class="tablewrap"><table class="table"><caption class="sr">插件市场列表</caption><thead><tr>'
+        + '<th scope="col">名称</th><th scope="col" class="w-author">开发者</th><th scope="col" class="w-num">安装量</th><th scope="col" class="w-num">版本</th><th scope="col" class="w-act">操作</th>'
+        + '</tr></thead><tbody>' + list.map(rowHtml).join("") + '</tbody></table></div>'
+      : emptyHtml())
+    + '<p class="foot-hint">点整行进详情；「已安装」点开是设置与卸载。安装量与「安装 / 更新」次数同源（download-counts.json）。</p>'
+    + '</div>';
+}
+function coverHtml(p, cls){
+  return '<button class="'+cls+'" data-act="detail" data-id="'+p.id+'" style="'+grad(p.id)+'" aria-label="查看 '+esc(p.name)+' 详情">'
+    + (p.shots?'<span class="cover-badge bdg">截图封面（示意）</span>':'')
+    + (p.shots?mockwin():'<span class="cover-ghost" aria-hidden="true">'+initial(p.name)+'</span>')
+    + '<span class="cover-name">'+esc(p.name)+'</span>'
+    + '</button>';
+}
+function cardHtml(p){
+  const upd=hasUpdate(p.id);
+  return '<article class="card">'
+    + coverHtml(p,"cover")
+    + '<div class="card-body">'
+    +   '<div class="card-titlerow"><button class="card-name" data-act="detail" data-id="'+p.id+'">'+esc(p.name)+'</button><span class="bdg">v'+p.version+'</span>'+(upd?'<span class="bdg bdg-accent">可更新</span>':'')+'</div>'
+    +   '<p class="card-desc">'+esc(p.desc)+'</p>'
+    +   '<div class="card-foot"><span class="author"><span class="av av-s" style="'+grad(p.author)+'">'+initial(p.author)+'</span>'+esc(p.author)+'</span><span class="grow"></span><span class="dl">'+ICON.dl+fmt(p.downloads)+'</span>'+actionHtml(p)+'</div>'
+    + '</div></article>';
+}
+function gridHtml(){
+  const list=visible();
+  return '<div class="body body-wide">'
+    + toolbarHtml(true)
+    + '<div class="sec-title"><h3>'+(state.category==="all"?"全部插件":CATS.find(c=>c.id===state.category).label)+'</h3><span>'+list.length+' 个 · 按'+({smart:"综合",downloads:"安装量",name:"名称"}[state.sort])+'排序</span></div>'
+    + (list.length?'<div class="grid">'+list.map(cardHtml).join("")+'</div>':emptyHtml())
+    + '<p class="foot-hint">当前索引里 7 个插件都还没提供截图，所以卡片用「确定性渐变 + 首字」兜底；有截图的插件（模型与供应商助手、WSL 管理器）在封面里画了示意缩略图。</p>'
+    + '</div>';
+}
+
+/* ============================ 方案 B：画廊 ============================ */
+function heroHtml(p){
+  return '<div class="hero">'
+    + '<div class="hero-cover">'+mockwin()+'</div>'
+    + '<div class="hero-body">'
+    +   '<span class="bdg bdg-accent" style="align-self:flex-start">精选 · 安装量最多</span>'
+    +   '<h3>'+esc(p.name)+'</h3>'
+    +   '<p>'+esc(p.desc)+'</p>'
+    +   '<div class="card-foot"><span class="author"><span class="av av-s" style="'+grad(p.author)+'">'+initial(p.author)+'</span>'+esc(p.author)+'</span><span class="grow"></span><span class="dl">'+ICON.dl+fmt(p.downloads)+'</span><span class="bdg">v'+p.version+'</span></div>'
+    +   '<div class="hero-actions"><button class="btn" data-act="detail" data-id="'+p.id+'">查看详情</button>'+actionHtml(p)+'</div>'
+    + '</div></div>';
+}
+function galleryHtml(){
+  const list=visible();
+  const hero = (state.category==="all" && !state.query.trim() && state.sort==="smart") ? list[0] : null;
+  const rest = hero ? list.slice(1) : list;
+  return '<div class="body body-wide">'
+    + toolbarHtml(false)
+    + (hero?heroHtml(hero):'')
+    + '<div class="sec-title"><h3>'+(hero?"更多插件":(state.category==="all"?"全部插件":CATS.find(c=>c.id===state.category).label))+'</h3><span>'+rest.length+' 个</span></div>'
+    + (rest.length?'<div class="grid">'+rest.map(cardHtml).join("")+'</div>':emptyHtml())
+    + '<p class="foot-hint">精选位取「安装量最多」的一个，不需要新数据；卡片墙在三列时一屏约 6 个，插件一多就得靠分类 chips 收敛。封面要靠插件自己补截图，否则同色系渐变会显得雷同。</p>'
+    + '</div>';
+}
+
+/* ============================ 方案 C：分栏 ============================ */
+function railHtml(){
+  return '<div class="split-rail">'
+    + '<p class="rail-cap">分类</p>'
+    + CATS.filter(c=>c.id==="all"||countOf(c.id)>0).map(c=>
+        '<button class="rail-item" aria-current="'+(state.category===c.id)+'" data-act="cat" data-cat="'+c.id+'"><span>'+c.label+'</span><span class="n">'+countOf(c.id)+'</span></button>').join("")
+    + '<p class="rail-cap">快捷筛选</p>'
+    + '<button class="rail-item" aria-current="'+state.onlyInstalled+'" data-act="only-installed"><span>已安装</span><span class="n">'+installedCount()+'</span></button>'
+    + '<button class="rail-item" aria-current="'+state.onlyUpdates+'" data-act="only-updates"><span>可更新</span><span class="n">'+updateCount()+'</span></button>'
+    + '</div>';
+}
+function srowHtml(p){
+  const ins=state.installed[p.id], upd=hasUpdate(p.id);
+  return '<button class="srow" role="option" aria-selected="'+(selectedPlugin().id===p.id)+'" data-act="select" data-id="'+p.id+'">'
+    + '<span class="av av-s" style="'+grad(p.id)+';width:30px;height:30px;border-radius:8px;font-size:12px">'+initial(p.name)+'</span>'
+    + '<span class="srow-main"><span class="srow-name">'+esc(p.name)+'</span><span class="srow-sub">'+esc(p.author)+(upd?" · 可更新到 "+p.version:"")+'</span></span>'
+    + '<span class="dl">'+fmt(p.downloads)+'</span>'
+    + (ins?(upd?'<span class="bdg bdg-accent">更新</span>':'<span style="color:var(--ok);display:inline-flex">'+ICON.check+'</span>'):'')
+    + '</button>';
+}
+function previewHtml(){
+  const p=selectedPlugin();
+  const ins=state.installed[p.id], upd=hasUpdate(p.id);
+  return '<div class="split-preview">'
+    + '<div class="preview-stage">'+(p.shots?mockwin():'<span class="preview-empty">'+ICON.grid+'暂无截图<br>插件可提供最多 5 张</span>')+'</div>'
+    + '<div class="badges" style="margin:14px 0 8px"><span class="bdg">v'+p.version+'</span><span class="bdg">'+(p.tier==="declarative"?"声明式":"JS 插件")+'</span>'+(ins?(upd?'<span class="bdg bdg-accent">可更新</span>':'<span class="bdg bdg-ok">已安装</span>'):'')+'</div>'
+    + '<h3 style="margin:0 0 6px;font-size:17px;font-weight:600">'+esc(p.name)+'</h3>'
+    + '<p style="margin:0 0 12px;font-size:12.5px;line-height:1.8;color:var(--ink2)">'+esc(p.desc)+'</p>'
+    + '<div class="card-foot" style="margin-bottom:14px"><span class="author"><span class="av av-s" style="'+grad(p.author)+'">'+initial(p.author)+'</span>'+esc(p.author)+'</span><span class="grow"></span><span class="dl">'+ICON.dl+'安装量 '+fmt(p.downloads)+'</span></div>'
+    + '<div class="hero-actions" style="margin:0 0 16px">'+actionHtml(p)+'<button class="btn" data-act="detail" data-id="'+p.id+'">查看完整详情 →</button></div>'
+    + '<dl class="meta">'
+    +   '<dt>需要宿主</dt><dd>CC GUI ≥ '+p.minApp+'</dd>'
+    +   (p.sdk?'<dt>SDK</dt><dd>'+p.sdk+'</dd>':'')
+    +   '<dt>权限</dt><dd>'+(p.perms.length?p.perms.length+" 项":"不申请权限")+'</dd>'
+    +   '<dt>仓库</dt><dd><button class="rail-link" data-act="noop">'+esc(p.repo)+'</button></dd>'
+    + '</dl>'
+    + (p.perms.length?'<div class="perm" style="margin-top:12px">'+p.perms.slice(0,5).map(x=>'<span>'+esc(permLabel(x))+'</span>').join("")+(p.perms.length>5?'<span>+'+(p.perms.length-5)+' 项</span>':'')+'</div>':'')
+    + '</div>';
+}
+function splitHtml(){
+  const list=visible();
+  return '<div class="body-split">'
+    + '<div class="split">'
+    + railHtml()
+    + '<div class="split-list">'
+    +   '<div class="split-list-head"><div class="search">'+ICON.search+'<input id="q" type="search" value="'+esc(state.query)+'" placeholder="搜索…" aria-label="搜索插件" data-act="query"></div>'
+    +     '<select class="sel" id="sort" data-act="sort" aria-label="排序方式" style="padding-right:20px"><option value="smart"'+(state.sort==="smart"?" selected":"")+'>综合</option><option value="downloads"'+(state.sort==="downloads"?" selected":"")+'>安装量</option><option value="name"'+(state.sort==="name"?" selected":"")+'>名称</option></select>'
+    +   '</div>'
+    +   '<div class="srows" role="listbox" aria-label="插件列表">'+(list.length?list.map(srowHtml).join(""):'<p class="empty" style="padding:24px 12px">没有匹配项</p>')+'</div>'
+    +   '<div class="split-hint">↑ ↓ 切换预览 · 点行选中</div>'
+    + '</div>'
+    + previewHtml()
+    + '</div>'
+    + '<p class="foot-hint">分类和「已安装 / 可更新」都在左栏，列表只负责挑选；右栏点「查看完整详情」才进整页。窗口 < 1100px 时三栏会挤，需要降级为两栏。</p>'
+    + '</div>';
+}
+
+/* ============================ 已安装（三方案共用） ============================ */
+function installedHtml(){
+  const rows = PLUGINS.filter(p=>state.installed[p.id]).map(p=>{
+    const v=state.installed[p.id], upd=hasUpdate(p.id);
+    return '<tr><td><span class="ident"><span class="av" style="'+grad(p.id)+'">'+initial(p.name)+'</span><span class="ident-text"><span class="ident-line"><span class="pname">'+esc(p.name)+'</span>'+(upd?'<span class="bdg bdg-accent">可更新到 '+p.version+'</span>':'<span class="bdg bdg-ok">正常</span>')+'</span><span class="pdesc">'+esc(p.desc)+'</span></span></span></td>'
+      + '<td style="font-variant-numeric:tabular-nums;color:var(--ink2)">v'+v+'</td>'
+      + '<td><span class="src">市场安装</span></td>'
+      + '<td style="text-align:right"><span style="display:inline-flex;gap:8px;justify-content:flex-end">'+(upd?'<button class="btn btn-primary" data-act="install" data-id="'+p.id+'">更新到 '+p.version+'</button>':'')+'<button class="btn" data-act="detail" data-id="'+p.id+'">设置</button><button class="btn btn-danger" data-act="uninstall" data-id="'+p.id+'">卸载</button></span></td></tr>';
+  }).join("")
+  + '<tr><td><span class="ident"><span class="av" style="'+grad(LOCAL_PLUGIN.id)+'">'+initial(LOCAL_PLUGIN.name)+'</span><span class="ident-text"><span class="ident-line"><span class="pname">'+esc(LOCAL_PLUGIN.name)+'</span><span class="bdg">示意行</span></span><span class="pdesc">'+esc(LOCAL_PLUGIN.desc)+'</span></span></span></td>'
+  + '<td style="color:var(--ink2)">v'+LOCAL_PLUGIN.version+'</td><td><span class="src">本地目录</span></td>'
+  + '<td style="text-align:right"><span style="display:inline-flex;gap:8px;justify-content:flex-end"><button class="btn" data-act="noop">重新加载</button><button class="btn btn-danger" data-act="noop">卸载</button></span></td></tr>';
+
+  return '<div class="body body-wide">'
+    + '<div class="inst-title"><h3>已安装</h3><span class="src">市场 3 个 + 本地 1 个（本地那行是示意）</span><span class="grow"></span>'
+    + '<div class="search" style="max-width:220px">'+ICON.search+'<input type="search" placeholder="搜索已安装…" aria-label="搜索已安装插件" data-act="noop"></div></div>'
+    + '<div class="tablewrap"><table class="table"><thead><tr><th scope="col">名称</th><th scope="col" style="width:96px">版本</th><th scope="col" style="width:110px">来源</th><th scope="col" style="width:260px;text-align:right">操作</th></tr></thead><tbody>'+rows+'</tbody></table></div>'
+    + '<p class="foot-hint">「已安装」这页这次不重点改，沿用现有行结构，只是把版本 / 来源 / 操作分列，和市场的列语言统一。</p>'
+    + '</div>';
+}
+
+/* ============================ 详情页（三方案共用） ============================ */
+function shotsHtml(p){
+  if(!p.shots){
+    return '<div class="stage is-empty"><div class="preview-empty">'+ICON.grid+'插件没有提供截图</div>'
+      + '<span class="bdg bdg-new">示意处理：不留整屏空白；插件补图后自动换成大图 + 下方缩略图条</span></div>';
+  }
+  const names=["主界面","设置页","使用示例","更多细节"];
+  return '<div class="stage"><span class="bdg bdg-new stage-tag">示意：真实截图由插件提供</span>'+mockwin()+'</div>'
+    + '<div class="thumbs">'+Array.from({length:p.shots}).map((_,i)=>
+        '<button class="thumb" aria-current="'+(i===0)+'" data-act="noop" style="'+grad(p.id+i)+'" aria-label="第 '+(i+1)+' 张截图"><span>'+names[i % names.length]+'</span></button>').join("")+'</div>';
+}
+function readmeHtml(p){
+  return '<div class="readme">'
+    + '<h3>安装后怎么用</h3>'
+    + '<ul><li>在「插件」页的「已安装」里找到它，点「设置」调整行为。</li><li>权限在首次启用时逐条确认，拒绝后插件会降级运行或提示不可用。</li></ul>'
+    + '<h3>权限说明</h3>'
+    + (p.perms.length
+        ? '<ul>'+p.perms.map(x=>'<li><code>'+esc(x)+'</code> — '+esc(permLabel(x))+'</li>').join("")+'</ul>'
+        : '<p>这个插件不申请任何权限，只做界面层面的声明式调整。</p>')
+    + '<h3>开发</h3>'
+    + '<pre>git clone https://github.com/'+esc(p.repo)+'.git\npnpm install &amp;&amp; pnpm build</pre>'
+    + '<p>本页正文来自插件仓库的 <code>README.md</code>，打开详情时才拉取，宿主缓存 1 小时；上面的文字是示意内容。</p>'
+    + '</div>';
+}
+function detailHtml(){
+  const p=byId(state.detailId)||PLUGINS[0];
+  const ins=state.installed[p.id], upd=hasUpdate(p.id), fav=state.favorites.has(p.id);
+  return '<div class="detail">'
+    + '<div class="crumbar"><button class="btn btn-quiet" data-act="back">← 返回插件列表</button><span class="crumb">插件 / '+esc(p.name)+'</span><span class="grow"></span><span class="bdg">详情页三方案共用</span></div>'
+    + '<div class="detail-inner">'
+    +   '<div class="detail-top">'
+    +     '<span class="av av-l" style="'+grad(p.id)+'">'+initial(p.name)+'</span>'
+    +     '<div class="grow"><h2>'+esc(p.name)+'</h2><p class="detail-desc">'+esc(p.desc)+'</p>'
+    +       '<div class="badges"><span class="bdg">v'+p.version+'</span><span class="bdg">'+(p.tier==="declarative"?"声明式插件":"JS 插件")+'</span>'+(ins?(upd?'<span class="bdg bdg-accent">可更新到 '+p.version+'</span>':'<span class="bdg bdg-ok">已安装 v'+ins+'</span>'):'')+'<span class="bdg">'+(p.perms.length?p.perms.length+" 项权限":"不申请权限")+'</span></div>'
+    +     '</div>'
+    +     '<div class="detail-actions">'
+    +       '<button class="btn btn-quiet fav" aria-pressed="'+fav+'" data-act="fav" data-id="'+p.id+'" title="收藏（仅本机保存）">'+(fav?"♥":"♡")+' '+(fav?"已收藏":"收藏")+' <span class="bdg" style="border:1px solid var(--accent);background:transparent;color:var(--accent-text)">本机</span></button>'
+    +       actionHtml(p)
+    +       (ins?'<button class="btn" data-act="noop">设置</button><button class="btn btn-danger" data-act="uninstall" data-id="'+p.id+'">卸载</button>':'')
+    +     '</div>'
+    +   '</div>'
+    +   '<div class="detail-cols">'
+    +     '<div class="detail-main">'+shotsHtml(p)+readmeHtml(p)+'</div>'
+    +     '<aside class="detail-rail">'
+    +       '<div class="rail-block"><h4>开发者</h4><span class="author"><span class="av av-s" style="'+grad(p.author)+'">'+initial(p.author)+'</span>'+esc(p.author)+'</span></div>'
+    +       '<div class="rail-block"><h4>仓库</h4><button class="rail-link" data-act="noop">'+esc(p.repo)+' ↗</button></div>'
+    +       '<div class="rail-block"><h4>类型</h4><span class="v">'+(p.tier==="declarative"?"声明式（无代码，只改界面）":"JS 插件（完整 SDK 能力）")+'</span></div>'
+    +       '<div class="rail-block"><h4>安装量</h4><span class="v">'+fmt(p.downloads)+' 次（安装 + 更新）</span></div>'
+    +       '<div class="rail-block"><h4>兼容</h4><span class="v">CC GUI ≥ '+p.minApp+(p.sdk?'<br>SDK '+p.sdk:'')+'</span></div>'
+    +       '<div class="rail-block"><h4>权限</h4>'
+    +         (p.perms.length
+              ? '<span class="v">'+p.perms.length+' 项</span><div class="perm">'+p.perms.slice(0,4).map(x=>'<span>'+esc(permLabel(x))+'</span>').join("")+'</div>'
+                + '<details class="more"><summary>展开全部 '+p.perms.length+' 项</summary><div class="perm-full">'+p.perms.map(x=>'<span>'+esc(x)+' — '+esc(permLabel(x))+'</span>').join("")+'</div></details>'
+              : '<span class="v">不申请任何权限</span>')
+    +       '</div>'
+    +       '<div class="rail-block"><h4>链接</h4><button class="rail-link" data-act="noop">发布记录 ↗</button><button class="rail-link" data-act="noop">问题反馈 ↗</button></div>'
+    +       '<div class="rail-block"><h4>最近更新</h4><span class="bdg bdg-new" style="align-self:flex-start">缺索引字段</span><span class="v" style="color:var(--ink2)">想要参考稿那列，就得给 plugins/&lt;id&gt;.json 加更新时间</span></div>'
+    +     '</aside>'
+    +   '</div>'
+    + '</div></div>';
+}
+
+/* ============================ 渲染 ============================ */
+const hub=document.getElementById("hub");
+const CAPTIONS={
+  a:"<b>方案 A · 密集表格</b> — 分类 chips 带计数 + 可排序表格 + 蓝色「安装」按钮；名称列里放版本/已安装/可更新标签，右侧是带文字的操作按钮。一屏 8–10 个，最接近参考稿的列表页。右上角图标可切到卡片视图。",
+  b:"<b>方案 B · 卡片画廊</b> — 精选项大图（安装量最多）+ 三列卡片墙；封面用「确定性渐变 + 首字」兜底，有截图的插件在封面里画了示意缩略图。商店氛围最好，但没有截图时卡片会比较像。",
+  c:"<b>方案 C · 分栏快速浏览</b> — 左分类栏（含「已安装 / 可更新」）+ 中间列表 + 右侧实时预览；点行不跳页就能连续比较，右栏「查看完整详情」才进整页。键盘 ↑ ↓ 可切换。",
+};
+function renderHub(){
+  if(state.view==="detail") return detailHtml();
+  const tab=state.view==="installed"?"installed":"market";
+  const head='<header class="hub-head"><h2>插件</h2>'
+    + '<div class="pills" role="tablist" aria-label="插件页签">'
+    + '<button role="tab" class="pill" aria-selected="'+(tab==="market")+'" data-act="tab" data-tab="market">市场</button>'
+    + '<button role="tab" class="pill" aria-selected="'+(tab==="installed")+'" data-act="tab" data-tab="installed">已安装</button>'
+    + '</div><span class="grow"></span>'
+    + '<button class="btn btn-quiet" data-act="noop">从本地目录安装</button>'
+    + '<button class="btn btn-quiet" data-act="noop">插件开发指南</button></header>';
+  let body;
+  if(tab==="installed") body=installedHtml();
+  else if(state.variant==="b") body=galleryHtml();
+  else if(state.variant==="c") body=splitHtml();
+  else body = state.layout==="grid" ? gridHtml() : tableHtml();
+  return head+body;
+}
+function render(){
+  hub.innerHTML=renderHub();
+  document.getElementById("caption").innerHTML=CAPTIONS[state.variant]+' <span style="color:var(--ink3)">「已安装」与详情页三个方案共用，点行/点卡片就能看。</span>';
+  document.querySelectorAll(".pitch .seg button").forEach(b=>b.setAttribute("aria-selected", String(b.dataset.variant===state.variant)));
+  if(state.focus){
+    const el=hub.querySelector("#"+state.focus);
+    state.focus=null;
+    if(el){ el.focus(); if(el.setSelectionRange && el.value!==undefined) el.setSelectionRange(el.value.length,el.value.length); }
+  }
+}
+
+/* ============================ 交互 ============================ */
+function toast(msg){
+  let t=document.getElementById("toast");
+  if(!t){ t=document.createElement("div"); t.id="toast"; t.className="toast"; document.body.appendChild(t); }
+  t.textContent=msg; t.classList.add("show");
+  clearTimeout(toast._t); toast._t=setTimeout(()=>t.classList.remove("show"),2200);
+}
+function openDetail(id){ state.focus=null; state.detailId=id; state.view="detail"; window.scrollTo({ top:0, behavior:"auto" }); render(); }
+function install(id){
+  if(state.installing) return;
+  const p=byId(id); if(!p) return;
+  state.focus=null; state.installing={ id, pct:0 }; render();
+  const timer=setInterval(()=>{
+    if(!state.installing || state.installing.id!==id){ clearInterval(timer); return; }
+    state.installing.pct += 9 + Math.random()*11;
+    if(state.installing.pct>=100){
+      clearInterval(timer);
+      state.installed[id]=p.version;
+      state.installing=null;
+      render();
+      toast((state.installed[id]?"已安装 ":"已更新 ")+p.name);
+    } else render();
+  },150);
+}
+hub.addEventListener("click",(e)=>{
+  const hit=e.target.closest("[data-act]"); if(!hit || !hub.contains(hit)) return;
+  const act=hit.dataset.act, id=hit.dataset.id;
+  if(act==="noop") return;
+  if(act!=="query") state.focus=null;
+  switch(act){
+    case "tab": state.view=hit.dataset.tab; render(); break;
+    case "detail": openDetail(id); break;
+    case "back": state.view="market"; render(); break;
+    case "install": install(id); break;
+    case "cat": state.category=hit.dataset.cat; state.onlyInstalled=false; state.onlyUpdates=false; render(); break;
+    case "only-installed": state.onlyInstalled=!state.onlyInstalled; if(state.onlyInstalled) state.onlyUpdates=false; render(); break;
+    case "only-updates": state.onlyUpdates=!state.onlyUpdates; if(state.onlyUpdates) state.onlyInstalled=false; render(); break;
+    case "layout": state.layout=hit.dataset.layout; render(); break;
+    case "reset": state.query=""; state.category="all"; state.onlyInstalled=false; state.onlyUpdates=false; render(); break;
+    case "select": state.selected=id; render(); break;
+    case "fav": state.favorites.has(id)?state.favorites.delete(id):state.favorites.add(id); render(); toast(state.favorites.has(id)?"已收藏（仅本机）":"已取消收藏"); break;
+    case "uninstall":
+      delete state.installed[id]; state.installing=null; state.view = state.detailId===id?"market":state.view; render();
+      toast("已卸载（示意，真实实现有确认弹窗）"); break;
+  }
+});
+hub.addEventListener("input",(e)=>{
+  const hit=e.target.closest("[data-act=query]"); if(!hit) return;
+  state.query=hit.value; state.focus="q"; render();
+});
+hub.addEventListener("change",(e)=>{
+  const hit=e.target.closest("[data-act=sort]"); if(!hit) return;
+  state.sort=hit.value; render();
+});
+document.addEventListener("keydown",(e)=>{
+  if(state.view!=="market" || state.variant!=="c") return;
+  const list=visible(); if(!list.length) return;
+  if(e.key!=="ArrowDown" && e.key!=="ArrowUp") return;
+  const cur=list.findIndex(p=>p.id===selectedPlugin().id);
+  const next=list[(cur + (e.key==="ArrowDown"?1:list.length-1)) % list.length];
+  if(next){ state.selected=next.id; e.preventDefault(); render(); }
+});
+document.querySelectorAll(".pitch .seg button").forEach(b=>b.addEventListener("click",()=>{
+  state.variant=b.dataset.variant; state.focus=null;
+  // 切方案时回到市场列表：详情页三方案共用，停在详情会看不到差异
+  if(state.view!=="market") state.view="market";
+  render();
+}));
+function setTheme(dark){
+  document.documentElement.dataset.theme=dark?"dark":"light";
+  document.getElementById("theme").textContent=dark?"◑ 浅色":"◐ 深色";
+}
+document.getElementById("theme").addEventListener("click",()=>setTheme(document.documentElement.dataset.theme!=="dark"));
+/* 深链接：本文件可以带 #b / #c / #installed / #detail/<id> 打开，方便截图与分享；?theme=dark 进深色 */
+(function applyHash(){
+  if(new URLSearchParams(location.search).get("theme")==="dark") setTheme(true);
+  const h=location.hash.replace(/^#/,"");
+  if(!h) return;
+  if(h==="installed"){ state.view="installed"; return; }
+  if(h.startsWith("detail/")){ const id=h.slice(7); if(byId(id)){ state.detailId=id; state.view="detail"; } return; }
+  if(["a","b","c"].includes(h)) state.variant=h;
+})();
+render();
+</script>
+</body>
+</html>

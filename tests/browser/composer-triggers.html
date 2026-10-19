@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Composer #/! trigger fixture</title>
+</head>
+<body style="margin:0">
+<div id="fixture"></div>
+<script>
+// Tauri IPC stand-in: enough surface for the composer's imports (invoke +
+// event listen). Catalogs are seeded straight into the zustand stores by
+// the fixture module, which also no-ops the stores' refresh actions.
+window.__TAURI_INTERNALS__ = {
+  transformCallback() { return 1; },
+  unregisterCallback() {},
+  convertFileSrc: (p) => p,
+  metadata: { currentWebview: { label: "main" }, currentWindow: { label: "main" } },
+  async invoke(cmd) {
+    if (cmd === "agent_list") return [];
+    if (cmd === "prompts_list") return [];
+    if (cmd === "list_slash_commands") return [];
+    if (cmd === "prompts_dirs") return { workspace: "/fixture-ws/.ccgui/prompts", global: "/home/.ccgui-next/prompts" };
+    if (cmd === "plugin:list" || cmd === "plugin_list") return [];
+    return null;
+  },
+};
+</script>
+<script type="module" src="./composer-triggers.tsx"></script>
+</body>
+</html>

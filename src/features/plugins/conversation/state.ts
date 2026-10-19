@@ -1,0 +1,148 @@
+import { safeRandomUUID } from "@/lib/id";
+import { readStoredJson, writeStored } from "@/lib/storage";
+import { registerRuntimeCheckpointParticipant } from "@/lib/runtime-checkpoint";
+
+export interface ConversationModeCheckpoint {
+  version: 1;
+  identities: Record<string, string>;
+  selections: Record<string, string>;
+  blocked: Record<string, string>;
+}
+
+function checkpointStrings(value: unknown): Record<string, string> {
+  if (!value || typeof value !== "object" || Array.isArray(value) || Object.values(value).some((entry) => typeof entry !== "string")) {
+    throw new Error("Invalid conversation mode checkpoint map");
+  }
+  return Object.fromEntries(Object.entries(value)) as Record<string, string>;
+}
+
+export class ConversationModeState {
+  private identities = new Map<string, string>();
+  private selections = new Map<string, string>();
+  private blocked = new Map<string, string>();
+
+  constructor(
+    saved: Record<string, string> = {},
+    private persist: (identities: Record<string, string>) => void = () => {},
+    savedLocks: Record<string, string> = {},
+    private persistLocks: (locks: Record<string, string>) => void = () => {},
+  ) {
+    this.identities = new Map(Object.entries(saved).filter(([, identity]) => typeof identity === "string"));
+    this.blocked = new Map(Object.entries(savedLocks).filter(([, mode]) => typeof mode === "string"));
+    this.selections = new Map(this.blocked);
+  }
+
+  captureCheckpoint(): ConversationModeCheckpoint {
+    return { version: 1, identities: Object.fromEntries(this.identities), selections: Object.fromEntries(this.selections), blocked: Object.fromEntries(this.blocked) };
+  }
+
+  /** Validate every map before changing any state. Restoring must never write
+   * preferences or mint a new draft identity. Existing callers retain this instance. */
+  restoreCheckpoint(value: unknown): void {
+    const snapshot = value as Partial<ConversationModeCheckpoint> | null;
+    if (snapshot?.version !== 1) throw new Error("Unsupported conversation mode checkpoint");
+    const identities = checkpointStrings(snapshot.identities);
+    const selections = checkpointStrings(snapshot.selections);
+    const blocked = checkpointStrings(snapshot.blocked);
+    this.identities = new Map(Object.entries(identities));
+    this.selections = new Map(Object.entries(selections));
+    this.blocked = new Map(Object.entries(blocked));
+  }
+
+  identity(sessionKey: string, workspacePath: string, draft: boolean): string {
+    const key = JSON.stringify([workspacePath, sessionKey]);
+    let identity = this.identities.get(key);
+    if (!identity) {
+      identity = draft ? JSON.stringify([workspacePath, sessionKey, safeRandomUUID()]) : key;
+      this.identities.set(key, identity);
+      this.persist(Object.fromEntries(this.identities));
+    }
+    return identity;
+  }
+
+  retain(sessions: readonly { key: string; workspacePath: string }[]): void {
+    const retained = new Set(sessions.map((session) => JSON.stringify([session.workspacePath, session.key])));
+    let changed = false;
+    for (const [key, identity] of this.identities) {
+      if (!retained.has(key) && !this.isExitBlocked(identity)) {
+        this.identities.delete(key);
+        this.selections.delete(identity);
+        changed = true;
+      }
+    }
+    if (changed) this.persist(Object.fromEntries(this.identities));
+  }
+
+  select(identity: string, mode: string, streaming: boolean, queued: number): boolean {
+    if (streaming || queued > 0 || (this.isExitBlocked(identity) && this.blocked.get(identity) !== mode)) return false;
+    this.selections.set(identity, mode);
+    return true;
+  }
+
+  selected(identity: string): string | undefined {
+    return this.blocked.get(identity) ?? this.selections.get(identity);
+  }
+
+  exit(identity: string): void {
+    if (this.isExitBlocked(identity)) return;
+    this.selections.delete(identity);
+  }
+
+  setExitBlocked(identity: string, mode: string, blocked: boolean): void {
+    if (blocked) {
+      this.blocked.set(identity, mode);
+      this.selections.set(identity, mode);
+    } else if (this.blocked.get(identity) === mode) {
+      this.blocked.delete(identity);
+    } else return;
+    this.persistLocks(Object.fromEntries(this.blocked));
+  }
+
+  isExitBlocked(identity: string): boolean {
+    return this.blocked.has(identity);
+  }
+
+  isTabCloseBlocked(sessionKey: string, workspacePath: string): boolean {
+    const identity = this.identities.get(JSON.stringify([workspacePath, sessionKey]));
+    return identity !== undefined && this.isExitBlocked(identity);
+  }
+
+  removeMode(mode: string): void {
+    for (const [identity, selected] of this.selections) {
+      if (selected === mode) this.selections.delete(identity);
+    }
+  }
+}
+
+function readStringMap(key: string): Record<string, string> {
+  return readStoredJson<Record<string, string>>(key, (value) =>
+    value && typeof value === "object" && !Array.isArray(value)
+      ? Object.fromEntries(Object.entries(value).filter(([, entry]) => typeof entry === "string"))
+      : null,
+  ) ?? {};
+}
+
+let sharedState: ConversationModeState | undefined;
+const identityKey = "ccgui.plugin-conversation-identities:v1";
+const lockKey = "ccgui.plugin-conversation-locks:v1";
+function createSharedState(identities: Record<string, string>, locks: Record<string, string>) {
+  return new ConversationModeState(identities,
+    (value) => writeStored(identityKey, JSON.stringify(value)), locks,
+    (value) => writeStored(lockKey, JSON.stringify(value)));
+}
+
+export function getConversationModeState(): ConversationModeState {
+  return sharedState ??= createSharedState(readStringMap(identityKey), readStringMap(lockKey));
+}
+
+const unregisterCheckpoint = registerRuntimeCheckpointParticipant({
+  id: "plugin-conversation-modes",
+  capture: () => getConversationModeState().captureCheckpoint(),
+  restore(value) {
+    // The boot checkpoint is authoritative. No storage reads/writes on restore.
+    const state = sharedState ?? createSharedState({}, {});
+    state.restoreCheckpoint(value);
+    sharedState = state;
+  },
+});
+if (import.meta.hot) import.meta.hot.dispose(unregisterCheckpoint);

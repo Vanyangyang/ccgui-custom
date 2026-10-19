@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Creator jump focus fixture</title>
+</head>
+<body style="margin:0">
+<div id="fixture"></div>
+<script>
+// Tauri IPC stand-in: the plugin hub and the chat pane only need reads here.
+window.__TAURI_INTERNALS__ = {
+  transformCallback() { return 1; },
+  unregisterCallback() {},
+  convertFileSrc: (p) => p,
+  metadata: { currentWebview: { label: "main" }, currentWindow: { label: "main" } },
+  async invoke(cmd) {
+    if (cmd === "plugin_list") return [];
+    if (cmd === "plugin_fetch_index") return [];
+    if (cmd === "plugin_check_updates") return [];
+    if (cmd === "list_slash_commands") return [];
+    if (cmd === "get_app_version") return "1.0.7";
+    return null;
+  },
+};
+</script>
+<script type="module" src="./creator-jump.tsx"></script>
+</body>
+</html>
