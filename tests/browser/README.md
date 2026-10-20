@@ -37,6 +37,15 @@ request. Plain row selection, unrelated rows and worktree rows retain their
 normal behavior. Storage, IPC and session selection are document-local mocks;
 this does not send real messages or verify native engine delivery.
 
+Use `?approval=1` for the cost approval card in the sender's input area, including
+model, 247,669 / 1,000,000 context tokens, capture time, cold cache and queue risk.
+Check 360 px and desktop widths, both languages and themes. The card scrolls
+inside a bounded area so multiple approvals cannot displace the composer.
+This fixture has no host bridge: clicking approve/cancel exercises the visible
+unavailable-runtime error only. Successful approval, cancellation, retry and
+checkpoint gating are covered by the cross-session and chat-bridge unit tests;
+do not treat this fixture as proof of native delivery.
+
 Active participants also show a tinted background and a truncated direction/peer
 caption in place of the time/workspace metadata (the original values remain in
 the row tooltip). Hover or keyboard-focus either indicator to emphasize its peer;
@@ -235,6 +244,13 @@ submit the draft, and inspect the pending send before confirming success/failure
 only successful launch confirmation may complete the handoff and archive the
 source; failure should retain the draft/card for retry. View the source, return
 to the draft, and restore an archived source with the fixture controls.
+Select `/synthetic-target-workspace` in the target workspace picker before
+sending. Check `activeWorkspace`, the source/target directory notice in the
+editable draft, and `lastSend.workspacePath`; source navigation and archive
+must still refer to `/synthetic-handoff-workspace`. Move back before sending:
+only the generated directory notice should disappear, with manual edits intact.
+Repeat while a mocked summary is pending and finish it after moving; it must
+update the moved draft without making another summary request.
 The read-only `handoff-state` and `handoff-draft` DOM outputs expose archive state,
 pending/call counts, last send arguments and the actual draft. Reload for a fresh
 scenario. These are manual browser acceptance steps, not recorded pass results;

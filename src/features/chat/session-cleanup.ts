@@ -1,5 +1,6 @@
 import type { CSSProperties } from "react";
 import { create } from "zustand";
+import i18n from "@/lib/i18n";
 import { ipc, type SessionMeta, type HandoffCompressionSelection } from "@/lib/ipc";
 import { EMPTY_SESSION, type SessionState } from "./store/stream";
 import type { LeaderSnapshot } from "@/features/leader/types";
@@ -587,6 +588,7 @@ export async function upgradeHandoffDraftWithGrok({
 
 export interface PendingHandoffSession {
   id: string;
+  /** Source directory, never changed when the destination draft moves. */
   workspacePath: string;
   sourceEngine: string;
   sourceSessionId: string;
@@ -609,6 +611,8 @@ export interface PendingHandoffSession {
   sending?: boolean;
   /** Last program-authored summary block; manual changes leave this unchanged. */
   managedSummary?: string;
+  /** Exact generated prefix; remove only this text, preserving user additions. */
+  workspaceNotice?: string;
 }
 
 /**
@@ -691,6 +695,7 @@ function applyHandoffModeDraft(
 
 export interface HandoffStoreState {
   byWorkspace: Record<string, PendingHandoffSession>;
+  moveHandoffToWorkspace: (workspacePath: string, targetWorkspacePath: string) => boolean;
   startHandoff: (args: {
     workspacePath: string;
     sourceEngine: string;
@@ -715,6 +720,7 @@ export interface HandoffStoreState {
 }
 
 let handoffSeq = 0;
+const movingHandoffs = new Set<string>();
 
 export const useHandoffStore = create<HandoffStoreState>((set, get) => {
   const requests = new Map<string, number>();
@@ -722,9 +728,14 @@ export const useHandoffStore = create<HandoffStoreState>((set, get) => {
     const entry = get().byWorkspace[workspacePath];
     if (!entry || entry.id !== handoffId || entry.mode !== "grok" || entry.sending) return;
     const startedAt = Date.now();
-    const request = (requests.get(workspacePath) ?? 0) + 1;
-    requests.set(workspacePath, request);
-    const isCurrent = () => get().byWorkspace[workspacePath]?.id === handoffId && requests.get(workspacePath) === request;
+    const request = (requests.get(handoffId) ?? 0) + 1;
+    requests.set(handoffId, request);
+    const isCurrent = () => {
+      const currentPath = Object.keys(get().byWorkspace).find((path) => get().byWorkspace[path]?.id === handoffId);
+      if (currentPath === undefined || requests.get(handoffId) !== request) return false;
+      workspacePath = currentPath;
+      return true;
+    };
     void upgradeHandoffDraftWithGrok({
       engine: entry.sourceEngine,
       sessionId: entry.sourceSessionId,
@@ -740,8 +751,9 @@ export const useHandoffStore = create<HandoffStoreState>((set, get) => {
       },
       getExpectedSummary: () => isCurrent() ? get().byWorkspace[workspacePath]?.managedSummary : undefined,
       applyDraft: (nextDraft) => {
+        if (!isCurrent()) return;
         const latest = get().byWorkspace[workspacePath];
-        if (!isCurrent() || !latest || latest.sending || latest.mode !== "grok") return;
+        if (!latest || latest.sending || latest.mode !== "grok") return;
         const key = resolveHandoffTargetDraftKey(workspacePath, entry.sourceEngine);
         useChatStore.getState().setDraft(key, nextDraft);
         set((s) => {
@@ -793,6 +805,41 @@ export const useHandoffStore = create<HandoffStoreState>((set, get) => {
   return {
     byWorkspace: {},
 
+    moveHandoffToWorkspace: (workspacePath, targetWorkspacePath) => {
+      const entry = get().byWorkspace[workspacePath];
+      const chat = useChatStore.getState();
+      if (!entry || entry.sending || (!chat.workspaces.some((w) => w.path === targetWorkspacePath)
+        && targetWorkspacePath !== entry.workspacePath)) return false;
+      if (workspacePath !== targetWorkspacePath && get().byWorkspace[targetWorkspacePath]) return false;
+      if (workspacePath !== targetWorkspacePath && Object.entries(chat.drafts).some(([key, text]) =>
+        parseDraftSessionKey(key)?.workspacePath === targetWorkspacePath && text.trim())) return false;
+      const key = resolveHandoffTargetDraftKey(workspacePath, entry.sourceEngine);
+      const parsed = parseDraftSessionKey(key);
+      const draft = chat.drafts[key] ?? "";
+      if (!parsed || !isHandoffDraft(draft, entry)) return false;
+      let nextDraft = draft;
+      if (entry.workspaceNotice && nextDraft.includes(entry.workspaceNotice)) {
+        nextDraft = nextDraft.replace(entry.workspaceNotice, "");
+      }
+      const workspaceNotice = targetWorkspacePath === entry.workspacePath ? undefined
+        : `${i18n.t("chat.handoffWorkspaceNotice", { source: entry.workspacePath, target: targetWorkspacePath })}\n\n`;
+      if (workspaceNotice) nextDraft = workspaceNotice + nextDraft;
+      movingHandoffs.add(entry.id);
+      try {
+        if (!chat.moveDraftToWorkspace(parsed.engine, workspacePath, targetWorkspacePath, nextDraft)) return false;
+        if (workspacePath === targetWorkspacePath) return true;
+        set((s) => {
+          const byWorkspace = { ...s.byWorkspace };
+          delete byWorkspace[workspacePath];
+          byWorkspace[targetWorkspacePath] = { ...entry, workspaceNotice };
+          return { byWorkspace };
+        });
+        return true;
+      } finally {
+        movingHandoffs.delete(entry.id);
+      }
+    },
+
     startHandoff: ({
       workspacePath,
       sourceEngine,
@@ -805,6 +852,8 @@ export const useHandoffStore = create<HandoffStoreState>((set, get) => {
       initialMode: requestedMode,
     }) => {
       const preferences = readHandoffCompressionPreferences();
+      const previousId = get().byWorkspace[workspacePath]?.id;
+      if (previousId) requests.delete(previousId);
       const initialMode = requestedMode ?? (preferences.enabled ? "grok" : "local");
       const id = `handoff-${++handoffSeq}-${Date.now()}`;
       const now = Date.now();
@@ -882,6 +931,8 @@ export const useHandoffStore = create<HandoffStoreState>((set, get) => {
               messages: page.messages,
             };
             set((s) => {
+              const workspacePath = Object.keys(s.byWorkspace).find((path) => s.byWorkspace[path]?.id === id);
+              if (workspacePath === undefined) return s;
               const cur = s.byWorkspace[workspacePath];
               if (!cur || cur.id !== id) return s;
               const updated: PendingHandoffSession = { ...cur, sourceState: hydratedState };
@@ -921,7 +972,7 @@ export const useHandoffStore = create<HandoffStoreState>((set, get) => {
         selection: entry.compressionSelection ?? legacyHandoffSelection(entry.compressionModel),
       });
       if (mode !== "grok") {
-        requests.set(workspacePath, (requests.get(workspacePath) ?? 0) + 1);
+        requests.set(entry.id, (requests.get(entry.id) ?? 0) + 1);
         updated.grokStatus = "idle";
         updated.grokStartedAt = null;
         updated.grokError = null;
@@ -969,7 +1020,7 @@ export const useHandoffStore = create<HandoffStoreState>((set, get) => {
       if (current.engine === selection.engine && current.model === selection.model
         && current.providerId === selection.providerId && current.effort === selection.effort) return;
       const compressionPreferenceError = !saveHandoffCompressionPreferences({ selection, enabled: entry.mode === "grok" });
-      requests.set(workspacePath, (requests.get(workspacePath) ?? 0) + 1);
+      requests.set(entry.id, (requests.get(entry.id) ?? 0) + 1);
       set((s) => ({
         byWorkspace: {
           ...s.byWorkspace,
@@ -1039,12 +1090,15 @@ export const useHandoffStore = create<HandoffStoreState>((set, get) => {
       const chatStore = useChatStore.getState();
       const meta =
         chatStore.sessions.find(
-          (item) => item.engine === entry.sourceEngine && item.sessionId === entry.sourceSessionId,
+          (item) => item.engine === entry.sourceEngine && item.sessionId === entry.sourceSessionId
+            && item.workspacePath === entry.workspacePath,
         ) ?? entry.sourceMeta;
       if (!meta) return;
       await chatStore.archiveSession(meta);
       if (!useChatStore.getState().archivedSessionKeys[sessionKey(meta.engine, meta.sessionId, meta.workspacePath)]) return;
       set((s) => {
+        const workspacePath = Object.keys(s.byWorkspace).find((path) => s.byWorkspace[path]?.id === entry.id);
+        if (workspacePath === undefined) return s;
         const cur = s.byWorkspace[workspacePath];
         if (!cur || cur.id !== entry.id) return s;
         return {
@@ -1066,6 +1120,8 @@ export const useHandoffStore = create<HandoffStoreState>((set, get) => {
       await useChatStore.getState().restoreSession(entry.sourceMeta);
       if (useChatStore.getState().archivedSessionKeys[sessionKey(entry.sourceEngine, entry.sourceSessionId, entry.workspacePath)]) return;
       set((s) => {
+        const workspacePath = Object.keys(s.byWorkspace).find((path) => s.byWorkspace[path]?.id === entry.id);
+        if (workspacePath === undefined) return s;
         const cur = s.byWorkspace[workspacePath];
         if (!cur || cur.id !== entry.id) return s;
         return {
@@ -1081,7 +1137,8 @@ export const useHandoffStore = create<HandoffStoreState>((set, get) => {
     },
 
     dismissHandoff: (workspacePath) => {
-      requests.delete(workspacePath);
+      const id = get().byWorkspace[workspacePath]?.id;
+      if (id) requests.delete(id);
       set((s) => {
         if (!(workspacePath in s.byWorkspace)) return s;
         const next = { ...s.byWorkspace };
@@ -1100,7 +1157,7 @@ export const useHandoffStore = create<HandoffStoreState>((set, get) => {
     completeHandoffOnSend: (workspacePath, id) => {
       const entry = get().byWorkspace[workspacePath];
       if (!entry || entry.id !== id) return;
-      requests.delete(workspacePath);
+      requests.delete(entry.id);
       set((s) => {
         const next = { ...s.byWorkspace };
         delete next[workspacePath];
@@ -1110,7 +1167,8 @@ export const useHandoffStore = create<HandoffStoreState>((set, get) => {
         const chatStore = useChatStore.getState();
         const meta =
           chatStore.sessions.find(
-            (item) => item.engine === entry.sourceEngine && item.sessionId === entry.sourceSessionId,
+            (item) => item.engine === entry.sourceEngine && item.sessionId === entry.sourceSessionId
+              && item.workspacePath === entry.workspacePath,
           ) ?? entry.sourceMeta;
         if (meta) {
           void chatStore.archiveSession(meta);
@@ -1120,11 +1178,11 @@ export const useHandoffStore = create<HandoffStoreState>((set, get) => {
   };
 });
 
-useChatStore.subscribe((state, prevState) => {
+useChatStore.subscribe?.((state, prevState) => {
   if (state.openTabs === prevState.openTabs) return;
   const byWorkspace = useHandoffStore.getState().byWorkspace;
   for (const [workspacePath, entry] of Object.entries(byWorkspace)) {
-    if (!entry || entry.sending) continue;
+    if (!entry || entry.sending || movingHandoffs.has(entry.id)) continue;
     const prevPendingTabs = prevState.openTabs.filter(
       (t) => t.sessionId === null && t.workspacePath === workspacePath,
     );

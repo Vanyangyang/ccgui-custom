@@ -3,6 +3,8 @@ import { listenEngineEvents, type EngineEventPayload } from "@/lib/events";
 import { newId } from "@/lib/id";
 import { isWeb } from "@/lib/transport";
 import { HostChatBusyError } from "@/features/chat/store/types";
+import { crossSessionCostReview, requiresCrossSessionCostApproval } from "@/features/chat/cross-session-cost";
+import { resolveSessionModel } from "@/features/chat/store/stream";
 import { cloneCheckpointValue, runtimeCheckpoint, type RuntimeCheckpoint, type RuntimeCheckpointParticipant } from "@/lib/runtime-checkpoint";
 import type { PluginStorageBackend } from "./context";
 
@@ -13,6 +15,8 @@ export interface HostChatDeliveryOptions { priority?: boolean }
 export interface HostChatFacade {
   current(): HostChatSession | null;
   inspect(target: HostChatTarget, options?: HostChatDeliveryOptions): HostChatSession | null;
+  model?(target: HostChatTarget): string | undefined;
+  requiresCostApproval?(target: HostChatTarget): Promise<boolean> | boolean;
   send(target: HostChatTarget, prompt: string, runId: string, options?: HostChatDeliveryOptions): Promise<{ runId: string; sessionId: string | null }>;
   subscribe(callback: () => void): Disposer;
   ready?(): Promise<void>;
@@ -30,7 +34,7 @@ export function hostChatLedgerKey(identity: HostChatFacade["identity"]): string 
 const MAX_TEXT = 65_536;
 const MAX_REQUESTS = 512; // Never evict idempotency keys silently.
 const terminal = new Set(["completed", "failed", "unknown"]);
-const statuses = new Set(["queued", "received", "executing", "awaiting_permission", ...terminal]);
+const statuses = new Set(["queued", "received", "executing", "awaiting_permission", "awaiting_cost_approval", ...terminal]);
 const interruptedResult: Partial<HostChatReceipt> = { status: "failed", error: "Original GUI turn was interrupted" };
 const reservations = new Set<string>();
 let desktopIdentity: HostChatFacade["identity"] | undefined;
@@ -116,6 +120,27 @@ export async function desktopChatFacade(): Promise<HostChatFacade> {
   return {
     identity,
     inspect,
+    model(target) {
+      const state = useChatStore.getState();
+      const tab = state.openTabs.find((t) => t.engine === target.engine && t.sessionId === target.nativeSessionId && t.workspacePath === target.workspacePath);
+      if (!tab || !inspect(target)) return undefined;
+      return resolveSessionModel(tab, state.bySession[sessionKey(target.engine, target.nativeSessionId, target.workspacePath)], state.models[target.engine]);
+    },
+    async requiresCostApproval(target) {
+      const session = inspect(target);
+      if (!session) return true;
+      const { ipc } = await import("@/lib/ipc");
+      const fresh = await ipc.listSessions().catch(() => null);
+      const state = useChatStore.getState();
+      const catalogMeta = fresh?.find((s) => s.engine === target.engine && s.sessionId === target.nativeSessionId && s.workspacePath === target.workspacePath);
+      const stateMeta = state.sessions?.find((s) => s.engine === target.engine && s.sessionId === target.nativeSessionId && s.workspacePath === target.workspacePath);
+      const meta = !stateMeta ? catalogMeta : !catalogMeta ? stateMeta : !catalogMeta.promptCache ? { ...stateMeta, promptCache: null }
+        : !stateMeta.promptCache || catalogMeta.promptCache.observedAt >= stateMeta.promptCache.observedAt
+          ? { ...stateMeta, promptCache: catalogMeta.promptCache } : stateMeta;
+      if (!meta) return true;
+      const review = crossSessionCostReview(meta, state, session.status);
+      return requiresCrossSessionCostApproval(review) || !review.cache;
+    },
     current() {
       const active = useChatStore.getState().active;
       if (!active?.sessionId) return null;
@@ -138,7 +163,7 @@ export async function desktopChatFacade(): Promise<HostChatFacade> {
   };
 }
 
-interface Entry { receipt: HostChatReceipt; prompt: string; fingerprint: string; lastSeq: number; priority?: true }
+interface Entry { receipt: HostChatReceipt; prompt: string; fingerprint: string; lastSeq: number; priority?: true; costGuard?: true; costReviewedModel?: string | null }
 interface Ledger { version: 1; entries: Entry[] }
 interface BridgeCheckpoint {
   version: 1;
@@ -171,6 +196,8 @@ function ledgerEntries(value: unknown, identity?: HostChatIdentity): Entry[] {
       !statuses.has(value.receipt.status) || typeof value.receipt.runId !== "string" || !value.receipt.runId.startsWith("run-") ||
       !Number.isFinite(value.receipt.acceptedAt) || !Number.isFinite(value.receipt.updatedAt) || !Number.isInteger(value.lastSeq) || value.lastSeq < -1 ||
       (value.priority !== undefined && value.priority !== true) ||
+      (value.costGuard !== undefined && value.costGuard !== true) ||
+      (value.costReviewedModel !== undefined && value.costReviewedModel !== null && typeof value.costReviewedModel !== "string") ||
       value.fingerprint !== JSON.stringify([target, value.prompt]) || requests.has(value.receipt.requestId) ||
       (value.receipt.text !== undefined && typeof value.receipt.text !== "string") ||
       (value.receipt.error !== undefined && typeof value.receipt.error !== "string") ||
@@ -204,6 +231,9 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
   PluginContext["chat"] & {
     dispose: Disposer;
     ready(): Promise<void>;
+    submitForCostApproval(request: HostChatSubmission): Promise<HostChatReceipt>;
+    submitWithCostGuard(request: HostChatSubmission, reviewedModel?: string | null, requiresCostApproval?: () => Promise<boolean> | boolean): Promise<HostChatReceipt>;
+    approveCost(requestId: string, reviewedModel?: string | null): Promise<HostChatReceipt | null>;
     prioritize(requestId: string): Promise<HostChatReceipt | null>;
     cancel(requestId: string): Promise<HostChatReceipt | null>;
   } {
@@ -223,6 +253,7 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
   const pendingTerminals = new Map<string, Partial<HostChatReceipt>>();
   // The durable may-have-started fence is not public proof of a native start.
   const pendingStarts = new Map<string, HostChatReceipt["status"]>();
+  const costGuards = new Map<string, () => Promise<boolean> | boolean>();
   const inFlightStarts = new Set<string>();
   const listeners = new Set<(receipt: HostChatReceipt) => void>();
   const disposers: Disposer[] = [];
@@ -263,6 +294,20 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
     sessionProvenRuns.delete(entry.receipt.runId);
     pendingTerminals.delete(entry.receipt.runId);
     pendingStarts.delete(entry.receipt.runId);
+    costGuards.delete(entry.receipt.requestId);
+  };
+  const evaluateCostGuard = async (requestId: string, target: HostChatTarget): Promise<boolean> => {
+    const check = costGuards.get(requestId);
+    if (check) return (await check()) === true;
+    return (await host.requiresCostApproval?.(target)) === true;
+  };
+  const shouldHoldForCost = async (entry: Entry): Promise<boolean> => {
+    const { target, requestId } = entry.receipt;
+    if (entry.costReviewedModel !== undefined && entry.costReviewedModel !== (host.model?.(target) ?? null)) {
+      return true;
+    }
+    if (!entry.costGuard) return false;
+    return evaluateCostGuard(requestId, target);
   };
   const change = async (entry: Entry, patch: Partial<HostChatReceipt>) => {
     if (disposed) return;
@@ -352,7 +397,29 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
         blockedTargets.add(key);
         const delivery = entry.priority ? { priority: true } : undefined;
         const session = host.inspect(target, delivery);
-        if (!session || session.status !== "idle" || reservations.has(key)) continue;
+        if (session && entry.costReviewedModel !== undefined && entry.costReviewedModel !== (host.model?.(target) ?? null)) {
+          await change(entry, { status: "awaiting_cost_approval" });
+          continue;
+        }
+        if (!session) continue;
+        if (session.status !== "idle") {
+          if (entry.receipt.status === "received") await change(entry, { status: "queued" });
+          continue;
+        }
+        if (reservations.has(key)) continue;
+        if (await shouldHoldForCost(entry)) {
+          if (disposed || fenced || checkpoint.isPaused()) { wakeRequested = true; break; }
+          await change(entry, { status: "awaiting_cost_approval" });
+          continue;
+        }
+        if (disposed || fenced || checkpoint.isPaused()) { wakeRequested = true; break; }
+        const readySession = host.inspect(target, delivery);
+        if (!readySession) continue;
+        if (readySession.status !== "idle") {
+          if (entry.receipt.status === "received") await change(entry, { status: "queued" });
+          continue;
+        }
+        if (reservations.has(key)) continue;
         reservations.add(key);
         pendingStarts.set(runId, entry.receipt.status);
         await change(entry, { status: "executing" });
@@ -368,8 +435,52 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
           continue;
         }
         // Revalidate after the durable write; never substitute active.
-        if (!host.inspect(target, delivery)) {
+        const beforeSend = host.inspect(target, delivery);
+        if (!beforeSend) {
           await change(entry, { status: "unknown", error: "Exact target became unreachable before native send" });
+          reservations.delete(key);
+          continue;
+        }
+        if (entry.costReviewedModel !== undefined && entry.costReviewedModel !== (host.model?.(target) ?? null)) {
+          pendingStarts.delete(runId);
+          await change(entry, { status: "awaiting_cost_approval" });
+          reservations.delete(key);
+          continue;
+        }
+        if (beforeSend.status !== "idle") {
+          pendingStarts.delete(runId);
+          await change(entry, { status: "queued" });
+          reservations.delete(key);
+          continue;
+        }
+        if (await shouldHoldForCost(entry)) {
+          pendingStarts.delete(runId);
+          if (!disposed && !fenced && !checkpoint.isPaused()) {
+            await change(entry, { status: "awaiting_cost_approval" });
+          } else if (!disposed && !fenced && checkpoint.isPaused()) {
+            await change(entry, { status: "queued" });
+            wakeRequested = true;
+          }
+          reservations.delete(key);
+          continue;
+        }
+        if (disposed || fenced || checkpoint.isPaused()) {
+          const previous = pendingStarts.get(runId) ?? "queued";
+          pendingStarts.delete(runId);
+          if (!disposed && !fenced) await change(entry, { status: previous });
+          reservations.delete(key);
+          if (checkpoint.isPaused()) wakeRequested = true;
+          continue;
+        }
+        const finalSend = host.inspect(target, delivery);
+        if (!finalSend) {
+          await change(entry, { status: "unknown", error: "Exact target became unreachable before native send" });
+          reservations.delete(key);
+          continue;
+        }
+        if (finalSend.status !== "idle") {
+          pendingStarts.delete(runId);
+          await change(entry, { status: "queued" });
           reservations.delete(key);
           continue;
         }
@@ -571,16 +682,105 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
 
   /** Host-only queue controls for a request still waiting on its target. A
    *  started, finished or unknown request is returned unchanged. */
-  const pending = (requestId: string, apply: (entry: Entry) => Promise<void>) => serial(async () => {
+  const pending = (requestId: string, apply: (entry: Entry) => Promise<void>, includeCostApproval = false) => serial(async () => {
     if (disposed) throw new Error("Host chat bridge has been disposed");
     const entry = entries.get(requestId);
     if (!entry) return null;
-    if (entry.receipt.status === "queued" || entry.receipt.status === "received") await apply(entry);
+    if (entry.receipt.status === "queued" || entry.receipt.status === "received" ||
+      (includeCostApproval && entry.receipt.status === "awaiting_cost_approval")) await apply(entry);
     return visible(entry.receipt);
   });
 
+  async function submit(
+    request: HostChatSubmission,
+    requiresCostApproval = false,
+    costGuard = false,
+    reviewedModel?: string | null,
+    checkCost?: () => Promise<boolean> | boolean,
+  ): Promise<HostChatReceipt> {
+    if (!validRequestId(request?.requestId) || typeof request.prompt !== "string" || !request.prompt.trim() || request.prompt.length > 131_072) throw new Error("Invalid host chat requestId or prompt");
+    const target = targetCopy(request.target);
+    const requestId = request.requestId;
+    const prompt = request.prompt;
+    const fingerprint = JSON.stringify([target, prompt]);
+    await ensure();
+    return serial(async () => {
+      if (disposed) throw new Error("Host chat bridge has been disposed");
+      if (target.clientInstanceId !== host.identity.clientInstanceId || target.windowId !== host.identity.windowId) throw new Error("Exact host chat target belongs to a different desktop document");
+      const previous = entries.get(requestId);
+      if (previous) {
+        if (previous.fingerprint !== fingerprint) throw new Error("Host chat requestId already belongs to a different target or prompt");
+        return visible(previous.receipt);
+      }
+      checkpoint.assertAllowed();
+      if (fenced) throw new Error("Host chat ledger is fenced after an ambiguous storage failure");
+      const initialSession = host.inspect(target);
+      if (!initialSession) throw new Error("Exact host chat target is unavailable (open, loaded native timeline required)");
+      if (entries.size >= MAX_REQUESTS) throw new Error("Host chat request ledger capacity reached");
+      if (costGuard && checkCost) costGuards.set(requestId, checkCost);
+      const initialModel = host.model?.(target) ?? null;
+      const costReviewedModel = costGuard ? reviewedModel === undefined ? initialModel : reviewedModel : undefined;
+      let needsApproval = requiresCostApproval || (costGuard && costReviewedModel !== initialModel);
+      if (!needsApproval && costGuard && initialSession.status === "idle") {
+        needsApproval = await evaluateCostGuard(requestId, target);
+        if (disposed) throw new Error("Host chat bridge has been disposed");
+        checkpoint.assertAllowed();
+        if (fenced) throw new Error("Host chat ledger is fenced after an ambiguous storage failure");
+      }
+      const session = host.inspect(target);
+      if (!session) {
+        costGuards.delete(requestId);
+        throw new Error("Exact host chat target is unavailable (open, loaded native timeline required)");
+      }
+      const currentModel = host.model?.(target) ?? null;
+      if (costGuard && costReviewedModel !== currentModel) needsApproval = true;
+      const at = now();
+      const entry: Entry = { prompt, fingerprint, lastSeq: -1, ...(costGuard ? { costGuard: true, costReviewedModel } : {}), receipt: { requestId, target,
+        runId: deps.runId?.() ?? `run-${newId()}`, status: needsApproval ? "awaiting_cost_approval" : session.status === "idle" ? "received" : "queued", acceptedAt: at, updatedAt: at } };
+      entries.set(requestId, entry);
+      try { await persist(); }
+      catch { entries.delete(requestId); costGuards.delete(requestId); fenced = true; throw new Error("Host chat acceptance could not be persisted; no native send was started"); }
+      emit(entry.receipt);
+      kick();
+      return visible(entry.receipt);
+    });
+  }
+
   return {
     ready,
+    submitForCostApproval: (request) => submit(request, true),
+    async submitWithCostGuard(request, reviewedModel, requiresCostApproval) {
+      if (reviewedModel !== undefined && reviewedModel !== null && typeof reviewedModel !== "string") {
+        throw new Error("Invalid host chat cost guard model");
+      }
+      if (requiresCostApproval !== undefined && typeof requiresCostApproval !== "function") {
+        throw new Error("Invalid host chat cost guard");
+      }
+      return submit(request, false, true, reviewedModel, requiresCostApproval);
+    },
+    async approveCost(requestId, reviewedModel) {
+      await ensure();
+      const receipt = await serial(async () => {
+        assertOwner();
+        const entry = entries.get(requestId);
+        if (!entry) return null;
+        if (entry.receipt.status === "awaiting_cost_approval") {
+          checkpoint.assertAllowed();
+          if (fenced) throw new Error("Host chat ledger is fenced after an ambiguous storage failure");
+          const session = host.inspect(entry.receipt.target);
+          if (!session) throw new Error("Exact host chat target is unavailable (open, loaded native timeline required)");
+          const currentModel = host.model?.(entry.receipt.target) ?? null;
+          if (reviewedModel !== undefined && reviewedModel !== currentModel) throw new Error("Host chat target model changed before cost approval");
+          entry.costReviewedModel = currentModel;
+          delete entry.costGuard;
+          costGuards.delete(requestId);
+          await change(entry, { status: session.status === "idle" ? "received" : "queued" });
+        }
+        return visible(entry.receipt);
+      });
+      kick();
+      return receipt;
+    },
     /** Send ahead of the target's own queued rows at its next idle moment. */
     async prioritize(requestId: string): Promise<HostChatReceipt | null> {
       await ensure();
@@ -596,7 +796,7 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
     /** Withdraw a request before any native send; the sender sees a failure. */
     async cancel(requestId: string): Promise<HostChatReceipt | null> {
       await ensure();
-      return pending(requestId, (entry) => change(entry, { status: "failed", error: "Cancelled by the user before delivery" }));
+      return pending(requestId, (entry) => change(entry, { status: "failed", error: "Cancelled by the user before delivery" }), true);
     },
     async identity() {
       await ensure();
@@ -605,37 +805,7 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
     },
     async current() { await ensure(); return disposed ? null : host.current(); },
     async inspect(target) { const exact = targetCopy(target); await ensure(); return disposed || exact.clientInstanceId !== host.identity.clientInstanceId || exact.windowId !== host.identity.windowId ? null : host.inspect(exact); },
-    async submit(request: HostChatSubmission) {
-      if (!validRequestId(request?.requestId) || typeof request.prompt !== "string" || !request.prompt.trim() || request.prompt.length > 131_072) throw new Error("Invalid host chat requestId or prompt");
-      const target = targetCopy(request.target);
-      const requestId = request.requestId;
-      const prompt = request.prompt;
-      const fingerprint = JSON.stringify([target, prompt]);
-      await ensure();
-      return serial(async () => {
-        if (disposed) throw new Error("Host chat bridge has been disposed");
-        if (target.clientInstanceId !== host.identity.clientInstanceId || target.windowId !== host.identity.windowId) throw new Error("Exact host chat target belongs to a different desktop document");
-        const previous = entries.get(requestId);
-        if (previous) {
-          if (previous.fingerprint !== fingerprint) throw new Error("Host chat requestId already belongs to a different target or prompt");
-          return visible(previous.receipt);
-        }
-        checkpoint.assertAllowed();
-        if (fenced) throw new Error("Host chat ledger is fenced after an ambiguous storage failure");
-        const session = host.inspect(target);
-        if (!session) throw new Error("Exact host chat target is unavailable (open, loaded native timeline required)");
-        if (entries.size >= MAX_REQUESTS) throw new Error("Host chat request ledger capacity reached");
-        const at = now();
-        const entry: Entry = { prompt, fingerprint, lastSeq: -1, receipt: { requestId, target,
-          runId: deps.runId?.() ?? `run-${newId()}`, status: session.status === "idle" ? "received" : "queued", acceptedAt: at, updatedAt: at } };
-        entries.set(requestId, entry);
-        try { await persist(); }
-        catch { entries.delete(requestId); fenced = true; throw new Error("Host chat acceptance could not be persisted; no native send was started"); }
-        emit(entry.receipt);
-        kick();
-        return visible(entry.receipt);
-      });
-    },
+    submit: (request) => submit(request),
     async receipt(requestId) { await ensure(); return serial(async () => entries.has(requestId) ? visible(entries.get(requestId)!.receipt) : null); },
     onEvent(callback) {
       if (disposed) throw new Error("Host chat bridge has been disposed");
@@ -654,7 +824,7 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
       }
       disposed = true;
       unregisterCheckpoint();
-      listeners.clear(); acknowledgedRuns.clear(); sessionProvenRuns.clear(); pendingTerminals.clear(); pendingStarts.clear();
+      listeners.clear(); acknowledgedRuns.clear(); sessionProvenRuns.clear(); pendingTerminals.clear(); pendingStarts.clear(); costGuards.clear();
       for (const off of disposers.splice(0)) off();
     },
   };

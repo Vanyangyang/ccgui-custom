@@ -7,6 +7,8 @@ import { getSessionCacheHeat, promptCacheForEngine } from "./prompt-cache";
 import { HostChatBusyError, type ChatStore } from "./store/types";
 import { createHostChatBridge, desktopChatFacade, type HostChatFacade } from "@/features/plugins/runtime/chat-bridge";
 import type { PluginStorageBackend } from "@/features/plugins/runtime/context";
+import { cloneCheckpointValue, runtimeCheckpoint } from "@/lib/runtime-checkpoint";
+import { crossSessionCostReview, requiresCrossSessionCostApproval, type CrossSessionCostReview } from "./cross-session-cost";
 
 export interface CrossSessionRequest {
   requestId: string;
@@ -38,6 +40,7 @@ export interface CrossSessionCommunicationRecord {
   acceptedAt: number;
   updatedAt: number;
   reviewedBy?: string[];
+  costReview?: CrossSessionCostReview;
 }
 
 export function isCrossSessionActiveStatus(status: CrossSessionCommunicationStatus): boolean {
@@ -46,6 +49,7 @@ export function isCrossSessionActiveStatus(status: CrossSessionCommunicationStat
     status === "queued" ||
     status === "received" ||
     status === "executing" ||
+    status === "awaiting_cost_approval" ||
     status === "awaiting_permission"
   );
 }
@@ -92,6 +96,10 @@ function preserveReview(
 }
 
 const MAX_CROSS_SESSION_RECORDS = 30;
+function retainedRecords(records: CrossSessionCommunicationRecord[]) {
+  let finished = 0;
+  return records.filter((r) => isCrossSessionActiveStatus(r.status) || ++finished <= MAX_CROSS_SESSION_RECORDS);
+}
 
 interface CrossSessionActivityState {
   records: CrossSessionCommunicationRecord[];
@@ -111,7 +119,7 @@ export const useCrossSessionActivityStore = create<CrossSessionActivityState>((s
       const next =
         idx >= 0
           ? state.records.map((r, i) => (i === idx ? preserveReview(r, { ...r, ...record }) : r))
-          : [record, ...state.records].slice(0, MAX_CROSS_SESSION_RECORDS);
+          : retainedRecords([record, ...state.records]);
       return {
         records: next,
       };
@@ -173,7 +181,30 @@ export const useCrossSessionActivityStore = create<CrossSessionActivityState>((s
   reset: () => set({ records: [] }),
 }));
 
-type Bridge = Pick<PluginContext["chat"], "identity" | "inspect" | "submit" | "receipt"> & Partial<Pick<PluginContext["chat"], "onEvent">>;
+// The approval card must survive the same runtime handoff as its held ledger
+// entry. A normal new desktop document retains the bridge's no-replay policy.
+export function captureCrossSessionActivity() {
+  return { version: 1, records: cloneCheckpointValue(useCrossSessionActivityStore.getState().records) };
+}
+export function restoreCrossSessionActivity(value: unknown) {
+  const snapshot = cloneCheckpointValue(value) as { version?: number; records?: CrossSessionCommunicationRecord[] };
+  if (snapshot?.version !== 1 || !Array.isArray(snapshot.records) || snapshot.records.length > 1024 ||
+    snapshot.records.some((r) => !r || typeof r.scopedId !== "string" || typeof r.message !== "string" ||
+      !r.sender?.sessionId || !r.target?.sessionId)) throw new Error("Invalid cross-session activity checkpoint");
+  useCrossSessionActivityStore.setState({ records: retainedRecords(snapshot.records.map((record) =>
+    record.status === "preparing"
+      ? { ...record, status: "unknown" as const, error: "History preparation did not finish before runtime handoff; no automatic resend" }
+      : record)) });
+}
+const unregisterActivityCheckpoint = runtimeCheckpoint.register({
+  id: "cross-session-activity",
+  capture: captureCrossSessionActivity,
+  restore: restoreCrossSessionActivity,
+});
+if (import.meta.hot) import.meta.hot.dispose(unregisterActivityCheckpoint);
+
+type Bridge = Pick<PluginContext["chat"], "identity" | "inspect" | "submit" | "receipt"> &
+  Pick<ReturnType<typeof createHostChatBridge>, "submitForCostApproval" | "submitWithCostGuard"> & Partial<Pick<PluginContext["chat"], "onEvent">>;
 interface Dependencies {
   store: { getState(): ChatStore };
   bridge: Bridge;
@@ -203,7 +234,7 @@ function waitSeconds(value: unknown): number {
 }
 function isSettledReceipt(receipt: HostChatReceipt | null): boolean {
   return !receipt || receipt.status === "completed" || receipt.status === "failed" ||
-    receipt.status === "unknown" || receipt.status === "awaiting_permission";
+    receipt.status === "unknown" || receipt.status === "awaiting_permission" || receipt.status === "awaiting_cost_approval";
 }
 async function waitForReceipt(
   bridge: Bridge,
@@ -252,7 +283,17 @@ async function scopedId(sender: CrossSessionRequest["sender"], id: string) {
   return `cross:${Array.from(new Uint8Array(hash), (b) => b.toString(16).padStart(2, "0")).join("")}`;
 }
 function publicReceipt(receipt: HostChatReceipt | null, id: string) {
-  return receipt ? { ...receipt, requestId: id } : null;
+  if (!receipt) return null;
+  const review = receipt.status === "awaiting_cost_approval"
+    ? useCrossSessionActivityStore.getState().records.find((r) => r.scopedId === receipt.requestId)?.costReview : undefined;
+  return {
+    ...receipt, requestId: id,
+    ...(receipt.status === "awaiting_cost_approval" ? {
+      submitted_to_model: false,
+      cost_review: review,
+      next_action: "A human must approve or cancel in the chat's cost review card. Do not poll continuously or resend with a new request_id.",
+    } : {}),
+  };
 }
 
 /** A finished UI turn can precede retirement of its Claude child process.
@@ -322,6 +363,14 @@ export function guardClaudeProcess(host: HostChatFacade, deps = {
 
 /** Host-owned preparation sits outside the plugin's open/loaded-only bridge. */
 export function createCrossSessionHandler(deps: Dependencies) {
+  const preparing = new Map<string, Promise<unknown>>();
+  const serialRequest = async (id: string, work: () => Promise<unknown>) => {
+    const prior = preparing.get(id);
+    const next = (prior ?? Promise.resolve()).catch(() => {}).then(work);
+    preparing.set(id, next);
+    try { return await next; }
+    finally { if (preparing.get(id) === next) preparing.delete(id); }
+  };
   const assertActive = () => { if (deps.isActive && !deps.isActive()) throw new Error("Host chat runtime has been disposed"); };
   deps.bridge.onEvent?.((receipt) => {
     if (!deps.isActive || deps.isActive()) {
@@ -381,6 +430,8 @@ export function createCrossSessionHandler(deps: Dependencies) {
       if (settled) useCrossSessionActivityStore.getState().applyReceipt(settled);
       return { receipt: publicReceipt(settled, id) };
     }
+    return serialRequest(scoped, async () => {
+    assertActive();
     const sessionId = requiredString(args.session_id, "session_id");
     const message = requiredString(args.message, "message");
     if (message.length > 130_000) throw new Error("message exceeds 130000 characters");
@@ -402,11 +453,18 @@ export function createCrossSessionHandler(deps: Dependencies) {
     const senderMeta = rows.find((s) => s.engine === request.sender.engine && s.sessionId === request.sender.sessionId);
     const existingReceipt = await deps.bridge.receipt(scoped);
     assertActive();
+    if (existingReceipt) {
+      // Validate the original target+prompt before touching the visible card.
+      // Retrying never approves a held request or replaces the approved text.
+      const previous = await deps.bridge.submit({ requestId: scoped, target, prompt });
+      const settled = await waitForReceipt(deps.bridge, scoped, previous, wait, assertActive);
+      if (settled) useCrossSessionActivityStore.getState().applyReceipt(settled);
+      return publicReceipt(settled, id);
+    }
     const now = Date.now();
     useCrossSessionActivityStore.getState().upsertRecord({
       scopedId: scoped,
       requestId: id,
-      runId: existingReceipt?.runId,
       sender: {
         engine: request.sender.engine,
         sessionId: request.sender.sessionId!,
@@ -420,25 +478,42 @@ export function createCrossSessionHandler(deps: Dependencies) {
         title: meta.customTitle ?? meta.title,
       },
       message,
-      status: existingReceipt ? existingReceipt.status : "preparing",
-      replyText: existingReceipt?.text,
-      truncated: existingReceipt?.truncated,
-      error: existingReceipt?.error,
-      acceptedAt: existingReceipt?.acceptedAt || now,
-      updatedAt: existingReceipt?.updatedAt || now,
+      status: "preparing",
+      acceptedAt: now,
+      updatedAt: now,
     });
     try {
-      // The bridge compares the original target+prompt even after it completes or
-      // the tab closes. A retry must not need to reload its old timeline.
-      if (!existingReceipt) {
-        if (!deps.store.getState().initialized) await deps.store.getState().init();
-        assertActive();
-        await deps.store.getState().selectSession(meta.engine, meta.sessionId, meta.workspacePath, { background: true, meta });
-        assertActive();
-        if (!await deps.bridge.inspect(target)) throw new Error("Exact target is unavailable after history preparation");
-      }
+      if (!deps.store.getState().initialized) await deps.store.getState().init();
       assertActive();
-      const submitted = await deps.bridge.submit({ requestId: scoped, target, prompt });
+      // This is a local history read only. It supplies the last measured context
+      // sample for review; no upstream model starts until the held entry is approved.
+      await deps.store.getState().selectSession(meta.engine, meta.sessionId, meta.workspacePath, { background: true, meta });
+      assertActive();
+      const inspected = await deps.bridge.inspect(target);
+      if (!inspected) throw new Error("Exact target is unavailable after history preparation");
+      const sampleReview = (catalogMeta: SessionMeta, targetStatus: CrossSessionCostReview["targetStatus"]) => {
+        const state = deps.store.getState();
+        const stateMeta = state.sessions?.find((s) => s.engine === meta.engine && s.sessionId === meta.sessionId && s.workspacePath === meta.workspacePath);
+        const latestMeta = !stateMeta ? catalogMeta : !catalogMeta.promptCache ? { ...stateMeta, promptCache: null }
+          : !stateMeta.promptCache || catalogMeta.promptCache.observedAt >= stateMeta.promptCache.observedAt
+            ? { ...stateMeta, promptCache: catalogMeta.promptCache } : stateMeta;
+        const nextReview = crossSessionCostReview(latestMeta, state, targetStatus);
+        const currentRecord = useCrossSessionActivityStore.getState().records.find((r) => r.scopedId === scoped);
+        if (currentRecord) useCrossSessionActivityStore.getState().upsertRecord({ ...currentRecord, costReview: nextReview });
+        return nextReview;
+      };
+      const review = sampleReview(meta, inspected.status);
+      assertActive();
+      const submission = { requestId: scoped, target, prompt };
+      const submitted = await (requiresCrossSessionCostApproval(review) || !review.cache
+        ? deps.bridge.submitForCostApproval(submission)
+        : deps.bridge.submitWithCostGuard(submission, review.model ?? null, async () => {
+          const freshRows = await catalog().catch(() => null);
+          const freshMeta = freshRows?.find((s) => s.engine === meta.engine && s.sessionId === meta.sessionId && s.workspacePath === meta.workspacePath) ?? meta;
+          const current = await deps.bridge.inspect(target);
+          const latest = sampleReview(freshMeta, current?.status ?? "idle");
+          return requiresCrossSessionCostApproval(latest) || !latest.cache;
+        }));
       useCrossSessionActivityStore.getState().applyReceipt(submitted);
       assertActive();
       const settled = await waitForReceipt(deps.bridge, scoped, submitted, wait, assertActive);
@@ -448,11 +523,25 @@ export function createCrossSessionHandler(deps: Dependencies) {
       useCrossSessionActivityStore.getState().markFailed(scoped, error instanceof Error ? error.message : String(error));
       throw error;
     }
+    });
   };
 }
 
 type CrossSessionQueueControls = Pick<ReturnType<typeof createHostChatBridge>, "prioritize" | "cancel">;
-let queueControls: CrossSessionQueueControls | undefined;
+let queueControls: (CrossSessionQueueControls & Pick<ReturnType<typeof createHostChatBridge>, "approveCost">) | undefined;
+
+/** Only a human UI action calls this host-only control. The MCP tool and the
+ * plugin facade cannot acknowledge or bypass the approval. Busy targets queue. */
+export async function approveCrossSessionMessage(
+  scopedId: string,
+  controls: Pick<ReturnType<typeof createHostChatBridge>, "approveCost"> | undefined = queueControls,
+  reviewedModel?: string | null,
+): Promise<void> {
+  if (!controls) throw new Error("Host chat runtime is unavailable");
+  const receipt = await controls.approveCost(scopedId, reviewedModel);
+  if (!receipt) throw new Error("Cost approval request is unavailable");
+  useCrossSessionActivityStore.getState().applyReceipt(receipt);
+}
 
 /** The target chat's user sends a waiting cross-session message now: it goes
  *  ahead of the chat's own queued rows, and a turn in flight is stopped the

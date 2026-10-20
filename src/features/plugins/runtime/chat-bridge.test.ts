@@ -17,7 +17,7 @@ function coordinator(snapshot?: RuntimeCheckpoint) {
   return checkpoint;
 }
 function fixture(pluginId = "one", data = new Map<string, unknown>(), identity: HostChatFacade["identity"] = a,
-  checkpoint = coordinator()) {
+  checkpoint = coordinator(), now?: () => number) {
   const documentIdentity = { clientInstanceId: identity.clientInstanceId, windowId: identity.windowId };
   const localA = { ...a, ...documentIdentity }; const localB = { ...b, ...documentIdentity };
   const sessions = new Map<string, HostChatSession>([[a.nativeSessionId, { ...localA, status: "idle" }], [b.nativeSessionId, { ...localB, status: "idle" }]]);
@@ -44,7 +44,7 @@ function fixture(pluginId = "one", data = new Map<string, unknown>(), identity: 
     wasInterrupted: vi.fn(() => false),
   };
   const listen = vi.fn(async (cb: (events: EngineEventPayload[]) => void) => { receive = cb; return () => { receive = () => {}; }; });
-  const bridge = createHostChatBridge(pluginId, backend, { host: async () => host, listen, checkpoint });
+  const bridge = createHostChatBridge(pluginId, backend, { host: async () => host, listen, checkpoint, now });
   bridges.push(bridge);
   return { bridge, host, backend, data, sessions, checkpoint, listen,
     activate: (target: HostChatTarget) => { active = target; observers.forEach((cb) => cb()); },
@@ -336,7 +336,7 @@ describe("desktop existing host chat request ledger", () => {
     expect(first.host.send).toHaveBeenCalledTimes(1); expect(second.host.send).toHaveBeenCalledTimes(1);
   });
 
-  it.each(["queued", "received", "executing", "awaiting_permission"])("does not replay a reloaded %s request even in the same test document identity", async (status) => {
+  it.each(["queued", "received", "executing", "awaiting_permission", "awaiting_cost_approval"])("does not replay a reloaded %s request even in the same test document identity", async (status) => {
     const f = fixture(); f.sessions.set(a.nativeSessionId, { ...a, status: "busy" });
     await f.bridge.submit({ requestId: "crash", target: a, prompt: "once" }); f.bridge.dispose();
     const ledger = structuredClone(f.data.get(`one:${hostChatLedgerKey(a)}`)) as { entries: Array<{ receipt: { status: string } }> };
@@ -585,6 +585,211 @@ describe("desktop existing host chat request ledger", () => {
     await new Promise((r) => setTimeout(r, 0));
     expect(old.data.get(`one:${hostChatLedgerKey(a)}`)).toEqual(saved);
     expect(await replacement.bridge.receipt("new")).not.toBeNull();
+  });
+});
+
+describe("host-only cost approval", () => {
+  it("requires fresh approval when a queued approved request's model changes", async () => {
+    const f = fixture();
+    let model = "model-a"; f.host.model = () => model;
+    await f.bridge.submitForCostApproval({ requestId: "model-queue", target: a, prompt: "review model" });
+    f.sessions.set(a.nativeSessionId, { ...a, status: "busy" });
+    expect(await f.bridge.approveCost("model-queue", "model-a")).toMatchObject({ status: "queued" });
+    model = "model-b"; f.idle(a); await f.bridge.ready();
+    expect(await f.bridge.receipt("model-queue")).toMatchObject({ status: "awaiting_cost_approval" });
+    expect(f.host.send).not.toHaveBeenCalled();
+    await f.bridge.approveCost("model-queue", "model-b"); await sent(f);
+  });
+
+  it("rejects an approval based on a stale reviewed model and gates a stale guarded submission", async () => {
+    const f = fixture("one", new Map(), a, coordinator(), () => 100);
+    f.host.model = () => "model-b";
+    expect(await f.bridge.submitWithCostGuard({ requestId: "model-guard", target: a, prompt: "review model" }, "model-a"))
+      .toMatchObject({ status: "awaiting_cost_approval" });
+    await expect(f.bridge.approveCost("model-guard", "model-a")).rejects.toThrow(/model changed/);
+    expect(await f.bridge.receipt("model-guard")).toMatchObject({ status: "awaiting_cost_approval" });
+    await f.bridge.ready(); expect(f.host.send).not.toHaveBeenCalled();
+  });
+
+  it.each([{ costGuard: "yes" }, { costGuard: false }, { costReviewedModel: 1 }])("rejects malformed internal cost metadata %j", async (invalid) => {
+    const f = fixture();
+    await f.bridge.submitForCostApproval({ requestId: "malformed-cost", target: a, prompt: "never" });
+    const key = `one:${hostChatLedgerKey(a)}`;
+    const ledger = structuredClone(f.data.get(key)) as { entries: Array<Record<string, unknown>> };
+    Object.assign(ledger.entries[0], invalid); f.data.set(key, ledger); f.bridge.dispose();
+    const next = fixture("one", f.data);
+    await expect(next.bridge.ready()).rejects.toThrow(/Invalid host chat request ledger/);
+  });
+
+  it("queues a guarded submission when the target is busy and evaluates latest cache evidence before sending", async () => {
+    let cacheCold = false;
+    const f = fixture("one", new Map(), a, coordinator(), () => 100);
+    f.sessions.set(a.nativeSessionId, { ...a, status: "busy" });
+    expect(await f.bridge.submitWithCostGuard({ requestId: "busy-guard", target: a, prompt: "later" }, null, () => cacheCold))
+      .toMatchObject({ status: "queued" });
+    await f.bridge.ready(); expect(f.host.send).not.toHaveBeenCalled();
+    // If cache became cold while waiting in queue, idle transition holds for approval instead of sending
+    cacheCold = true;
+    f.idle(a); await f.bridge.ready();
+    expect(await f.bridge.receipt("busy-guard")).toMatchObject({ status: "awaiting_cost_approval" });
+    expect(f.host.send).not.toHaveBeenCalled();
+    await f.bridge.approveCost("busy-guard"); await sent(f);
+  });
+
+  it.each(["busy", "expired"] as const)("rechecks guarded acceptance after persistence (%s)", async (cause) => {
+    let cacheExpired = false;
+    const f = fixture("one", new Map(), a, coordinator());
+    const write = Promise.withResolvers<void>();
+    f.backend.set.mockImplementationOnce(async (id, key, value) => {
+      await write.promise; f.data.set(`${id}:${key}`, structuredClone(value));
+    });
+    const request = { requestId: "accept-guard", target: a, prompt: "guarded" };
+    const accepting = f.bridge.submitWithCostGuard(request, null, () => cacheExpired);
+    await vi.waitFor(() => expect(f.backend.set).toHaveBeenCalledTimes(1));
+    if (cause === "busy") f.sessions.set(a.nativeSessionId, { ...a, status: "busy" });
+    else cacheExpired = true;
+    write.resolve(); await accepting;
+    await f.bridge.ready();
+    expect(await f.bridge.submit(request)).toMatchObject({ status: cause === "busy" ? "queued" : "awaiting_cost_approval" });
+    expect(f.host.send).not.toHaveBeenCalled();
+  });
+
+  it.each(["busy", "expired", "model"] as const)("rechecks the durable pre-send fence (%s)", async (cause) => {
+    let cacheExpired = false;
+    const f = fixture("one", new Map(), a, coordinator());
+    let model = "model-a"; f.host.model = () => model;
+    const write = Promise.withResolvers<void>();
+    f.backend.set.mockImplementationOnce(async (id, key, value) => { f.data.set(`${id}:${key}`, structuredClone(value)); })
+      .mockImplementationOnce(async (id, key, value) => {
+        await write.promise; f.data.set(`${id}:${key}`, structuredClone(value));
+      });
+    await f.bridge.submitWithCostGuard({ requestId: "send-guard", target: a, prompt: "guarded" }, "model-a", () => cacheExpired);
+    await vi.waitFor(() => expect(f.backend.set).toHaveBeenCalledTimes(2));
+    if (cause === "busy") f.sessions.set(a.nativeSessionId, { ...a, status: "awaiting_permission" });
+    else if (cause === "expired") cacheExpired = true;
+    else model = "model-b";
+    write.resolve(); await f.bridge.ready();
+    expect(await f.bridge.receipt("send-guard")).toMatchObject({ status: cause === "busy" ? "queued" : "awaiting_cost_approval" });
+    expect(f.host.send).not.toHaveBeenCalled();
+  });
+
+  it("retains the original guard across ordinary retries and priority, then clears it only on approval", async () => {
+    let cacheExpired = false;
+    const f = fixture("one", new Map(), a, coordinator());
+    const request = { requestId: "retry-guard", target: a, prompt: "guarded" };
+    // Accept while idle, then leave the exact target temporarily unavailable.
+    f.backend.set.mockImplementationOnce(async (id, key, value) => {
+      f.data.set(`${id}:${key}`, structuredClone(value)); f.sessions.delete(a.nativeSessionId);
+    });
+    await f.bridge.submitWithCostGuard(request, null, () => cacheExpired); await f.bridge.ready();
+    expect(await f.bridge.submit(request)).toMatchObject({ status: "received" });
+    await f.bridge.submitWithCostGuard(request, null, () => false);
+    await f.bridge.prioritize(request.requestId);
+    const ledger = () => f.data.get(`one:${hostChatLedgerKey(a)}`) as { entries: Array<{ costGuard?: true }> };
+    expect(ledger().entries[0].costGuard).toBe(true);
+    expect(f.host.send).not.toHaveBeenCalled();
+    cacheExpired = true; f.idle(a); await f.bridge.ready();
+    expect(await f.bridge.receipt(request.requestId)).toMatchObject({ status: "awaiting_cost_approval" });
+    f.sessions.set(a.nativeSessionId, { ...a, status: "busy" });
+    expect(await f.bridge.approveCost(request.requestId)).toMatchObject({ status: "queued" });
+    expect(ledger().entries[0].costGuard).toBeUndefined();
+    f.idle(a); await sent(f);
+  });
+
+  it("rejects invalid cost guard arguments", async () => {
+    const f = fixture();
+    await expect(f.bridge.submitWithCostGuard({ requestId: "invalid-guard", target: a, prompt: "never" }, 123 as never)).rejects.toThrow(/model/);
+    await expect(f.bridge.submitWithCostGuard({ requestId: "invalid-guard-fn", target: a, prompt: "never" }, null, "not-fn" as never)).rejects.toThrow(/guard/);
+    expect(f.host.send).not.toHaveBeenCalled();
+  });
+
+  it("persists a gated request and rejects bypass through ordinary retries, priority or changed payloads", async () => {
+    const f = fixture();
+    const request = { requestId: "cost", target: a, prompt: "expensive work" };
+    const accepted = await f.bridge.submitForCostApproval(request);
+    expect(accepted.status).toBe("awaiting_cost_approval");
+    expect(await f.bridge.submit(request)).toEqual(accepted);
+    expect(await f.bridge.submitForCostApproval(request)).toEqual(accepted);
+    expect(await f.bridge.prioritize(request.requestId)).toEqual(accepted);
+    await expect(f.bridge.submit({ ...request, prompt: "changed" })).rejects.toThrow(/different/);
+    await expect(f.bridge.submitForCostApproval({ ...request, target: b })).rejects.toThrow(/different/);
+    f.idle(a); await f.bridge.ready();
+    expect(f.host.send).not.toHaveBeenCalled();
+    const saved = f.data.get(`one:${hostChatLedgerKey(a)}`) as { entries: Array<{ receipt: HostChatReceipt; priority?: true }> };
+    expect(saved.entries[0].receipt).toEqual(accepted);
+    expect(saved.entries[0].priority).toBeUndefined();
+  });
+
+  it("persists approval before sending and serializes double approval to one original run", async () => {
+    const f = fixture();
+    const accepted = await f.bridge.submitForCostApproval({ requestId: "double", target: a, prompt: "once" });
+    await f.bridge.ready();
+    const write = Promise.withResolvers<void>();
+    f.backend.set.mockImplementationOnce(async (id, key, value) => {
+      await write.promise;
+      f.data.set(`${id}:${key}`, structuredClone(value));
+    });
+    const approvals = Promise.all([f.bridge.approveCost("double"), f.bridge.approveCost("double")]);
+    await vi.waitFor(() => expect(f.backend.set).toHaveBeenCalledTimes(2));
+    expect(f.host.send).not.toHaveBeenCalled();
+    write.resolve();
+    expect((await approvals).every((receipt) => receipt?.runId === accepted.runId)).toBe(true);
+    await sent(f);
+    expect(f.host.send).toHaveBeenCalledWith(a, "once", accepted.runId, undefined);
+    await f.bridge.approveCost("double"); await f.bridge.ready();
+    expect(f.host.send).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["approve-first", "cancel-first"])("serializes approval and cancellation safely (%s)", async (order) => {
+    const f = fixture();
+    await f.bridge.submitForCostApproval({ requestId: "cancel-race", target: a, prompt: "withdraw" });
+    await f.bridge.ready();
+    const approve = () => f.bridge.approveCost("cancel-race");
+    const cancel = () => f.bridge.cancel("cancel-race");
+    await Promise.all(order === "approve-first" ? [approve(), cancel()] : [cancel(), approve()]);
+    await f.bridge.ready();
+    expect(await f.bridge.receipt("cancel-race")).toMatchObject({ status: "failed" });
+    expect(await f.bridge.approveCost("cancel-race")).toMatchObject({ status: "failed" });
+    expect(f.host.send).not.toHaveBeenCalled();
+  });
+
+  it("uses the target's current busy or permission state at approval without interrupting it", async () => {
+    const f = fixture();
+    await f.bridge.submitForCostApproval({ requestId: "busy-cost", target: a, prompt: "later" });
+    f.sessions.set(a.nativeSessionId, { ...a, status: "awaiting_permission" });
+    expect(await f.bridge.approveCost("busy-cost")).toMatchObject({ status: "queued" });
+    await f.bridge.ready(); expect(f.host.send).not.toHaveBeenCalled();
+    f.idle(a); await sent(f);
+  });
+
+  it("keeps an unavailable target gated and fences a failed approval write without sending", async () => {
+    const f = fixture();
+    await f.bridge.submitForCostApproval({ requestId: "failed-cost", target: a, prompt: "never" });
+    f.sessions.delete(a.nativeSessionId);
+    await expect(f.bridge.approveCost("failed-cost")).rejects.toThrow(/unavailable/);
+    expect(await f.bridge.receipt("failed-cost")).toMatchObject({ status: "awaiting_cost_approval" });
+    f.idle(a); await f.bridge.ready();
+    f.backend.set.mockRejectedValueOnce(new Error("disk"));
+    expect(await f.bridge.approveCost("failed-cost")).toMatchObject({ status: "unknown" });
+    await f.bridge.ready(); expect(f.host.send).not.toHaveBeenCalled();
+  });
+
+  it("preserves the gate through a runtime checkpoint and resume until explicit approval", async () => {
+    const old = fixture();
+    const request = { requestId: "cost-cut", target: a, prompt: "after approval" };
+    const accepted = await old.bridge.submitForCostApproval(request);
+    const snapshot = await old.checkpoint.prepare(); old.bridge.dispose();
+    const checkpoint = coordinator(snapshot);
+    const next = fixture("one", old.data, a, checkpoint);
+    await next.bridge.ready();
+    // Ledger restoration normalizes optional text/error/truncation fields.
+    expect(await next.bridge.receipt(request.requestId)).toMatchObject(accepted);
+    await expect(next.bridge.approveCost(request.requestId)).rejects.toThrow(/paused/);
+    await checkpoint.resume(); await next.bridge.ready();
+    expect(await next.bridge.submit(request)).toMatchObject(accepted);
+    expect(next.host.send).not.toHaveBeenCalled();
+    await next.bridge.approveCost(request.requestId); await sent(next);
+    expect(next.host.send).toHaveBeenCalledWith(a, request.prompt, accepted.runId, undefined);
   });
 });
 

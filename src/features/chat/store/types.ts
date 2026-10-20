@@ -139,6 +139,8 @@ export interface ChatStore {
     toIndex: number,
   ) => void;
   startNewChat: (workspacePath: string) => void;
+  /** Move an unused draft tab and its composer state; refuses occupied targets. */
+  moveDraftToWorkspace: (engine: string, workspacePath: string, targetWorkspacePath: string, draft: string) => boolean;
   setActiveEngine: (engine: string) => void;
   setPermission: (permission: ComposerPermission) => void;
   setEffort: (engine: string, effort: EffortLevel) => Promise<void>;

@@ -45,6 +45,19 @@ beforeEach(async () => {
 afterEach(async () => { await act(async () => root.unmount()); node.remove(); });
 
 describe("cross-session communication details", () => {
+  it("prioritizes cost approval and keeps it pending when details close", async () => {
+    store.getState().upsertRecord(record({ status: "awaiting_cost_approval" }));
+    store.getState().upsertRecord(record({ scopedId: "executing-2" }));
+    await act(async () => root.render(<><ActivitySummary side="sender" /><CrossSessionThreadIndicator threadId="codex/sender" workspacePath="/ws" /></>));
+    expect(node.querySelector("output")?.textContent).toBe(i18n.t("crossSession.rowAwaitingCostApproval", { title: target.title }));
+    const trigger = node.querySelector<HTMLButtonElement>('[data-testid="thread-cross-session-btn"]')!;
+    expect(trigger.dataset.commStatus).toBe("awaiting_cost_approval");
+    await click(trigger);
+    expect(details()?.querySelector('[data-testid="cross-session-cost-approval"]')).not.toBeNull();
+    await close();
+    expect(store.getState().records.find((r) => r.scopedId === "message-1")?.status).toBe("awaiting_cost_approval");
+  });
+
   it.each(["zh", "en"])("describes actual sender and recipient roles in %s and clears terminal summaries", async (language) => {
     await i18n.changeLanguage(language);
     store.getState().upsertRecord(record({ status: "received" }));

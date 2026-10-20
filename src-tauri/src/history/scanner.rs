@@ -610,10 +610,12 @@ fn scan_inner(
 pub fn spawn_scan(db: Arc<crate::db::Db>, sink: Arc<crate::event_sink::EventSink>) {
     use std::sync::atomic::{AtomicBool, Ordering};
     static SCAN_RUNNING: AtomicBool = AtomicBool::new(false);
+    static SCAN_PENDING: AtomicBool = AtomicBool::new(false);
     if SCAN_RUNNING
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
+        SCAN_PENDING.store(true, Ordering::SeqCst);
         return;
     }
     tauri::async_runtime::spawn_blocking(move || {
@@ -625,8 +627,14 @@ pub fn spawn_scan(db: Arc<crate::db::Db>, sink: Arc<crate::event_sink::EventSink
             }
         }
         let _guard = ResetOnDrop;
-        if let Err(error) = scan_with_sink(&db, &sink) {
-            eprintln!("[scanner] scan failed: {error}");
+        loop {
+            SCAN_PENDING.store(false, Ordering::SeqCst);
+            if let Err(error) = scan_with_sink(&db, &sink) {
+                eprintln!("[scanner] scan failed: {error}");
+            }
+            if !SCAN_PENDING.swap(false, Ordering::SeqCst) {
+                break;
+            }
         }
         // Full-text index follows every scan — including tier-1
         // short-circuits: right after an upgrade the scan may see no file

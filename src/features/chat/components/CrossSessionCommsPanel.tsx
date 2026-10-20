@@ -15,6 +15,7 @@ import { CLI_DISPLAY_NAMES } from "@/components/foundations/icons/engine-brands"
 import { usePopoverState } from "@/utils/use-dismiss-on-outside-press";
 import { cx } from "@/utils/cx";
 import { useChatStore } from "../store";
+import { CrossSessionCostApproval } from "./CrossSessionCostApproval";
 import {
   crossSessionParticipantKey,
   crossSessionRecordMatchesParticipant,
@@ -55,11 +56,13 @@ export function useCrossSessionThreadActivity(threadId?: string, workspacePath?:
   const records = useCrossSessionActivityStore(useShallow((state) => participant
     ? state.records.filter((record) => crossSessionRecordMatchesParticipant(record, participant)) : []));
   const emphasized = useCommsEmphasis((state) => state.participant);
-  const active = records.find((record) => isCrossSessionActiveStatus(record.status));
+  const active = records.find((record) => record.status === "awaiting_cost_approval") ??
+    records.find((record) => isCrossSessionActiveStatus(record.status));
   const outgoing = !!active && !!participant && crossSessionParticipantKey(active.sender) === crossSessionParticipantKey(participant);
   const other = active ? outgoing ? active.target : active.sender : undefined;
   const title = useChatStore((state) => other ? resolveParticipantLabel(other, state.sessions) : "");
-  const summary = active ? t(active.status === "awaiting_permission" ? "crossSession.rowAwaitingPermission" :
+  const summary = active ? t(active.status === "awaiting_cost_approval" ? "crossSession.rowAwaitingCostApproval" :
+    active.status === "awaiting_permission" ? "crossSession.rowAwaitingPermission" :
     outgoing ? "crossSession.rowAsking" : active.status === "executing" ? "crossSession.rowReplying" : "crossSession.rowReceiving", { title }) : undefined;
   const related = !!participant && !!emphasized && crossSessionParticipantKey(participant) !== crossSessionParticipantKey(emphasized) &&
     records.some((record) => crossSessionRecordMatchesParticipant(record, emphasized) && needsAttention(record, emphasized));
@@ -67,7 +70,7 @@ export function useCrossSessionThreadActivity(threadId?: string, workspacePath?:
 }
 
 function StatusIcon({ status }: { status: CrossSessionCommunicationRecord["status"] }) {
-  if (status === "failed" || status === "unknown" || status === "awaiting_permission") {
+  if (status === "failed" || status === "unknown" || status === "awaiting_permission" || status === "awaiting_cost_approval") {
     return <CircleAlert className={cx("size-3 shrink-0", status === "failed" ? "text-notification-error" : "text-text-warning-primary")} aria-hidden />;
   }
   if (status === "executing") return <span className="sidebar-thread-status sidebar-thread-status-processing" aria-hidden />;
@@ -111,7 +114,8 @@ function CommsPopover({ participant }: { participant?: CrossSessionParticipant }
   const activeCount = attention.filter((record) => isCrossSessionActiveStatus(record.status)).length;
   const unreadCount = attention.length - activeCount;
   // Prioritize something requiring intervention, then active work, then replies.
-  const primary = attention.find((r) => ["failed", "awaiting_permission", "unknown"].includes(r.status)) ??
+  const primary = attention.find((r) => r.status === "awaiting_cost_approval") ??
+    attention.find((r) => ["failed", "awaiting_permission", "unknown"].includes(r.status)) ??
     attention.find((r) => isCrossSessionActiveStatus(r.status)) ?? attention[0];
   let summary = activeCount ? t("crossSession.activeBadge", { count: activeCount }) :
     unreadCount ? t("crossSession.unreadBadge", { count: unreadCount }) : t("crossSession.title");
@@ -230,6 +234,7 @@ function CommsDetails({ records, participant, onClose }: {
       <p className="whitespace-pre-wrap text-caption-1-regular text-text-secondary [overflow-wrap:anywhere]">
         <span className="font-medium">{t("crossSession.promptLabel")}： </span>{record.message}
       </p>
+      {record.status === "awaiting_cost_approval" && <CrossSessionCostApproval record={record} />}
       {record.replyText && <div className="rounded-md bg-background-primary-default p-2 text-caption-1-regular text-text-secondary">
         <span className="font-medium">{t(record.status === "executing" ? "crossSession.replyStreamingLabel" : "crossSession.replyDoneLabel")}： </span>
         <span className="whitespace-pre-wrap [overflow-wrap:anywhere]">{record.replyText}</span>

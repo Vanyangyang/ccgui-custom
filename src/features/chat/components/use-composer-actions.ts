@@ -25,6 +25,7 @@ import { recordPrompt } from "../prompt-history";
 import { clearComposerPrediction } from "../composer-prediction";
 import { IMAGE_EXTENSIONS } from "./use-composer-images";
 import { isHandoffDraft, useHandoffStore } from "../session-cleanup";
+import { crossSessionCostReview, requiresSessionSendCostApproval, useSessionSendCostGuardStore } from "../cross-session-cost";
 
 /** Composer submit/draft/attach/stop handlers plus the pending-@mention
  * bridge, so ChatConversation stays a composition layer. */
@@ -169,6 +170,42 @@ export function useComposerActions({
           });
           return;
         }
+        if (liveActive.sessionId !== null && !isStreaming) {
+          const sessionState = current.bySession[liveKey];
+          const activeMeta = current.sessions?.find(
+            (item) =>
+              item.engine === liveActive.engine &&
+              item.sessionId === liveActive.sessionId &&
+              (!item.workspacePath || item.workspacePath === liveActive.workspacePath),
+          );
+          if (activeMeta && sessionState) {
+            const review = crossSessionCostReview(activeMeta, current, "idle");
+            const guardStore = useSessionSendCostGuardStore.getState();
+            if (requiresSessionSendCostApproval(review, activeMeta, sessionState) && !guardStore.isApproved(liveKey, review)) {
+              const heldImages = [...images];
+              guardStore.hold({
+                sessionKey: liveKey,
+                engine: liveActive.engine,
+                sessionId: liveActive.sessionId,
+                workspacePath: liveActive.workspacePath,
+                prompt,
+                images: heldImages,
+                computerUse,
+                mode: "send",
+                review,
+                onApproveSend: () => {
+                  const latestDraft = useChatStore.getState().drafts?.[liveKey];
+                  const finalPrompt = latestDraft !== undefined && latestDraft.trim() ? latestDraft : prompt;
+                  setDraft(liveKey, "");
+                  clearImages();
+                  void send(finalPrompt, heldImages, computerUse ? { computerUse: true } : undefined, liveActive);
+                },
+              });
+              return;
+            }
+          }
+        }
+        useSessionSendCostGuardStore.getState().dismiss(liveKey);
         setDraft(liveKey, ""); clearImages();
         if (isStreaming && mode === "queue") queueMessage(prompt, images, computerUse ? { computerUse: true } : undefined, liveActive);
         else if (isStreaming) void sendWhileBusy(prompt, images, computerUse ? { computerUse: true } : undefined, liveActive);
@@ -283,6 +320,7 @@ export function useComposerActions({
       // user-defined catalog command of the same name takes precedence
       // (parseAppCommand).
       if (appCommand?.command === "new") {
+        useSessionSendCostGuardStore.getState().dismiss(liveKey);
         useHandoffStore.getState().dismissHandoff(liveActive.workspacePath);
         setDraft(liveKey, ""); clearImages();
         startNewChat(liveActive.workspacePath);
@@ -314,6 +352,7 @@ export function useComposerActions({
           setSessionError(liveKey, t("chat.handoffWhileStreaming"));
           return;
         }
+        useSessionSendCostGuardStore.getState().dismiss(liveKey);
         setDraft(liveKey, ""); clearImages();
         const stateNow = useChatStore.getState();
         const activeMeta = stateNow.sessions.find(
@@ -373,8 +412,11 @@ export function useComposerActions({
     (v: string) => {
       const liveKey = resolveLiveSessionKey(sessionKey, useChatStore.getState().openTabs);
       setDraft(liveKey, v);
+      if (!v.trim() && images.length === 0 && useSessionSendCostGuardStore.getState().bySessionKey[liveKey]?.mode === "send") {
+        useSessionSendCostGuardStore.getState().dismiss(liveKey);
+      }
     },
-    [sessionKey, setDraft],
+    [sessionKey, setDraft, images.length],
   );
 
   // Shared partition for the file picker and OS drops: images flow through

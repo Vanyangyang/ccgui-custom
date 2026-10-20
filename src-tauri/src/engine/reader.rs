@@ -1029,6 +1029,9 @@ impl TurnCore {
                 state.push(&self.sink, &run_id, &self.engine_id, "activity", serde_json::json!({ "state": activity }));
             }
             EngineEvent::TurnComplete { usage, interrupted } => {
+                if let (Some(db), Some(sid)) = (&self.db, state.native_session_id.as_deref()) {
+                    crate::history::reader::refresh_session_prompt_cache(db, &self.engine_id, sid);
+                }
                 let gen_ms = state.take_gen_ms();
                 let mut data = serde_json::json!({ "usage": usage });
                 // Present only when true, so ordinary payloads keep their shape.
@@ -1043,6 +1046,9 @@ impl TurnCore {
                 // Done that suppresses its own validation failure.
                 if let Some(id) = session_id {
                     if !self.adopt_session_id(state, &id, false) { return; }
+                }
+                if let (Some(db), Some(sid)) = (&self.db, state.native_session_id.as_deref()) {
+                    crate::history::reader::refresh_session_prompt_cache(db, &self.engine_id, sid);
                 }
                 self.settle_tasks(state, "unknown");
                 // Done is the native run's settle: only an Activity seen after

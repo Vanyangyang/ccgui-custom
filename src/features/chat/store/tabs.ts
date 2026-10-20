@@ -2,6 +2,7 @@ import { writeStored } from "@/lib/storage";
 import {
   ENGINE_PREF_KEY,
   persistTabs,
+  parseDraftSessionKey,
   sameTab,
   sessionKey,
   type ActiveSession,
@@ -16,6 +17,7 @@ import { getConversationModeState } from "@/features/plugins/conversation/state"
 import type { ChatStore } from "./types";
 import type { StoreGet, StoreSet } from "./context";
 import { useSidechatStore } from "@/features/sidechat/store";
+import { hasComposerImageDraft } from "../components/use-composer-images";
 
 /**
  * Tab-strip actions: new/close/focus/move and the engine picker's pending-tab
@@ -73,7 +75,7 @@ export function createTabActions(
 ): TabHelpers &
   Pick<
     ChatStore,
-    "startNewChat" | "closeTab" | "focusTab" | "moveTab" | "setActiveEngine"
+    "startNewChat" | "moveDraftToWorkspace" | "closeTab" | "focusTab" | "moveTab" | "setActiveEngine"
   > {
   const { set, get } = deps;
 
@@ -209,6 +211,53 @@ export function createTabActions(
         adoptedDraftKeys.delete(key);
         return { openTabs, active: tab };
       });
+    },
+
+    moveDraftToWorkspace: (engine, workspacePath, targetWorkspacePath, draft) => {
+      const s = get();
+      const oldKey = sessionKey(engine, null, workspacePath);
+      const newKey = sessionKey(engine, null, targetWorkspacePath);
+      const tab = s.openTabs.find((t) => sameTab(t, engine, null, workspacePath));
+      const occupied = (key: string, path: string) => {
+        const state = s.bySession[key];
+        const sidechat = useSidechatStore.getState();
+        return !!(s.streamingByKey[key] || s.retryingByKey[key] || state?.streaming
+          || state?.loading || state?.draftLaunching || state?.messages.length
+          || state?.subagentHistory.length || state?.queue.length || state?.liveLaunch
+          || state?.codexRunId || state?.compaction || state?.handoff
+          || sidechat.btwBySession[key] || sidechat.sidechatBySession[key]
+          || hasComposerImageDraft(key)
+          || getConversationModeState().hasTabMode(key, path)
+          || getConversationModeState().isTabCloseBlocked(key, path));
+      };
+      if (!tab || occupied(oldKey, workspacePath)) return false;
+      if (workspacePath === targetWorkspacePath) return true;
+      const targetKeys = new Set([
+        newKey, ...Object.keys(s.bySession), ...Object.keys(s.drafts),
+        ...Object.keys(s.streamingByKey), ...Object.keys(s.retryingByKey),
+        ...Object.keys(useSidechatStore.getState().btwBySession),
+        ...Object.keys(useSidechatStore.getState().sidechatBySession),
+        ...s.openTabs.map((t) => sessionKey(t.engine, t.sessionId, t.workspacePath)),
+      ]);
+      for (const targetKey of targetKeys) {
+        if (parseDraftSessionKey(targetKey)?.workspacePath !== targetWorkspacePath) continue;
+        if (s.drafts[targetKey]?.trim() || occupied(targetKey, targetWorkspacePath)) return false;
+      }
+      const moved = { ...tab, workspacePath: targetWorkspacePath };
+      const openTabs = s.openTabs.filter((t) => !sameTab(t, engine, null, targetWorkspacePath))
+        .map((t) => t === tab ? moved : t);
+      const drafts = { ...s.drafts, [newKey]: draft };
+      const bySession = { ...s.bySession };
+      delete drafts[oldKey];
+      delete bySession[newKey];
+      if (bySession[oldKey]) bySession[newKey] = bySession[oldKey];
+      delete bySession[oldKey];
+      const active = s.active && sameTab(s.active, engine, null, workspacePath) ? moved : s.active;
+      adoptedDraftKeys.delete(oldKey);
+      adoptedDraftKeys.delete(newKey);
+      persistTabs(openTabs, active);
+      set({ openTabs, active, drafts, bySession });
+      return true;
     },
 
     closeTab: (engine, sessionId, workspacePath) => {

@@ -56,6 +56,12 @@ interface ImageCheckpointOwner { key?: string; paths: () => string[]; pending: (
 const imageOwners = new Map<string, ImageCheckpointOwner>();
 const restoredImages = new Map<string, string[]>();
 const imageReadyWaiters = new Set<() => void>();
+/** Draft moves cannot transfer component-local attachments or pending imports. */
+export function hasComposerImageDraft(key: string): boolean {
+  return !!restoredImages.get(key)?.length || [...imageOwners.values()].some(
+    (owner) => owner.key === key && (owner.paths().length > 0 || owner.pending() > 0),
+  );
+}
 function imagesClaimed() {
   if (restoredImages.size) return;
   for (const resolve of imageReadyWaiters) resolve();

@@ -195,19 +195,29 @@ describe("handoff lifecycle ownership", () => {
     await act(async () => root.unmount());
   });
 
-  it.each([false, true])("uses real store.send: native launch success=%s controls completion after local commit", async (success) => {
+  it.each([
+    { success: false, crossWorkspace: false }, { success: true, crossWorkspace: false },
+    { success: false, crossWorkspace: true }, { success: true, crossWorkspace: true },
+  ])("uses real store.send: success=$success crossWorkspace=$crossWorkspace controls completion after local commit", async ({ success, crossWorkspace }) => {
     const native = deferred<Awaited<ReturnType<typeof ipc.sendMessage>>>();
     const launch = vi.spyOn(ipc, "sendMessage").mockReturnValue(native.promise);
     const archive = vi.spyOn(ipc, "archiveSession").mockResolvedValue();
     useChatStore.setState({ refreshSessionUsage: vi.fn().mockResolvedValue(undefined) });
     useHandoffStore.getState().startHandoff({ ...args, initialMode: "local", archiveSourceOnSend: true });
     if (!success) useChatStore.getState().setDraft(key, draft().replace("original conclusion", "用户发送前手写摘要"));
-    const submitted = draft();
-    const id = useHandoffStore.getState().byWorkspace[workspacePath].id;
+    const destination = crossWorkspace ? "/handoff-target" : workspacePath;
+    const targetKey = sessionKey("codex", null, destination);
+    const targetDraft = () => useChatStore.getState().drafts[targetKey];
+    if (crossWorkspace) {
+      useChatStore.setState({ workspaces: [{ id: "target", path: destination, name: "target", sortOrder: 0, lastOpenedAt: 1, groupId: null }] });
+      expect(useHandoffStore.getState().moveHandoffToWorkspace(workspacePath, destination)).toBe(true);
+    }
+    const submitted = targetDraft();
+    const id = useHandoffStore.getState().byWorkspace[destination].id;
     let submit!: (value: string) => void;
     function Harness() {
       const ref = useRef<ComposerInputHandle>(null);
-      submit = useComposerActions({ active: { engine: "codex", sessionId: null, workspacePath }, sessionKey: key, streaming: false, images: [], clearImages: vi.fn(), captureImageSubmission: () => vi.fn(), importImageFiles: vi.fn(), supportsImages: true, composerInputRef: ref }).submit;
+      submit = useComposerActions({ active: { engine: "codex", sessionId: null, workspacePath: destination }, sessionKey: targetKey, streaming: false, images: [], clearImages: vi.fn(), captureImageSubmission: () => vi.fn(), importImageFiles: vi.fn(), supportsImages: true, composerInputRef: ref }).submit;
       return null;
     }
     const root = createRoot(document.createElement("div"));
@@ -215,24 +225,29 @@ describe("handoff lifecycle ownership", () => {
     try {
       await act(async () => submit(submitted));
       expect(launch).toHaveBeenCalledOnce();
+      expect(launch.mock.calls[0][0].workspacePath).toBe(destination);
+      if (crossWorkspace) {
+        expect(submitted).toContain(workspacePath);
+        expect(submitted).toContain(destination);
+      }
       // This is the actual store's optimistic commit, before IPC acceptance.
-      expect(useChatStore.getState().bySession[key].messages.some((message) => message.role === "user" && message.text === submitted)).toBe(true);
+      expect(useChatStore.getState().bySession[targetKey].messages.some((message) => message.role === "user" && message.text === submitted)).toBe(true);
       expect(archive).not.toHaveBeenCalled();
-      expect(draft()).toBe(submitted);
-      expect(useHandoffStore.getState().byWorkspace[workspacePath].id).toBe(id);
+      expect(targetDraft()).toBe(submitted);
+      expect(useHandoffStore.getState().byWorkspace[destination].id).toBe(id);
       if (success) {
         await act(async () => { native.resolve({ runId: "native-handoff-run", sessionId: null }); await native.promise; });
         expect(archive).toHaveBeenCalledExactlyOnceWith(sourceMeta);
-        expect(draft()).toBe("");
-        expect(useHandoffStore.getState().byWorkspace[workspacePath]).toBeUndefined();
+        expect(targetDraft()).toBe("");
+        expect(useHandoffStore.getState().byWorkspace[destination]).toBeUndefined();
       } else {
         const editedWhileWaiting = submitted.replace("用户发送前手写摘要", "用户在等待时继续修改摘要") + "\n用户在等待时补充";
-        await act(async () => useChatStore.getState().setDraft(key, editedWhileWaiting));
+        await act(async () => useChatStore.getState().setDraft(targetKey, editedWhileWaiting));
         await act(async () => { native.reject(new Error("native launch failed")); await native.promise.catch(() => {}); });
         expect(archive).not.toHaveBeenCalled();
-        expect(draft()).toBe(editedWhileWaiting);
-        expect(useHandoffStore.getState().byWorkspace[workspacePath]).toMatchObject({ id, sending: false });
-        expect(useChatStore.getState().bySession[key].error).toContain("native launch failed");
+        expect(targetDraft()).toBe(editedWhileWaiting);
+        expect(useHandoffStore.getState().byWorkspace[destination]).toMatchObject({ id, sending: false });
+        expect(useChatStore.getState().bySession[targetKey].error).toContain("native launch failed");
       }
     } finally {
       await act(async () => root.unmount());

@@ -1,13 +1,14 @@
 import { webcrypto } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { HostChatReceipt, HostChatTarget } from "@ccgui/plugin-sdk";
-import { cancelCrossSessionMessage, createCrossSessionHandler, crossSessionParticipantKey, sendCrossSessionMessageNow, crossSessionRecordMatchesParticipant, guardClaudeProcess, isCrossSessionRecordUnread, startCrossSessionRuntime, useCrossSessionActivityStore, type CrossSessionCommunicationRecord, type CrossSessionRequest } from "./cross-session";
+import { approveCrossSessionMessage, cancelCrossSessionMessage, createCrossSessionHandler, crossSessionParticipantKey, sendCrossSessionMessageNow, crossSessionRecordMatchesParticipant, guardClaudeProcess, isCrossSessionRecordUnread, startCrossSessionRuntime, useCrossSessionActivityStore, type CrossSessionCommunicationRecord, type CrossSessionRequest } from "./cross-session";
 import { createHostChatBridge, type HostChatFacade } from "@/features/plugins/runtime/chat-bridge";
 import { EMPTY_SESSION } from "./store/stream";
 import { sessionKey } from "./store/persistence";
 import type { ChatStore } from "./store/types";
 import type { SessionMeta, Workspace } from "@/lib/ipc";
 import { createRuntimeCheckpointCoordinator } from "@/lib/runtime-checkpoint";
+import { captureCrossSessionActivity, restoreCrossSessionActivity } from "./cross-session";
 
 const transport = vi.hoisted(() => ({ invoke: vi.fn(async (_command: string, _args?: Record<string, unknown>) => null),
   listen: vi.fn(async (_event: string, _callback?: unknown) => () => {}), isWeb: false }));
@@ -28,7 +29,8 @@ function request(method = "send_message", args: Record<string, unknown> = {}, fr
 function fixture(status: "idle" | "busy" | "awaiting_permission" = "idle") {
   const data = new Map<string, unknown>(); const observers = new Set<() => void>();
   let onEngineEvents: ((events: Array<{ runId: string; engine: string; sessionId: string; seq: number; kind: string; data?: unknown }>) => void) | undefined;
-  const meta = { ...target, title: "Target", preview: "private preview", model: "saved-model", effort: "high", provider: "saved-provider" } as SessionMeta;
+  const meta = { ...target, title: "Target", preview: "private preview", model: "saved-model", effort: "high", provider: "saved-provider",
+    promptCache: { startedAt: Date.now() - 1000, observedAt: Date.now(), ttlSeconds: 3600, source: "anthropic-usage" } } as SessionMeta;
   const rows = { sessions: [meta], archived: [] as SessionMeta[], workspaces: [{ path: target.workspacePath }] as Workspace[] };
   const key = sessionKey(target.engine, target.sessionId, target.workspacePath);
   const state = { initialized: true, bySession: {}, archivedSessionKeys: {}, openTabs: [], active: sender, drafts: { draft: "do not alter" }, activeEngine: "codex", permission: "manual" } as unknown as ChatStore;
@@ -37,6 +39,7 @@ function fixture(status: "idle" | "busy" | "awaiting_permission" = "idle") {
     state.bySession[key] = { ...EMPTY_SESSION, messages: [], activeModel: meta.model, activeEffort: meta.effort, activeProvider: meta.provider };
   });
   const host: HostChatFacade = { identity: { clientInstanceId: "desktop", windowId: "window" }, current: () => null,
+    model: () => state.bySession[key]?.activeModel ?? meta.model ?? undefined,
     inspect: (t) => state.bySession[key] && state.openTabs.some((tab) => tab.sessionId === t.nativeSessionId && tab.engine === t.engine && tab.workspacePath === t.workspacePath) ? { ...t, status } : null,
     send: vi.fn(async (t, _prompt, runId) => { status = "busy"; return { runId, sessionId: t.nativeSessionId }; }),
     subscribe: (cb) => { observers.add(cb); return () => { observers.delete(cb); }; }, wasInterrupted: () => false };
@@ -48,6 +51,7 @@ function fixture(status: "idle" | "busy" | "awaiting_permission" = "idle") {
 beforeEach(() => {
   vi.clearAllMocks(); transport.invoke.mockReset().mockResolvedValue(null); transport.listen.mockReset().mockResolvedValue(() => {});
   vi.stubGlobal("crypto", webcrypto); transport.isWeb = false;
+  useCrossSessionActivityStore.getState().reset();
 });
 afterEach(() => { bridges.splice(0).forEach((bridge) => bridge.dispose()); vi.unstubAllGlobals(); });
 describe("host cross-session messaging", () => {
@@ -61,19 +65,54 @@ describe("host cross-session messaging", () => {
     expect(vi.mocked(f.host.send).mock.calls[0][1]).toContain("Please inspect this");
     expect(f.state.active).toBe(active); expect(f.state.drafts).toBe(drafts); expect(f.state.permission).toBe("manual");
   });
-  it.each(["busy", "awaiting_permission"] as const)("queues a %s target and sends only after it becomes idle", async (status) => {
-    const f = fixture(status); const receipt = await f.handler(request()) as { status: string };
+  it.each(["busy", "awaiting_permission"] as const)("queues a %s target with hot cache without approval, and re-evaluates latest cache evidence before sending", async (status) => {
+    const f = fixture(status);
+    // Initial cache is hot, even if near the end of its non-expiring window:
+    const now = Date.now();
+    f.rows.sessions[0].promptCache = { startedAt: now - 3000 * 1000, observedAt: now - 2990 * 1000, ttlSeconds: 3600, source: "anthropic-usage" };
+    const receipt = await f.handler(request()) as { status: string };
     expect(receipt.status).toBe("queued"); expect(f.host.send).not.toHaveBeenCalled();
+    expect(useCrossSessionActivityStore.getState().records[0].status).toBe("queued");
+    // A new cached request during the busy turn renews the cache window; must not use a fixed submission expiry:
+    f.rows.sessions[0].promptCache = { startedAt: Date.now() - 10 * 1000, observedAt: Date.now(), ttlSeconds: 3600, source: "anthropic-usage" };
+    f.idle(); await vi.waitFor(() => expect(f.host.send).toHaveBeenCalledTimes(1));
+  });
+  it.each(["busy", "awaiting_permission"] as const)("gates a queued %s target before sending when continuous output did not renew an expired cache", async (status) => {
+    const f = fixture(status);
+    const receipt = await f.handler(request()) as { status: string };
+    expect(receipt.status).toBe("queued"); expect(f.host.send).not.toHaveBeenCalled();
+    // Continuous streaming updates updatedAt, but does not renew promptCache.startedAt:
+    f.rows.sessions[0].updatedAt = Date.now();
+    f.rows.sessions[0].promptCache = { startedAt: Date.now() - 7200 * 1000, observedAt: Date.now() - 7100 * 1000, ttlSeconds: 3600, source: "anthropic-usage" };
+    f.idle();
+    await vi.waitFor(() => expect(useCrossSessionActivityStore.getState().records[0].status).toBe("awaiting_cost_approval"));
+    expect(useCrossSessionActivityStore.getState().records[0].costReview?.cacheHeat).toBe("cold");
+    expect(f.host.send).not.toHaveBeenCalled();
+    await approveCrossSessionMessage(useCrossSessionActivityStore.getState().records[0].scopedId, f.bridge);
+    await vi.waitFor(() => expect(f.host.send).toHaveBeenCalledTimes(1));
+  });
+  it.each(["busy", "awaiting_permission"] as const)("requires cost approval at submission for a %s target with cold cache, then queues without interrupting", async (status) => {
+    const f = fixture(status);
+    f.rows.sessions[0].promptCache = { startedAt: Date.now() - 7200 * 1000, observedAt: Date.now() - 7100 * 1000, ttlSeconds: 3600, source: "anthropic-usage" };
+    const receipt = await f.handler(request()) as { status: string };
+    expect(receipt.status).toBe("awaiting_cost_approval"); expect(f.host.send).not.toHaveBeenCalled();
+    const record = useCrossSessionActivityStore.getState().records[0];
+    expect(record.costReview?.targetStatus).toBe(status);
+    await approveCrossSessionMessage(record.scopedId, f.bridge);
+    expect(useCrossSessionActivityStore.getState().records[0].status).toBe("queued");
+    expect(f.host.send).not.toHaveBeenCalled();
     f.idle(); await vi.waitFor(() => expect(f.host.send).toHaveBeenCalledTimes(1));
   });
   it("lists unopened saved local chats without exposing previews or messages", async () => {
     const f = fixture(); f.rows.sessions.push({ ...target2, title: "Other", remote: true } as SessionMeta);
+    f.rows.sessions[0].promptCache = null;
     const result = await f.handler(request("list_chats", { query: "Target", limit: 1 }));
     expect(result).toEqual({ chats: [{ engine: target.engine, session_id: target.sessionId, workspace_path: target.workspacePath, title: "Target", status: "idle", cache_warmth: "unknown" }] });
     expect(JSON.stringify(result)).not.toContain("private preview"); expect(f.state.selectSession).not.toHaveBeenCalled();
   });
   it("keeps idle_seconds separate from cache retention evidence", async () => {
     const f = fixture();
+    f.rows.sessions[0].promptCache = null;
     f.rows.sessions[0].updatedAt = Date.now() - 45_000;
     const result = await f.handler(request("list_chats", { query: "Target", limit: 1 })) as { chats: Array<Record<string, unknown>> };
     expect(result.chats[0]).toMatchObject({
@@ -182,12 +221,14 @@ describe("host cross-session messaging", () => {
   it("tracks real-time waiting, replying stream, and completion states in useCrossSessionActivityStore", async () => {
     useCrossSessionActivityStore.getState().reset();
     const f = fixture("busy");
+    f.rows.sessions[0].promptCache = null;
     const receipt = await f.handler(request("send_message", {
       request_id: "live-ui-1",
       session_id: target.sessionId,
       message: "Check status panel",
     })) as { status: string };
-    expect(receipt.status).toBe("queued");
+    expect(receipt.status).toBe("awaiting_cost_approval");
+    await approveCrossSessionMessage(useCrossSessionActivityStore.getState().records[0].scopedId, f.bridge);
     expect(useCrossSessionActivityStore.getState().records[0]).toMatchObject({
       requestId: "live-ui-1",
       status: "queued",
@@ -237,6 +278,46 @@ describe("host cross-session messaging", () => {
     await expect(pending).rejects.toThrow(/disposed/);
     expect(submit).not.toHaveBeenCalled(); expect(f.host.send).not.toHaveBeenCalled();
   });
+  it.each(["cold", "unknown", "expiring"] as const)("holds a %s target until a human approves and returns context for review", async (heat) => {
+    const f = fixture();
+    f.rows.sessions[0].promptCache = heat === "unknown" ? null : {
+      startedAt: Date.now() - (heat === "cold" ? 7200 : 3500) * 1000,
+      observedAt: Date.now() - (heat === "cold" ? 7100 : 3490) * 1000,
+      ttlSeconds: 3600, source: "anthropic-usage",
+    };
+    vi.mocked(f.state.selectSession).mockImplementationOnce(async () => {
+      f.state.openTabs.push(target);
+      f.state.bySession[sessionKey(target.engine, target.sessionId, target.workspacePath)] = {
+        ...EMPTY_SESSION, activeModel: "saved-model",
+        usage: { input_tokens: 100, cache_read_input_tokens: 800, output_tokens: 100, context_window: 2000 },
+      };
+    });
+    const result = await f.handler(request("send_message", { wait_seconds: 20, approve: true })) as Record<string, unknown>;
+    expect(result).toMatchObject({ status: "awaiting_cost_approval", submitted_to_model: false,
+      cost_review: { context: { used: 1000, max: 2000, kind: "current_context" } } });
+    const record = useCrossSessionActivityStore.getState().records[0];
+    expect(f.host.send).not.toHaveBeenCalled();
+    expect(await f.handler(request("get_message_status"))).toMatchObject({ receipt: { status: "awaiting_cost_approval" } });
+    await f.handler(request());
+    expect(f.state.selectSession).toHaveBeenCalledTimes(1);
+    expect(f.host.send).not.toHaveBeenCalled();
+    await Promise.all([approveCrossSessionMessage(record.scopedId, f.bridge), approveCrossSessionMessage(record.scopedId, f.bridge)]);
+    await vi.waitFor(() => expect(f.host.send).toHaveBeenCalledTimes(1));
+  });
+  it("does not replace approval text or turn a held request into a failure on changed-payload retries", async () => {
+    const f = fixture(); f.rows.sessions[0].promptCache = null;
+    await Promise.all([f.handler(request()), f.handler(request())]);
+    expect(f.state.selectSession).toHaveBeenCalledTimes(1);
+    const record = useCrossSessionActivityStore.getState().records[0];
+    await expect(f.handler(request("send_message", { message: "Different instructions" }))).rejects.toThrow(/different/);
+    expect(useCrossSessionActivityStore.getState().records[0]).toMatchObject({
+      message: "Please inspect this", status: "awaiting_cost_approval",
+    });
+    await cancelCrossSessionMessage(record.scopedId, f.bridge);
+    await f.handler(request());
+    expect(useCrossSessionActivityStore.getState().records[0].status).toBe("failed");
+    expect(f.host.send).not.toHaveBeenCalled();
+  });
 });
 describe("cross-session activity review", () => {
   const store = useCrossSessionActivityStore;
@@ -250,6 +331,30 @@ describe("cross-session activity review", () => {
     runId: "run-1", status: "completed", text: "Done", acceptedAt: 1, updatedAt: 3, ...overrides,
   });
   beforeEach(() => store.getState().reset());
+
+  it("keeps pending approvals visible beyond the terminal history limit and clear-finished", () => {
+    for (let i = 0; i < 40; i++) store.getState().upsertRecord(record({ scopedId: `held-${i}`, status: "awaiting_cost_approval" }));
+    for (let i = 0; i < 40; i++) store.getState().upsertRecord(record({ scopedId: `done-${i}` }));
+    expect(store.getState().records.filter((r) => r.status === "awaiting_cost_approval")).toHaveLength(40);
+    store.getState().clearFinished();
+    expect(store.getState().records).toHaveLength(40);
+    expect(store.getState().records.every((r) => !isCrossSessionRecordUnread(r))).toBe(true);
+  });
+  it("restores the held card and its original text, but never revives unfinished preparation", () => {
+    const f = fixture();
+    const costReview = { capturedAt: 1, cacheHeat: "cold" as const, targetStatus: "idle" as const,
+      model: "saved-model", context: { used: 1000, max: 2000, kind: "current_context" as const, capacityKnown: true, reference: false, modelMismatch: false } };
+    store.getState().upsertRecord(record({ status: "awaiting_cost_approval", costReview }));
+    store.getState().upsertRecord(record({ scopedId: "preparing", status: "preparing" }));
+    const checkpoint = captureCrossSessionActivity();
+    store.getState().reset();
+    restoreCrossSessionActivity(checkpoint);
+    expect(store.getState().records.find((r) => r.scopedId === "activity-1")).toMatchObject({
+      status: "awaiting_cost_approval", message: "Inspect this", costReview,
+    });
+    expect(store.getState().records.find((r) => r.scopedId === "preparing")?.status).toBe("unknown");
+    expect(f.host.send).not.toHaveBeenCalled();
+  });
 
   it("isolates participant identity by engine, session, and workspace, ignoring titles", () => {
     const current = record();

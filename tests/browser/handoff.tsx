@@ -20,6 +20,7 @@ const params = new URLSearchParams(location.search);
 void i18n.changeLanguage(params.get("lang") === "en" ? "en" : "zh");
 document.documentElement.classList.toggle("dark", params.get("theme") === "dark");
 const workspace: Workspace = { id: "handoff-fixture", path: "/synthetic-handoff-workspace", name: "Handoff fixture", lastOpenedAt: null, sortOrder: null, groupId: null };
+const targetWorkspace: Workspace = { ...workspace, id: "handoff-target", path: "/synthetic-target-workspace", name: "Handoff target" };
 const source: SessionMeta = {
   engine: "claude", sessionId: "synthetic-handoff-source-001", workspacePath: workspace.path,
   filePath: "/synthetic-handoff-workspace/source.jsonl", fileSize: 1, fileMtimeMs: 1,
@@ -28,7 +29,6 @@ const source: SessionMeta = {
 };
 const sourceTab = { engine: source.engine, sessionId: source.sessionId, workspacePath: workspace.path };
 const sourceKey = sessionKey(source.engine, source.sessionId, workspace.path);
-const draftKey = sessionKey(source.engine, null, workspace.path);
 const sourceState = { ...EMPTY_SESSION, messages: [
   { seq: 1, role: "user", text: "请修复虚构项目中的草稿保留问题。约束：发送成功后才能归档来源。", ts: null },
   { seq: 2, role: "assistant", text: "已定位草稿切换逻辑，准备验证失败和重试。", ts: null },
@@ -79,14 +79,15 @@ window.__HANDOFF_INVOKE__ = async (command, args = {}) => {
 useAgentStore.setState({ agents: [], builtInAgents: [], builtInDivisions: [], loaded: true, refresh: async () => {} });
 usePromptStore.setState({ ensure: () => {}, refresh: async () => {} });
 useChatStore.setState({ initialized: true, active: sourceTab, openTabs: [sourceTab], activeEngine: source.engine,
-  workspaces: [workspace], sessions: [source], drafts: {}, bySession: { [sourceKey]: sourceState }, engines,
+  workspaces: [workspace, targetWorkspace], sessions: [source], drafts: {}, bySession: { [sourceKey]: sourceState }, engines,
   models: { claude: "opus" }, efforts: { claude: "high" }, providers: {}, permission: "manual",
   streamingByKey: {}, retryingByKey: {}, archivedSessionKeys: {}, unseen: {},
 });
 
 function Fixture() {
   const chat = useChatStore();
-  const entry = useHandoffStore(s => s.byWorkspace[workspace.path]);
+  const entry = useHandoffStore(s => s.byWorkspace[chat.active?.workspacePath ?? workspace.path]);
+  const draftKey = sessionKey(chat.active?.engine ?? source.engine, null, chat.active?.workspacePath ?? workspace.path);
   const ref = useRef<ComposerInputHandle | null>(null);
   const [, refresh] = useState(0);
   const [preview, setPreview] = useState(params.get("width") === "320" && !params.has("embedded"));
@@ -109,6 +110,7 @@ function Fixture() {
   };
   const readout = {
     activeSession: chat.active?.sessionId ?? "draft", sourceArchived: Boolean(chat.archivedSessionKeys[sourceKey]),
+    activeWorkspace: chat.active?.workspacePath, sourceWorkspace: entry?.workspacePath,
     mockArchive: archived, sourceVisible: chat.sessions.some(s => s.sessionId === source.sessionId),
     mode: entry?.mode ?? null, grokStatus: entry?.grokStatus ?? null, sending: entry?.sending ?? false,
     compressionModel: entry?.compressionModel ?? null,
@@ -136,13 +138,17 @@ function Fixture() {
       <button disabled={!sends.length} onClick={() => settleSend(true)}>确认发送成功</button>
       <button disabled={!sends.length} onClick={() => settleSend(false)}>确认发送失败</button>
       <button onClick={() => void useChatStore.getState().selectSession(source.engine, source.sessionId, workspace.path)}>查看来源</button>
-      <button onClick={() => useChatStore.getState().focusTab(source.engine, null, workspace.path)}>返回草稿</button>
+      <button onClick={() => {
+        const targetPath = Object.entries(useHandoffStore.getState().byWorkspace).find(([, item]) => item.sourceSessionId === source.sessionId)?.[0] ?? workspace.path;
+        const tab = useChatStore.getState().openTabs.find(item => item.sessionId === null && item.workspacePath === targetPath);
+        useChatStore.getState().focusTab(tab?.engine ?? source.engine, null, targetPath);
+      }}>返回草稿</button>
       <button disabled={!archived} onClick={() => void useChatStore.getState().restoreSession(source)}>恢复原会话</button>
       {!params.has("embedded") && <button onClick={() => setPreview(v => !v)}>320 px 独立预览</button>}
     </header>
     {preview ? <iframe title="320 px isolated handoff fixture" src={`./handoff.html?${previewParams}`} style={{ width: 320, maxWidth: "100%", flex: 1, minHeight: 0, alignSelf: "center", border: "1px solid #888" }} /> : <>
       <section className="flex min-h-0 min-w-0 flex-1 flex-col">
-        <ChatConversation active={chat.active} engines={engines} workspaces={[workspace]} startNewChat={chat.startNewChat} composerInputRef={ref} />
+        <ChatConversation active={chat.active} engines={engines} workspaces={[workspace, targetWorkspace]} startNewChat={chat.startNewChat} composerInputRef={ref} />
       </section>
       <details className="fixture-readout" open>
         <summary>只读状态 / 实际草稿 / 最后发送内容</summary>

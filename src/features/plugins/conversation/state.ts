@@ -107,6 +107,11 @@ export class ConversationModeState {
     return identity !== undefined && this.isExitBlocked(identity);
   }
 
+  hasTabMode(sessionKey: string, workspacePath: string): boolean {
+    const identity = this.identities.get(JSON.stringify([workspacePath, sessionKey]));
+    return identity !== undefined && this.selected(identity) !== undefined;
+  }
+
   removeMode(mode: string): void {
     for (const [identity, selected] of this.selections) {
       if (selected === mode) this.selections.delete(identity);

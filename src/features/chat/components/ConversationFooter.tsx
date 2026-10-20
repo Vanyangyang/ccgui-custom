@@ -24,6 +24,7 @@ import { sessionKey } from "../store";
 import { BtwOverlayCard } from "@/features/sidechat/BtwOverlayCard";
 import { HandoffOverlayCard } from "./HandoffOverlayCard";
 import { CrossSessionQueue } from "./CrossSessionQueue";
+import { SessionSendCostApproval } from "./CrossSessionCostApproval";
 import { ComposerSlotExtras } from "@/features/plugins/boundary/composer-slot-extras";
 import { COMPOSER_DRAFT_TOPIC, pluginBus } from "@/features/plugins/runtime/events";
 import { cursorContextOccupancyKnown, selectCursorContext } from "../usage";
@@ -615,6 +616,7 @@ export function ConversationFooter({
           className="mx-auto w-full max-w-3xl"
         />
         <CrossSessionQueue active={active} className="mx-auto w-full max-w-3xl" />
+        <SessionSendCostApproval active={active} className="mx-auto w-full max-w-3xl" />
         <ErrorBanner message={imageError} onDismiss={onDismissImageError} />
         <ErrorBanner message={branchError} onDismiss={onDismissBranchError} />
         <AttachmentChips

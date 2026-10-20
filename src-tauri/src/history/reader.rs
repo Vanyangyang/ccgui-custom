@@ -1181,6 +1181,24 @@ pub fn rename_session(
     )
 }
 
+pub(crate) fn refresh_session_prompt_cache(
+    db: &crate::db::Db,
+    engine: &str,
+    session_id: &str,
+) {
+    if !matches!(engine, "claude" | "codex" | "agy") {
+        return;
+    }
+    let Ok(Some(path)) = find_session_file_path(db, engine, session_id) else {
+        return;
+    };
+    let Ok(summary) = super::scan_summary_file(engine, &path) else {
+        return;
+    };
+    let conn = db.0.lock();
+    let _ = super::prompt_cache::set(&conn, engine, session_id, summary.prompt_cache.as_ref());
+}
+
 #[tauri::command]
 pub fn rescan_sessions(state: tauri::State<'_, crate::AppState>) {
     super::scanner::spawn_scan(Arc::clone(&state.db), Arc::clone(&state.sink));

@@ -49,7 +49,7 @@ export interface HostChatSession extends HostChatTarget {
   readonly status: "idle" | "busy" | "awaiting_permission";
 }
 export type HostChatReceiptStatus = "queued" | "received" | "executing" |
-  "awaiting_permission" | "completed" | "failed" | "unknown";
+  "awaiting_permission" | "awaiting_cost_approval" | "completed" | "failed" | "unknown";
 export interface HostChatReceipt {
   readonly requestId: string;
   readonly target: HostChatTarget;

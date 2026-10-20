@@ -15,6 +15,7 @@ import { EngineIcon } from "@/components/foundations/icons/engine-icon";
 import { useChatStore, type ActiveSession } from "../store";
 import { useHandoffStore } from "../session-cleanup";
 import { HandoffCompressionControls } from "./HandoffCompressionControls";
+import { HandoffWorkspaceControl } from "./HandoffWorkspaceControl";
 
 export function HandoffOverlayCard({
   active,
@@ -171,6 +172,8 @@ export function HandoffOverlayCard({
             />
           </div>
         </header>
+
+        <HandoffWorkspaceControl workspacePath={workspacePath} entry={entry} />
 
         {/* Bottom Row: Compression Mode Segmented Control + Takeover Engine/Model + Source Session Archive Control */}
         <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">

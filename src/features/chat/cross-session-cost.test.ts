@@ -1,0 +1,132 @@
+import { beforeEach, describe, expect, it } from "vitest";
+import type { SessionMeta } from "@/lib/ipc";
+import type { ChatStore } from "./store/types";
+import { EMPTY_SESSION } from "./store/stream";
+import { sessionKey } from "./store/persistence";
+import {
+  crossSessionCostReview,
+  requiresCrossSessionCostApproval,
+  requiresQueueDrainCostApproval,
+  requiresSessionSendCostApproval,
+  useSessionSendCostGuardStore,
+} from "./cross-session-cost";
+import { writeAgyReferenceWindow } from "./components/agy-context";
+
+const NOW = 1_800_000_000_000;
+function fixture(engine = "claude", usage: unknown = null) {
+  const meta = { engine, sessionId: "target", workspacePath: "/workspace", model: "model-a",
+    // Archive bytes are deliberately unrelated to current occupancy.
+    fileSize: 90_000_000, messageCount: 100_000,
+    promptCache: { startedAt: NOW - 1000, observedAt: NOW, ttlSeconds: 3600, source: "anthropic-usage" },
+  } as SessionMeta;
+  const session = { ...EMPTY_SESSION, usage, messages: [] };
+  const state = {
+    openTabs: [{ engine, sessionId: meta.sessionId, workspacePath: meta.workspacePath, model: meta.model }],
+    bySession: { [sessionKey(engine, meta.sessionId, meta.workspacePath)]: session },
+    models: { [engine]: "default-model" },
+  } as unknown as ChatStore;
+  return { meta, state, session, review: () => crossSessionCostReview(meta, state, "idle", NOW) };
+}
+beforeEach(() => {
+  localStorage.clear();
+  useSessionSendCostGuardStore.getState().reset();
+});
+
+describe("cross-session cost review telemetry", () => {
+  it("uses last Claude occupancy including cache, never file size or message count", () => {
+    const f = fixture("claude", { input_tokens: 10, cache_read_input_tokens: 800, cache_creation_input_tokens: 100, output_tokens: 90, context_window: 2000 });
+    expect(f.review()).toMatchObject({ model: "model-a", cacheHeat: "hot", capturedAt: NOW,
+      context: { used: 1000, max: 2000, kind: "current_context", capacityKnown: true } });
+    expect(requiresCrossSessionCostApproval(f.review())).toBe(false);
+  });
+  it("uses Codex last_token_usage instead of cumulative billing", () => {
+    const f = fixture("codex", { info: {
+      last_token_usage: { input_tokens: 800, cached_input_tokens: 600, output_tokens: 200 },
+      total_token_usage: { input_tokens: 900000, output_tokens: 100000 },
+      model_context_window: 4000,
+    } });
+    expect(f.review().context).toMatchObject({ used: 1000, max: 4000, kind: "current_context" });
+  });
+  it("does not turn missing telemetry or the 200k fallback into a known window", () => {
+    const f = fixture();
+    expect(f.review().context).toMatchObject({ kind: "unknown", capacityKnown: false });
+    expect(f.review().context.used).toBeUndefined();
+    expect(f.review().context.max).toBeUndefined();
+    f.session.usage = { input_tokens: 500 };
+    expect(f.review().context).toMatchObject({ used: 500, capacityKnown: false });
+  });
+  it("does not turn AGY session billing into current occupancy", () => {
+    const f = fixture("agy", { input_tokens: 500000, output_tokens: 90000, session_usage: { input_tokens: 500000 } });
+    expect(f.review().context.kind).toBe("unknown");
+    expect(f.review().context.used).toBeUndefined();
+  });
+  it("keeps AGY last request distinct even with a user reference window", () => {
+    const f = fixture("agy", { context_usage_kind: "last_prompt", context_usage: { input_tokens: 10000, output_tokens: 1000 } });
+    writeAgyReferenceWindow(200000);
+    expect(f.review().context).toMatchObject({ used: 11000, max: 200000, kind: "last_request", reference: true });
+    f.session.usage = { context_usage_kind: "current_context", context_usage: { input_tokens: 10000, model_context_window: 1000000 } };
+    expect(f.review().context).toMatchObject({ used: 10000, max: 1000000, kind: "current_context", reference: false });
+  });
+  it("uses Cursor measured context, and rejects a billed-only aggregate", () => {
+    const f = fixture("cursor", { input_tokens: 2000000, context_usage_kind: "current_context", context_usage: { used_tokens: 50000, context_window: 200000 } });
+    expect(f.review()).toMatchObject({ cacheHeat: "unknown", context: { used: 50000, max: 200000, kind: "current_context" } });
+    f.session.usage = { input_tokens: 2000000, context_window: 200000 };
+    expect(f.review().context.kind).toBe("unknown");
+  });
+  it("marks an old model's sample as historical, without inheriting its window for the new model", () => {
+    const f = fixture("claude", { input_tokens: 50000, context_window: 200000 });
+    f.state.bySession[sessionKey(f.meta.engine, f.meta.sessionId, f.meta.workspacePath)].messages = [
+      { model: "old-model", usage: f.session.usage } as never,
+    ];
+    expect(f.review().context).toMatchObject({ used: 50000, kind: "last_request", modelMismatch: true, usageModel: "old-model", capacityKnown: false });
+    expect(f.review().context.max).toBeUndefined();
+    expect(requiresCrossSessionCostApproval(f.review())).toBe(true);
+  });
+  it("pairs retained occupancy with its source model when a newer model only has an empty/error report", () => {
+    const f = fixture("claude", { input_tokens: 50000, context_window: 200000 });
+    f.state.bySession[sessionKey(f.meta.engine, f.meta.sessionId, f.meta.workspacePath)].messages = [
+      { model: "old-model", usage: f.session.usage } as never,
+      { model: "model-a", usage: { input_tokens: 0, output_tokens: 0, context_window: 1000000 } } as never,
+    ];
+    expect(f.review().context).toMatchObject({
+      used: 50000, kind: "last_request", usageModel: "old-model", modelMismatch: true, capacityKnown: false,
+    });
+    expect(requiresCrossSessionCostApproval(f.review())).toBe(true);
+  });
+  it("does not require approval solely because target is busy when cache is hot, but requires approval for unknown, elapsed, expiring and model mismatch", () => {
+    const f = fixture();
+    for (const targetStatus of ["busy", "awaiting_permission"] as const) {
+      expect(requiresCrossSessionCostApproval(crossSessionCostReview(f.meta, f.state, targetStatus, NOW))).toBe(false);
+    }
+    f.meta.promptCache = null;
+    expect(requiresCrossSessionCostApproval(f.review())).toBe(true);
+    f.meta.promptCache = { startedAt: NOW - 3500000, observedAt: NOW - 3490000, ttlSeconds: 3600, source: "anthropic-usage" };
+    expect(f.review().cacheHeat).toBe("hot");
+    expect(requiresCrossSessionCostApproval(f.review())).toBe(true);
+    expect(requiresCrossSessionCostApproval(crossSessionCostReview(f.meta, f.state, "idle", NOW + 7200000))).toBe(true);
+  });
+  it("gates daily session sends and queue drains on cold or model-mismatched context, while letting expiring-soon hot cache send immediately", () => {
+    const f = fixture("claude", { input_tokens: 60000, context_window: 200000 });
+    expect(requiresSessionSendCostApproval(f.review(), f.meta, f.session, NOW)).toBe(false);
+    expect(requiresQueueDrainCostApproval(f.review())).toBe(false);
+
+    // Expiring soon (last 10%) is still hot and should NOT block daily send or queue drain
+    f.meta.promptCache = { startedAt: NOW - 3500000, observedAt: NOW - 3490000, ttlSeconds: 3600, source: "anthropic-usage" };
+    const expiringReview = crossSessionCostReview(f.meta, f.state, "idle", NOW);
+    expect(expiringReview.cacheHeat).toBe("hot");
+    expect(requiresSessionSendCostApproval(expiringReview, f.meta, f.session, NOW)).toBe(false);
+    expect(requiresQueueDrainCostApproval(expiringReview)).toBe(false);
+
+    // Cold cache triggers both daily send and queue drain cost guards
+    const coldReview = crossSessionCostReview(f.meta, f.state, "idle", NOW + 7200000);
+    expect(coldReview.cacheHeat).toBe("cold");
+    expect(requiresSessionSendCostApproval(coldReview, f.meta, f.session, NOW + 7200000)).toBe(true);
+    expect(requiresQueueDrainCostApproval(coldReview)).toBe(true);
+
+    // Approving a specific model + cacheStartedAt signature allows that exact state until changed
+    const key = sessionKey(f.meta.engine, f.meta.sessionId, f.meta.workspacePath);
+    useSessionSendCostGuardStore.getState().markApproved(key, coldReview);
+    expect(useSessionSendCostGuardStore.getState().isApproved(key, coldReview)).toBe(true);
+    expect(useSessionSendCostGuardStore.getState().isApproved(key, { ...coldReview, model: "model-b" })).toBe(false);
+  });
+});

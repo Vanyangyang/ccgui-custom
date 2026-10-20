@@ -35,6 +35,7 @@ import {
   type SessionState,
 } from "./stream";
 import { latestMessageUsage, mergeUsage, parseUsage } from "../usage";
+import { crossSessionCostReview, requiresQueueDrainCostApproval, useSessionSendCostGuardStore } from "../cross-session-cost";
 import { settleThroughput } from "../throughput";
 import { persistClaudeUltracode } from "./claude-ultracode";
 import { beginRuntimeOperation, guardRuntimeActions, isRuntimeSubmissionPaused } from "@/lib/runtime-checkpoint";
@@ -707,6 +708,50 @@ export function createMessagingActions(
     );
     if (!tab) return;
     const [head, ...rest] = session.queue;
+    if (tab.sessionId) {
+      const meta = s.sessions?.find(
+        (item) =>
+          item.engine === tab.engine &&
+          item.sessionId === tab.sessionId &&
+          (!item.workspacePath || item.workspacePath === tab.workspacePath),
+      );
+      if (meta) {
+        const review = crossSessionCostReview(meta, s, "idle");
+        const cache = review.cache;
+        const ttlMs = cache ? (cache.reference?.maxTtlSeconds ?? cache.ttlSeconds) * 1000 : 0;
+        const stalePreTurnCache = !!cache && cache.observedAt < head.queuedAt &&
+          review.capturedAt - head.queuedAt < ttlMs;
+        const guardStore = useSessionSendCostGuardStore.getState();
+        if (!stalePreTurnCache && requiresQueueDrainCostApproval(review) && !guardStore.isApproved(key, review)) {
+          set((prev) => {
+            const cur = prev.bySession[key] ?? EMPTY_SESSION;
+            if (!cur.queue.length) return {};
+            return {
+              bySession: {
+                ...prev.bySession,
+                [key]: {
+                  ...cur,
+                  queue: [{ ...cur.queue[0], manualOnly: true }, ...cur.queue.slice(1)],
+                },
+              },
+            };
+          });
+          guardStore.hold({
+            sessionKey: key,
+            engine: tab.engine,
+            sessionId: tab.sessionId,
+            workspacePath: tab.workspacePath,
+            prompt: head.text,
+            images: head.images,
+            computerUse: head.computerUse,
+            mode: "queue_drain",
+            queuedItemId: head.id,
+            review,
+          });
+          return;
+        }
+      }
+    }
     set((prev) => ({
       bySession: {
         ...prev.bySession,
@@ -1486,6 +1531,9 @@ export function createMessagingActions(
     removeQueued: (id, key) => {
       const targetKey = resolveKey(key, get().active);
       if (!targetKey) return;
+      if (useSessionSendCostGuardStore.getState().bySessionKey[targetKey]?.queuedItemId === id) {
+        useSessionSendCostGuardStore.getState().dismiss(targetKey);
+      }
       set((s) => {
         const prev = s.bySession[targetKey];
         if (!prev) return {};
@@ -1528,6 +1576,9 @@ export function createMessagingActions(
     clearQueue: (key) => {
       const targetKey = resolveKey(key, get().active);
       if (!targetKey) return;
+      if (useSessionSendCostGuardStore.getState().bySessionKey[targetKey]?.mode === "queue_drain") {
+        useSessionSendCostGuardStore.getState().dismiss(targetKey);
+      }
       set((s) => {
         const prev = s.bySession[targetKey];
         if (!prev || prev.queue.length === 0) return {};
@@ -1553,6 +1604,16 @@ export function createMessagingActions(
       if (!item || !session) return;
       const running = session.streaming;
       const tab = get().openTabs.find((t) => sessionKey(t.engine, t.sessionId, t.workspacePath) === targetKey);
+      if (tab?.sessionId) {
+        const meta = get().sessions?.find(
+          (m) => m.engine === tab.engine && m.sessionId === tab.sessionId && (!m.workspacePath || m.workspacePath === tab.workspacePath),
+        );
+        if (meta) {
+          useSessionSendCostGuardStore.getState().markApproved(targetKey, crossSessionCostReview(meta, get(), running ? "busy" : "idle"));
+        } else {
+          useSessionSendCostGuardStore.getState().dismiss(targetKey);
+        }
+      }
       if (running && tab?.engine === "codex") {
         // Sending a queued Codex instruction steers the existing turn; no
         // interrupt/kill is ever a substitute for an unavailable steer.
