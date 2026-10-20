@@ -23,7 +23,7 @@ The host exposes `task_spawn`, `task_list`, `task_wait`, `task_send`, `task_rene
 
 Delegate when useful within the authorized task. Give each child enough context to act: the objective, relevant paths and facts, edit scope and constraints, and the expected verification. Children share workspace files and receive only their task text, so coordinate overlapping edits. Review their deliverables and uncertainty before accepting results.
 
-Before selecting a model, inspect `task_list.modelPolicy` for the intended engine: `allowedModels: null` means no model restriction, `[]` blocks new children for that engine, and a nonempty list permits exact ids only. An omitted model uses the effective `defaultModel`. Choose effort supported by the engine, or omit it to use that engine's default; the host applies the engine's supported effort behavior. These restrictions apply only when creating future child tasks. Parent conversations, existing children and saved-chat consultations keep their settings.
+Choose an engine and model suited to the task, or omit model and effort to use the host's defaults. If a launch is rejected, use the returned error to resolve that specific request.
 
 Use `task_list` or `task_wait` to inspect progress and results. Follow up with `task_send` only when more work is needed. Use stable request IDs for creation and follow-up; inspect state after an uncertain outcome instead of duplicating work. TTL expiry calls for inspection; it does not automatically stop or reassign work. Completion preserves conversations, and `task_stop` stops execution without deleting history. Use `task_renew` when an existing task needs more time.
 

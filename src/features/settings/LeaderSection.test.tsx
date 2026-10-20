@@ -41,7 +41,7 @@ function mode(engine: string, value: PolicyMode) {
   if (!element) throw new Error(`missing ${engine} ${value} policy button`);
   return element;
 }
-function expectMode(engine: string, selected: PolicyMode | "unconfigured") {
+function expectMode(engine: string, selected: PolicyMode) {
   for (const value of Object.keys(MODE_KEYS) as PolicyMode[]) {
     expect(mode(engine, value).getAttribute("aria-pressed")).toBe(String(value === selected));
   }
@@ -73,6 +73,19 @@ beforeEach(() => {
 afterEach(() => { if (!unmounted) unmount(); container.remove(); vi.useRealTimers(); });
 
 describe("LeaderSection", () => {
+  it.each([undefined, null])("treats AGY %j as unrestricted without requiring or writing a policy", async (agy) => {
+    stored = makeSettings({ leaderAllowedModels: agy === undefined ? {} : { agy } });
+    await render();
+    expectMode("agy", "unrestricted");
+    expect(container.textContent).not.toContain("尚未配置");
+    expect(container.textContent).not.toContain("no saved model policy");
+    expect(button(i18n.t("common.save")).disabled).toBe(true);
+    await save();
+    expect(updateAppSettings).not.toHaveBeenCalled();
+    await click(mode("codex", "disabled")); await save();
+    expect(stored.leaderAllowedModels?.agy).toEqual(agy);
+    expect(Object.hasOwn(stored.leaderAllowedModels!, "agy")).toBe(agy !== undefined);
+  });
   it("treats null as unrestricted without changing another engine's disabled policy", async () => {
     stored = makeSettings({ leaderAllowedModels: { claude: null, agy: [] } });
     await render();
@@ -161,31 +174,34 @@ describe("LeaderSection", () => {
   it("loads and saves AGY model restrictions independently, including exact effort variants", async () => {
     await render();
     expect(listEngineModels).toHaveBeenCalledWith("agy");
-    expectMode("agy", "unconfigured");
+    expectMode("agy", "unrestricted");
     await click(mode("agy", "restricted"));
     expect(choice("gemini-3.8-flash-high").checked).toBe(true);
     await click(choice("claude-opus-4-6"));
     await save();
     expect(stored.leaderAllowedModels).toEqual({ agy: ["gemini-3.8-flash-high", "claude-opus-4-6"] });
-    expectMode("claude", "unconfigured");
-    expectMode("codex", "unconfigured");
+    expectMode("claude", "unrestricted");
+    expectMode("codex", "unrestricted");
     await click(mode("agy", "disabled")); await save();
     expect(stored.leaderAllowedModels?.agy).toEqual([]);
     await click(mode("agy", "unrestricted")); await save();
     expect(stored.leaderAllowedModels).toEqual({ agy: null });
   });
-  it("defaults to unconfigured without writing and selects each engine mode independently", async () => {
+  it("defaults to unrestricted without writing and selects each engine mode independently", async () => {
     await render();
-    expectMode("claude", "unconfigured");
-    expectMode("codex", "unconfigured");
-    expect(container.textContent).toContain(i18n.t("settings.leaderModeUnconfiguredNote"));
+    expectMode("claude", "unrestricted");
+    expectMode("codex", "unrestricted");
+    expectMode("agy", "unrestricted");
+    expect(container.textContent).not.toContain("尚未配置");
+    expect(container.textContent).not.toContain("no saved model policy");
+    expect(container.textContent).not.toContain(i18n.t("settings.leaderDisabledPolicy"));
     expect(button(i18n.t("common.save")).disabled).toBe(true);
     await save();
     expect(updateAppSettings).not.toHaveBeenCalled();
     await click(mode("claude", "restricted"));
     expectMode("claude", "restricted");
     expect(choice("default-claude").checked).toBe(true);
-    expectMode("codex", "unconfigured");
+    expectMode("codex", "unrestricted");
     await click(mode("codex", "restricted"));
     expect(choice("codex-first").checked).toBe(true);
     await click(mode("codex", "disabled"));
@@ -220,7 +236,7 @@ describe("LeaderSection", () => {
     stored = makeSettings({ leaderAllowedModels: { claude: [] } });
     await render();
     expectMode("claude", "disabled");
-    expectMode("codex", "unconfigured");
+    expectMode("codex", "unrestricted");
     await click(mode("codex", "disabled")); await save();
     expect(stored.leaderAllowedModels).toEqual({ claude: [], codex: [] });
     expectMode("claude", "disabled");
@@ -271,7 +287,7 @@ describe("LeaderSection", () => {
     expect(stored.leaderAllowedModels).toEqual({ codex: [] });
     await act(async () => models.resolve(catalog(["late-model"])));
     expectMode("codex", "disabled");
-    expectMode("claude", "unconfigured");
+    expectMode("claude", "unrestricted");
     expect(button(i18n.t("common.save")).disabled).toBe(true);
   });
 
@@ -330,12 +346,12 @@ describe("LeaderSection", () => {
     expect(container.textContent).toContain(i18n.t("settings.leaderSaved"));
   });
 
-  it("saves explicit null for unrestricted and leaves untouched unconfigured engines absent", async () => {
+  it("saves explicit null for unrestricted and leaves untouched engine settings absent", async () => {
     stored = makeSettings({ leaderAllowedModels: { claude: ["default-claude"], codex: [] } });
     await render(); await click(mode("claude", "unrestricted")); await save();
     expect(stored.leaderAllowedModels).toEqual({ claude: null, codex: [] });
     expectMode("claude", "unrestricted");
-    expectMode("agy", "unconfigured");
+    expectMode("agy", "unrestricted");
     expect(() => mode("cursor", "unrestricted")).toThrow("missing cursor");
   });
 

@@ -646,7 +646,7 @@ export interface AppSettings {
   customModels: Record<string, string[]>;
   /** Per-engine optional display aliases for custom/mounted models (modelId -> displayName). */
   customModelLabels?: Record<string, Record<string, string>>;
-  /** Model policy: missing is unconfigured, null unrestricted except Cursor; Cursor sends require saved selections. */
+  /** Model policy: missing/null is unrestricted except Cursor; Cursor sends require saved selections. */
   leaderAllowedModels?: Record<string, string[] | null>;
   defaultEfforts: Record<string, string>;
   /** Starting Ultracode choice for new Claude chats; existing sessions keep their own. */

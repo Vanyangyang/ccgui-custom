@@ -126,6 +126,8 @@ fn tool_publication_and_guidance_follow_trusted_capabilities() {
             assert_eq!(server.get_tool("get_self_update_status").is_some(), self_update);
             let instructions = server.get_info().instructions.unwrap();
             assert_eq!(instructions.contains("task_spawn"), task_tools);
+            assert!(!instructions.contains("modelPolicy"));
+            assert!(!instructions.contains("before choosing a model"));
             assert!(!instructions.contains("Leader mode"));
             assert_eq!(instructions.contains("ccgui-self-update"), self_update);
             assert_eq!(instructions.contains("coordinate_self_update"), self_update);
@@ -1111,20 +1113,24 @@ fn published_task_tools_preserve_delegation_without_model_deletion() {
     assert!(properties["task"]["description"]
         .as_str().unwrap().contains("cannot see this conversation"));
     let model_description = properties["model"]["description"].as_str().unwrap();
-    assert!(model_description.contains("task_list modelPolicy"));
-    assert!(model_description.contains("denied ID"));
-    assert!(model_description.contains("Omit to use the effective default"));
+    assert!(model_description.contains("Optional exact model ID"));
+    assert!(model_description.contains("Omit to use the host's default"));
+    assert!(!model_description.contains("task_list"));
     assert!(
         properties["effort"]["description"]
             .as_str().unwrap().contains("Omit to use the user's default"),
         "effort omission must preserve the user's engine default"
     );
-    assert!(description.contains("empty list disables new children"));
+    assert!(!description.contains("modelPolicy"));
+    assert!(!description.contains("configured=false"));
+    assert!(!description.contains("before choosing"));
     let list = tools.iter().find(|tool| tool.name == "task_list").unwrap();
     let list_description = list.description.as_deref().unwrap();
-    assert!(list_description.contains("configured (false blocks NEW children"));
-    assert!(list_description.contains("allowedModels (null is unrestricted only when configured=true, [] disables NEW children"));
-    assert!(list_description.contains("defaultModel (the effective model when omitted)"));
+    assert!(!list_description.contains("modelPolicy"));
+    assert!(!list_description.contains("allowedModels"));
+    let skill = include_str!("../../resources/skills/ccgui-collab/SKILL.md");
+    assert!(!skill.contains("modelPolicy"));
+    assert!(!skill.contains("Before selecting a model"));
 
     let wait = tools.iter().find(|tool| tool.name == "task_wait").unwrap();
     let description = wait.description.as_deref().unwrap();

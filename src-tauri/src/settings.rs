@@ -57,9 +57,9 @@ pub struct AppSettings {
     /// Per-engine optional display aliases for custom/mounted models (`modelId -> displayName`).
     #[serde(default)]
     pub custom_model_labels: HashMap<String, HashMap<String, String>>,
-    /// Models available to NEW Leader children. A missing engine is unconfigured;
-    /// null explicitly permits any model except Cursor, which requires a saved list.
-    /// Cursor uses this list for every send; an empty list permits no models.
+    /// Models available to NEW Leader children. Missing/null permits any model
+    /// for Claude/Codex/AGY; explicit lists remain restrictive and [] permits none.
+    /// Cursor requires a saved list of concrete models for every send.
     #[serde(default)]
     pub leader_allowed_models: HashMap<String, Option<Vec<String>>>,
     #[serde(default = "default_claude_efforts", deserialize_with = "deserialize_default_efforts")]

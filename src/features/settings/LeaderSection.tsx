@@ -13,7 +13,7 @@ import { ipc, type AppSettings, type EngineModel } from "@/lib/ipc";
 
 const ENGINES = ["claude", "codex", "agy", "cursor"] as const;
 type LeaderEngine = (typeof ENGINES)[number];
-type PolicyMode = "unconfigured" | "unrestricted" | "restricted" | "disabled";
+type PolicyMode = "unrestricted" | "restricted" | "disabled";
 interface ModelPolicy { mode: PolicyMode; models: string[] }
 type Draft = Record<LeaderEngine, ModelPolicy>;
 const POLICY_MODES = [
@@ -38,8 +38,7 @@ function isExplicitCursorModel(id: string): boolean {
 
 function policies(settings?: AppSettings): Draft {
   return Object.fromEntries(ENGINES.map((engine) => [engine, {
-    mode: engine === "cursor" ? "restricted" : settings?.leaderAllowedModels?.[engine] === undefined ? "unconfigured" :
-      settings.leaderAllowedModels[engine] === null ? "unrestricted" :
+    mode: engine === "cursor" ? "restricted" : settings?.leaderAllowedModels?.[engine] == null ? "unrestricted" :
         settings.leaderAllowedModels[engine]?.length ? "restricted" : "disabled",
     models: [...new Set((settings?.leaderAllowedModels?.[engine] ?? []).map(normalizedModelId))]
       .filter((id) => engine !== "cursor" || isExplicitCursorModel(id)),
@@ -113,7 +112,6 @@ function EnginePolicyCard({ engine, settings, policy, disabled, onChange }: {
           <p role={engine !== "cursor" && policy.mode === "restricted" && policy.models.length === 0 ? "alert" : undefined}
             className={`text-body-2-regular [overflow-wrap:anywhere] ${engine !== "cursor" && policy.mode === "restricted" && policy.models.length === 0 ? "text-text-warning-primary" : "text-text-secondary"}`}>
             {engine === "cursor" ? t("settings.leaderCursorModelsNote") :
-              policy.mode === "unconfigured" ? t("settings.leaderModeUnconfiguredNote") :
               policy.mode === "unrestricted" ? t("settings.leaderUnrestricted") :
               policy.mode === "disabled" ? t("settings.leaderDisabledPolicy") :
                 policy.models.length === 0 ? t("settings.leaderEmptyPolicy") : t("settings.leaderModelFallback", { model: fallback })}
@@ -188,7 +186,6 @@ export function LeaderSection() {
       if (!mounted.current) return;
       const leaderAllowedModels = { ...latest.leaderAllowedModels };
       for (const engine of changed) {
-        if (draft[engine].mode === "unconfigured") continue;
         if (draft[engine].mode === "unrestricted") leaderAllowedModels[engine] = null;
         else leaderAllowedModels[engine] = draft[engine].mode === "disabled" ? [] : [...draft[engine].models];
       }

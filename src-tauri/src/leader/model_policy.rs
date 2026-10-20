@@ -4,7 +4,6 @@ use serde::Serialize;
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct EngineModelPolicy {
-    configured: bool,
     allowed_models: Option<Vec<String>>,
     default_model: Option<String>,
 }
@@ -19,11 +18,6 @@ pub(super) struct ModelPolicy {
 
 impl EngineModelPolicy {
     fn resolve(&self, engine: &str, requested: Option<&str>) -> Result<Option<String>, String> {
-        if !self.configured {
-            return Err(format!(
-                "Child task model policy is not configured for {engine}; configure delegation models in Settings before spawning new tasks. Inspect task_list modelPolicy"
-            ));
-        }
         let Some(allowed) = &self.allowed_models else {
             return Ok(requested
                 .map(str::to_owned)
@@ -32,13 +26,13 @@ impl EngineModelPolicy {
         let choices = serde_json::to_string(allowed).map_err(|e| e.to_string())?;
         if allowed.is_empty() {
             return Err(format!(
-                "Child task spawning is disabled for {engine}; allowed models: {choices}. Inspect task_list modelPolicy for available choices"
+                "Child task spawning is disabled for {engine}; allowed models: {choices}"
             ));
         }
         if let Some(model) = requested {
             if !allowed.iter().any(|id| id == model) {
                 return Err(format!(
-                    "Child task model is not allowed for {engine}; allowed models: {choices}. Choose an exact ID from task_list modelPolicy"
+                    "Child task model is not allowed for {engine}; allowed models: {choices}"
                 ));
             }
             return Ok(Some(model.to_owned()));
@@ -55,7 +49,6 @@ pub(super) fn snapshot(settings: &AppSettings) -> Result<ModelPolicy, String> {
             .get(id)
             .filter(|model| !model.trim().is_empty())
             .cloned();
-        let configured = policy.contains_key(id);
         let allowed_models = if id == "cursor" {
             Some(policy.get(id).cloned().flatten().unwrap_or_default().into_iter()
                 .filter(|model| !model.eq_ignore_ascii_case("auto") && !model.eq_ignore_ascii_case("default"))
@@ -63,19 +56,14 @@ pub(super) fn snapshot(settings: &AppSettings) -> Result<ModelPolicy, String> {
         } else {
             policy.get(id).cloned().flatten()
         };
-        let default_model = if !configured {
-            None
-        } else {
-            match &allowed_models {
-                None => app_default,
-                Some(allowed) => app_default
-                    .map(|model| model.trim().to_owned())
-                    .filter(|model| allowed.contains(model))
-                    .or_else(|| allowed.first().cloned()),
-            }
+        let default_model = match &allowed_models {
+            None => app_default,
+            Some(allowed) => app_default
+                .map(|model| model.trim().to_owned())
+                .filter(|model| allowed.contains(model))
+                .or_else(|| allowed.first().cloned()),
         };
         EngineModelPolicy {
-            configured,
             allowed_models,
             default_model,
         }
@@ -130,24 +118,28 @@ mod tests {
         assert_eq!(
             serde_json::to_value(snapshot(&settings).unwrap()).unwrap(),
             json!({
-                "claude":{"configured":true,"allowedModels":null,"defaultModel":"sonnet"},
-                "codex":{"configured":true,"allowedModels":null,"defaultModel":null},
-                "agy":{"configured":false,"allowedModels":null,"defaultModel":null},
-                "cursor":{"configured":false,"allowedModels":[],"defaultModel":null}
+                "claude":{"allowedModels":null,"defaultModel":"sonnet"},
+                "codex":{"allowedModels":null,"defaultModel":null},
+                "agy":{"allowedModels":null,"defaultModel":null},
+                "cursor":{"allowedModels":[],"defaultModel":null}
             })
         );
     }
 
     #[test]
-    fn unconfigured_policy_rejects_explicit_and_default_models() {
-        let settings = settings(json!({}), json!({"claude":"sonnet"}));
-        for engine in ["claude", "codex", "agy", "cursor"] {
-            for requested in [None, Some("custom-id")] {
-                assert!(resolve(&settings, engine, requested).unwrap_err().contains("not configured"));
-            }
+    fn unconfigured_non_cursor_policy_preserves_explicit_and_default_models() {
+        let mut settings = settings(json!({}), json!({"claude":"sonnet","codex":"gpt-default","agy":"gemini-default"}));
+        for engine in ["agy", "claude", "codex"] {
+            assert_eq!(resolve(&settings, engine, Some("custom-id")).unwrap().as_deref(), Some("custom-id"));
+            assert_eq!(resolve(&settings, engine, None).unwrap(), settings.default_models.get(engine).cloned());
             let snapshot = serde_json::to_value(snapshot(&settings).unwrap()).unwrap();
-            assert_eq!(snapshot[engine]["configured"], false);
-            assert_eq!(snapshot[engine]["defaultModel"], serde_json::Value::Null);
+            assert_eq!(snapshot[engine]["allowedModels"], serde_json::Value::Null);
+            assert_eq!(snapshot[engine]["defaultModel"], json!(settings.default_models.get(engine)));
+            assert!(snapshot[engine].get("configured").is_none());
+        }
+        settings.default_models.clear();
+        for engine in ["claude", "codex", "agy"] {
+            assert_eq!(resolve(&settings, engine, None).unwrap(), None);
         }
     }
 
@@ -246,7 +238,8 @@ mod tests {
         assert!(resolve(&settings, "agy", None).unwrap_err().contains("disabled for agy"));
         assert!(resolve(&settings, "agy", Some("claude-opus-4-6")).is_err());
         settings.leader_allowed_models.remove("agy");
-        assert!(resolve(&settings, "agy", Some("custom-model")).unwrap_err().contains("not configured"));
+        assert_eq!(resolve(&settings, "agy", Some("custom-model")).unwrap().as_deref(), Some("custom-model"));
+        assert_eq!(resolve(&settings, "agy", None).unwrap().as_deref(), Some("outside-policy"));
         settings.leader_allowed_models.insert("agy".into(), None);
         assert_eq!(resolve(&settings, "agy", Some("custom-model")).unwrap().as_deref(), Some("custom-model"));
     }

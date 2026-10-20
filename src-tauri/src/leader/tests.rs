@@ -948,26 +948,28 @@ fn leader_model_policy_changes_do_not_interfere_with_send_settings() {
 }
 
 #[test]
-fn leader_model_policy_list_preserves_metadata_and_response_budget() {
+fn leader_task_list_reports_branches_without_eager_model_policy() {
     let f = basic();
     for index in 0..9 {
         let (id, _) = spawn(&f, &format!("policy-large-{index}"));
         f.manager.inner.lock().branches.get_mut(&id).unwrap().branch.result = "😀".repeat(MAX_RESULT_CHARS);
     }
-    let models: Vec<String> = (0..128).map(|index| format!("{}{index}", "\"".repeat(250))).collect();
-    let settings: crate::settings::AppSettings = serde_json::from_value(json!({
-        "leaderAllowedModels":{"claude":models,"codex":models}
-    })).unwrap();
-    let policy = model_policy::snapshot(&settings).unwrap();
-    let expected = encoded(&policy).unwrap();
-    let response = f.manager.list_response(&f.manager.inner.lock(), &f.parent, policy).unwrap();
-    assert_eq!(response["modelPolicy"], expected);
-    assert_eq!(response["modelPolicy"]["claude"]["configured"], true);
-    assert_eq!(response["modelPolicy"]["agy"]["configured"], false);
-    assert_eq!(response["modelPolicy"]["agy"]["defaultModel"], Value::Null);
+    let response = f.manager.list_response(&f.manager.inner.lock(), &f.parent).unwrap();
+    assert!(response.get("modelPolicy").is_none());
+    assert_eq!(response.as_object().unwrap().len(), 1);
     assert_eq!(response["branches"].as_array().unwrap().len(), 9);
     assert!(serde_json::to_vec(&response).unwrap().len() < MAX_TOOL_RESPONSE_BYTES);
     assert!(f.manager.inner.lock().branches.values().all(|record| record.branch.result.chars().count() == MAX_RESULT_CHARS));
+}
+
+#[test]
+fn leader_role_guidance_does_not_require_model_policy_preflight() {
+    for child in [false, true] {
+        let guidance = role(child);
+        assert!(!guidance.contains("modelPolicy"));
+        assert!(!guidance.contains("before choosing"));
+        assert!(guidance.contains("shares workspace files"));
+    }
 }
 
 fn event(run: &str, session: Option<&str>, kind: &str, data: Value, seq: u64) -> Value {

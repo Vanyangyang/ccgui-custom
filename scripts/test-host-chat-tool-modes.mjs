@@ -26,7 +26,7 @@ async function checkCapabilities(capabilityResponse) {
     if (taskCapability && body.method === 'task_list') {
       assert.deepEqual(body.arguments, {});
       response.writeHead(200, { 'content-type': 'application/json' });
-      response.end(JSON.stringify({ result: { branches: [], modelPolicy: { agy: { allowedModels: null, defaultModel: 'gemini-4-argon' } } } }));
+      response.end(JSON.stringify({ result: { branches: [] } }));
       return;
     }
     if (taskCapability && body.method === 'task_spawn') {
@@ -87,6 +87,8 @@ async function checkCapabilities(capabilityResponse) {
     assert.ok(!tools.some(tool => tool.name === 'get_host_capabilities'));
     for (const tool of tools) assert.equal(tool.inputSchema.type, 'object', tool.name);
     assert.equal(initialized.result.instructions.includes('task_spawn'), taskCapability);
+    assert.equal(initialized.result.instructions.includes('modelPolicy'), false);
+    assert.equal(JSON.stringify(tools).includes('modelPolicy'), false);
     assert.equal(initialized.result.instructions.includes('ccgui-self-update'), selfUpdate);
     for (const name of ['leader_spawn', 'leader_list', 'leader_wait', 'leader_send', 'leader_renew', 'leader_stop', 'leader_reclaim']) {
       const retired = await call('tools/call', { name, arguments: {} });
@@ -96,21 +98,21 @@ async function checkCapabilities(capabilityResponse) {
       const hidden = await call('tools/call', { name: 'task_list', arguments: {} });
       assert.ok(hidden.error || hidden.result?.isError, 'hidden tool must not dispatch');
     } else {
-      const list = await call('tools/call', { name: 'task_list', arguments: {} });
-      assert.equal(list.result?.isError, false);
-      assert.equal(JSON.parse(list.result.content[0].text).modelPolicy.agy.defaultModel, 'gemini-4-argon');
       const created = await call('tools/call', { name: 'task_spawn', arguments: {
         engine: 'agy', model: 'gemini-4-argon', effort: 'high', request_id: 'task-contract-smoke',
         title: 'Contract fixture', task: 'Fixture only; no real model or conversation is started.',
       } });
       assert.equal(created.result?.isError, false);
       assert.equal(JSON.parse(created.result.content[0].text).branch.id, 'fixture-child');
+      const list = await call('tools/call', { name: 'task_list', arguments: {} });
+      assert.equal(list.result?.isError, false);
+      assert.deepEqual(JSON.parse(list.result.content[0].text), { branches: [] });
     }
     if (!selfUpdate) {
       const hidden = await call('tools/call', { name: 'get_self_update_status', arguments: {} });
       assert.ok(hidden.error || hidden.result?.isError, 'hidden self-update tool must not dispatch');
     }
-    assert.deepEqual(requests, taskCapability ? ['get_host_capabilities', 'task_list', 'task_spawn'] : ['get_host_capabilities']);
+    assert.deepEqual(requests, taskCapability ? ['get_host_capabilities', 'task_spawn', 'task_list'] : ['get_host_capabilities']);
     return { taskCapability, selfUpdate, capabilityUnavailable: capabilityResponse === null, tools: tools.map(tool => tool.name), instructionsCharacters: initialized.result.instructions.length, passed: true };
   } finally {
     for (const waiter of pending.values()) clearTimeout(waiter.timer);

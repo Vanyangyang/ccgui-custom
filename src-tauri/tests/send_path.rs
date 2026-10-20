@@ -860,7 +860,6 @@ const ORDINARY_TASK_GUIDANCE: &str = concat!(
     "Delegate within the user's task when useful and verify deliverables before reporting completion. ",
     "Each child sees only its task and shares workspace files: specify scope and coordinate edits. ",
     "Operate only direct children you created. Existing chats contacted with send_message remain independent. ",
-    "Inspect task_list modelPolicy before choosing a model; omitted model and effort use user defaults. ",
     "Use task_wait when results are needed. TTL expiry prompts inspection, not termination. Completion preserves conversations.",
 );
 

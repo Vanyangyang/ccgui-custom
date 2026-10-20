@@ -101,8 +101,7 @@ pub struct SpawnArgs {
     /// Everything the child receives: it cannot see this conversation, so include the goal,
     /// relevant paths and facts, constraints, and what its final reply should report.
     pub task: String,
-    /// Inspect task_list modelPolicy before choosing an exact model ID. A denied ID
-    /// fails before launch. Omit to use the effective default in that policy.
+    /// Optional exact model ID. Omit to use the host's default for this engine.
     pub model: Option<String>,
     /// Reasoning effort such as low, medium, high, xhigh or max. Omit to use the user's default.
     pub effort: Option<String>,
@@ -1648,7 +1647,7 @@ fn role(child: bool) -> String {
     } else {
         "Collaboration is available for this task without a separate mode. You retain responsibility for decisions, integration and acceptance. Delegate within the user's task when useful and verify deliverables before reporting completion."
     };
-    format!("{description} Each child sees only its task and shares workspace files: specify scope and coordinate edits. Operate only direct children you created. Existing chats contacted with send_message remain independent. Inspect task_list modelPolicy before choosing a model; omitted model and effort use user defaults. Use task_wait when results are needed. TTL expiry prompts inspection, not termination. Completion preserves conversations.")
+    format!("{description} Each child sees only its task and shares workspace files: specify scope and coordinate edits. Operate only direct children you created. Existing chats contacted with send_message remain independent. Use task_wait when results are needed. TTL expiry prompts inspection, not termination. Completion preserves conversations.")
 }
 
 pub(crate) fn unscoped_task_instructions() -> String { role(false) }
@@ -3219,12 +3218,8 @@ impl LeaderManager {
         &self,
         inner: &Inner,
         parent: &LeaderIdentity,
-        policy: model_policy::ModelPolicy,
     ) -> Result<Value, String> {
-        let policy = encoded(&policy)?;
-        let policy_bytes = serde_json::to_vec(&policy).map_err(|e| e.to_string())?.len();
-        let budget = (MAX_TOOL_RESPONSE_BYTES - 8192).saturating_sub(policy_bytes);
-        Ok(json!({"branches":self.views_with_budget(inner,parent,None,budget)?,"modelPolicy":policy}))
+        Ok(json!({"branches":self.views(inner,parent,None)?}))
     }
 
     fn views_with_budget(
@@ -3858,11 +3853,9 @@ pub async fn dispatch(
         }
         "task_list" => {
             manager.checkpoint()?;
-            let settings = crate::settings::read_settings()?;
-            let policy = model_policy::snapshot(&settings)?;
             let inner = manager.inner.lock();
             manager.authorize(&inner, &caller)?;
-            manager.list_response(&inner, &parent, policy)
+            manager.list_response(&inner, &parent)
         }
         "task_wait" => {
             let args: WaitArgs = decode(arguments)?;
