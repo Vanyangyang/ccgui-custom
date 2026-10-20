@@ -268,8 +268,19 @@ pub(crate) fn reconcile_offline_upgrade(has_running_workers: bool) -> Result<(),
 
 fn reconcile_offline_upgrade_in(update: &UpdateStore, current: &Path, state_path: &Path, has_running_workers: bool) -> Result<(), String> {
     let state = update.read_state()?;
+    let schema = crate::task_worker::schema_hash();
+    // A first update can have no active/previous identity. Do not let the new
+    // GUI open its DB and then automatically activate that older candidate.
+    if state.transaction.as_ref().is_some_and(|t| {
+        (matches!(t.phase, TransactionPhase::Preparing | TransactionPhase::Ready | TransactionPhase::Activating)
+            || (t.phase == TransactionPhase::Failed
+                && t.failure_reason == Some(crate::live_update::FailureReason::CandidateIdentityUnknown)))
+            && !crate::task_worker::schemas_compatible(&t.candidate.schema_hash, &schema)
+    }) {
+        return Err("Recover the pending update in the previous version before installing a different database contract".into());
+    }
     let Some(active) = &state.active else { return Ok(()); };
-    if crate::task_worker::schemas_compatible(&active.schema_hash, &crate::task_worker::schema_hash()) {
+    if crate::task_worker::schemas_compatible(&active.schema_hash, &schema) {
         return Ok(());
     }
     if has_running_workers {
@@ -1382,10 +1393,33 @@ pub(crate) mod tests {
         std::thread::sleep(Duration::from_millis(25));
         let update = UpdateStore::open(&root, Limits::default()).unwrap();
         let old = update.stage(&source, &hash).unwrap();
-        update.initialize_active(old.clone()).unwrap();
-        let before = update.read_state().unwrap();
         let state_path = root.join("runtime-updates/state.json");
         let launcher = canonical(&launcher).unwrap();
+        let v1 = Compatibility { worker_protocol: 1, checkpoint_schema: 1,
+            schema_hash: crate::task_worker::SCHEMA_CONTRACT_V1_HASH.into() };
+        let first = update.prepare(old.clone(), &v1).unwrap();
+        let assert_first_update_blocked = || {
+            let pending = update.read_state().unwrap();
+            assert!(pending.active.is_none());
+            assert!(pending.transaction.as_ref().unwrap().previous.is_none());
+            assert_eq!(reconcile_offline_upgrade_in(&update, &launcher, &state_path, false).unwrap_err(),
+                "Recover the pending update in the previous version before installing a different database contract");
+            assert_eq!(update.read_state().unwrap(), pending);
+        };
+        assert_first_update_blocked();
+        update.ready(&first.id).unwrap();
+        assert_first_update_blocked();
+        update.activating(&first.id).unwrap();
+        assert_first_update_blocked();
+        update.abort_activation(&first.id, crate::live_update::FailureReason::CandidateIdentityUnknown).unwrap();
+        assert_first_update_blocked();
+        update.record_failure_reason(&first.id, crate::live_update::FailureReason::CandidateExited).unwrap();
+        update.rollback(&first.id).unwrap();
+        let retry = update.prepare(old.clone(), &v1).unwrap();
+        update.ready(&retry.id).unwrap();
+        update.activating(&retry.id).unwrap();
+        update.confirm_healthy(&retry.id).unwrap();
+        let before = update.read_state().unwrap();
         assert!(reconcile_offline_upgrade_in(&update, &launcher, &state_path, false).is_err());
         std::thread::sleep(Duration::from_millis(25));
         std::fs::write(&launcher, b"new standalone v2").unwrap();
