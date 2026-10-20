@@ -53,7 +53,7 @@ import { mergeUsage, parseUsage, reportedContextWindow, type ParsedUsage } from 
 import { usageTrackingEnabled } from "@/features/settings/usage-tracking";
 import { migrateSelectedAgent } from "@/features/agents/selected-agent";
 import { handleSideRunEvent, isSideRunEvent, migrateSidechatSessionKey } from "@/features/sidechat/store";
-import { claimLeaderAssignment, isReclaimedLeaderSession, leaderEventAllowed, markLeaderSession, rememberLeaderSession } from "@/features/leader/event-state";
+import { claimLeaderAssignment, emitLeaderStreamDelta, isReclaimedLeaderSession, leaderEventAllowed, markLeaderSession, rememberLeaderSession } from "@/features/leader/event-state";
 import { beginNativeRun, mergeNativeTaskSnapshot, readNativeTasks } from "./native-tasks";
 import { followUpGuardActive, runsEffort, runsModel } from "./live-follow-up";
 import { persistClaudeUltracode } from "./claude-ultracode";
@@ -794,14 +794,113 @@ function addTurnUsage(runId: string, parsed: ParsedUsage): ParsedUsage {
   return totals;
 }
 
-/** 【cursor上下文】回复花费不带当前占用，避免整段被当成上下文快照而不显示本轮用量。 */
-function usageForTurnRow(usage: unknown): unknown {
-  if (!usage || typeof usage !== "object") return usage;
+/** 【Codex上下文隔离】会话级 usage 仅保存上下文占用，剥离单回合吞吐统计以免污染后续回合。 */
+function stripTurnThroughput(usage: unknown): unknown {
+  if (!usage || typeof usage !== "object" || Array.isArray(usage)) return usage;
   const raw = usage as Record<string, unknown>;
-  if (raw.context_usage_kind !== "current_context") return usage;
+  if (!("turn_throughput" in raw)) return usage;
   const rest = { ...raw };
-  delete rest.context_usage_kind;
-  delete rest.context_usage;
+  delete rest.turn_throughput;
+  return rest;
+}
+
+/** 【Codex回合吞吐提取】仅接受与当前 run/回合严格匹配、已进入 complete 终态且无排除原因的 Codex 吞吐样本。 */
+function settledCodexTurnThroughput(
+  event: ChatEngineEvent,
+  before: ThroughputState | null | undefined,
+  settled: ThroughputState | null | undefined,
+  interrupted: boolean,
+  responseAlreadyComplete: boolean,
+  rawDoneUsage: Record<string, unknown> | null,
+): { output_tokens: number; elapsed_ms: number } | null {
+  if (event.engine !== "codex" || interrupted || responseAlreadyComplete) return null;
+  if (before) {
+    if (before.runId !== event.runId || before.ended || before.seq >= event.seq) return null;
+    const sample = settled?.sample;
+    if (
+      !sample ||
+      sample.source !== "codex_app_server" ||
+      sample.status !== "complete" ||
+      sample.turnReason != null ||
+      typeof sample.outputTokens !== "number" ||
+      !Number.isSafeInteger(sample.outputTokens) ||
+      sample.outputTokens < 0 ||
+      typeof sample.elapsedMs !== "number" ||
+      !Number.isFinite(sample.elapsedMs) ||
+      sample.elapsedMs <= 0
+    ) {
+      return null;
+    }
+    return { output_tokens: sample.outputTokens, elapsed_ms: sample.elapsedMs };
+  }
+  const candidate = rawDoneUsage?.turn_throughput;
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return null;
+  const rec = candidate as Record<string, unknown>;
+  const outputTokens = rec.output_tokens ?? rec.outputTokens;
+  const elapsedMs = rec.elapsed_ms ?? rec.elapsedMs;
+  if (
+    typeof outputTokens !== "number" ||
+    !Number.isSafeInteger(outputTokens) ||
+    outputTokens < 0 ||
+    typeof elapsedMs !== "number" ||
+    !Number.isFinite(elapsedMs) ||
+    elapsedMs <= 0
+  ) {
+    return null;
+  }
+  return { output_tokens: outputTokens, elapsed_ms: elapsedMs };
+}
+
+/** Keep response scope and terminal status on the message, separately from
+ *  context occupancy and billing. Codex paired statistics stay response-local. */
+function usageForTurnRow(
+  usage: unknown,
+  codexTurnThroughput?: { output_tokens: number; elapsed_ms: number } | null,
+  engine?: string,
+  hasTurnTotals = false,
+  partial = false,
+): unknown {
+  const turnStatus = partial ? "partial" : "complete";
+  const isCodexLastRequest = engine === "codex" && !hasTurnTotals;
+  if (!usage || typeof usage !== "object" || Array.isArray(usage)) {
+    if (codexTurnThroughput) {
+      return {
+        usage_scope: "last_request",
+        turn_throughput: codexTurnThroughput,
+        turn_status: turnStatus,
+      };
+    }
+    // No counters means no summary rate to suppress. Keep absent usage absent.
+    return usage;
+  }
+  const raw = usage as Record<string, unknown>;
+  const stripContext = raw.context_usage_kind === "current_context";
+  const stripOldThroughput = "turn_throughput" in raw && !codexTurnThroughput;
+  const needsLastRequestScope =
+    isCodexLastRequest &&
+    raw.usage_scope !== "turn" &&
+    raw.usage_scope !== "unknown" &&
+    raw.usage_scope !== "last_request";
+  const needsTurnScope = engine === "claude" && raw.usage_scope === undefined;
+  if (!stripContext && !stripOldThroughput && !needsLastRequestScope && !needsTurnScope
+    && !codexTurnThroughput && raw.turn_status === turnStatus) {
+    return usage;
+  }
+  const rest: Record<string, unknown> = { ...raw, turn_status: turnStatus };
+  if (stripContext) {
+    delete rest.context_usage_kind;
+    delete rest.context_usage;
+  }
+  delete rest.turn_throughput;
+  if (needsLastRequestScope) {
+    rest.usage_scope = "last_request";
+  } else if (needsTurnScope) {
+    // Unlike transcript assistant records, Claude's result is a turn total.
+    rest.usage_scope = "turn";
+  }
+  if (codexTurnThroughput) {
+    rest.turn_throughput = codexTurnThroughput;
+  }
   return rest;
 }
 
@@ -1439,19 +1538,20 @@ function onDone(event: ChatEngineEvent, key: string, deps: EngineEventDeps, resp
   // Zero (or no) usage is "nothing measured", not a reply that cost nothing: the
   // real CLI reports zero for an interrupted response. It must neither replace
   // the meter's occupancy nor be stamped on a row as the reply's cost.
-  const tokensReported = turnTotals !== undefined || parseUsage(data.usage) !== null;
   const rawDoneUsage =
-    data.usage && typeof data.usage === "object"
+    data.usage && typeof data.usage === "object" && !Array.isArray(data.usage)
       ? (data.usage as Record<string, unknown>)
       : null;
+  const cleanDoneUsage = stripTurnThroughput(data.usage);
+  const tokensReported = turnTotals !== undefined || parseUsage(cleanDoneUsage) !== null;
   const contextReported =
-    rawDoneUsage?.context_usage != null || reportedContextWindow(data.usage) !== undefined;
+    rawDoneUsage?.context_usage != null || reportedContextWindow(cleanDoneUsage) !== undefined;
   let settledUsage = tokensReported
-    ? mergeUsage(turnTotals ? prev.usage : data.usage, prev.usage)
+    ? mergeUsage(turnTotals ? stripTurnThroughput(prev.usage) : cleanDoneUsage, stripTurnThroughput(prev.usage))
     : contextReported
-      ? mergeUsage(data.usage, prev.usage)
-      : (prev.usage ?? null);
-  const finalWindow = reportedContextWindow(data.usage);
+      ? mergeUsage(cleanDoneUsage, stripTurnThroughput(prev.usage))
+      : stripTurnThroughput(prev.usage ?? null);
+  const finalWindow = reportedContextWindow(cleanDoneUsage);
   if (finalWindow && settledUsage && typeof settledUsage === "object") {
     settledUsage = { ...settledUsage, model_context_window: finalWindow };
   }
@@ -1486,6 +1586,28 @@ function onDone(event: ChatEngineEvent, key: string, deps: EngineEventDeps, resp
     const durationMs = turnStart ? Math.max(0, Date.now() - turnStart) : null;
     const model = stampedModel(deps, event.engine, key);
     const effort = stampedEffort(deps, event.engine, key);
+    const interrupted = Boolean(data.interrupted || cur.interrupted);
+    const settledThroughput = settleThroughput(cur.throughput, event.runId, interrupted, event.seq);
+    // AGY can report interruption in native telemetry without a Done flag.
+    // Only this response's observation may mark its summary incomplete.
+    const partial = interrupted || Boolean(cur.throughput?.runId === event.runId
+      && !cur.throughput.ended && cur.throughput.seq < event.seq
+      && cur.throughput.sample?.status === "partial");
+    const codexTurnThroughput = settledCodexTurnThroughput(
+      event,
+      cur.throughput,
+      settledThroughput,
+      partial,
+      responseAlreadyComplete,
+      rawDoneUsage,
+    );
+    const rowUsage = usageForTurnRow(
+      tokensReported ? finalUsage : null,
+      codexTurnThroughput,
+      event.engine,
+      turnTotals !== undefined,
+      partial,
+    );
     // Stamp usage, durationMs, effort, and model onto the turn's last assistant message.
     for (let i = responseAlreadyComplete ? -1 : messages.length - 1; i >= 0; i--) {
       // The user's message starts the turn: an assistant row before it is an
@@ -1504,7 +1626,7 @@ function onDone(event: ChatEngineEvent, key: string, deps: EngineEventDeps, resp
           ...messages.slice(0, i),
           {
             ...messages[i],
-            ...(tokensReported && finalUsage ? { usage: usageForTurnRow(finalUsage) } : {}),
+            ...(rowUsage ? { usage: rowUsage } : {}),
             ...(durationMs != null ? { durationMs } : {}),
             ...(effort ? { effort } : model && encodedModelEffort(event.engine, model) ? { effort: null } : {}),
             ...(model ? { model } : {}),
@@ -1526,7 +1648,7 @@ function onDone(event: ChatEngineEvent, key: string, deps: EngineEventDeps, resp
           turnStartedAt: responseOnly ? cur.turnStartedAt : null,
           usage: settledUsage,
           turnUsage: null,
-          throughput: settleThroughput(cur.throughput, event.runId, data.interrupted || cur.interrupted, event.seq),
+          throughput: settledThroughput,
           interrupted: responseOnly ? cur.interrupted : false,
           handoff: responseOnly ? cur.handoff : null,
           nativeActivity: responseOnly ? cur.nativeActivity : null,
@@ -1767,6 +1889,9 @@ function adoptLeaderSession(event: ChatEngineEvent, nativeId: string | null, dep
   if (!deps.get().sessions.some((s) => s.engine === event.engine && s.sessionId === nativeId)) {
     deps.upsertSessionMeta(optimisticMeta(event.engine, nativeId, event.leader.workspacePath, event.leader.title));
   }
+  if (event.kind === "delta" && typeof event.data === "string" && event.data) {
+    emitLeaderStreamDelta(event.leader.branchId, event.data);
+  }
   routeAndReconcileRun(deps.set, event.runId, key);
 }
 
@@ -1942,6 +2067,7 @@ export function handleEngineEvents(
       case "message":
         if (isTool && data) {
           if (retryingKeys.has(key)) clearRetry(key, deps);
+          resumeThroughput(event, key, deps);
           toolBatch ??= { event, key, tools: [] };
           toolBatch.tools.push({ ...data, patch: data.patch === true });
         } else {

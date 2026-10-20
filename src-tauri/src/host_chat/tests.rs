@@ -1122,7 +1122,8 @@ fn published_task_tools_preserve_delegation_without_model_deletion() {
     assert!(description.contains("empty list disables new children"));
     let list = tools.iter().find(|tool| tool.name == "task_list").unwrap();
     let list_description = list.description.as_deref().unwrap();
-    assert!(list_description.contains("allowedModels (null is unrestricted, [] disables NEW children"));
+    assert!(list_description.contains("configured (false blocks NEW children"));
+    assert!(list_description.contains("allowedModels (null is unrestricted only when configured=true, [] disables NEW children"));
     assert!(list_description.contains("defaultModel (the effective model when omitted)"));
 
     let wait = tools.iter().find(|tool| tool.name == "task_wait").unwrap();

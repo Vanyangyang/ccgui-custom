@@ -373,6 +373,47 @@ pub fn unregister_hidden_session(
     removed
 }
 
+/// Promotion must remain recoverable if either metadata write fails. Keep
+/// both in-memory maps unchanged until the paired durable update commits.
+pub(crate) fn promote_hidden_session(
+    owner: &SideSessionOwner,
+    session_id: &str,
+    db: &crate::db::Db,
+) -> Result<(), String> {
+    ensure_hidden_loaded(db);
+    let key = (owner.engine.clone(), session_id.to_string());
+    let mut hidden = HIDDEN_SESSIONS.lock().unwrap_or_else(|p| p.into_inner());
+    let mut owners = SESSION_OWNERS.lock().unwrap_or_else(|p| p.into_inner());
+    if !hidden.contains(&key) || owners.get(&key) != Some(owner) {
+        return Err("Sidechat session does not belong to this workspace and parent conversation".into());
+    }
+    let remaining_hidden: Vec<_> = hidden.iter().filter(|entry| **entry != key).collect();
+    let remaining_owners: Vec<_> = owners.iter()
+        .filter(|(entry, _)| **entry != key)
+        .map(|((engine, sid), owner)| (engine, sid, owner)).collect();
+    let hidden_json = serde_json::to_string(&remaining_hidden).map_err(|e| e.to_string())?;
+    let owners_json = serde_json::to_string(&remaining_owners).map_err(|e| e.to_string())?;
+    let mut conn = db.0.lock();
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    for (key, value) in [(HIDDEN_META_KEY, hidden_json), (OWNERS_META_KEY, owners_json)] {
+        tx.execute("INSERT INTO meta (key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            rusqlite::params![key, value]).map_err(|e| format!("Persist Sidechat promotion: {e}"))?;
+    }
+    tx.commit().map_err(|e| format!("Persist Sidechat promotion: {e}"))?;
+    hidden.remove(&key);
+    owners.remove(&key);
+    Ok(())
+}
+
+/// A stable scan input: visibility changes can make an unchanged native file
+/// newly eligible for indexing. Callers load persisted state before scanning.
+pub(crate) fn hidden_session_snapshot() -> Vec<(String, String)> {
+    let mut entries: Vec<_> = HIDDEN_SESSIONS.lock().unwrap_or_else(|p| p.into_inner())
+        .iter().cloned().collect();
+    entries.sort();
+    entries
+}
+
 pub fn is_hidden_session(engine: &str, session_id: &str) -> bool {
     let sid = session_id.trim();
     if sid.is_empty() {

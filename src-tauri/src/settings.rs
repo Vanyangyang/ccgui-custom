@@ -57,10 +57,11 @@ pub struct AppSettings {
     /// Per-engine optional display aliases for custom/mounted models (`modelId -> displayName`).
     #[serde(default)]
     pub custom_model_labels: HashMap<String, HashMap<String, String>>,
-    /// Models available to NEW Leader children. A missing engine is unrestricted;
-    /// an empty list disables spawning children for that engine.
+    /// Models available to NEW Leader children. A missing engine is unconfigured;
+    /// null explicitly permits any model except Cursor, which requires a saved list.
+    /// Cursor uses this list for every send; an empty list permits no models.
     #[serde(default)]
-    pub leader_allowed_models: HashMap<String, Vec<String>>,
+    pub leader_allowed_models: HashMap<String, Option<Vec<String>>>,
     #[serde(default = "default_claude_efforts", deserialize_with = "deserialize_default_efforts")]
     pub default_efforts: HashMap<String, String>,
     /// Independent Claude Ultracode default, supplied explicitly by chat clients.
@@ -470,13 +471,17 @@ impl AppSettings {
 /// the fallback when the app default is outside the policy. Reject an invalid
 /// policy as a whole, so sanitizing it can never silently remove a restriction.
 pub(crate) fn normalize_leader_allowed_models(
-    policy: &HashMap<String, Vec<String>>,
-) -> Result<HashMap<String, Vec<String>>, String> {
+    policy: &HashMap<String, Option<Vec<String>>>,
+) -> Result<HashMap<String, Option<Vec<String>>>, String> {
     let mut normalized = HashMap::new();
     for (engine, models) in policy {
         if !matches!(engine.as_str(), "claude" | "codex" | "agy" | "cursor") {
             return Err("leaderAllowedModels supports only claude, codex, agy and cursor engine keys".into());
         }
+        let Some(models) = models else {
+            normalized.insert(engine.clone(), None);
+            continue;
+        };
         if models.len() > 128 {
             return Err(format!("leaderAllowedModels.{engine} must contain at most 128 model IDs"));
         }
@@ -492,7 +497,7 @@ pub(crate) fn normalize_leader_allowed_models(
                 ids.push(id.to_owned());
             }
         }
-        normalized.insert(engine.clone(), ids);
+        normalized.insert(engine.clone(), Some(ids));
     }
     Ok(normalized)
 }
@@ -1111,10 +1116,13 @@ mod tests {
         assert!(legacy.leader_allowed_models.is_empty());
         assert!(AppSettings::default().leader_allowed_models.is_empty());
         let settings: AppSettings = serde_json::from_value(serde_json::json!({
-            "leaderAllowedModels":{"claude":["sonnet","sonnet[1m]"],"codex":[]}
+            "leaderAllowedModels":{"claude":["sonnet","sonnet[1m]"],"codex":[],"agy":null}
         })).unwrap();
         let serialized = serde_json::to_value(&settings).unwrap();
-        assert_eq!(serialized["leaderAllowedModels"], serde_json::json!({"claude":["sonnet","sonnet[1m]"],"codex":[]}));
+        assert_eq!(serialized["leaderAllowedModels"], serde_json::json!({"claude":["sonnet","sonnet[1m]"],"codex":[],"agy":null}));
+        assert!(!settings.leader_allowed_models.contains_key("cursor"));
+        assert_eq!(settings.leader_allowed_models.get("agy"), Some(&None));
+        assert_eq!(normalize_leader_allowed_models(&settings.leader_allowed_models).unwrap(), settings.leader_allowed_models);
         let restored: AppSettings = serde_json::from_value(serialized).unwrap();
         assert_eq!(restored.leader_allowed_models, settings.leader_allowed_models);
     }
@@ -1125,8 +1133,8 @@ mod tests {
             "leaderAllowedModels":{"claude":[" opus ","sonnet[1m]","opus","Sonnet","提供商/model","\u{feff}sonnet","sonnet\u{0085}"],"codex":[]}
         })).unwrap();
         let normalized = normalize_leader_allowed_models(&settings.leader_allowed_models).unwrap();
-        assert_eq!(normalized["claude"], ["opus","sonnet[1m]","Sonnet","提供商/model","\u{feff}sonnet","sonnet"]);
-        assert!(normalized["codex"].is_empty());
+        assert_eq!(normalized["claude"].as_ref().unwrap(), &["opus","sonnet[1m]","Sonnet","提供商/model","\u{feff}sonnet","sonnet"]);
+        assert!(normalized["codex"].as_ref().unwrap().is_empty());
         assert_eq!(normalize_leader_allowed_models(&normalized).unwrap(), normalized);
     }
 
@@ -1153,8 +1161,8 @@ mod tests {
             assert_eq!(settings.leader_allowed_models, original, "invalid policy cannot be partly sanitized");
             assert_eq!(std::fs::read_to_string(&path).unwrap(), "existing settings");
         }
-        let boundary: HashMap<String, Vec<String>> = HashMap::from([("codex".into(), vec!["x".repeat(256);128])]);
-        assert_eq!(normalize_leader_allowed_models(&boundary).unwrap()["codex"].len(), 1);
+        let boundary = HashMap::from([("codex".into(), Some(vec!["x".repeat(256);128]))]);
+        assert_eq!(normalize_leader_allowed_models(&boundary).unwrap()["codex"].as_ref().unwrap().len(), 1);
     }
 
     #[test]

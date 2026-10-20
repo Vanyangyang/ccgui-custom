@@ -13,7 +13,7 @@ import { ipc, type AppSettings, type EngineModel } from "@/lib/ipc";
 
 const ENGINES = ["claude", "codex", "agy", "cursor"] as const;
 type LeaderEngine = (typeof ENGINES)[number];
-type PolicyMode = "unrestricted" | "restricted" | "disabled";
+type PolicyMode = "unconfigured" | "unrestricted" | "restricted" | "disabled";
 interface ModelPolicy { mode: PolicyMode; models: string[] }
 type Draft = Record<LeaderEngine, ModelPolicy>;
 const POLICY_MODES = [
@@ -32,11 +32,17 @@ function normalizedModelId(id: string): string {
   return trimmed && !CONTROL_CHARACTER.test(trimmed) ? trimmed : id;
 }
 
+function isExplicitCursorModel(id: string): boolean {
+  return !["auto", "default"].includes(id.toLowerCase());
+}
+
 function policies(settings?: AppSettings): Draft {
   return Object.fromEntries(ENGINES.map((engine) => [engine, {
-    mode: settings?.leaderAllowedModels?.[engine] == null ? "unrestricted" :
-      settings.leaderAllowedModels[engine].length ? "restricted" : "disabled",
-    models: [...new Set((settings?.leaderAllowedModels?.[engine] ?? []).map(normalizedModelId))],
+    mode: engine === "cursor" ? "restricted" : settings?.leaderAllowedModels?.[engine] === undefined ? "unconfigured" :
+      settings.leaderAllowedModels[engine] === null ? "unrestricted" :
+        settings.leaderAllowedModels[engine]?.length ? "restricted" : "disabled",
+    models: [...new Set((settings?.leaderAllowedModels?.[engine] ?? []).map(normalizedModelId))]
+      .filter((id) => engine !== "cursor" || isExplicitCursorModel(id)),
   }])) as Draft;
 }
 
@@ -83,7 +89,7 @@ function EnginePolicyCard({ engine, settings, policy, disabled, onChange }: {
     ...(defaultModel ? [defaultModel] : []),
     ...(settings?.leaderAllowedModels?.[engine] ?? []),
     ...policy.models,
-  ].map(normalizedModelId))];
+  ].map(normalizedModelId))].filter((id) => engine !== "cursor" || isExplicitCursorModel(id));
   const fallback = defaultModel && policy.models.includes(defaultModel) ? defaultModel : policy.models[0];
   const engineLabel = CLI_DISPLAY_NAMES[engine];
 
@@ -94,7 +100,7 @@ function EnginePolicyCard({ engine, settings, policy, disabled, onChange }: {
         <SettingsRow anchor={`leaderModels:${engine}`} label={t("settings.leaderRestrictModels")}
           labelAdornment={<EngineIcon engine={engine} size={14} />} />
         <div className="flex min-w-0 flex-col gap-3 py-3 pr-3">
-          <div role="group" aria-label={t("settings.leaderPolicyForEngine", { engine: engineLabel })}
+          {engine !== "cursor" && <div role="group" aria-label={t("settings.leaderPolicyForEngine", { engine: engineLabel })}
             className="flex min-w-0 flex-wrap gap-2">
             {POLICY_MODES.map(([mode, label]) => <Button key={mode} size="small"
               variant={policy.mode === mode ? "primary" : "secondary"}
@@ -103,10 +109,12 @@ function EnginePolicyCard({ engine, settings, policy, disabled, onChange }: {
                 defaultModel ? [defaultModel] : catalog[0] ? [normalizedModelId(catalog[0].id)] : [] : policy.models })}>
               {t(label)}
             </Button>)}
-          </div>
-          <p role={policy.mode === "restricted" && policy.models.length === 0 ? "alert" : undefined}
-            className={`text-body-2-regular [overflow-wrap:anywhere] ${policy.mode === "restricted" && policy.models.length === 0 ? "text-text-warning-primary" : "text-text-secondary"}`}>
-            {policy.mode === "unrestricted" ? t("settings.leaderUnrestricted") :
+          </div>}
+          <p role={engine !== "cursor" && policy.mode === "restricted" && policy.models.length === 0 ? "alert" : undefined}
+            className={`text-body-2-regular [overflow-wrap:anywhere] ${engine !== "cursor" && policy.mode === "restricted" && policy.models.length === 0 ? "text-text-warning-primary" : "text-text-secondary"}`}>
+            {engine === "cursor" ? t("settings.leaderCursorModelsNote") :
+              policy.mode === "unconfigured" ? t("settings.leaderModeUnconfiguredNote") :
+              policy.mode === "unrestricted" ? t("settings.leaderUnrestricted") :
               policy.mode === "disabled" ? t("settings.leaderDisabledPolicy") :
                 policy.models.length === 0 ? t("settings.leaderEmptyPolicy") : t("settings.leaderModelFallback", { model: fallback })}
           </p>
@@ -168,7 +176,7 @@ export function LeaderSection() {
   useEffect(() => { void loadSettings().catch(() => {}); }, [loadSettings]);
 
   const changed = ENGINES.filter((engine) => policyChanged(draft[engine], policies(settings)[engine]));
-  const invalidDraft = ENGINES.some((engine) => draft[engine].mode === "restricted" && !draft[engine].models.length);
+  const invalidDraft = ENGINES.some((engine) => engine !== "cursor" && draft[engine].mode === "restricted" && !draft[engine].models.length);
   const save = async () => {
     if (savePending.current || !settings || !changed.length || invalidDraft) return;
     savePending.current = true;
@@ -180,7 +188,8 @@ export function LeaderSection() {
       if (!mounted.current) return;
       const leaderAllowedModels = { ...latest.leaderAllowedModels };
       for (const engine of changed) {
-        if (draft[engine].mode === "unrestricted") delete leaderAllowedModels[engine];
+        if (draft[engine].mode === "unconfigured") continue;
+        if (draft[engine].mode === "unrestricted") leaderAllowedModels[engine] = null;
         else leaderAllowedModels[engine] = draft[engine].mode === "disabled" ? [] : [...draft[engine].models];
       }
       await ipc.updateAppSettings({ ...latest, leaderAllowedModels });

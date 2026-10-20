@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useRef } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import ArrowUpRight from "lucide-react/dist/esm/icons/arrow-up-right";
 import GitBranch from "lucide-react/dist/esm/icons/git-branch";
@@ -10,6 +10,7 @@ import X from "lucide-react/dist/esm/icons/x";
 import { Button } from "@/components/base/buttons/button";
 import { useCopied } from "@/hooks/use-copied";
 import type { Message } from "@/lib/ipc";
+import { errorText } from "@/lib/errors";
 import { useChatStore, type ActiveSession } from "@/features/chat/store";
 import { resolveSideLaunch } from "./launch";
 import { CacheHitBadge, SideMarkdown, SideThinking, SideToolPills } from "./side-parts";
@@ -83,6 +84,7 @@ export const SidechatPanel = memo(function SidechatPanel({
   const closeSidechat = useSidechatStore((s) => s.closeSidechat);
   const resetSidechat = useSidechatStore((s) => s.resetSidechat);
   const promoteSidechatToTab = useSidechatStore((s) => s.promoteSidechatToTab);
+  const [promoting, setPromoting] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickRef = useRef(true);
   const visible = Boolean(sc?.open && isSidechatSupportedEngine(sc.engine));
@@ -122,16 +124,31 @@ export const SidechatPanel = memo(function SidechatPanel({
   );
 
   const promote = useCallback(async () => {
-    const promoted = await promoteSidechatToTab(key);
-    if (!promoted) return;
-    const chat = useChatStore.getState();
-    await chat.refreshSessions();
-    await chat.selectSession(promoted.engine, promoted.sessionId, promoted.workspacePath);
-  }, [key, promoteSidechatToTab]);
+    if (promoting) return;
+    setPromoting(true);
+    try {
+      const promoted = await promoteSidechatToTab(key);
+      if (!promoted) return;
+      const chat = useChatStore.getState();
+      await chat.refreshSessions();
+      await chat.selectSession(promoted.engine, promoted.sessionId, promoted.workspacePath);
+    } catch (error) {
+      useChatStore.setState({ actionError: errorText(error) });
+    } finally {
+      setPromoting(false);
+    }
+  }, [key, promoteSidechatToTab, promoting]);
 
   if (!sc || !sc.open || !isSidechatSupportedEngine(sc.engine)) return null;
 
-  const canPromote = Boolean(sc.sideSessionId) && !sc.streaming;
+  const canPromote = Boolean(sc.sideSessionId) && !sc.streaming && !promoting;
+  const promoteHint = promoting
+    ? "sidechat.promoting"
+    : sc.streaming
+      ? "sidechat.promoteBusyHint"
+      : !sc.sideSessionId
+        ? "sidechat.promoteUnavailableHint"
+        : "sidechat.promoteHint";
   const canReset = sc.messages.length > 0 || Boolean(sc.sideSessionId);
 
   return (
@@ -175,7 +192,8 @@ export const SidechatPanel = memo(function SidechatPanel({
           iconOnly
           leadingIcon={ArrowUpRight}
           aria-label={t("sidechat.promote")}
-          title={t("sidechat.promoteHint")}
+          title={t(promoteHint)}
+          aria-busy={promoting}
           disabled={!canPromote}
           onClick={() => void promote()}
         />

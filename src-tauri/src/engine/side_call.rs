@@ -490,6 +490,8 @@ pub(crate) async fn cursor_text_call(
     timeout: Duration,
 ) -> Result<String, SideCallError> {
     let settings = crate::settings::read_settings().unwrap_or_default();
+    super::cursor::ensure_model_selected(&settings, Some(model))
+        .map_err(|_| SideCallError::Unavailable)?;
     let bin = super::engine_bin(&settings, "cursor");
     let cwd = crate::paths::app_home().join("side-call");
     std::fs::create_dir_all(&cwd).map_err(|_| SideCallError::Unavailable)?;

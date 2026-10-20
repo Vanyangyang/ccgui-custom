@@ -191,4 +191,40 @@ describe("cross-session communication details", () => {
     expect(chat.selectSession).toHaveBeenCalledTimes(2);
     expect(details()).toBeNull();
   });
+
+  it("renders subtask delegation wording, matches pending leader branches, and disables opening an unbound child", async () => {
+    await i18n.changeLanguage("zh");
+    const pendingChild = { engine: "agy", sessionId: "leader-branch:branch-pending", workspacePath: "G:\\ws", title: "子对话任务" };
+    store.getState().upsertRecord(record({
+      scopedId: "leader:branch-pending",
+      requestId: "branch-pending",
+      kind: "subtask",
+      sender: { ...sender, workspacePath: "G:/ws" },
+      target: pendingChild,
+      message: "请重构 Godot 架构",
+      status: "executing",
+    }));
+    const branchMeta = { id: "branch-pending", engine: "agy", sessionId: null, workspacePath: "G:\\ws", title: "子对话任务" };
+    function SubtaskSummary() {
+      const parentActivity = useCrossSessionThreadActivity("codex/sender", "G:/ws");
+      const childActivity = useCrossSessionThreadActivity("leader-branch:branch-pending", "G:\\ws", branchMeta);
+      return <>
+        <output data-side="parent">{parentActivity.summary}</output>
+        <output data-side="child">{childActivity.summary}</output>
+        <div data-side="parent"><CrossSessionThreadIndicator threadId="codex/sender" workspacePath="G:/ws" /></div>
+        <div data-side="child"><CrossSessionThreadIndicator threadId="leader-branch:branch-pending" workspacePath="G:\\ws" leaderBranch={branchMeta} /></div>
+      </>;
+    }
+    await act(async () => root.render(<SubtaskSummary />));
+    expect(node.querySelector('output[data-side="parent"]')?.textContent).toBe(i18n.t("crossSession.rowDelegating", { title: "子对话任务" }));
+    expect(node.querySelector('output[data-side="child"]')?.textContent).toBe(i18n.t("crossSession.rowSubtaskRunning", { title: sender.title }));
+    const childBtn = node.querySelector<HTMLButtonElement>('[data-side="child"] [data-testid="thread-cross-session-btn"]')!;
+    expect(childBtn).not.toBeNull();
+    await click(childBtn);
+    expect(details()?.textContent).toContain(`${i18n.t("crossSession.subtaskPromptLabel")}： 请重构 Godot 架构`);
+    const targetButton = details()!.querySelector<HTMLButtonElement>(`button[aria-label="${i18n.t("crossSession.openTarget", { title: "子对话任务" })}"]`)!;
+    expect(targetButton.disabled).toBe(true);
+    await click(targetButton);
+    expect(chat.selectSession).not.toHaveBeenCalled();
+  });
 });

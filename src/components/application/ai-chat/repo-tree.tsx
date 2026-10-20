@@ -353,7 +353,7 @@ function ThreadItem({
 }) {
   const { t } = useTranslation();
   const branchDeadline = leaderBranch ? leaderDeadlineInfo(leaderBranch) : null;
-  const comms = useCrossSessionThreadActivity(isDraft ? undefined : id, workspacePath ?? leaderBranch?.workspacePath);
+  const comms = useCrossSessionThreadActivity(isDraft ? undefined : id, workspacePath ?? leaderBranch?.workspacePath, leaderBranch);
   const enabledCache = promptCacheForEngine(engine, promptCache);
   const cacheHeat = usePromptCacheHeat(enabledCache);
   const heatRatio = getPromptCacheHeatRatio(enabledCache, updatedAt, streaming);
@@ -436,7 +436,7 @@ function ThreadItem({
             );
           })()}
         </span>
-        {comms.summary && <span data-testid="thread-cross-session-summary" title={comms.summary}
+        {comms.summary && !leaderBranch && <span data-testid="thread-cross-session-summary" title={comms.summary}
           className="max-w-[48%] shrink truncate text-caption-2-medium text-status-purple-text">{comms.summary}</span>}
       </button>
       {id && selectable && (
@@ -468,7 +468,7 @@ function ThreadItem({
       ) : null}
       {/* Keep this at the row edge: hover swaps metadata for action buttons,
           so a marker placed before them would move away from the pointer. */}
-      {id && !isDraft && <CrossSessionThreadIndicator threadId={id} workspacePath={workspacePath ?? leaderBranch?.workspacePath} />}
+      {id && !isDraft && <CrossSessionThreadIndicator threadId={id} workspacePath={workspacePath ?? leaderBranch?.workspacePath} leaderBranch={leaderBranch} />}
     </div>
   );
 }

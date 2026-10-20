@@ -117,6 +117,32 @@ describe("timeline search within bounded process history", () => {
     expect(container.textContent).toContain("工具 499 目标🙂");
   });
 
+  it.each(["codex", "claude", "agy"])("renders interactive storage constraints for %s on completion and history reload", async (engine) => {
+    await import("./Markdown");
+    await import("@/features/interactive-answer/InteractiveAnswer");
+    const source = '```ccgui-ui\nroot = Stack([Select($network, "网络条件", ["可联网", "必须离线"]), Toggle($devices, "多设备"), Text(result)])\n$network = "可联网"\n$devices = true\nresult = $devices ? ($network == "必须离线" ? "本地保存并在联网后同步，需处理冲突" : "通过服务端同步设备") : ($network == "必须离线" ? "本地保存，无需跨设备同步" : "联网存储，无需跨设备同步")\n```';
+    const render = async (text: string, live: boolean) => {
+      await act(async () => root.render(<MessageRow engine={engine} message={{ seq: 2, role: "assistant", text, ts: null, live }} workspacePath="/ws" turnFinal={!live} />));
+    };
+    await render(source.slice(0, -3), true);
+    expect(container.querySelector("select")).toBeNull();
+    await render(source, false);
+    const select = container.querySelector("select")!;
+    expect(select).not.toBeNull();
+    expect(container.textContent).toContain("通过服务端同步设备");
+    await act(async () => {
+      select.value = "必须离线";
+      select.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    expect(container.textContent).toContain("本地保存并在联网后同步，需处理冲突");
+    const toggle = container.querySelector('input[role="switch"]') as HTMLInputElement;
+    await act(async () => toggle.click());
+    expect(container.textContent).toContain("本地保存，无需跨设备同步");
+    await act(async () => root.render(null));
+    await render(source, false);
+    expect(container.querySelector("select")).not.toBeNull();
+  });
+
   it("shows a Codex Desktop turn's stage and Desktop's own model in the tail", async () => {
     const messages: Message[] = [{ seq: 1, role: "user", text: "好的", ts: null }];
     const render = async (stage: "running" | "approval") => {
@@ -179,7 +205,7 @@ describe("timeline search within bounded process history", () => {
     const summary = summaries()[0];
     expect(summary.textContent).toContain("↑1k ↓200");
     expect(summary.textContent).toContain("90%");
-    expect(summary.textContent).toContain("均速 20 tok/s");
+    expect(summary.textContent).toContain("整轮效率 20 tok/s");
     const content = summary.textContent;
 
     // A new prompt makes the timeline live before any assistant row arrives.

@@ -18,3 +18,11 @@ it("preserves unknown and malformed errors", () => {
   expect(errorText("CCGUI_PROVIDER_MIGRATION_CONFLICT:invalid")).toBe("CCGUI_PROVIDER_MIGRATION_CONFLICT:invalid");
   expect(errorText(new Error("disk full"))).toBe("disk full");
 });
+
+it("localizes the Cursor saved-selection gate", async () => {
+  const message = "Cursor model is not selected in saved settings; select it in Settings → Collaboration and save before sending";
+  await i18n.changeLanguage("zh");
+  expect(errorText(message)).toContain("勾选具体模型并保存");
+  await i18n.changeLanguage("en");
+  expect(errorText(new Error(message))).toContain("Check a specific model");
+});

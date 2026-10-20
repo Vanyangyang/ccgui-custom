@@ -25,13 +25,14 @@ import {
   type CrossSessionCommunicationRecord,
   type CrossSessionParticipant,
 } from "../cross-session";
+import { sameLeaderWorkspace } from "@/features/leader/workspace-path";
 
 function resolveParticipantLabel(
   participant: CrossSessionParticipant,
   sessions: ReturnType<typeof useChatStore.getState>["sessions"],
 ): string {
   const match = sessions.find((s) => s.engine === participant.engine &&
-    s.sessionId === participant.sessionId && s.workspacePath === participant.workspacePath);
+    s.sessionId === participant.sessionId && sameLeaderWorkspace(s.workspacePath, participant.workspacePath));
   const title = match?.customTitle || match?.title || participant.title;
   if (title?.trim()) return title.trim();
   return `${CLI_DISPLAY_NAMES[participant.engine] ?? participant.engine} · ${participant.sessionId.slice(0, 8)}`;
@@ -41,7 +42,15 @@ function needsAttention(record: CrossSessionCommunicationRecord, participant?: C
   return isCrossSessionActiveStatus(record.status) || isCrossSessionRecordUnread(record, participant);
 }
 
-function threadParticipant(threadId?: string, workspacePath?: string): CrossSessionParticipant | undefined {
+function threadParticipant(threadId?: string, workspacePath?: string, leaderBranch?: { id: string; engine: string; sessionId: string | null; workspacePath: string; title?: string }): CrossSessionParticipant | undefined {
+  if (leaderBranch) {
+    return {
+      engine: leaderBranch.engine,
+      sessionId: leaderBranch.sessionId ?? `leader-branch:${leaderBranch.id}`,
+      workspacePath: workspacePath ?? leaderBranch.workspacePath,
+      title: leaderBranch.title,
+    };
+  }
   const separator = threadId?.indexOf("/") ?? -1;
   if (!threadId || separator <= 0 || separator === threadId.length - 1 || !workspacePath) return undefined;
   return { engine: threadId.slice(0, separator), sessionId: threadId.slice(separator + 1), workspacePath };
@@ -50,9 +59,13 @@ function threadParticipant(threadId?: string, workspacePath?: string): CrossSess
 // Transient emphasis only; never changes selection, disclosure or read state.
 const useCommsEmphasis = create<{ owner?: string; participant?: CrossSessionParticipant }>(() => ({}));
 
-export function useCrossSessionThreadActivity(threadId?: string, workspacePath?: string) {
+export function useCrossSessionThreadActivity(
+  threadId?: string,
+  workspacePath?: string,
+  leaderBranch?: { id: string; engine: string; sessionId: string | null; workspacePath: string; title?: string },
+) {
   const { t } = useTranslation();
-  const participant = threadParticipant(threadId, workspacePath);
+  const participant = threadParticipant(threadId, workspacePath, leaderBranch);
   const records = useCrossSessionActivityStore(useShallow((state) => participant
     ? state.records.filter((record) => crossSessionRecordMatchesParticipant(record, participant)) : []));
   const emphasized = useCommsEmphasis((state) => state.participant);
@@ -61,9 +74,12 @@ export function useCrossSessionThreadActivity(threadId?: string, workspacePath?:
   const outgoing = !!active && !!participant && crossSessionParticipantKey(active.sender) === crossSessionParticipantKey(participant);
   const other = active ? outgoing ? active.target : active.sender : undefined;
   const title = useChatStore((state) => other ? resolveParticipantLabel(other, state.sessions) : "");
+  const isSubtask = active?.kind === "subtask";
   const summary = active ? t(active.status === "awaiting_cost_approval" ? "crossSession.rowAwaitingCostApproval" :
     active.status === "awaiting_permission" ? "crossSession.rowAwaitingPermission" :
-    outgoing ? "crossSession.rowAsking" : active.status === "executing" ? "crossSession.rowReplying" : "crossSession.rowReceiving", { title }) : undefined;
+    outgoing ? (isSubtask ? "crossSession.rowDelegating" : "crossSession.rowAsking") :
+    active.status === "executing" ? (isSubtask ? "crossSession.rowSubtaskRunning" : "crossSession.rowReplying") :
+    (isSubtask ? "crossSession.rowSubtaskStarting" : "crossSession.rowReceiving"), { title }) : undefined;
   const related = !!participant && !!emphasized && crossSessionParticipantKey(participant) !== crossSessionParticipantKey(emphasized) &&
     records.some((record) => crossSessionRecordMatchesParticipant(record, emphasized) && needsAttention(record, emphasized));
   return { active: !!active, summary, related };
@@ -84,8 +100,16 @@ export function CrossSessionCommsToggleButton() {
 }
 
 /** Shared by workspace, recent, worktree and nested real-session rows. */
-export function CrossSessionThreadIndicator({ threadId, workspacePath }: { threadId: string; workspacePath?: string }) {
-  const participant = threadParticipant(threadId, workspacePath);
+export function CrossSessionThreadIndicator({
+  threadId,
+  workspacePath,
+  leaderBranch,
+}: {
+  threadId: string;
+  workspacePath?: string;
+  leaderBranch?: { id: string; engine: string; sessionId: string | null; workspacePath: string; title?: string };
+}) {
+  const participant = threadParticipant(threadId, workspacePath, leaderBranch);
   return participant ? <CommsPopover participant={participant} /> : null;
 }
 
@@ -122,7 +146,8 @@ function CommsPopover({ participant }: { participant?: CrossSessionParticipant }
   if (participant && primary) {
     const outgoing = crossSessionParticipantKey(primary.sender) === crossSessionParticipantKey(participant);
     const other = resolveParticipantLabel(outgoing ? primary.target : primary.sender, useChatStore.getState().sessions);
-    summary = `${t(outgoing ? "crossSession.outgoing" : "crossSession.incoming", { title: other })} · ${t(`crossSession.status.${primary.status}`)}`;
+    const isSubtask = primary.kind === "subtask";
+    summary = `${t(outgoing ? (isSubtask ? "crossSession.subtaskOutgoing" : "crossSession.outgoing") : (isSubtask ? "crossSession.subtaskIncoming" : "crossSession.incoming"), { title: other })} · ${t(`crossSession.status.${primary.status}`)}`;
     if (attention.length > 1) summary += ` · ${t("crossSession.recordCount", { count: attention.length })}`;
   }
   const label = participant ? t("crossSession.showDetails", { summary }) :
@@ -192,10 +217,11 @@ function CommsDetails({ records, participant, onClose }: {
     return () => clearInterval(timer);
   }, [active]);
   const selectParticipant = async (target: CrossSessionParticipant) => {
+    if (target.sessionId.startsWith("leader-branch:")) return;
     setNavigationError(undefined);
-    const meta = sessions.find((s) => s.engine === target.engine && s.sessionId === target.sessionId && s.workspacePath === target.workspacePath);
+    const meta = sessions.find((s) => s.engine === target.engine && s.sessionId === target.sessionId && sameLeaderWorkspace(s.workspacePath, target.workspacePath));
     try {
-      await useChatStore.getState().selectSession(target.engine, target.sessionId, target.workspacePath, meta ? { meta } : undefined);
+      await useChatStore.getState().selectSession(target.engine, target.sessionId, meta?.workspacePath ?? target.workspacePath, meta ? { meta } : undefined);
       onClose();
     } catch {
       setNavigationError(t("crossSession.openFailed"));
@@ -215,12 +241,13 @@ function CommsDetails({ records, participant, onClose }: {
       <div className="flex items-center gap-1 text-caption-2-medium">
         {[record.sender, record.target].map((target, index) => {
           const title = resolveParticipantLabel(target, sessions);
+          const pendingTarget = target.sessionId.startsWith("leader-branch:");
           return <div key={index} className="contents">
             {index === 1 && <ArrowRight className="size-3 shrink-0 text-foreground-icon-tertiary" aria-hidden />}
-            <button type="button" onClick={() => void selectParticipant(target)}
+            <button type="button" disabled={pendingTarget} onClick={() => void selectParticipant(target)}
               aria-label={t(index === 0 ? "crossSession.openSender" : "crossSession.openTarget", { title })}
               title={title}
-              className="inline-flex min-w-0 flex-1 cursor-pointer items-center gap-1 rounded-sm px-1 py-1 text-left text-text-secondary outline-none hover:bg-background-tertiary-hover focus-visible:ring-2 focus-visible:ring-border-focus-ring">
+              className="inline-flex min-w-0 flex-1 cursor-pointer items-center gap-1 rounded-sm px-1 py-1 text-left text-text-secondary outline-none hover:bg-background-tertiary-hover focus-visible:ring-2 focus-visible:ring-border-focus-ring disabled:cursor-default disabled:hover:bg-transparent">
               <EngineIcon engine={target.engine} size={12} className="size-3 shrink-0" />
               <span className="truncate">{title}</span>
             </button>
@@ -232,7 +259,7 @@ function CommsDetails({ records, participant, onClose }: {
         <span className="text-text-tertiary">{t("crossSession.elapsedSeconds", { seconds: Math.max(0, Math.floor(((isCrossSessionActiveStatus(record.status) ? now : record.updatedAt) - record.acceptedAt) / 1000)) })}</span>
       </div>
       <p className="whitespace-pre-wrap text-caption-1-regular text-text-secondary [overflow-wrap:anywhere]">
-        <span className="font-medium">{t("crossSession.promptLabel")}： </span>{record.message}
+        <span className="font-medium">{t(record.kind === "subtask" ? "crossSession.subtaskPromptLabel" : "crossSession.promptLabel")}： </span>{record.message}
       </p>
       {record.status === "awaiting_cost_approval" && <CrossSessionCostApproval record={record} />}
       {record.replyText && <div className="rounded-md bg-background-primary-default p-2 text-caption-1-regular text-text-secondary">

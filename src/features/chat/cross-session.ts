@@ -9,6 +9,7 @@ import { createHostChatBridge, desktopChatFacade, type HostChatFacade } from "@/
 import type { PluginStorageBackend } from "@/features/plugins/runtime/context";
 import { cloneCheckpointValue, runtimeCheckpoint } from "@/lib/runtime-checkpoint";
 import { crossSessionCostReview, requiresCrossSessionCostApproval, type CrossSessionCostReview } from "./cross-session-cost";
+import { leaderWorkspacePathKey } from "@/features/leader/workspace-path";
 
 export interface CrossSessionRequest {
   requestId: string;
@@ -30,6 +31,7 @@ export interface CrossSessionCommunicationRecord {
   scopedId: string;
   requestId: string;
   runId?: string;
+  kind?: "consultation" | "subtask";
   sender: CrossSessionParticipant;
   target: CrossSessionParticipant;
   message: string;
@@ -55,7 +57,7 @@ export function isCrossSessionActiveStatus(status: CrossSessionCommunicationStat
 }
 
 export function crossSessionParticipantKey(participant: CrossSessionParticipant): string {
-  return JSON.stringify([participant.engine, participant.sessionId, participant.workspacePath]);
+  return JSON.stringify([participant.engine, participant.sessionId, leaderWorkspacePathKey(participant.workspacePath)]);
 }
 
 export function crossSessionRecordMatchesParticipant(
@@ -80,7 +82,13 @@ function sameReviewContent(
   current: CrossSessionCommunicationRecord,
   observed: CrossSessionCommunicationRecord,
 ): boolean {
-  return current.status === observed.status && current.replyText === observed.replyText && current.error === observed.error;
+  return (
+    current.status === observed.status &&
+    current.replyText === observed.replyText &&
+    current.error === observed.error &&
+    current.message === observed.message &&
+    (current.runId === undefined || observed.runId === undefined || current.runId === observed.runId)
+  );
 }
 
 function preserveReview(
@@ -104,6 +112,7 @@ function retainedRecords(records: CrossSessionCommunicationRecord[]) {
 interface CrossSessionActivityState {
   records: CrossSessionCommunicationRecord[];
   upsertRecord: (record: CrossSessionCommunicationRecord) => void;
+  removeRecords: (scopedIds: Iterable<string>) => void;
   applyReceipt: (receipt: HostChatReceipt) => void;
   markFailed: (scopedId: string, error: string) => void;
   markReviewed: (observedRecords: CrossSessionCommunicationRecord[], participant?: CrossSessionParticipant) => void;
@@ -123,6 +132,13 @@ export const useCrossSessionActivityStore = create<CrossSessionActivityState>((s
       return {
         records: next,
       };
+    }),
+  removeRecords: (scopedIds) =>
+    set((state) => {
+      const target = new Set(scopedIds);
+      if (!target.size) return state;
+      const next = state.records.filter((r) => !target.has(r.scopedId));
+      return next.length === state.records.length ? state : { records: next };
     }),
   applyReceipt: (receipt) =>
     set((state) => {

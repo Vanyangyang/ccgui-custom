@@ -14,6 +14,22 @@ pub(crate) fn cursor_home() -> PathBuf {
     crate::engine::engine_home(Some("CURSOR_CONFIG_DIR"), ".cursor")
 }
 
+pub(crate) fn ensure_model_selected(
+    settings: &crate::settings::AppSettings,
+    model: Option<&str>,
+) -> Result<(), String> {
+    let policy = crate::settings::normalize_leader_allowed_models(&settings.leader_allowed_models)?;
+    let selected = policy.get("cursor").and_then(Option::as_ref);
+    let permitted = model.map(super::cursor_picker::split_launch_model).transpose()?
+        .is_some_and(|launch| !launch.model_id.eq_ignore_ascii_case("auto")
+            && !launch.model_id.eq_ignore_ascii_case("default")
+            && selected.is_some_and(|models| models.contains(&launch.model_id)));
+    if !permitted {
+        return Err("Cursor model is not selected in saved settings; select it in Settings → Collaboration and save before sending".into());
+    }
+    Ok(())
+}
+
 /// Marker so a re-read prompt can be told apart from user text.
 pub const CURSOR_IMAGE_MARKER: &str = "\n\n<!-- ccgui:cursor-image-attachments -->\n";
 pub const CURSOR_HOST_INSTRUCTIONS_START: &str = "<!-- ccgui:cursor-host-instructions:start -->";
@@ -297,7 +313,10 @@ impl Engine for CursorEngine {
         }
         for dir in &req.additional_dirs {
             let dir = dir.trim();
-            if !dir.is_empty() && seen.insert(dir.to_string()) {
+            // Grants outlive the directories they reference. Cursor validates
+            // every --add-dir before starting and aborts on a stale grant.
+            // Recheck each send without deleting the persisted authorization.
+            if !dir.is_empty() && Path::new(dir).is_dir() && seen.insert(dir.to_string()) {
                 cmd.arg("--add-dir");
                 cmd.arg(dir);
             }
@@ -589,6 +608,49 @@ mod tests {
         // manual is unsupported and resolves to the first supported mode.
         let manual = args(&engine.build_command(&req(Some("manual")), "cursor-agent").unwrap());
         assert!(manual.contains(&"--force".to_string()));
+    }
+
+    #[test]
+    fn command_skips_stale_grants_and_rechecks_directories_on_each_send() {
+        let root = std::env::temp_dir().join(format!("ccgui-cursor-grants-{}", uuid::Uuid::new_v4()));
+        let shared = root.join("shared directory");
+        let missing = root.join("deleted-plugin-hooks");
+        let file = root.join("ordinary-file");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(&file, "not a directory").unwrap();
+        let mut request = req(Some("auto"));
+        request.workspace = root.clone();
+        request.session_id = Some("existing-session".into());
+        request.additional_dirs = vec![
+            missing.to_string_lossy().into_owned(),
+            file.to_string_lossy().into_owned(),
+            format!("  {}  ", shared.display()),
+            shared.to_string_lossy().into_owned(),
+            root.to_string_lossy().into_owned(),
+            "   ".into(),
+        ];
+        let grants = request.additional_dirs.clone();
+        let engine = CursorEngine::new();
+        let first = args(&engine.build_command(&request, "cursor-agent").unwrap());
+        std::fs::remove_dir(&shared).unwrap();
+        let next = args(&engine.build_command(&request, "cursor-agent").unwrap());
+        std::fs::create_dir(&shared).unwrap();
+        let restored = args(&engine.build_command(&request, "cursor-agent").unwrap());
+        std::fs::remove_dir(&shared).unwrap();
+        std::fs::remove_file(&file).unwrap();
+        std::fs::remove_dir(&root).unwrap();
+
+        let additional: Vec<_> = first
+            .windows(2)
+            .filter(|pair| pair[0] == "--add-dir")
+            .map(|pair| pair[1].as_str())
+            .collect();
+        assert_eq!(additional, [shared.to_string_lossy().as_ref()]);
+        assert!(!next.iter().any(|arg| arg == "--add-dir"));
+        assert_eq!(restored, first);
+        assert!(first.windows(2).any(|pair| pair[0] == "--workspace" && pair[1] == root.to_string_lossy()));
+        assert!(first.windows(2).any(|pair| pair == ["--resume", "existing-session"]));
+        assert_eq!(request.additional_dirs, grants, "grants must remain available if directories return");
     }
 
     #[test]

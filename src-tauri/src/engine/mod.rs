@@ -668,6 +668,9 @@ fn prepare_launch(
     } else {
         model
     };
+    if engine == "cursor" {
+        cursor::ensure_model_selected(&settings, model.as_deref())?;
+    }
     let effort = effort
         .filter(|e| !e.trim().is_empty())
         .or_else(|| settings.default_efforts.get(engine).cloned())
@@ -1986,8 +1989,20 @@ pub async fn cleanup_side_session(
     cleanup_side_session_inner(&state, engine, session_id, workspace_path, parent_session_id).await
 }
 
+#[cfg(test)]
 pub(crate) fn promote_side_session_inner(
     state: &crate::AppState,
+    engine: String,
+    session_id: String,
+    workspace_path: String,
+    parent_session_id: Option<String>,
+) -> Result<(), String> {
+    promote_side_session_blocking(&state.db, &state.processes, engine, session_id, workspace_path, parent_session_id)
+}
+
+fn promote_side_session_blocking(
+    db: &crate::db::Db,
+    processes: &ProcessRegistry,
     engine: String,
     session_id: String,
     workspace_path: String,
@@ -1998,21 +2013,28 @@ pub(crate) fn promote_side_session_inner(
         return Err("无效的会话 ID".into());
     }
     let owner = sidechat::SideSessionOwner { engine: engine.clone(), workspace_path, parent_session_id };
-    sidechat::validate_session_owner(&owner, sid, Some(&state.db))?;
-    if state.processes.get(sid).is_some() { return Err("Stop Sidechat before promoting it".into()); }
-    sidechat::unregister_hidden_session(&engine, sid, Some(&state.db));
-    Ok(())
+    sidechat::validate_session_owner(&owner, sid, Some(db))?;
+    if processes.get(sid).is_some() { return Err("Stop Sidechat before promoting it".into()); }
+    crate::history::scanner::index_side_session(db, &engine, sid, &owner.workspace_path)?;
+    // A writer may have started while history was being read. Never unhide it
+    // merely because the earlier preflight saw an idle session.
+    if processes.get(sid).is_some() { return Err("Stop Sidechat before promoting it".into()); }
+    sidechat::promote_hidden_session(&owner, sid, db)
 }
 
 #[tauri::command]
-pub fn promote_side_session(
+pub async fn promote_side_session(
     state: tauri::State<'_, crate::AppState>,
     engine: String,
     session_id: String,
     workspace_path: String,
     parent_session_id: Option<String>,
 ) -> Result<(), String> {
-    promote_side_session_inner(&state, engine, session_id, workspace_path, parent_session_id)
+    let db = Arc::clone(&state.db);
+    let processes = Arc::clone(&state.processes);
+    tauri::async_runtime::spawn_blocking(move || {
+        promote_side_session_blocking(&db, &processes, engine, session_id, workspace_path, parent_session_id)
+    }).await.map_err(|e| e.to_string())?
 }
 /// Async + spawn_blocking: the kill waits for the Windows tree walk to
 /// finish (see `kill_process_group`), and a synchronous command would hold
@@ -4287,7 +4309,7 @@ mod plan_respond_tests {
     use std::sync::{Arc, Mutex};
     use tauri::Manager;
 
-    fn build_state(tag: &str) -> (tauri::App<tauri::test::MockRuntime>, Arc<crate::db::Db>) {
+    pub(super) fn build_state(tag: &str) -> (tauri::App<tauri::test::MockRuntime>, Arc<crate::db::Db>) {
         let app = tauri::test::mock_builder()
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .unwrap();
@@ -4614,5 +4636,239 @@ mod plan_respond_tests {
         assert!(message.contains("expired"), "{message}");
         let expired = plan_review::get_review(&db, "plan-d", 1).unwrap().unwrap();
         assert_eq!(expired.status, plan_review::PlanStatus::Expired);
+    }
+}
+
+#[cfg(test)]
+mod sidechat_promotion_tests {
+    use super::*;
+    use tauri::Manager;
+
+    struct SidechatHomeGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl SidechatHomeGuard {
+        fn set(home: &std::path::Path) -> Self {
+            let mut previous = Vec::new();
+            for key in ["HOME", "USERPROFILE", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "CURSOR_CONFIG_DIR", "ANTIGRAVITY_HOME"] {
+                previous.push((key, std::env::var_os(key)));
+                std::env::set_var(key, home);
+            }
+            Self(previous)
+        }
+    }
+    impl Drop for SidechatHomeGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.0.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sidechat_promotion_indexes_hidden_history_before_success() {
+        let _env_lock = crate::paths::HOME_ENV_LOCK.lock();
+        let home = std::env::temp_dir().join(format!("ccgui-promote-{}", uuid::Uuid::new_v4()));
+        let workspace = home.join("ws").to_string_lossy().to_string();
+        let project = home.join("projects").join(crate::history::claude_encode_project_path(&workspace));
+        std::fs::create_dir_all(&project).unwrap();
+        let _home_guard = SidechatHomeGuard::set(&home);
+        let (app, db) = super::plan_respond_tests::build_state("sidechat-index");
+        db.0.lock().execute("INSERT INTO workspaces(id,path,name) VALUES('sidechat',?1,'test')", [&workspace]).unwrap();
+        let sid = uuid::Uuid::new_v4().to_string();
+        let parent = uuid::Uuid::new_v4().to_string();
+        let transcript = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"侧聊 👋\"}}\n";
+        std::fs::write(project.join(format!("{parent}.jsonl")), transcript).unwrap();
+        std::fs::write(project.join(format!("{sid}.jsonl")), transcript).unwrap();
+        let run = format!("sidechat-{}", uuid::Uuid::new_v4());
+        let owner = sidechat::SideSessionOwner { engine: "claude".into(), workspace_path: workspace.clone(), parent_session_id: Some(parent.clone()) };
+        sidechat::begin_run(&run, owner, None, true).unwrap();
+        sidechat::register_owned_session(&run, &sid, Some(&db)).unwrap();
+        sidechat::finish_run(&run);
+        crate::history::scanner::scan_with(&db, || {}).unwrap();
+        assert!(crate::history::reader::find_session_file_path(&db, "claude", &sid).unwrap().is_none());
+        let signature: String = db.0.lock().query_row("SELECT value FROM meta WHERE key='stat_signature'", [], |r| r.get(0)).unwrap();
+        promote_side_session_inner(&app.state(), "claude".into(), sid.clone(), workspace, Some(parent)).unwrap();
+        assert_eq!(crate::history::reader::find_session_file_path(&db, "claude", &sid).unwrap(), Some(project.join(format!("{sid}.jsonl"))));
+        assert!(crate::history::reader::list_sessions_from(&db).unwrap().iter().any(|s| s.session_id == sid));
+        let after: String = db.0.lock().query_row("SELECT value FROM meta WHERE key='stat_signature'", [], |r| r.get(0)).unwrap();
+        assert_eq!(signature, after);
+    }
+
+    #[test]
+    fn sidechat_promotion_without_history_preserves_ownership() {
+        let _env_lock = crate::paths::HOME_ENV_LOCK.lock();
+        let home = std::env::temp_dir().join(format!("ccgui-promote-missing-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home).unwrap();
+        let _home_guard = SidechatHomeGuard::set(&home);
+        let (app, db) = super::plan_respond_tests::build_state("sidechat-missing");
+        let sid = uuid::Uuid::new_v4().to_string();
+        let run = format!("sidechat-{}", uuid::Uuid::new_v4());
+        let owner = sidechat::SideSessionOwner { engine: "claude".into(), workspace_path: home.to_string_lossy().to_string(), parent_session_id: None };
+        sidechat::begin_run(&run, owner.clone(), None, true).unwrap();
+        sidechat::register_owned_session(&run, &sid, Some(&db)).unwrap();
+        sidechat::finish_run(&run);
+        assert!(promote_side_session_inner(&app.state(), "claude".into(), sid.clone(), owner.workspace_path.clone(), None).is_err());
+        assert!(sidechat::validate_session_owner(&owner, &sid, Some(&db)).is_ok());
+        sidechat::unregister_hidden_session("claude", &sid, Some(&db));
+    }
+
+    fn own_codex(db: &Arc<crate::db::Db>, home: &std::path::Path) -> (String, sidechat::SideSessionOwner, PathBuf) {
+        let sid = uuid::Uuid::new_v4().to_string();
+        let parent = uuid::Uuid::new_v4().to_string();
+        let workspace = home.join("workspace").to_string_lossy().to_string();
+        std::fs::create_dir_all(home.join("sessions")).unwrap();
+        let path = home.join("sessions").join(format!("rollout-2026-10-20-{sid}.jsonl"));
+        let transcript = |id: &str| format!("{}\n{}\n",
+            serde_json::json!({"type":"session_meta","payload":{"id":id,"cwd":workspace,"source":"cli"}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"侧聊 👋"}]}}));
+        std::fs::write(&path, transcript(&sid)).unwrap();
+        std::fs::write(home.join("sessions").join(format!("rollout-2026-10-20-{parent}.jsonl")), transcript(&parent)).unwrap();
+        db.0.lock().execute("INSERT INTO workspaces(id,path,name) VALUES('codex',?1,'test')", [&workspace]).unwrap();
+        let owner = sidechat::SideSessionOwner { engine: "codex".into(), workspace_path: workspace, parent_session_id: Some(parent) };
+        let run = format!("sidechat-{}", uuid::Uuid::new_v4());
+        sidechat::begin_run(&run, owner.clone(), None, true).unwrap();
+        sidechat::register_owned_session(&run, &sid, Some(db)).unwrap();
+        sidechat::finish_run(&run);
+        (sid, owner, path)
+    }
+
+    #[test]
+    fn sidechat_promotion_codex_indexes_unchanged_hidden_rollout_and_recovers_old_unhide() {
+        let _env_lock = crate::paths::HOME_ENV_LOCK.lock();
+        let home = std::env::temp_dir().join(format!("ccgui-promote-codex-{}", uuid::Uuid::new_v4()));
+        let _home_guard = SidechatHomeGuard::set(&home);
+        let (app, db) = super::plan_respond_tests::build_state("sidechat-codex");
+        let (sid, owner, path) = own_codex(&db, &home);
+        crate::history::scanner::scan_with(&db, || {}).unwrap();
+        assert!(crate::history::reader::find_session_file_path(&db, "codex", &sid).unwrap().is_none());
+        let signature: String = db.0.lock().query_row("SELECT value FROM meta WHERE key='stat_signature'", [], |r| r.get(0)).unwrap();
+        assert_eq!(crate::history::scanner::scan_with(&db, || {}).unwrap().reparsed, 0);
+        promote_side_session_inner(&app.state(), "codex".into(), sid.clone(), owner.workspace_path.clone(), owner.parent_session_id.clone()).unwrap();
+        assert_eq!(crate::history::reader::find_session_file_path(&db, "codex", &sid).unwrap(), Some(path.clone()));
+        let after: String = db.0.lock().query_row("SELECT value FROM meta WHERE key='stat_signature'", [], |r| r.get(0)).unwrap();
+        assert_eq!(signature, after, "targeted indexing must not advance the global scan");
+        // Model the previous version's successful unhide without an index row.
+        db.0.lock().execute("DELETE FROM sessions WHERE engine='codex' AND session_id=?1", [&sid]).unwrap();
+        crate::history::scanner::scan_with(&db, || {}).unwrap();
+        assert_eq!(crate::history::reader::find_session_file_path(&db, "codex", &sid).unwrap(), Some(path));
+        assert!(crate::history::reader::list_sessions_from(&db).unwrap().iter().any(|s| s.session_id == sid));
+    }
+
+    #[test]
+    fn sidechat_promotion_rejects_active_wrong_owner_and_failed_index_without_unhiding() {
+        let _env_lock = crate::paths::HOME_ENV_LOCK.lock();
+        let home = std::env::temp_dir().join(format!("ccgui-promote-failures-{}", uuid::Uuid::new_v4()));
+        let _home_guard = SidechatHomeGuard::set(&home);
+        let (app, db) = super::plan_respond_tests::build_state("sidechat-failures");
+        let (sid, owner, path) = own_codex(&db, &home);
+        let promote = || promote_side_session_inner(&app.state(), "codex".into(), sid.clone(), owner.workspace_path.clone(), owner.parent_session_id.clone());
+        assert!(promote_side_session_inner(&app.state(), "codex".into(), sid.clone(), "wrong-workspace".into(), owner.parent_session_id.clone()).is_err());
+        assert!(promote_side_session_inner(&app.state(), "codex".into(), sid.clone(), owner.workspace_path.clone(), None).is_err());
+        let state = app.state::<crate::AppState>();
+        state.processes.0.lock().unwrap().insert(sid.clone(), ChildEntry::worker_proxy("sidechat-active", 1));
+        assert_eq!(promote().unwrap_err(), "Stop Sidechat before promoting it");
+        state.processes.remove_if_pid(&sid, 1);
+        assert!(crate::history::reader::find_session_file_path(&db, "codex", &sid).unwrap().is_none());
+        db.0.lock().execute_batch("CREATE TRIGGER reject_sidechat_index BEFORE INSERT ON sessions BEGIN SELECT RAISE(ABORT,'index rejected'); END;").unwrap();
+        assert!(promote().unwrap_err().contains("index rejected"));
+        assert!(sidechat::validate_session_owner(&owner, &sid, Some(&db)).is_ok());
+        db.0.lock().execute_batch("DROP TRIGGER reject_sidechat_index;").unwrap();
+        let original = std::fs::read(&path).unwrap();
+        std::fs::write(&path, format!("{}\nnot-json\n", serde_json::json!({"type":"session_meta","payload":{"id":sid,"cwd":owner.workspace_path}}))).unwrap();
+        assert!(promote().unwrap_err().contains("no readable messages"));
+        assert!(sidechat::validate_session_owner(&owner, &sid, Some(&db)).is_ok());
+        std::fs::write(&path, original).unwrap();
+        // Fail the second metadata write: the first must roll back too.
+        let hidden_before: String = db.0.lock().query_row("SELECT value FROM meta WHERE key='hidden_side_sessions'", [], |r| r.get(0)).unwrap();
+        db.0.lock().execute_batch("CREATE TRIGGER reject_sidechat_owners BEFORE UPDATE ON meta WHEN NEW.key='side_session_owners' BEGIN SELECT RAISE(ABORT,'owners rejected'); END;").unwrap();
+        assert!(promote().unwrap_err().contains("owners rejected"));
+        assert!(sidechat::validate_session_owner(&owner, &sid, Some(&db)).is_ok());
+        let hidden_after: String = db.0.lock().query_row("SELECT value FROM meta WHERE key='hidden_side_sessions'", [], |r| r.get(0)).unwrap();
+        assert_eq!(hidden_before, hidden_after);
+        db.0.lock().execute_batch("DROP TRIGGER reject_sidechat_owners;").unwrap();
+        promote().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod cursor_model_admission_tests {
+    use super::*;
+
+    struct ModelHome(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl Drop for ModelHome {
+        fn drop(&mut self) {
+            for (key, previous) in self.0.drain(..) {
+                if let Some(value) = previous { std::env::set_var(key, value); }
+                else { std::env::remove_var(key); }
+            }
+        }
+    }
+    fn model_home() -> ModelHome {
+        let root = std::env::temp_dir().join(format!("ccgui-cursor-admission-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join(".ccgui-next")).unwrap();
+        let previous = ["HOME", "USERPROFILE", "CURSOR_CONFIG_DIR"].into_iter().map(|key| {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, &root);
+            (key, previous)
+        }).collect();
+        ModelHome(previous)
+    }
+    fn save(policy: Value) {
+        std::fs::write(crate::paths::settings_path(), serde_json::json!({
+            "defaultModels": {"cursor": "grok-4.7"}, "leaderAllowedModels": policy,
+        }).to_string()).unwrap();
+    }
+    fn launch(model: Option<&str>) -> Result<Launch, String> {
+        prepare_launch("cursor", "C:/fixture", None, "test".into(), None,
+            model.map(str::to_owned), None, None, vec![], None, None, None, false, None, None)
+    }
+
+    #[test]
+    fn cursor_models_require_saved_checkmarks_even_for_the_default() {
+        let _lock = crate::paths::HOME_ENV_LOCK.lock();
+        let _home = model_home();
+        for policy in [serde_json::json!({}), serde_json::json!({"cursor":null}), serde_json::json!({"cursor":[]})] {
+            save(policy);
+            assert!(launch(None).is_err(), "an engine default cannot grant model access");
+            assert!(launch(Some("grok-4.7")).is_err(), "an explicit request cannot grant model access");
+        }
+        save(serde_json::json!({"cursor":["auto","default"]}));
+        assert!(launch(Some("auto")).is_err(), "automatic routing is not a selected concrete model");
+        assert!(launch(Some("default")).is_err());
+    }
+
+    #[test]
+    fn cursor_models_accept_only_saved_choices_and_recheck_after_unchecking() {
+        let _lock = crate::paths::HOME_ENV_LOCK.lock();
+        let _home = model_home();
+        save(serde_json::json!({"cursor":["grok-4.7"]}));
+        assert_eq!(launch(None).unwrap().req.model.as_deref(), Some("grok-4.7"));
+        assert!(launch(Some("grok-4.7")).is_ok());
+        assert!(launch(Some("gemini-4-argon")).is_err());
+        let config = cursor::cursor_home().join("cli-config.json");
+        std::fs::write(&config, "{}").unwrap();
+        let with_parameters = "grok-4.7\u{1e}{\"context\":\"500k\"}";
+        assert_eq!(launch(Some(with_parameters)).unwrap().req.model.as_deref(), Some(with_parameters));
+        let before = std::fs::read(&config).unwrap();
+        assert!(launch(Some("gemini-4-argon\u{1e}{}")).is_err());
+        assert_eq!(std::fs::read(&config).unwrap(), before, "a blocked model must not rewrite the CLI selection");
+        save(serde_json::json!({"cursor":[]}));
+        assert!(launch(Some("grok-4.7")).is_err(), "the next send must read the saved checkmarks again");
+    }
+
+    #[tokio::test]
+    async fn cursor_models_also_gate_handoff_side_calls_before_launch() {
+        let _lock = crate::paths::HOME_ENV_LOCK.lock();
+        let _home = model_home();
+        // A regressed gate must never run the real Cursor CLI in this test.
+        std::fs::write(crate::paths::settings_path(), serde_json::json!({
+            "cursorBin": std::env::current_exe().unwrap(),
+            "leaderAllowedModels": {"cursor":["grok-4.7"]},
+        }).to_string()).unwrap();
+        let result = side_call::cursor_text_call("gemini-4-argon", "fixture", std::time::Duration::from_secs(2)).await;
+        assert_eq!(result.unwrap_err(), side_call::SideCallError::Unavailable);
+        assert!(!crate::paths::app_home().join("side-call").exists());
     }
 }

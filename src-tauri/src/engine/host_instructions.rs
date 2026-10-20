@@ -10,8 +10,9 @@ const CHAT_PRESENTATION: &str = include_str!("../../../src/features/interactive-
 /// Engines whose ordinary chat renderer supports this protocol; keep aligned
 /// with `supportsInteractiveAnswer` in the interactive-answer frontend. Compose
 /// with the existing role context: Codex keeps configured developer
-/// instructions, Claude appends it to the system prompt.
-const PRESENTATION_ENGINES: [&str; 2] = ["codex", "claude"];
+/// instructions, Claude appends it to the system prompt, and AGY loads it from
+/// its per-run host plugin rules.
+const PRESENTATION_ENGINES: [&str; 3] = ["codex", "claude", "agy"];
 
 pub(super) fn with_chat_presentation(engine: &str, ordinary_chat: bool, role: Option<String>) -> Option<String> {
     if !ordinary_chat || !PRESENTATION_ENGINES.contains(&engine) { return role; }
@@ -83,11 +84,15 @@ mod tests {
 
     #[test]
     fn presentation_context_is_scoped_and_preserves_role_guidance() {
-        for engine in ["agy", "cursor", "gemini"] {
+        for engine in ["cursor", "gemini"] {
             assert_eq!(with_chat_presentation(engine, true, Some("role".into())), Some("role".into()));
         }
-        assert_eq!(with_chat_presentation("codex", false, Some("role".into())), Some("role".into()));
-        assert_eq!(with_chat_presentation("claude", false, None), None);
+        for engine in PRESENTATION_ENGINES {
+            assert_eq!(with_chat_presentation(engine, false, Some("role".into())), Some("role".into()));
+            assert_eq!(with_chat_presentation(engine, false, None), None);
+            assert_eq!(with_chat_presentation(engine, true, None), Some(CHAT_PRESENTATION.into()));
+            assert_eq!(with_chat_presentation(engine, true, Some("role".into())), Some(format!("role\n\n{CHAT_PRESENTATION}")));
+        }
         assert_eq!(with_chat_presentation("claude", true, Some("Leader".into())).unwrap(),
             format!("Leader
 

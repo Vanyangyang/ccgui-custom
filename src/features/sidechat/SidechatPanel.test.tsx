@@ -2,12 +2,16 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import i18n from "@/lib/i18n";
+import { ipc } from "@/lib/ipc";
 import { SidechatPanel } from "./SidechatPanel";
 import { useSidechatStore } from "./store";
 import { SIDECHAT_WIDTH_KEY } from "./use-sidechat-resize";
 
-vi.mock("@/lib/ipc", () => ({ ipc: {} }));
-vi.mock("@/features/chat/store", () => ({ useChatStore: Object.assign((selector: (state: { engines: unknown[] }) => unknown) => selector({ engines: [] }), { getState: vi.fn() }) }));
+const chat = vi.hoisted(() => ({
+  refreshSessions: vi.fn(), selectSession: vi.fn(), setState: vi.fn(),
+}));
+vi.mock("@/lib/ipc", () => ({ ipc: { promoteSideSession: vi.fn() } }));
+vi.mock("@/features/chat/store", () => ({ useChatStore: Object.assign((selector: (state: { engines: unknown[] }) => unknown) => selector({ engines: [] }), { getState: () => chat, setState: chat.setState }) }));
 vi.mock("./launch", () => ({ resolveSideLaunch: vi.fn() }));
 vi.mock("./insert-answer", () => ({ insertSideAnswer: vi.fn() }));
 
@@ -21,6 +25,10 @@ describe("Sidechat panel resize integration", () => {
     sessionKey, engine: "codex", workspacePath: "C:/fixture", parentSessionId: "resize-parent",
   });
   beforeEach(() => {
+    vi.clearAllMocks();
+    chat.refreshSessions.mockResolvedValue(undefined);
+    chat.selectSession.mockResolvedValue(undefined);
+    vi.mocked(ipc.promoteSideSession).mockResolvedValue(undefined);
     localStorage.clear();
     useSidechatStore.setState({ sidechatBySession: {}, btwBySession: {} });
     vi.stubGlobal("ResizeObserver", class { observe() {} unobserve() {} disconnect() {} });
@@ -86,6 +94,72 @@ describe("Sidechat panel resize integration", () => {
     } } })));
     expect(container.querySelector("[data-side-run-status]")).toBeNull();
     expect(container.querySelector('[role="alert"]')?.textContent).toBe("connection lost");
+  });
+
+  it("explains why promotion is unavailable before a native session exists or while running", async () => {
+    await i18n.changeLanguage("zh");
+    await open();
+    await act(async () => root.render(<SidechatPanel active={null} sessionKey={sessionKey} />));
+    const button = () => container.querySelector<HTMLButtonElement>('button[aria-label="转为独立对话"]')!;
+    expect(button().disabled).toBe(true);
+    expect(button().title).toBe("旁聊取得可恢复的会话后才能转为独立对话。");
+    await act(async () => useSidechatStore.setState((s) => ({ sidechatBySession: { [sessionKey]: {
+      ...s.sidechatBySession[sessionKey], sideSessionId: "side-ready", streaming: true,
+    } } })));
+    expect(button().disabled).toBe(true);
+    expect(button().title).toBe("请先等待旁聊结束或停止，再转为独立对话。");
+    expect(ipc.promoteSideSession).not.toHaveBeenCalled();
+  });
+
+  async function renderPromotable() {
+    await i18n.changeLanguage("zh");
+    await open();
+    useSidechatStore.setState((s) => ({ sidechatBySession: { [sessionKey]: {
+      ...s.sidechatBySession[sessionKey], sideSessionId: "side-ready",
+      messages: [{ seq: 1, role: "user", text: "保留旁聊 中文🙂", ts: null }],
+    } } }));
+    await act(async () => root.render(<SidechatPanel active={null} sessionKey={sessionKey} />));
+    return container.querySelector<HTMLButtonElement>('button[aria-label="转为独立对话"]')!;
+  }
+
+  it("waits for promotion, prevents repeated clicks and opens the indexed conversation", async () => {
+    let finish!: () => void;
+    vi.mocked(ipc.promoteSideSession).mockImplementationOnce(() => new Promise<void>((resolve) => { finish = resolve; }));
+    const button = await renderPromotable();
+    await act(async () => button.click());
+    try {
+      expect(button.disabled).toBe(true);
+      expect(button.title).toBe("正在转为独立对话…");
+      expect(chat.selectSession).not.toHaveBeenCalled();
+      expect(container.textContent).toContain("保留旁聊 中文🙂");
+      await act(async () => button.click());
+      expect(ipc.promoteSideSession).toHaveBeenCalledTimes(1);
+    } finally {
+      await act(async () => finish());
+    }
+    expect(ipc.promoteSideSession).toHaveBeenCalledWith("codex", "side-ready", "C:/fixture", "resize-parent");
+    expect(chat.refreshSessions).toHaveBeenCalledTimes(1);
+    expect(chat.selectSession).toHaveBeenCalledWith("codex", "side-ready", "C:/fixture");
+    expect(container.querySelector("aside")).toBeNull();
+  });
+
+  it("keeps the branch visible and allows retry when native indexing fails", async () => {
+    const button = await renderPromotable();
+    vi.mocked(ipc.promoteSideSession).mockRejectedValueOnce(new Error("Sidechat history is not available yet"));
+    await act(async () => button.click());
+    expect(container.textContent).toContain("保留旁聊 中文🙂");
+    expect(container.querySelector('[role="alert"]')?.textContent).toBe("Sidechat history is not available yet");
+    expect(button.disabled).toBe(false);
+    expect(chat.selectSession).not.toHaveBeenCalled();
+    await act(async () => button.click());
+    expect(chat.selectSession).toHaveBeenCalledWith("codex", "side-ready", "C:/fixture");
+  });
+
+  it("reports tab-opening failures after native promotion instead of dropping the error", async () => {
+    const button = await renderPromotable();
+    chat.selectSession.mockRejectedValueOnce(new Error("tab unavailable"));
+    await act(async () => button.click());
+    expect(chat.setState).toHaveBeenCalledWith({ actionError: "tab unavailable" });
   });
 
   it.each([

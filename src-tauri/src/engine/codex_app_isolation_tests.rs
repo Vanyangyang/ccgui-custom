@@ -182,6 +182,11 @@ mod isolation_tests {
         teardown(&mut spawned.child).await;
         result.unwrap();
         assert_eq!(view.last_usage.as_ref().unwrap()["output_tokens"], 17);
+        assert_eq!(view.last_usage.as_ref().unwrap()["usage_scope"], "last_request");
+        assert_eq!(
+            view.turn_throughput,
+            Some(json!({ "output_tokens": 17, "elapsed_ms": 1000 }))
+        );
         let events = flushed(&core, &emitter);
         let text: Vec<_> = events.iter().filter(|(kind, _)| kind == "delta").map(|(_, data)| data.clone()).collect();
         assert_eq!(text, vec![json!("parent continues")]);
@@ -213,8 +218,97 @@ mod isolation_tests {
         teardown(&mut spawned.child).await;
         assert!(result.unwrap().is_none(), "the acknowledged parent already completed");
         assert_eq!(view.last_usage.as_ref().unwrap()["output_tokens"], 17);
+        assert_eq!(view.last_usage.as_ref().unwrap()["usage_scope"], "last_request");
+        assert_eq!(
+            view.turn_throughput,
+            Some(json!({ "output_tokens": 17, "elapsed_ms": 1000 }))
+        );
         let events = flushed(&core, &emitter);
         assert!(events.iter().any(|(kind, data)| kind == "delta" && data == "fast parent"));
         assert!(events.iter().any(|(kind, data)| kind == "throughput" && data["status"] == "complete" && data["outputTokens"] == 17));
+    }
+
+    #[tokio::test]
+    async fn settled_done_usage_keeps_last_occupancy_separate_from_verified_turn_throughput() {
+        // 【Codex多请求回归】last 请求输出 90、本轮累计输出 6000 / 300000ms 时，Done 载荷同时保留 last_request 占用与整轮吞吐统计。
+        let (core, _, emitter) = test_core();
+        let mut state = TurnState::new(Some("parent".into()));
+        let mut view = active_view();
+        view.throughput.begin("parent", true);
+        view.throughput.acknowledge(Some("parent-turn"));
+        route(&core, &mut state, &mut view, &json!({
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": "parent",
+                "turnId": "parent-turn",
+                "tokenUsage": {
+                    "total": { "outputTokens": 5910 },
+                    "last": { "inputTokens": 40_000, "cachedInputTokens": 32_000, "outputTokens": 1200, "totalTokens": 41_200 }
+                }
+            }
+        }));
+        route(&core, &mut state, &mut view, &json!({
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": "parent",
+                "turnId": "parent-turn",
+                "tokenUsage": {
+                    "total": { "outputTokens": 6000 },
+                    "last": { "inputTokens": 45_000, "cachedInputTokens": 36_000, "outputTokens": 90, "totalTokens": 45_090 }
+                }
+            }
+        }));
+        route(&core, &mut state, &mut view, &json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "parent",
+                "turn": { "id": "parent-turn", "status": "completed", "durationMs": 300_000 }
+            }
+        }));
+        let killed = Arc::new(AtomicBool::new(false));
+        settle(&core, &mut state, &mut view, Ok(()), &killed, 4_000_000_099, Some("parent".into())).await;
+        let events = flushed(&core, &emitter);
+        let done_usage = events.iter()
+            .find_map(|(kind, data)| (kind == "done").then(|| data["usage"].clone()))
+            .expect("done event with usage");
+        assert_eq!(done_usage["usage_scope"], json!("last_request"));
+        assert_eq!(done_usage["output_tokens"], json!(90));
+        assert_eq!(
+            done_usage["turn_throughput"],
+            json!({ "output_tokens": 6000, "elapsed_ms": 300_000 })
+        );
+
+        // 【Codex缺基线回归】恢复会话缺少基线时不附加 turn_throughput，避免伪造整轮效率。
+        let (core_missing, _, emitter_missing) = test_core();
+        let mut state_missing = TurnState::new(Some("parent".into()));
+        let mut view_missing = active_view();
+        view_missing.throughput.begin("parent", false);
+        view_missing.throughput.acknowledge(Some("parent-turn"));
+        route(&core_missing, &mut state_missing, &mut view_missing, &json!({
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": "parent",
+                "turnId": "parent-turn",
+                "tokenUsage": {
+                    "total": { "outputTokens": 6000 },
+                    "last": { "inputTokens": 45_000, "outputTokens": 90, "totalTokens": 45_090 }
+                }
+            }
+        }));
+        route(&core_missing, &mut state_missing, &mut view_missing, &json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "parent",
+                "turn": { "id": "parent-turn", "status": "completed", "durationMs": 300_000 }
+            }
+        }));
+        settle(&core_missing, &mut state_missing, &mut view_missing, Ok(()), &killed, 4_000_000_099, Some("parent".into())).await;
+        let missing_events = flushed(&core_missing, &emitter_missing);
+        let missing_usage = missing_events.iter()
+            .find_map(|(kind, data)| (kind == "done").then(|| data["usage"].clone()))
+            .expect("done event with usage");
+        assert_eq!(missing_usage["usage_scope"], json!("last_request"));
+        assert_eq!(missing_usage["output_tokens"], json!(90));
+        assert!(missing_usage.get("turn_throughput").is_none());
     }
 }

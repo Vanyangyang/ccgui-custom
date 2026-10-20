@@ -1002,7 +1002,7 @@ pub(super) async fn dispatch(
         }
         "promote_side_session" => {
             let a: SideSessionArgs = parse_args(&raw)?;
-            ser(crate::engine::promote_side_session(app.state(), a.engine, a.session_id, a.workspace_path, a.parent_session_id))
+            ser(crate::engine::promote_side_session(app.state(), a.engine, a.session_id, a.workspace_path, a.parent_session_id).await)
         }
         "runtime_worker_sources" => {
             let a:WorkerSourcesArgs = parse_args(&raw)?;

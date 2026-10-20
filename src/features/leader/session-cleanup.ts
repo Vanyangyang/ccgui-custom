@@ -1,3 +1,4 @@
+import { useCrossSessionActivityStore } from "@/features/chat/cross-session";
 import { useChatStore, sessionKey } from "@/features/chat/store";
 import { persistTabs } from "@/features/chat/store/persistence";
 import { activateChatTab } from "@/features/chat/store/tabs";
@@ -10,6 +11,9 @@ import type { LeaderBranch, LeaderIdentity } from "./types";
  * activated midway through group removal. Archive markers are reversible;
  * only actual deletion may create permanent event tombstones. */
 export function removeLeaderSessions(members: LeaderIdentity[], branches: LeaderBranch[], permanent: boolean) {
+  if (branches.length) {
+    useCrossSessionActivityStore.getState().removeRecords(branches.map((branch) => `leader:${branch.id}`));
+  }
   const keys = new Set(members.map((m) => sessionKey(m.engine, m.sessionId, m.workspacePath)));
   if (permanent) {
     for (const branch of branches) retireLeaderBranch(branch.id, branch.sessionId ? sessionKey(branch.engine, branch.sessionId, branch.workspacePath) : undefined);

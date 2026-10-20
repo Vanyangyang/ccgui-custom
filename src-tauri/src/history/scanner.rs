@@ -140,6 +140,60 @@ fn gather_candidates(workspaces: &[String]) -> Vec<Candidate> {
     candidates
 }
 
+/// Promotion needs an immediately readable index row, even while its history
+/// is hidden and the ordinary scan's file-stat signature has not changed.
+/// Never advance the global scan signature for this single-session operation.
+pub(crate) fn index_side_session(
+    db: &crate::db::Db,
+    engine: &str,
+    session_id: &str,
+    workspace_path: &str,
+) -> Result<(), String> {
+    let _guard = SCAN_LOCK.lock();
+    let workspace = Path::new(workspace_path);
+    let file = if engine == "codex" {
+        let suffix = format!("{session_id}.jsonl");
+        codex_candidates().into_iter().find_map(|path| {
+            let plain = super::codex_rollout::plain_path(&path);
+            let name = plain.file_name()?.to_str()?;
+            if name != suffix && !name.ends_with(&format!("-{suffix}")) {
+                return None;
+            }
+            let (id, cwd) = identify_head("codex", &path)?;
+            (id == session_id && Path::new(&cwd) == workspace).then_some(super::SessionFile {
+                engine: "codex", session_id: id, workspace_path: cwd, file_path: path,
+            })
+        })
+    } else {
+        let files = match engine {
+            "claude" => discover_claude(workspace),
+            "agy" => discover_agy(workspace),
+            "cursor" => discover_cursor(workspace),
+            _ => return Err("Unsupported Sidechat engine".into()),
+        };
+        files.into_iter().find(|file| file.session_id == session_id
+            && Path::new(&file.workspace_path) == workspace)
+    }.ok_or_else(|| format!("Sidechat history not found: {engine}/{session_id}"))?;
+    let (size, mtime_ms) = stat_signature(&file.file_path)
+        .ok_or_else(|| format!("Cannot read Sidechat history: {engine}/{session_id}"))?;
+    let summary = scan_summary_file(engine, &file.file_path)?;
+    // Summary readers intentionally tolerate malformed native records. An
+    // empty/invalid transcript must not become a successful but blank tab.
+    if summary.message_count == 0 {
+        return Err(format!("Sidechat history has no readable messages: {engine}/{session_id}"));
+    }
+    let row = PreparedUpsert {
+        engine: file.engine,
+        session_id: file.session_id,
+        workspace_path: file.workspace_path,
+        path_str: file.file_path.to_string_lossy().to_string(),
+        size,
+        mtime_ms,
+        summary,
+    };
+    upsert_rows(db, &[row], None)
+}
+
 /// Stat every candidate and fold (path, size, mtime) into one signature.
 fn stat_all(workspaces: &[String], candidates: &[Candidate]) -> (Vec<Option<(i64, i64)>>, String) {
     let mut signature_hasher = Sha256::new();
@@ -147,6 +201,13 @@ fn stat_all(workspaces: &[String], candidates: &[Candidate]) -> (Vec<Option<(i64
     signature_hasher.update(b"codex_home=");
     signature_hasher.update(crate::engine::codex_home().to_string_lossy().as_bytes());
     signature_hasher.update(b"|");
+    signature_hasher.update(b"sidechat_visibility_v1=");
+    for (engine, session_id) in crate::engine::sidechat::hidden_session_snapshot() {
+        signature_hasher.update(engine.as_bytes());
+        signature_hasher.update(b":");
+        signature_hasher.update(session_id.as_bytes());
+        signature_hasher.update(b"|");
+    }
     for w in workspaces {
         signature_hasher.update(w.as_bytes());
         signature_hasher.update(b"|");
@@ -459,7 +520,7 @@ fn prune_stale_sessions(db: &crate::db::Db) -> Result<bool, String> {
 
 /// Phase B (one lock, one transaction): upsert every prepared row, then
 /// record the signature that makes the next scan a short-circuit.
-fn upsert_rows(db: &crate::db::Db, rows: &[PreparedUpsert], tier1: &Tier1) -> Result<(), String> {
+fn upsert_rows(db: &crate::db::Db, rows: &[PreparedUpsert], tier1: Option<&Tier1>) -> Result<(), String> {
     let mut conn = db.0.lock();
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     for row in rows {
@@ -511,18 +572,20 @@ fn upsert_rows(db: &crate::db::Db, rows: &[PreparedUpsert], tier1: &Tier1) -> Re
         ).map_err(|e| e.to_string())?;
         super::prompt_cache::set(&tx, row.engine, &row.session_id, row.summary.prompt_cache.as_ref()).map_err(|e| e.to_string())?;
     }
-    tx.execute(
-        "INSERT INTO meta(key, value) VALUES('stat_signature', ?1)
-         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        rusqlite::params![tier1.signature],
-    )
-    .map_err(|e| e.to_string())?;
-    tx.execute(
-        "INSERT INTO meta(key, value) VALUES('title_version', ?1)
-         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        [TITLE_VERSION],
-    )
-    .map_err(|e| e.to_string())?;
+    if let Some(tier1) = tier1 {
+        tx.execute(
+            "INSERT INTO meta(key, value) VALUES('stat_signature', ?1)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            rusqlite::params![tier1.signature],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO meta(key, value) VALUES('title_version', ?1)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [TITLE_VERSION],
+        )
+        .map_err(|e| e.to_string())?;
+    }
     tx.commit().map_err(|e| e.to_string())
 }
 
@@ -587,7 +650,7 @@ fn scan_inner(
 
     // Phase B: the db lock is held only for the upsert transaction.
     let reparsed = rows.len();
-    upsert_rows(db, &rows, &tier1)?;
+    upsert_rows(db, &rows, Some(&tier1))?;
     prune_stale_sessions(db)?;
     super::codex_titles::sync(db)?;
     on_changed();
@@ -671,7 +734,7 @@ pub(super) mod tests {
         let (stats, stale) = prefetch_stat_keys(&db, tier.retitle_pending)?;
         let candidate = Candidate { engine: "claude", path: path.clone(), known_id: Some("cache".into()), known_workspace: Some("/ws".into()) };
         let row = prepare_candidate(&candidate, sig, &stats, &stale, &["/ws".into()]).unwrap();
-        upsert_rows(&db, &[row], &tier)?;
+        upsert_rows(&db, &[row], Some(&tier))?;
         let rows = super::super::reader::list_sessions_from(&db)?;
         let w = rows[0].prompt_cache.as_ref().unwrap();
         assert_eq!(w.ttl_seconds, 3600);
@@ -707,7 +770,7 @@ pub(super) mod tests {
         assert!(stale.contains(&path_str));
         let candidate = Candidate { engine: "cursor", path: path.clone(), known_id: Some("aux".into()), known_workspace: Some("/ws".into()) };
         let row = prepare_candidate(&candidate, sig, &stats, &stale, &["/ws".into()]).unwrap();
-        upsert_rows(&db, &[row], &tier)?;
+        upsert_rows(&db, &[row], Some(&tier))?;
         {
             let conn = db.0.lock();
             let saved: (String, i64, String) = conn.query_row("SELECT title,pinned,custom_title FROM sessions", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
@@ -722,7 +785,7 @@ pub(super) mod tests {
         // A meaningful automatic title is also user-visible state: keep it.
         db.0.lock().execute("UPDATE session_auto_titles SET title='合理自动标题'", []).unwrap();
         let row = prepare_candidate(&candidate, sig, &stats, &std::collections::HashSet::from([path_str]), &["/ws".into()]).unwrap();
-        upsert_rows(&db, &[row], &tier)?;
+        upsert_rows(&db, &[row], Some(&tier))?;
         assert_eq!(db.0.lock().query_row("SELECT title FROM session_auto_titles", [], |r| r.get::<_,String>(0)).unwrap(), "合理自动标题");
         db.0.lock().execute("DELETE FROM session_archives", []).unwrap();
         let sessions = super::super::reader::list_sessions_from(&db)?;
@@ -735,7 +798,7 @@ pub(super) mod tests {
         // Reclassification must clear persisted metadata, not retain the old mark.
         let mut ordinary = prepare_candidate(&candidate, sig, &stats, &std::collections::HashSet::from([path.to_string_lossy().to_string()]), &["/ws".into()]).unwrap();
         ordinary.summary.auxiliary_kind = None;
-        upsert_rows(&db, &[ordinary], &tier)?;
+        upsert_rows(&db, &[ordinary], Some(&tier))?;
         assert_eq!(super::super::reader::list_sessions_from(&db)?[0].auxiliary_kind, None);
         assert_eq!(db.plugin_kv_get(crate::db::session_auxiliary::NAMESPACE, "cursor:aux")?, None);
         std::fs::remove_dir_all(home).unwrap();

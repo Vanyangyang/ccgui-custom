@@ -962,6 +962,9 @@ fn leader_model_policy_list_preserves_metadata_and_response_budget() {
     let expected = encoded(&policy).unwrap();
     let response = f.manager.list_response(&f.manager.inner.lock(), &f.parent, policy).unwrap();
     assert_eq!(response["modelPolicy"], expected);
+    assert_eq!(response["modelPolicy"]["claude"]["configured"], true);
+    assert_eq!(response["modelPolicy"]["agy"]["configured"], false);
+    assert_eq!(response["modelPolicy"]["agy"]["defaultModel"], Value::Null);
     assert_eq!(response["branches"].as_array().unwrap().len(), 9);
     assert!(serde_json::to_vec(&response).unwrap().len() < MAX_TOOL_RESPONSE_BYTES);
     assert!(f.manager.inner.lock().branches.values().all(|record| record.branch.result.chars().count() == MAX_RESULT_CHARS));

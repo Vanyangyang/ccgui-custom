@@ -7,7 +7,7 @@ import budget from "../fixtures/interactive-answer/gpt-budget.md?raw";
 import { Button } from "../../src/components/base/buttons/button";
 
 const broken = '文字说明仍然保留。\n\n```ccgui-ui\nroot = Text(@OpenUrl("https://example.test"))\n```';
-const slider = '```ccgui-ui\nroot = Stack([Heading("餐饮预算", "lg"), Slider($people, "人数", 1, 50, 1, "人"), Metric("餐饮费用", $people * 120, "元"), Select($kind, "活动形式", ["室内", "户外"]), Toggle($extra, "包含交通"), Text($kind), Metric("交通费用", $extra ? 300 : 0, "元")])\n$people = 12\n$kind = "室内"\n$extra = false\n```';
+const slider = '```ccgui-ui\nroot = Stack([Heading("活动预算", "lg"), Text("演示假设：餐费每人120元，室内场地800元、户外1200元，交通300元。"), Slider($people, "人数", 1, 50, 1, "人"), Metric("餐饮费用", $people * 120, "元"), Select($kind, "活动形式", ["室内", "户外"]), Toggle($extra, "包含交通"), Metric("场地费用", venue, "元"), Metric("交通费用", transport, "元"), Metric("总预算", $people * 120 + venue + transport, "元")])\n$people = 12\n$kind = "室内"\n$extra = false\nvenue = $kind == "室内" ? 800 : 1200\ntransport = $extra ? 300 : 0\n```';
 
 function Fixture() {
   const [scenario, setScenario] = useState("gpt");
@@ -40,7 +40,7 @@ function Fixture() {
         </div>
       </header>
       {mounted && <Markdown text={source} workspacePath="/interactive-answer-fixture" streaming={replay !== null} interactive interactiveIdentity={`fixture-${scenario}`} />}
-      <p className="mt-8 text-caption-1-regular text-text-tertiary">参数在本页内保留；刷新后恢复初始值。这里验证界面，生产接入入口是 Codex 会话中的 /ui。</p>
+      <p className="mt-8 text-caption-1-regular text-text-tertiary">参数在本页内保留；刷新后恢复初始值。这里验证界面，正式使用可在 Codex、Claude 或 AGY 普通对话中自然语言提出，无需专用指令。</p>
     </div>
   </main>;
 }

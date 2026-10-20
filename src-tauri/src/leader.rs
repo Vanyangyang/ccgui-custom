@@ -1290,6 +1290,7 @@ impl LeaderManager {
             dirty: false,
         };
         record.branch.run_id = Some(run_id.clone());
+        record.branch.task = args.message.clone();
         record.branch.state = "starting".into();
         record.branch.updated_at = (self.clock)();
         record.branch.last_activity_at = record.branch.updated_at;

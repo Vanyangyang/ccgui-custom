@@ -5,7 +5,7 @@ const END = "\n</ccgui-interactive-answer-v1>";
  *  `ccgui-ui` fences; keep aligned with `PRESENTATION_ENGINES` in
  *  `src-tauri/src/engine/host_instructions.rs`. */
 export function supportsInteractiveAnswer(engine: string | undefined): boolean {
-  return engine === "codex" || engine === "claude";
+  return engine === "codex" || engine === "claude" || engine === "agy";
 }
 
 /** Instructions the retired `/ui` command appended to a request. Kept verbatim

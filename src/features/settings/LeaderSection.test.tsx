@@ -41,7 +41,7 @@ function mode(engine: string, value: PolicyMode) {
   if (!element) throw new Error(`missing ${engine} ${value} policy button`);
   return element;
 }
-function expectMode(engine: string, selected: PolicyMode) {
+function expectMode(engine: string, selected: PolicyMode | "unconfigured") {
   for (const value of Object.keys(MODE_KEYS) as PolicyMode[]) {
     expect(mode(engine, value).getAttribute("aria-pressed")).toBe(String(value === selected));
   }
@@ -74,51 +74,118 @@ afterEach(() => { if (!unmounted) unmount(); container.remove(); vi.useRealTimer
 
 describe("LeaderSection", () => {
   it("treats null as unrestricted without changing another engine's disabled policy", async () => {
-    stored = makeSettings({ leaderAllowedModels: { claude: null, agy: [] } as unknown as AppSettings["leaderAllowedModels"] });
+    stored = makeSettings({ leaderAllowedModels: { claude: null, agy: [] } });
     await render();
     expectMode("claude", "unrestricted");
     expectMode("agy", "disabled");
     expect(updateAppSettings).not.toHaveBeenCalled();
-    await click(mode("cursor", "disabled")); await save();
-    expect(stored.leaderAllowedModels).toEqual({ claude: null, agy: [], cursor: [] });
+    await click(mode("codex", "disabled")); await save();
+    expect(stored.leaderAllowedModels).toEqual({ claude: null, agy: [], codex: [] });
   });
-  it("preserves Cursor's exact models through restricted, disabled and unrestricted policies", async () => {
+  it("saves and restores Cursor checkboxes without implicitly selecting defaults or catalog models", async () => {
+    stored = makeSettings({ defaultModels: { cursor: "gemini-3.8-flash" } });
     listEngineModels.mockImplementation(async (engine: string) => catalog(engine === "cursor" ? ["gemini-3.8-flash", "claude-opus-5-5"] : ["other-model"]));
     await render();
     expect(listEngineModels).toHaveBeenCalledWith("cursor");
-    expectMode("cursor", "unrestricted");
-    await click(mode("cursor", "restricted"));
+    expect(() => mode("cursor", "unrestricted")).toThrow("missing cursor");
+    expect(choice("gemini-3.8-flash").checked).toBe(false);
+    expect(choice("claude-opus-5-5").checked).toBe(false);
+    expect(button(i18n.t("common.save")).disabled).toBe(true);
     await click(choice("claude-opus-5-5")); await save();
-    expect(stored.leaderAllowedModels?.cursor).toEqual(["gemini-3.8-flash", "claude-opus-5-5"]);
-    await click(mode("cursor", "disabled")); await save();
+    expect(stored.leaderAllowedModels?.cursor).toEqual(["claude-opus-5-5"]);
+    unmount(); root = createRoot(container); unmounted = false;
+    await render();
+    expect(choice("claude-opus-5-5").checked).toBe(true);
+    expect(choice("gemini-3.8-flash").checked).toBe(false);
+    await click(choice("claude-opus-5-5"));
+    expect(button(i18n.t("common.save")).disabled).toBe(false);
+    await save();
     expect(stored.leaderAllowedModels?.cursor).toEqual([]);
-    await click(mode("cursor", "unrestricted")); await save();
-    expect(stored.leaderAllowedModels).toEqual({});
+    expect(choice("claude-opus-5-5").checked).toBe(false);
+  });
+  it.each([undefined, null, []])("shows Cursor %j policy as empty without changing it on another engine save", async (cursor) => {
+    stored = makeSettings({ leaderAllowedModels: cursor === undefined ? {} : { cursor } });
+    listEngineModels.mockImplementation(async (engine: string) => catalog(engine === "cursor" ? ["cursor-model"] : []));
+    await render();
+    expect(choice("cursor-model").checked).toBe(false);
+    expect(choice("cursor-model").disabled).toBe(false);
+    expect(container.textContent).toContain(i18n.t("settings.leaderCursorModelsNote"));
+    await click(mode("codex", "disabled")); await save();
+    expect(stored.leaderAllowedModels?.cursor).toEqual(cursor);
+  });
+  it("preserves Cursor draft on save failure and merges only its changed list", async () => {
+    stored = makeSettings({ leaderAllowedModels: { cursor: ["saved-cursor"], claude: ["old"] } });
+    await render();
+    await click(choice("saved-cursor"));
+    updateAppSettings.mockRejectedValueOnce(new Error("write failed"));
+    await save();
+    expect(choice("saved-cursor").checked).toBe(false);
+    expect(container.textContent).toContain("write failed");
+    expect(container.textContent).not.toContain(i18n.t("settings.leaderSaved"));
+    stored = { ...stored, theme: "dark", leaderAllowedModels: { ...stored.leaderAllowedModels, claude: ["concurrent"] } };
+    await save();
+    expect(stored.theme).toBe("dark");
+    expect(stored.leaderAllowedModels).toEqual({ cursor: [], claude: ["concurrent"] });
+  });
+  it("excludes Cursor auto/default aliases from saved selections and catalog choices", async () => {
+    stored = makeSettings({
+      defaultModels: { cursor: "Auto" },
+      leaderAllowedModels: { cursor: ["AUTO", " default ", "cursor-model"], claude: ["auto"] },
+    });
+    listEngineModels.mockImplementation(async (engine: string) => catalog(engine === "cursor"
+      ? ["auto", "DEFAULT", "cursor-model", "cursor-new"] : []));
+    await render();
+    const cursorChoices = [...container.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')]
+      .filter((input) => input.getAttribute("aria-label")?.startsWith(`${CLI_DISPLAY_NAMES.cursor}: `));
+    expect(cursorChoices.map((input) => input.getAttribute("aria-label"))).toEqual([
+      `${CLI_DISPLAY_NAMES.cursor}: cursor-model`, `${CLI_DISPLAY_NAMES.cursor}: cursor-new`,
+    ]);
+    expect(choice("cursor-model").checked).toBe(true);
+    expect(choice("auto").checked).toBe(true); // Other engines keep their existing semantics.
+    await click(choice("cursor-new")); await save();
+    expect(stored.leaderAllowedModels).toEqual({ cursor: ["cursor-model", "cursor-new"], claude: ["auto"] });
+  });
+  it("does not select Cursor models when the catalog arrives after editing", async () => {
+    stored = makeSettings({ defaultModels: { cursor: "cursor-default" } });
+    const models = deferred<EngineCatalog>();
+    listEngineModels.mockImplementation(async (engine: string) => engine === "cursor" ? models.promise : catalog([]));
+    await render();
+    expect(choice("cursor-default").checked).toBe(false);
+    await click(choice("cursor-default"));
+    await act(async () => models.resolve(catalog(["cursor-new"])));
+    expect(choice("cursor-new").checked).toBe(false);
+    expect(choice("cursor-default").checked).toBe(true);
+    await save();
+    expect(stored.leaderAllowedModels?.cursor).toEqual(["cursor-default"]);
   });
   it("loads and saves AGY model restrictions independently, including exact effort variants", async () => {
     await render();
     expect(listEngineModels).toHaveBeenCalledWith("agy");
-    expectMode("agy", "unrestricted");
+    expectMode("agy", "unconfigured");
     await click(mode("agy", "restricted"));
     expect(choice("gemini-3.8-flash-high").checked).toBe(true);
     await click(choice("claude-opus-4-6"));
     await save();
     expect(stored.leaderAllowedModels).toEqual({ agy: ["gemini-3.8-flash-high", "claude-opus-4-6"] });
-    expectMode("claude", "unrestricted");
-    expectMode("codex", "unrestricted");
+    expectMode("claude", "unconfigured");
+    expectMode("codex", "unconfigured");
     await click(mode("agy", "disabled")); await save();
     expect(stored.leaderAllowedModels?.agy).toEqual([]);
     await click(mode("agy", "unrestricted")); await save();
-    expect(stored.leaderAllowedModels).toEqual({});
+    expect(stored.leaderAllowedModels).toEqual({ agy: null });
   });
-  it("defaults to unrestricted without writing and selects each engine mode independently", async () => {
+  it("defaults to unconfigured without writing and selects each engine mode independently", async () => {
     await render();
-    expectMode("claude", "unrestricted");
-    expectMode("codex", "unrestricted");
+    expectMode("claude", "unconfigured");
+    expectMode("codex", "unconfigured");
+    expect(container.textContent).toContain(i18n.t("settings.leaderModeUnconfiguredNote"));
+    expect(button(i18n.t("common.save")).disabled).toBe(true);
+    await save();
+    expect(updateAppSettings).not.toHaveBeenCalled();
     await click(mode("claude", "restricted"));
     expectMode("claude", "restricted");
     expect(choice("default-claude").checked).toBe(true);
-    expectMode("codex", "unrestricted");
+    expectMode("codex", "unconfigured");
     await click(mode("codex", "restricted"));
     expect(choice("codex-first").checked).toBe(true);
     await click(mode("codex", "disabled"));
@@ -153,7 +220,7 @@ describe("LeaderSection", () => {
     stored = makeSettings({ leaderAllowedModels: { claude: [] } });
     await render();
     expectMode("claude", "disabled");
-    expectMode("codex", "unrestricted");
+    expectMode("codex", "unconfigured");
     await click(mode("codex", "disabled")); await save();
     expect(stored.leaderAllowedModels).toEqual({ claude: [], codex: [] });
     expectMode("claude", "disabled");
@@ -204,7 +271,7 @@ describe("LeaderSection", () => {
     expect(stored.leaderAllowedModels).toEqual({ codex: [] });
     await act(async () => models.resolve(catalog(["late-model"])));
     expectMode("codex", "disabled");
-    expectMode("claude", "unrestricted");
+    expectMode("claude", "unconfigured");
     expect(button(i18n.t("common.save")).disabled).toBe(true);
   });
 
@@ -263,10 +330,13 @@ describe("LeaderSection", () => {
     expect(container.textContent).toContain(i18n.t("settings.leaderSaved"));
   });
 
-  it("removes the engine key when unrestricted is saved", async () => {
+  it("saves explicit null for unrestricted and leaves untouched unconfigured engines absent", async () => {
     stored = makeSettings({ leaderAllowedModels: { claude: ["default-claude"], codex: [] } });
     await render(); await click(mode("claude", "unrestricted")); await save();
-    expect(stored.leaderAllowedModels).toEqual({ codex: [] });
+    expect(stored.leaderAllowedModels).toEqual({ claude: null, codex: [] });
+    expectMode("claude", "unrestricted");
+    expectMode("agy", "unconfigured");
+    expect(() => mode("cursor", "unrestricted")).toThrow("missing cursor");
   });
 
   it("keeps configured choices on catalog error and recovers with retry", async () => {

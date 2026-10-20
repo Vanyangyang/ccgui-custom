@@ -27,7 +27,7 @@ describe("answer draft continuation", () => {
     const container = document.createElement("div"); document.body.appendChild(container);
     const root = createRoot(container); roots.push(root);
     await act(async () => root.render(<SessionScope session={{ engine: "codex", sessionId: "origin", workspacePath: "/work" }}>
-      <InteractiveAnswer source={'root = Stack([NumberInput($n, "N", 0, 100)])\n$n = 1'} complete streaming={false} identity={identity} />
+      <InteractiveAnswer source={'root = Stack([NumberInput($n, "N", 0, 100), Metric("Total", $n * 20)])\n$n = 1'} complete streaming={false} identity={identity} />
     </SessionScope>));
     return container;
   }
@@ -57,6 +57,19 @@ describe("answer draft continuation", () => {
     const button = Array.from(container.querySelectorAll("button")).find(b => b.textContent?.includes("continueParameters"))!;
     expect(button.disabled).toBe(true);
     expect(container.textContent).toContain("feedbackUnavailable");
+  });
+  it("keeps rejected historical source accessible without exposing parameter actions", async () => {
+    const source = 'root = Stack([NumberInput($n, "N", 0, 100), Text("Static report")])\n$n = 1';
+    const container = document.createElement("div"); document.body.appendChild(container);
+    const root = createRoot(container); roots.push(root);
+    await act(async () => root.render(<InteractiveAnswer source={source} complete streaming={false} />));
+    expect(container.textContent).toContain("interactiveAnswer.invalid");
+    expect(container.querySelector("input")).toBeNull();
+    expect(container.textContent).not.toContain("continueParameters");
+    expect(mock.invoke).not.toHaveBeenCalled();
+    const showSource = Array.from(container.querySelectorAll("button")).find(button => button.textContent?.includes("showSource"))!;
+    await act(async () => showSource.click());
+    expect(container.querySelector("pre code")?.textContent).toBe(source);
   });
   it("reloads conflicting saved values only when the explicit reload action is clicked", async () => {
     vi.useFakeTimers();

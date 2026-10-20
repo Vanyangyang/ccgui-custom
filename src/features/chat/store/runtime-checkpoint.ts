@@ -101,11 +101,35 @@ export function createChatCheckpointParticipant(store: ChatCheckpointStore, get:
       const snapshot = parseCheckpoint(value);
       // Select only data keys. A malformed checkpoint cannot replace actions.
       const data = Object.fromEntries(STATE_KEYS.map((key) => [key, snapshot.state[key]])) as ChatData;
-      for (const session of Object.values(data.bySession)) {
+      for (const [key, session] of Object.entries(data.bySession)) {
         if (session.messages.some((m) => m.model === "<synthetic>")) {
           session.messages = session.messages.map((m) =>
             m.model === "<synthetic>" ? { ...m, model: undefined, usage: undefined } : m,
           );
+        }
+        // Old Claude checkpoints do not distinguish live turn totals from
+        // single-request history. Preserve counts without claiming completeness.
+        const codex = key.startsWith("codex/") || key.startsWith("new:codex:");
+        const claude = key.startsWith("claude/") || key.startsWith("new:claude:");
+        if (codex || claude) {
+          if (
+            session.messages.some(
+              (m) =>
+                m.usage &&
+                typeof m.usage === "object" &&
+                !Array.isArray(m.usage) &&
+                !("usage_scope" in (m.usage as Record<string, unknown>)),
+            )
+          ) {
+            session.messages = session.messages.map((m) =>
+              m.usage &&
+              typeof m.usage === "object" &&
+              !Array.isArray(m.usage) &&
+              !("usage_scope" in (m.usage as Record<string, unknown>))
+                ? { ...m, usage: { ...(m.usage as Record<string, unknown>), usage_scope: codex ? "last_request" : "unknown" } }
+                : m,
+            );
+          }
         }
         if (session.activeModel === "<synthetic>") session.activeModel = null;
       }

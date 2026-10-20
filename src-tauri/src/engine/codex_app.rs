@@ -125,6 +125,8 @@ struct TurnView {
     /// Last `thread/tokenUsage/updated` payload, folded into this turn's Done:
     /// the terminal notification itself carries no usage.
     last_usage: Option<Value>,
+    /// 【Codex整轮吞吐】仅当终态 throughput 样本完整可信时记录，与 last 请求占用分离附在 Done 用量中。
+    turn_throughput: Option<Value>,
     /// Independent diagnostics; never changes content or billing projection.
     throughput: CodexThroughput,
     /// Bound to the native account/config before this process starts.
@@ -372,6 +374,22 @@ fn route(core: &TurnCore, state: &mut TurnState, view: &mut TurnView, value: &Va
         // but a child thread must not replace that baseline during resume.
         if belongs_to_thread(state, &params) {
             if let Some(payload) = view.throughput.observe(method, &params) {
+                // 【Codex整轮吞吐】仅在终态样本为 complete 且无排除原因时保存可信本轮输出与耗时。
+                if payload.get("status").and_then(Value::as_str) == Some("complete")
+                    && payload.get("turnReason").is_none_or(Value::is_null)
+                {
+                    if let (Some(output_tokens), Some(elapsed_ms)) = (
+                        payload.get("outputTokens").and_then(Value::as_u64),
+                        payload.get("elapsedMs").and_then(Value::as_u64).filter(|ms| *ms > 0),
+                    ) {
+                        view.turn_throughput = Some(json!({
+                            "output_tokens": output_tokens,
+                            "elapsed_ms": elapsed_ms,
+                        }));
+                    }
+                } else if payload.get("status").and_then(Value::as_str) == Some("partial") {
+                    view.turn_throughput = None;
+                }
                 core.dispatch_event(state, EngineEvent::Throughput(payload));
             }
         }
@@ -1168,6 +1186,25 @@ fn usage_payload(usage: &Value, context_window: Option<&Value>) -> Option<Value>
     if out.is_empty() {
         return None;
     }
+    // 【Codex用量范围】last 仅代表最近一次请求占用，明确标记为 last_request，不能冒充整轮完整用量。
+    out.insert("usage_scope".to_string(), json!("last_request"));
+    Some(Value::Object(out))
+}
+
+/// 【Codex回合结算】保持 last 请求占用与回合吞吐统计分离；仅在拥有可信终态样本时附加 turn_throughput。
+fn settled_turn_usage(last_usage: Option<Value>, turn_throughput: Option<&Value>) -> Option<Value> {
+    let Some(tt) = turn_throughput else {
+        return last_usage;
+    };
+    let mut out = match last_usage {
+        Some(Value::Object(map)) => map,
+        _ => {
+            let mut map = Map::new();
+            map.insert("usage_scope".to_string(), json!("last_request"));
+            map
+        }
+    };
+    out.insert("turn_throughput".to_string(), tt.clone());
     Some(Value::Object(out))
 }
 
@@ -1563,6 +1600,7 @@ async fn settle(
     // Flush before an error/done makes dispatch terminal. Native completion
     // already flushed in route; transport failure/cancel has partial data only.
     if let Some(payload) = view.throughput.finish(true) {
+        view.turn_throughput = None;
         core.dispatch_event(state, EngineEvent::Throughput(payload));
     }
     // Pending questions die with the turn: settle their cards BEFORE any
@@ -1598,7 +1636,7 @@ async fn settle(
         let usage = if killed.load(Ordering::SeqCst) {
             None
         } else {
-            view.last_usage.clone()
+            settled_turn_usage(view.last_usage.clone(), view.turn_throughput.as_ref())
         };
         let session_id = state.native_session_id.clone();
         core.dispatch_event(state, EngineEvent::Done { session_id, usage });
@@ -2366,6 +2404,7 @@ async fn handshake_and_start(
     if killed.load(Ordering::SeqCst) {
         return Err("Codex launch was stopped before turn/start".into());
     }
+    view.turn_throughput = None;
     view.throughput.begin(&thread_id, req.session_id.is_none());
     if super::parse_compact_prompt(&req.prompt).is_some() {
         return start_compact_turn(server, core, state, view, &thread_id, ack_timeout, killed).await;
@@ -3822,6 +3861,7 @@ mod tests {
         assert_eq!(payload["reasoning_output_tokens"], json!(7));
         assert_eq!(payload["total_tokens"], json!(150));
         assert_eq!(payload["model_context_window"], json!(128_000));
+        assert_eq!(payload["usage_scope"], json!("last_request"));
     }
 
     #[test]
@@ -3829,7 +3869,7 @@ mod tests {
         assert!(usage_payload(&json!({ "total": { "totalTokens": 3 } }), None).is_none());
         assert!(usage_payload(&json!({ "last": {} }), None).is_none());
         let payload = usage_payload(&json!({ "last": { "totalTokens": 3 } }), None).unwrap();
-        assert_eq!(payload, json!({ "total_tokens": 3 }));
+        assert_eq!(payload, json!({ "total_tokens": 3, "usage_scope": "last_request" }));
     }
 
     // Every test below drives the router, so each needs a runtime: the sink
@@ -4087,7 +4127,7 @@ mod tests {
         );
         assert_eq!(
             view.last_usage,
-            Some(json!({ "total_tokens": 42, "model_context_window": 1000 }))
+            Some(json!({ "total_tokens": 42, "model_context_window": 1000, "usage_scope": "last_request" }))
         );
         // The run reports usage once, with its Done: a mid-turn frame would
         // make the UI's context meter jump between turns.
@@ -4586,6 +4626,7 @@ mod tests {
                 "output_tokens": 0,
                 "total_tokens": 19_974,
                 "model_context_window": 1_000_000,
+                "usage_scope": "last_request",
             }))
         );
         let events = flushed(&core, &emitter);

@@ -6,6 +6,8 @@ import { bufferStreamPart, drainPending, EMPTY_SESSION, runRouting } from "./sto
 import { sessionKey } from "./store/persistence";
 import { createSessionActions } from "./store/sessions";
 import { averageTps, beginThroughput, type ThroughputSample } from "./throughput";
+import { buildTurnSummary } from "./turn-summary";
+import { parseUsage } from "./usage";
 
 vi.mock("@/lib/ipc", () => ({ ipc: {
   rescanSessions: vi.fn(async () => {}), usageRecord: vi.fn(async () => {}), listPlanReviews: vi.fn(async () => []),
@@ -183,5 +185,174 @@ describe("throughput sidecar lifecycle", () => {
     await otherActions.selectSession(tab.engine, tab.sessionId, tab.workspacePath, { background: true });
     expect(session().throughput?.sample).toBe(sample);
     expect(session().streaming).toBe(false);
+  });
+
+  it("stamps verified Codex whole-turn throughput onto the settled assistant row while keeping session occupancy on last request", () => {
+    // 【Codex页脚与状态栏一致性回归】last output 90、本轮 output 6000 / 300000ms => 页脚整轮效率 20，会话 occupancy 仍为 last 请求。
+    const codex = { ...tab, engine: "codex" };
+    const codexKey = sessionKey(codex.engine, codex.sessionId, codex.workspacePath);
+    useChatStore.setState({
+      active: codex,
+      openTabs: [codex],
+      activeEngine: "codex",
+      bySession: {
+        [codexKey]: {
+          ...EMPTY_SESSION,
+          streaming: true,
+          turnStartedAt: Date.now() - 300_000,
+          throughput: beginThroughput(run),
+          messages: [{ role: "user", text: "refactor", seq: 1, ts: null }],
+        },
+      },
+    });
+    runRouting.set(run, codexKey);
+    const codexEv = (kind: ChatEngineEvent["kind"], seq: number, data: unknown, runId = run): ChatEngineEvent => ({
+      ...codex,
+      runId,
+      seq,
+      kind,
+      data,
+    });
+    emit(
+      codexEv("delta", 2, "已完成多步工具调用"),
+      codexEv("throughput", 3, {
+        version: 1,
+        source: "codex_app_server",
+        status: "complete",
+        outputTokens: 6_000,
+        elapsedMs: 300_000,
+        generation: null,
+        generationReason: "unavailable_timing",
+        turnReason: null,
+      }),
+      codexEv("done", 4, {
+        usage: {
+          usage_scope: "last_request",
+          input_tokens: 45_000,
+          cached_input_tokens: 36_000,
+          output_tokens: 90,
+          total_tokens: 45_090,
+          model_context_window: 258_400,
+        },
+      }),
+    );
+    const settled = useChatStore.getState().bySession[codexKey];
+    const assistant = settled.messages.findLast((m) => m.role === "assistant")!;
+    // 会话级 occupancy 保持为 last 请求，不含 turn_throughput
+    expect(parseUsage(settled.usage)).toMatchObject({ input: 9_000, cacheRead: 36_000, output: 90, total: 45_090 });
+    expect((settled.usage as Record<string, unknown>).turn_throughput).toBeUndefined();
+    // 回答页脚小结读取可信终态 sample：output=6000、outputTps=20，且不伪装整轮 input 或缓存比
+    const summary = buildTurnSummary(assistant, 5);
+    expect(summary).toMatchObject({
+      input: 45_000,
+      output: 6_000,
+      usageComplete: false,
+      cacheHitPercent: null,
+      tools: 5,
+      outputTps: 20,
+    });
+    expect(averageTps(settled.throughput?.sample)).toBe(20);
+  });
+
+  it("does not leak previous Codex turn throughput into a subsequent turn, follow-up, missing-baseline turn, or interrupted turn", () => {
+    // 【Codex多回合与异常边界回归】第一轮有可信样本（20 tok/s），第二轮缺基线或仅 running 结束时不得复用第一轮样本。
+    const codex = { ...tab, engine: "codex" };
+    const codexKey = sessionKey(codex.engine, codex.sessionId, codex.workspacePath);
+    useChatStore.setState({
+      active: codex,
+      openTabs: [codex],
+      activeEngine: "codex",
+      bySession: {
+        [codexKey]: {
+          ...EMPTY_SESSION,
+          streaming: true,
+          turnStartedAt: Date.now() - 300_000,
+          throughput: beginThroughput("run-1"),
+          messages: [{ role: "user", text: "turn 1", seq: 1, ts: null }],
+        },
+      },
+    });
+    runRouting.set("run-1", codexKey);
+    const codexEv = (runId: string, kind: ChatEngineEvent["kind"], seq: number, data: unknown): ChatEngineEvent => ({
+      ...codex,
+      runId,
+      seq,
+      kind,
+      data,
+    });
+    emit(
+      codexEv("run-1", "delta", 1, "first reply"),
+      codexEv("run-1", "throughput", 2, {
+        version: 1,
+        source: "codex_app_server",
+        status: "complete",
+        outputTokens: 6_000,
+        elapsedMs: 300_000,
+        generation: null,
+        generationReason: "unavailable_timing",
+        turnReason: null,
+      }),
+      codexEv("run-1", "done", 3, {
+        usage: { input_tokens: 10_000, output_tokens: 90, total_tokens: 10_090 },
+      }),
+    );
+    // 迟到的重复 done 或 throughput 不能覆盖已结算的第一轮
+    emit(
+      codexEv("run-1", "throughput", 4, {
+        version: 1,
+        source: "codex_app_server",
+        status: "complete",
+        outputTokens: 99_000,
+        elapsedMs: 1_000,
+        generation: null,
+        generationReason: "unavailable_timing",
+        turnReason: null,
+      }),
+      codexEv("run-1", "done", 5, { usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } }),
+    );
+    const afterTurn1 = useChatStore.getState().bySession[codexKey];
+    const firstReply = afterTurn1.messages.find((m) => m.role === "assistant")!;
+    expect(buildTurnSummary(firstReply)?.outputTps).toBe(20);
+
+    // 第二轮恢复会话缺少 baseline：不应串用第一轮 sample，也不应回落到 90 / 300s = 0.3
+    useChatStore.setState((s) => ({
+      bySession: {
+        ...s.bySession,
+        [codexKey]: {
+          ...s.bySession[codexKey],
+          streaming: true,
+          turnStartedAt: Date.now() - 300_000,
+          messages: [...s.bySession[codexKey].messages, { role: "user", text: "turn 2", seq: 10, ts: null }],
+        },
+      },
+    }));
+    runRouting.set("run-2", codexKey);
+    emit(
+      codexEv("run-2", "delta", 1, "second reply"),
+      codexEv("run-2", "throughput", 2, {
+        version: 1,
+        source: "codex_app_server",
+        status: "complete",
+        outputTokens: null,
+        elapsedMs: 300_000,
+        generation: null,
+        generationReason: "unavailable_timing",
+        turnReason: "missing_baseline",
+      }),
+      codexEv("run-2", "done", 3, {
+        usage: { input_tokens: 12_000, output_tokens: 90, total_tokens: 12_090 },
+      }),
+    );
+    const afterTurn2 = useChatStore.getState().bySession[codexKey];
+    const replies = afterTurn2.messages.filter((m) => m.role === "assistant");
+    expect(replies).toHaveLength(2);
+    expect(buildTurnSummary(replies[0])?.outputTps).toBe(20);
+    expect(buildTurnSummary(replies[1])).toMatchObject({
+      input: 12_000,
+      output: 90,
+      usageComplete: false,
+      cacheHitPercent: null,
+      outputTps: null,
+    });
   });
 });

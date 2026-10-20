@@ -708,6 +708,12 @@ mod tests {
         let role = "Leader 指令 🧭\n子任务范围：%PATH% `echo` $(id)";
         append_host_instructions(&mut first, role).unwrap();
         assert_eq!(std::fs::read_to_string(first.cleanup_files[0].join(HOST_PLUGIN).join("rules/AGENTS.md")).unwrap(), role);
+        let presentation = super::super::host_instructions::with_chat_presentation("agy", true, Some(role.into())).unwrap();
+        assert!(presentation.starts_with(role));
+        assert!(presentation.contains("<ccgui-presentation-capabilities>"));
+        append_host_instructions(&mut first, &presentation).unwrap();
+        assert_eq!(std::fs::read_to_string(first.cleanup_files[0].join(HOST_PLUGIN).join("rules/AGENTS.md")).unwrap(), presentation);
+        assert_eq!(std::fs::read_to_string(second.cleanup_files[0].join(HOST_PLUGIN).join("rules/AGENTS.md")).unwrap(), "");
         super::super::cleanup_staged_files(&first.cleanup_files);
         super::super::cleanup_staged_files(&second.cleanup_files);
         assert!(first.cleanup_files.iter().all(|path| !path.exists()));

@@ -14,14 +14,15 @@ export function groupLeaderThreads(threads: AiChatThread[], snapshot: LeaderSnap
   for (const branch of branches) {
     const id = branch.sessionId ? `${branch.engine}/${branch.sessionId}` : `leader-branch:${branch.id}`;
     childIds.add(id);
-    const row = rows.get(id) ?? { id, label: branch.title, engine: branch.engine, time: "" };
-    rows.set(id, { ...row, label: row.label || branch.title, leaderBranch: branch, protectedFromDeletion: true, selectable: !!branch.sessionId });
+    const row = rows.get(id) ?? { id, label: branch.title, engine: branch.engine, workspacePath: branch.workspacePath, time: "" };
+    rows.set(id, { ...row, workspacePath: row.workspacePath ?? branch.workspacePath, label: row.label || branch.title, leaderBranch: branch, protectedFromDeletion: true, selectable: !!branch.sessionId });
     const parentId = `${branch.parentEngine}/${branch.parentSessionId}`;
-    if (!rows.has(parentId)) rows.set(parentId, { id: parentId, label: branch.parentSessionId.slice(0, 8), engine: branch.parentEngine, time: "", leaderParentFallback: true });
+    if (!rows.has(parentId)) rows.set(parentId, { id: parentId, label: branch.parentSessionId.slice(0, 8), engine: branch.parentEngine, workspacePath: branch.workspacePath, time: "", leaderParentFallback: true });
   }
   for (const branch of branches) {
     const id = branch.sessionId ? `${branch.engine}/${branch.sessionId}` : `leader-branch:${branch.id}`;
     const parent = rows.get(`${branch.parentEngine}/${branch.parentSessionId}`)!;
+    parent.workspacePath ??= branch.workspacePath;
     parent.isLeader = true;
     parent.protectedFromDeletion = true;
     (parent.children ??= []).push(rows.get(id)!);

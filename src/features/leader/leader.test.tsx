@@ -20,6 +20,7 @@ import { useLeaderTreeUI } from "./tree-ui";
 import { startLeaderRuntime } from "./runtime";
 import { LeaderManagementHost } from "./LeaderManagementHost";
 import type { LeaderArchivedGroup, LeaderBranch, LeaderSnapshot } from "./types";
+import { isCrossSessionRecordUnread, useCrossSessionActivityStore } from "@/features/chat/cross-session";
 
 const runtime = vi.hoisted(() => ({ web: false }));
 vi.mock("@/lib/transport", () => ({ get isWeb() { return runtime.web; }, invoke: vi.fn(), listen: vi.fn(async () => () => {}) }));
@@ -49,6 +50,7 @@ beforeEach(() => {
   vi.mocked(ipc.officialConfigRead).mockReset().mockResolvedValue([{ path: "/global/.claude/settings.json", exists: true, format: "json", content: '{"autoCompactWindow":750000}' }]);
   vi.mocked(invoke).mockReset().mockResolvedValue(snapshot());
   useLeaderTreeUI.setState({ expanded: new Set() });
+  useCrossSessionActivityStore.getState().reset();
   useLeaderStore.setState({ snapshot: snapshot(), error: null, busy: false, managing: null });
   useChatStore.setState({ sessions: [], bySession: {}, drafts: {}, unseen: {}, openTabs: [], active: null, activeEngine: "codex", streamingByKey: {}, retryingByKey: {}, archivedSessionKeys: {} });
   node = document.createElement("div"); document.body.append(node); root = createRoot(node);
@@ -906,5 +908,69 @@ describe("parent management and lifecycle", () => {
     vi.mocked(listen).mockImplementationOnce(() => new Promise((done) => { resolve = done; }));
     const off = startLeaderRuntime(); off(); resolve(lateOff); await Promise.resolve();
     expect(lateOff).toHaveBeenCalledOnce(); expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("syncs subtask communication UI across live streaming, completion, and archival/reclaim cleanup", async () => {
+    const initialCompleted = { ...branch("old-done"), state: "completed" as const, result: "old result" };
+    useLeaderStore.setState({ snapshot: { leaders: [parent], branches: [] } });
+    vi.mocked(invoke).mockResolvedValue({ leaders: [parent], branches: [initialCompleted] });
+    const off = startLeaderRuntime();
+    try {
+      // First hydration marks pre-existing terminal branches as reviewed so they do not clutter the sidebar.
+      await vi.waitFor(() => {
+        expect(useCrossSessionActivityStore.getState().records.find((r) => r.scopedId === "leader:old-done")).toBeDefined();
+      });
+      const oldRecord = useCrossSessionActivityStore.getState().records.find((r) => r.scopedId === "leader:old-done")!;
+      expect(isCrossSessionRecordUnread(oldRecord)).toBe(false);
+
+      // A newly spawned branch transitions to running, streams deltas, and completes unread.
+      const liveChild = { ...branch("live-child", "agy"), state: "running" as const, task: "Refactor architecture", result: "" };
+      await act(async () => {
+        useLeaderStore.setState({ snapshot: { leaders: [parent], branches: [initialCompleted, liveChild] } });
+      });
+      expect(useCrossSessionActivityStore.getState().records.find((r) => r.scopedId === "leader:live-child")).toMatchObject({
+        kind: "subtask",
+        status: "executing",
+        message: "Refactor architecture",
+      });
+
+      const threads = groupLeaderThreads(
+        [{ id: "claude/root", label: "Root", engine: "claude", time: "1m" }, { id: "agy/live-child", label: "Child", engine: "agy", time: "1m" }],
+        useLeaderStore.getState().snapshot,
+        "/branches",
+      );
+      await act(async () => root.render(<AiChatSidebar repos={[{ id: "ws", label: "workspace", defaultOpen: true, threads }]} activeThreadId="agy/live-child" />));
+      expect(node.querySelectorAll('[data-testid="thread-cross-session-btn"]')).toHaveLength(2);
+
+      // Stream live delta from engine event before snapshot settles
+      act(() => {
+        handleEngineEvents([
+          { engine: "agy", sessionId: "live-child", runId: "run-live-child", seq: 1, kind: "delta", data: "Streaming reply chunk...", leader: { branchId: "live-child", workspacePath: "/branches", title: "task-live-child" } },
+        ], deps());
+      });
+      expect(useCrossSessionActivityStore.getState().records.find((r) => r.scopedId === "leader:live-child")?.replyText).toBe("Streaming reply chunk...");
+
+      // Transition to completed -> unread for both parent and child
+      await act(async () => {
+        useLeaderStore.setState({
+          snapshot: {
+            leaders: [parent],
+            branches: [initialCompleted, { ...liveChild, state: "completed", result: "Final subtask report" }],
+          },
+        });
+      });
+      const finishedRecord = useCrossSessionActivityStore.getState().records.find((r) => r.scopedId === "leader:live-child")!;
+      expect(finishedRecord.status).toBe("completed");
+      expect(finishedRecord.replyText).toBe("Final subtask report");
+      expect(isCrossSessionRecordUnread(finishedRecord)).toBe(true);
+
+      // Reclaiming or archiving removes the communication records
+      await act(async () => {
+        useLeaderStore.setState({ snapshot: { leaders: [parent], branches: [] } });
+      });
+      expect(useCrossSessionActivityStore.getState().records).toHaveLength(0);
+    } finally {
+      off();
+    }
   });
 });

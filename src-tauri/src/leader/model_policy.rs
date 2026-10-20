@@ -4,6 +4,7 @@ use serde::Serialize;
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct EngineModelPolicy {
+    configured: bool,
     allowed_models: Option<Vec<String>>,
     default_model: Option<String>,
 }
@@ -18,6 +19,11 @@ pub(super) struct ModelPolicy {
 
 impl EngineModelPolicy {
     fn resolve(&self, engine: &str, requested: Option<&str>) -> Result<Option<String>, String> {
+        if !self.configured {
+            return Err(format!(
+                "Child task model policy is not configured for {engine}; configure delegation models in Settings before spawning new tasks. Inspect task_list modelPolicy"
+            ));
+        }
         let Some(allowed) = &self.allowed_models else {
             return Ok(requested
                 .map(str::to_owned)
@@ -49,15 +55,27 @@ pub(super) fn snapshot(settings: &AppSettings) -> Result<ModelPolicy, String> {
             .get(id)
             .filter(|model| !model.trim().is_empty())
             .cloned();
-        let allowed_models = policy.get(id).cloned();
-        let default_model = match &allowed_models {
-            None => app_default,
-            Some(allowed) => app_default
-                .map(|model| model.trim().to_owned())
-                .filter(|model| allowed.contains(model))
-                .or_else(|| allowed.first().cloned()),
+        let configured = policy.contains_key(id);
+        let allowed_models = if id == "cursor" {
+            Some(policy.get(id).cloned().flatten().unwrap_or_default().into_iter()
+                .filter(|model| !model.eq_ignore_ascii_case("auto") && !model.eq_ignore_ascii_case("default"))
+                .collect())
+        } else {
+            policy.get(id).cloned().flatten()
+        };
+        let default_model = if !configured {
+            None
+        } else {
+            match &allowed_models {
+                None => app_default,
+                Some(allowed) => app_default
+                    .map(|model| model.trim().to_owned())
+                    .filter(|model| allowed.contains(model))
+                    .or_else(|| allowed.first().cloned()),
+            }
         };
         EngineModelPolicy {
+            configured,
             allowed_models,
             default_model,
         }
@@ -96,8 +114,8 @@ mod tests {
     }
 
     #[test]
-    fn legacy_policy_preserves_explicit_and_engine_defaults() {
-        let settings = settings(json!({}), json!({"claude":"sonnet","codex":" "}));
+    fn explicitly_unrestricted_policy_preserves_explicit_and_engine_defaults() {
+        let settings = settings(json!({"claude":null,"codex":null}), json!({"claude":"sonnet","codex":" "}));
         assert_eq!(
             resolve(&settings, "claude", Some("custom-id"))
                 .unwrap()
@@ -112,12 +130,44 @@ mod tests {
         assert_eq!(
             serde_json::to_value(snapshot(&settings).unwrap()).unwrap(),
             json!({
-                "claude":{"allowedModels":null,"defaultModel":"sonnet"},
-                "codex":{"allowedModels":null,"defaultModel":null},
-                "agy":{"allowedModels":null,"defaultModel":null},
-                "cursor":{"allowedModels":null,"defaultModel":null}
+                "claude":{"configured":true,"allowedModels":null,"defaultModel":"sonnet"},
+                "codex":{"configured":true,"allowedModels":null,"defaultModel":null},
+                "agy":{"configured":false,"allowedModels":null,"defaultModel":null},
+                "cursor":{"configured":false,"allowedModels":[],"defaultModel":null}
             })
         );
+    }
+
+    #[test]
+    fn unconfigured_policy_rejects_explicit_and_default_models() {
+        let settings = settings(json!({}), json!({"claude":"sonnet"}));
+        for engine in ["claude", "codex", "agy", "cursor"] {
+            for requested in [None, Some("custom-id")] {
+                assert!(resolve(&settings, engine, requested).unwrap_err().contains("not configured"));
+            }
+            let snapshot = serde_json::to_value(snapshot(&settings).unwrap()).unwrap();
+            assert_eq!(snapshot[engine]["configured"], false);
+            assert_eq!(snapshot[engine]["defaultModel"], serde_json::Value::Null);
+        }
+    }
+
+    #[test]
+    fn cursor_has_no_unrestricted_bypass_for_saved_model_selections() {
+        for policy in [json!({}), json!({"cursor":null}), json!({"cursor":[]})] {
+            let settings = settings(policy, json!({"cursor":"grok-4.7"}));
+            assert!(resolve(&settings, "cursor", None).is_err());
+            assert!(resolve(&settings, "cursor", Some("grok-4.7")).is_err());
+            let snapshot = serde_json::to_value(snapshot(&settings).unwrap()).unwrap();
+            assert_eq!(snapshot["cursor"]["allowedModels"], json!([]));
+            assert_eq!(snapshot["cursor"]["defaultModel"], serde_json::Value::Null);
+        }
+        let selected = settings(json!({"cursor":["grok-4.7"]}), json!({"cursor":"gemini-4-argon"}));
+        assert_eq!(resolve(&selected, "cursor", None).unwrap().as_deref(), Some("grok-4.7"));
+        assert!(resolve(&selected, "cursor", Some("gemini-4-argon")).is_err());
+        let automatic = settings(json!({"cursor":["auto","default","grok-4.7"]}), json!({"cursor":"auto"}));
+        assert_eq!(resolve(&automatic, "cursor", None).unwrap().as_deref(), Some("grok-4.7"));
+        assert!(resolve(&automatic, "cursor", Some("auto")).is_err());
+        assert!(resolve(&automatic, "cursor", Some("default")).is_err());
     }
 
     #[test]
@@ -167,7 +217,7 @@ mod tests {
 
     #[test]
     fn disabled_engine_rejects_explicit_and_omitted_models() {
-        let settings = settings(json!({"claude":[]}), json!({"claude":"sonnet"}));
+        let settings = settings(json!({"claude":[],"codex":null}), json!({"claude":"sonnet"}));
         for requested in [None, Some("sonnet")] {
             let error = resolve(&settings, "claude", requested).unwrap_err();
             assert!(error.contains("disabled for claude"));
@@ -192,10 +242,12 @@ mod tests {
         assert!(resolve(&settings, "agy", Some("gemini-3.8-flash")).unwrap_err().contains("not allowed"));
         settings.default_models.insert("agy".into(), "outside-policy".into());
         assert_eq!(resolve(&settings, "agy", None).unwrap().as_deref(), Some("gemini-3.8-flash-high"));
-        settings.leader_allowed_models.insert("agy".into(), vec![]);
+        settings.leader_allowed_models.insert("agy".into(), Some(vec![]));
         assert!(resolve(&settings, "agy", None).unwrap_err().contains("disabled for agy"));
         assert!(resolve(&settings, "agy", Some("claude-opus-4-6")).is_err());
         settings.leader_allowed_models.remove("agy");
+        assert!(resolve(&settings, "agy", Some("custom-model")).unwrap_err().contains("not configured"));
+        settings.leader_allowed_models.insert("agy".into(), None);
         assert_eq!(resolve(&settings, "agy", Some("custom-model")).unwrap().as_deref(), Some("custom-model"));
     }
 

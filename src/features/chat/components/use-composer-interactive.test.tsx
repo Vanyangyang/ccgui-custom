@@ -31,14 +31,14 @@ afterEach(async () => { await act(async () => root.unmount()); host.remove(); us
 
 describe("retired /ui app command", () => {
   it("sends /ui text verbatim through the ordinary path for every engine", async () => {
-    for (const engine of ["codex", "claude"]) {
+    for (const engine of ["codex", "claude", "agy"]) {
       const active = { ...tab, engine };
       await act(async () => useChatStore.setState({ active, openTabs: [active] }));
       await act(async () => root.render(<Harness engine={engine} />));
       await act(async () => host.querySelector("button")!.click());
       expect(sends).toHaveBeenLastCalledWith("/ui 做一个预算表", [], undefined, active);
     }
-    expect(sends).toHaveBeenCalledTimes(2);
+    expect(sends).toHaveBeenCalledTimes(3);
     expect(errors).not.toHaveBeenCalled();
   });
 });

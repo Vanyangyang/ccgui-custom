@@ -353,6 +353,21 @@ export function checkInteractiveProgram(raw: string): ProgramCheck {
     for (const statement of all) { const budget = measureStatement(statement.name); nodes += budget.nodes; text += budget.text; }
     if (nodes > ANSWER_LIMITS.expandedNodes || text > ANSWER_LIMITS.expandedText) reject("size");
     checkCalculations(all, defaults, controlRanges);
+    // Structural minimum only: a dependency does not prove semantic value.
+    // Follow root references after the cycle/depth/expansion checks above.
+    const bound = new Set<string>(), output = new Set<string>();
+    const inspectInteraction = (expr: Expr): void => {
+      if (expr.kind === "state") { output.add(expr.name); return; }
+      if (expr.kind === "ref") { inspectInteraction(byName.get(expr.name)!.expr); return; }
+      if (expr.kind === "call" && ["Slider", "NumberInput", "Select", "Toggle"].includes(expr.name)) {
+        bound.add((expr.args[0] as Extract<Expr, { kind: "ref" | "state" }>).name);
+        // Binding, label, and range changes alone are not a result.
+        return;
+      }
+      for (const child of children(expr)) inspectInteraction(child);
+    };
+    inspectInteraction(byName.get("root")!.expr);
+    if (!bound.size || Object.keys(defaults).some(name => !bound.has(name) || !output.has(name))) reject("unsupported");
     const source = all.map(item => `${item.name} = ${serialize(item.expr)}`).join("\n");
     if (new TextEncoder().encode(source).length > ANSWER_LIMITS.bytes) reject("size");
     return { ok: true, source, defaults: { ...defaults } };

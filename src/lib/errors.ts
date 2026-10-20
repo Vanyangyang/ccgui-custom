@@ -20,6 +20,9 @@ export function errorText(err: unknown): string {
     if (text === "Invalid Codex channel config.toml") {
       return i18n.t("settings.cliCodexConfigInvalid") || text;
     }
+    if (text === "Cursor model is not selected in saved settings; select it in Settings → Collaboration and save before sending") {
+      return i18n.t("settings.cursorModelNotSelected") || text;
+    }
     return text;
   }
   try {

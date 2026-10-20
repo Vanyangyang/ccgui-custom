@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { RuntimeCheckpoint } from "@/lib/runtime-checkpoint";
 import { EMPTY_SESSION } from "./stream";
+import { buildTurnSummary } from "../turn-summary";
 
 const loadSessionPage = vi.fn(async () => ({
   messages: [
@@ -103,6 +104,25 @@ describe("unreadableUsageKeys", () => {
             { seq: 2, role: "assistant", text: "You've hit your session limit", ts: null, model: "<synthetic>", usage: { ...ZERO } },
           ],
         },
+        "codex/c1": {
+          ...EMPTY_SESSION,
+          usage: { input_tokens: 45_000, output_tokens: 90, total_tokens: 45_090 },
+          messages: [
+            { seq: 1, role: "assistant", text: "codex reply", ts: null, durationMs: 300_000, usage: { input_tokens: 45_000, output_tokens: 90, total_tokens: 45_090 } },
+          ],
+        },
+        "claude/cached": {
+          ...EMPTY_SESSION,
+          usage: { input_tokens: 1000, output_tokens: 90 },
+          messages: [
+            { seq: 1, role: "assistant", text: "old history", ts: null, durationMs: 300_000,
+              usage: { input_tokens: 1000, output_tokens: 90 } },
+            { seq: 2, role: "assistant", text: "verified live total", ts: null, durationMs: 300_000,
+              usage: { input_tokens: 1000, output_tokens: 6000, usage_scope: "turn", turn_status: "complete" } },
+            { seq: 3, role: "assistant", text: "interrupted", ts: null, durationMs: 10_000,
+              usage: { input_tokens: 1000, output_tokens: 400, usage_scope: "turn", turn_status: "partial" } },
+          ],
+        },
       },
     });
     const checkpoint: RuntimeCheckpoint = await coordinator.prepareRuntimeCheckpoint();
@@ -117,6 +137,12 @@ describe("unreadableUsageKeys", () => {
     expect(beforeResume.activeModel).toBeNull();
     expect(beforeResume.messages[1].model).toBeUndefined();
     expect(beforeResume.messages[1].usage).toBeUndefined();
+    const restoredCodex = restoredStore.getState().bySession["codex/c1"];
+    expect(restoredCodex.messages[0].usage).toMatchObject({ usage_scope: "last_request", output_tokens: 90 });
+    const cachedClaude = restoredStore.getState().bySession["claude/cached"];
+    expect(cachedClaude.messages[0].usage).toMatchObject({ usage_scope: "unknown", output_tokens: 90 });
+    expect(cachedClaude.messages.map(m => buildTurnSummary(m)?.outputTps)).toEqual([null, 20, null]);
+    expect(cachedClaude.usage).toEqual({ input_tokens: 1000, output_tokens: 90 });
 
     nextCoord.resumeCommittedRuntimeCheckpoint();
     await vi.waitFor(() => {

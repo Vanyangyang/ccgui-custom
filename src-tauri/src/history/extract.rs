@@ -588,11 +588,20 @@ fn pi_image_part(part: &Value) -> Option<String> {
 /// when last is unavailable so history cannot reuse an earlier occupancy.
 fn usage_from_codex_token_info(info: Option<&Value>) -> Option<Value> {
     let info = info?.as_object()?;
-    let mut usage = info
+    let mut usage = match info
         .get("last_token_usage")
         .filter(|last| last.is_object())
         .cloned()
-        .unwrap_or_else(|| Value::Object(info.clone()));
+    {
+        Some(mut last) => {
+            // 【Codex历史用量范围】原生历史仅记录最后一次请求占用，标记为 last_request 以避免冒充整轮完整用量。
+            if let Some(obj) = last.as_object_mut() {
+                obj.insert("usage_scope".to_string(), Value::from("last_request"));
+            }
+            last
+        }
+        None => Value::Object(info.clone()),
+    };
     if let Some(window) = info.get("model_context_window") {
         if let Some(obj) = usage.as_object_mut() {
             obj.insert("model_context_window".to_string(), window.clone());
@@ -1548,7 +1557,16 @@ fn extract_claude_line(value: &Value, images: ImageMode) -> LineRows {
     // zero snapshot superseded the real occupancy and a reopened session's
     // context gauge fell back to "unknown". The text itself still shows.
     let synthetic = message.get("model").and_then(Value::as_str) == Some(CLAUDE_SYNTHETIC_MODEL);
-    let usage = if synthetic { None } else { message.get("usage").cloned() };
+    let usage = if synthetic { None } else {
+        message.get("usage").cloned().map(|mut usage| {
+            // Transcript assistant usage covers one model request. The row's
+            // timestamp-derived duration can include earlier tools/requests.
+            if let Some(obj) = usage.as_object_mut() {
+                obj.insert("usage_scope".to_string(), Value::from("last_request"));
+            }
+            usage
+        })
+    };
     let model = if synthetic {
         None
     } else {
@@ -2760,6 +2778,7 @@ mod tests {
         let rows = extract_codex_line(&line, ImageMode::Collect);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].role, "__usage__");
+        assert_eq!(rows[0].usage.as_ref().unwrap()["usage_scope"], "last_request");
         assert_eq!(rows[0].usage.as_ref().unwrap()["input_tokens"], 34660);
         assert_eq!(rows[0].usage.as_ref().unwrap()["total_tokens"], 34745);
         assert_eq!(
@@ -2944,6 +2963,10 @@ mod tests {
         assert_eq!(rows[0].role, "__usage__");
         let usage = rows[0].usage.as_ref().expect("usage object");
         assert_eq!(
+            usage.get("usage_scope").and_then(Value::as_str),
+            Some("last_request")
+        );
+        assert_eq!(
             usage.get("input_tokens").and_then(Value::as_i64),
             Some(30000)
         );
@@ -3083,6 +3106,37 @@ mod tests {
     }
 
     #[test]
+    fn claude_history_request_usage_is_not_whole_turn_accounting() {
+        let mut tool = claude_usage_line(serde_json::json!([
+            {"type": "tool_use", "id": "read-1", "name": "Read", "input": {"file_path": "a.rs"}}
+        ]), 1000, "claude-model");
+        tool["timestamp"] = serde_json::json!("2026-10-04T00:00:10Z");
+        tool["message"]["usage"]["output_tokens"] = serde_json::json!(5910);
+        let mut answer = claude_usage_line(
+            serde_json::json!([{"type": "text", "text": "完成 中文🙂"}]), 2000, "claude-model");
+        answer["timestamp"] = serde_json::json!("2026-10-04T00:05:00Z");
+        answer["message"]["usage"]["output_tokens"] = serde_json::json!(90);
+        let parsed = parse_claude_lines(&[
+            serde_json::json!({"type":"user","timestamp":"2026-10-04T00:00:00Z",
+                "message":{"role":"user","content":[{"type":"text","text":"task"}]}}),
+            tool,
+            serde_json::json!({"type":"user","timestamp":"2026-10-04T00:00:20Z",
+                "message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"read-1","content":"ok"}]}}),
+            answer,
+        ]);
+        let reply = parsed.messages.iter().rev().find(|m| m.role == "assistant").unwrap();
+        assert_eq!(reply.text, "完成 中文🙂");
+        assert_eq!(reply.duration_ms, Some(300_000));
+        let usage = reply.usage.as_ref().unwrap();
+        assert_eq!(usage["input_tokens"], 2000);
+        assert_eq!(usage["output_tokens"], 90);
+        assert_eq!(usage["usage_scope"], "last_request");
+        assert!(usage.get("turn_throughput").is_none());
+        assert!(parsed.messages.iter().filter_map(|m| m.usage.as_ref())
+            .all(|usage| usage["usage_scope"] == "last_request"));
+    }
+
+    #[test]
     fn claude_nontext_history_retains_latest_snapshot_once() {
         let transcript = std::env::temp_dir().join(format!("ccgui-claude-usage-{}.jsonl", uuid::Uuid::new_v4()));
         for (content, output_role) in [
@@ -3126,7 +3180,9 @@ mod tests {
             let extracted = extract_claude_line(&latest, ImageMode::Collect);
             assert_eq!(extracted.len(), 1);
             assert_eq!(extracted[0].role, "__usage__");
-            assert_eq!(extracted[0].usage, latest["message"].get("usage").cloned());
+            let mut expected_usage = latest["message"]["usage"].clone();
+            expected_usage["usage_scope"] = serde_json::json!("last_request");
+            assert_eq!(extracted[0].usage, Some(expected_usage));
             assert!(parse_claude_lines(&[latest.clone()]).messages.is_empty(),
                 "a usage-only transcript has no visible output to attach metadata to");
             for earlier_content in [
