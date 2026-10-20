@@ -856,12 +856,15 @@ mod tests {
             fs::write(path.join("build-provenance.json"), serde_json::to_vec(&serde_json::json!({"updateBatch":batch.proof()})).unwrap()).unwrap(); path
         }
         fn hash(&self, path: &Path) -> String {
+            self.hash_with_schema(path, &"b".repeat(64))
+        }
+        fn hash_with_schema(&self, path: &Path, schema: &str) -> String {
             let files = ["build-provenance.json", "ccgui-next.exe"].iter().map(|name| {
                 let bytes = fs::read(path.join(name)).unwrap();
                 ReleaseFile { path: (*name).into(), bytes: bytes.len() as u64, sha256: format!("{:x}", Sha256::digest(&bytes)) }
             }).collect();
             let manifest = ReleaseManifest { manifest_version: 1, channel: CHANNEL.into(), release_id: "fixture".into(),
-                version: "1.0.0".into(), worker_protocol: 1, checkpoint_schema: 1, schema_hash: "b".repeat(64), executable: "ccgui-next.exe".into(), files };
+                version: "1.0.0".into(), worker_protocol: 1, checkpoint_schema: 1, schema_hash: schema.into(), executable: "ccgui-next.exe".into(), files };
             let bytes = serde_json::to_vec(&manifest).unwrap();
             fs::write(path.join(MANIFEST), &bytes).unwrap(); format!("{:x}", Sha256::digest(bytes))
         }
@@ -1144,6 +1147,31 @@ mod tests {
             assert_eq!(f.store().channel_status().unwrap().batch.unwrap().phase, expected);
             f.transaction(&hash_b, TransactionPhase::Committed);
             assert!(f.begin(&a, "next").start_build, "terminal batch must not resurrect after journal replacement");
+        }
+    }
+
+    #[test]
+    fn offline_upgrade_preserves_terminal_channel_before_retiring_v1_journal() {
+        for (phase, expected) in [(TransactionPhase::Committed, Phase::Committed),
+            (TransactionPhase::Failed, Phase::Failed), (TransactionPhase::RolledBack, Phase::RolledBack)] {
+            let f = Fixture::new(); let a = owner("codex"); f.ready(&a, "ui", "r1");
+            let batch = f.begin(&a, "build").channel.batch.unwrap();
+            let package = f.package(&batch);
+            let hash = f.hash_with_schema(&package, crate::task_worker::SCHEMA_CONTRACT_V1_HASH);
+            let store = f.store();
+            store.bind_update_package(&a, Some(&batch.id), &hash, &package).unwrap();
+            let candidate = store.stage(&package, &hash).unwrap();
+            let mut state = UpdateState { state_version: 1, active: Some(candidate.clone()),
+                transaction: Some(Transaction { id: uuid::Uuid::new_v4().to_string(), phase: TransactionPhase::Preparing,
+                    previous: Some(candidate.clone()), candidate, failure_reason: None }) };
+            store.persist(&state).unwrap();
+            f.ready(&a, "late", "r2"); // Persist Preparing; only the journal knows its later terminal state.
+            state.transaction.as_mut().unwrap().phase = phase;
+            store.persist(&state).unwrap();
+            store.retire_v1_after_offline_upgrade(&state).unwrap();
+            assert_eq!(store.read_state().unwrap(), UpdateState::default());
+            assert_eq!(store.channel_status().unwrap().batch.unwrap().phase, expected);
+            assert!(f.begin(&a, "next").start_build);
         }
     }
 

@@ -587,7 +587,9 @@ describe("parent management and lifecycle", () => {
     useLeaderStore.setState({ snapshot: before });
     const survivor = { engine: "codex", sessionId: "archive-focus-survivor", workspacePath: "/foreground" };
     const keys = members.map((m) => `${m.engine}/${m.sessionId}`);
-    useChatStore.setState({ active: members[0], openTabs: [survivor, ...members], bySession: Object.fromEntries([...keys, "codex/archive-focus-survivor"].map((key) => [key, { ...EMPTY_SESSION, messages: [{ seq: 1, role: "assistant", text: "loaded history", ts: null }] }])), drafts: Object.fromEntries(keys.map((key) => [key, "unsent"])), unseen: Object.fromEntries(keys.map((key) => [key, true])) });
+    // A fully warm cache includes usage; missing usage legitimately triggers a history backfill.
+    const usage = { input_tokens: 100, output_tokens: 20 };
+    useChatStore.setState({ active: members[0], openTabs: [survivor, ...members], bySession: Object.fromEntries([...keys, "codex/archive-focus-survivor"].map((key) => [key, { ...EMPTY_SESSION, usage, messages: [{ seq: 1, role: "assistant", text: "loaded history", ts: null, usage }] }])), drafts: Object.fromEntries(keys.map((key) => [key, "unsent"])), unseen: Object.fromEntries(keys.map((key) => [key, true])) });
     vi.mocked(invoke).mockResolvedValue(before);
     const off = startLeaderRuntime(); await Promise.resolve(); await Promise.resolve();
     const activated = vi.fn(); const offActivated = pluginBus.on(SESSION_ACTIVATED_TOPIC, activated);
@@ -645,7 +647,8 @@ describe("parent management and lifecycle", () => {
     const keys = members.map((member) => `${member.engine}/${member.sessionId}`);
     const survivor = { engine: "codex", sessionId: "partial-cache-survivor", workspacePath: "/foreground" };
     const survivorKey = "codex/partial-cache-survivor";
-    const cache = { ...EMPTY_SESSION, messages: [{ seq: 1, role: "assistant", text: "warm survivor history", ts: null }] };
+    const usage = { input_tokens: 100, output_tokens: 20 };
+    const cache = { ...EMPTY_SESSION, usage, messages: [{ seq: 1, role: "assistant", text: "warm survivor history", ts: null, usage }] };
     useLeaderStore.setState({ snapshot: before });
     useChatStore.setState({ active: groupRoot, openTabs: [survivor, ...members], bySession: Object.fromEntries([...keys, survivorKey].map((key) => [key, cache])),
       drafts: Object.fromEntries(keys.map((key) => [key, "draft"])), unseen: Object.fromEntries(keys.map((key) => [key, true])) });
@@ -872,7 +875,8 @@ describe("parent management and lifecycle", () => {
     const before = { leaders: [parent], branches: [dead] };
     useLeaderStore.setState({ snapshot: before });
     const survivor = { engine: "claude", sessionId: "warm-survivor", workspacePath: "/branches", model: "tab-model" };
-    const cached = { ...EMPTY_SESSION, activeModel: "session-model", activeEffort: "high", messages: [{ seq: 1, role: "assistant", text: "warm history", ts: null }] };
+    const usage = { input_tokens: 100, output_tokens: 20 };
+    const cached = { ...EMPTY_SESSION, activeModel: "session-model", activeEffort: "high", usage, messages: [{ seq: 1, role: "assistant", text: "warm history", ts: null, usage }] };
     useChatStore.setState({ active: { engine: dead.engine, sessionId: dead.sessionId, workspacePath: dead.workspacePath }, openTabs: [survivor, { engine: dead.engine, sessionId: dead.sessionId, workspacePath: dead.workspacePath }], bySession: { "claude/warm-survivor": cached } });
     vi.mocked(invoke).mockResolvedValue(before);
     const off = startLeaderRuntime(); await Promise.resolve(); await Promise.resolve();

@@ -94,10 +94,11 @@ async function check() {
     await run('native assistant notices', 'cargo', ['test', '--quiet', 'assistant_notices', '--lib', '--', '--test-threads=1'], path.join(ROOT, 'src-tauri'), env, log);
     await run('native plugin boundaries', 'cargo', ['test', '--quiet', 'plugin_caps', '--lib'], path.join(ROOT, 'src-tauri'), env, log);
     await run('native Leader', 'cargo', ['test', '--quiet', 'leader', '--lib'], path.join(ROOT, 'src-tauri'), env, log);
+    await run('native update compatibility', 'cargo', ['test', '--quiet', '--lib', '--', 'task_worker::tests::schema_', 'live_update::', 'handoff::tests::', 'activation::tests::'], path.join(ROOT, 'src-tauri'), env, log);
     await run('native history archive and deletion', 'cargo', ['test', '--quiet', 'history::reader::', '--lib'], path.join(ROOT, 'src-tauri'), env, log);
     await run('native isolated send path', 'cargo', ['test', '--quiet', '--features', 'test-harness', '--test', 'send_path'], path.join(ROOT, 'src-tauri'), env, log);
     git(['diff', '--check']);
-    recordVerification(production, checkedHead, ['maintenance safety', 'self-update build safety', 'release compiler privacy', 'privacy boundary', 'types', 'vitest', 'native quota', 'native auto title', 'native isolated title calls', 'native single instance', 'native startup modes', 'native bundled skills', 'native bundled agents', 'native relay transport', 'native passive throughput', 'native task control', 'native host chat', 'native Codex', 'native assistant notices', 'native plugin boundaries', 'native Leader', 'native history archive and deletion', 'native isolated send path', 'diff']);
+    recordVerification(production, checkedHead, ['maintenance safety', 'self-update build safety', 'release compiler privacy', 'privacy boundary', 'types', 'vitest', 'native quota', 'native auto title', 'native isolated title calls', 'native single instance', 'native startup modes', 'native bundled skills', 'native bundled agents', 'native relay transport', 'native passive throughput', 'native task control', 'native host chat', 'native Codex', 'native assistant notices', 'native plugin boundaries', 'native Leader', 'native update compatibility', 'native history archive and deletion', 'native isolated send path', 'diff']);
     console.log(JSON.stringify({ passed: true, log: filename }));
   } finally { log.end(); }
 }

@@ -41,7 +41,9 @@
 
 旧 `spellcast-canvas-bridge` 已退役，兼容恢复为它注册只保存数据的检查点参与者，不再等待插件加载、恢复回发或重放排队请求。原检查点内容继续随后续交接保存，恢复不读取也不改动插件文件和 KV，二者被手动删除也不影响恢复；主聊天与 worker 仍按原链路恢复。此例外只匹配该插件的精确检查点 ID 和身份，其他缺失参与者仍阻止健康确认，不能以忽略全部缺失插件绕过恢复检查。
 
-辅助会话的 `auxiliary_kind` 是扫描派生元数据，使用 v1 已有 `plugin_kv` 的内部命名空间 `$ccgui-session-auxiliary` 保存 JSON 字符串，不再向 `sessions` 新增列。已有开发数据库中的旧列只做一次数据导入，保留原列且不覆盖更新的 KV 值；扫描缓存版本升级后重新识别已有 Cursor 会话。此兼容修复不放宽 schema 门闩，重新打包前应先通过 `schema_hash_matches_v1_contract_and_recognizes_legacy_equivalent_hashes` 回归。
+辅助会话的 `auxiliary_kind` 是扫描派生元数据，使用 v1 已有 `plugin_kv` 的内部命名空间 `$ccgui-session-auxiliary` 保存 JSON 字符串，不再向 `sessions` 新增列。已有开发数据库中的旧列只做一次数据导入，保留原列且不覆盖更新的 KV 值；扫描缓存版本升级后重新识别已有 Cursor 会话。此兼容修复不放宽 schema 门闩。
+
+任务缓存成本审批引入 V2 持久化契约：描述符包含 `costApproval`、嵌套缓存记录以及分支、请求的审批状态，真实计算 hash 为 `9a17d672b37a0dec0ec7e5f1c1b8aee3ee1cea74619bfe88c86d4fcd17123a04`。V1 与其历史源字节等价哈希仍互认，均不能与 V2 热更新或混用 worker。V2 能读取缺少审批字段的旧记录；旧版不理解审批守卫，故从 V1 保留全部功能升级必须完整退出并安装 standalone V2，具体见[安装与恢复](custom-maintenance.zh-CN.md#安装与恢复)。`task_worker::tests::schema_` 回归固定当前真实契约和双向拒绝，不允许以删除功能或伪造哈希绕过。
 
 ## 事件、回执与恢复
 

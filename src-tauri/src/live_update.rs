@@ -582,6 +582,43 @@ impl UpdateStore {
         self.persist(&state)
     }
 
+    /// Called only by an exclusive, offline-installed GUI before opening its DB,
+    /// after confirming that no worker or checkpoint resume is still active.
+    /// Preserve the old metadata, but never use a v1 release as a v2 rollback.
+    pub(crate) fn retire_v1_after_offline_upgrade(
+        &self,
+        expected: &UpdateState,
+    ) -> Result<(), String> {
+        let _guard = WRITES.lock().map_err(|_| "update write lock poisoned")?;
+        let _process_guard = state_lock(&self.root)?;
+        let state = self.read_state()?;
+        if &state != expected {
+            return Err("update state changed during offline upgrade".into());
+        }
+        let active = state.active.as_ref().ok_or("offline upgrade baseline missing")?;
+        if crate::task_worker::schema_hash() != crate::task_worker::SCHEMA_CONTRACT_V2_HASH
+            || !crate::task_worker::schemas_compatible(
+                &active.schema_hash,
+                crate::task_worker::SCHEMA_CONTRACT_V1_HASH,
+            )
+        {
+            return Err("unsupported offline schema upgrade".into());
+        }
+        if state.transaction.as_ref().is_some_and(|t| {
+            matches!(t.phase, TransactionPhase::Preparing | TransactionPhase::Ready | TransactionPhase::Activating)
+                || (t.phase == TransactionPhase::Failed
+                    && t.failure_reason == Some(FailureReason::CandidateIdentityUnknown))
+        }) {
+            return Err("an update transaction is already pending".into());
+        }
+        self.verify_identity(active)?;
+        let backup = self.root.join(format!("offline-v1-state-{}.json", uuid::Uuid::new_v4()));
+        write_new(&backup, &serde_json::to_vec(&state).map_err(|e| e.to_string())?)?;
+        sync_directory(&self.root)?;
+        self.checkpoint_channel_unlocked()?;
+        self.persist(&UpdateState::default())
+    }
+
     pub fn prepare(
         &self,
         candidate: ReleaseIdentity,
@@ -864,6 +901,9 @@ mod tests {
             Self(path)
         }
         fn release(&self, name: &str) -> (PathBuf, String) {
+            self.release_with_schema(name, &"a".repeat(64))
+        }
+        fn release_with_schema(&self, name: &str, schema: &str) -> (PathBuf, String) {
             let directory = self.0.join(name);
             fs::create_dir(&directory).unwrap();
             fs::write(directory.join("ccgui-next.exe"), name).unwrap();
@@ -874,7 +914,7 @@ mod tests {
                 version: "1.0.0+protected.1".into(),
                 worker_protocol: 1,
                 checkpoint_schema: 1,
-                schema_hash: "a".repeat(64),
+                schema_hash: schema.into(),
                 executable: "ccgui-next.exe".into(),
                 files: vec![ReleaseFile {
                     path: "ccgui-next.exe".into(),
@@ -906,6 +946,62 @@ mod tests {
             checkpoint_schema: 1,
             schema_hash: "a".repeat(64),
         }
+    }
+
+    #[test]
+    fn offline_upgrade_preserves_old_metadata_and_uses_installed_baseline_for_next_update() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let (source, hash) = fixture.release_with_schema("v1", crate::task_worker::SCHEMA_CONTRACT_V1_HASH);
+        let old = store.stage(&source, &hash).unwrap();
+        store.initialize_active(old.clone()).unwrap();
+        let before = store.read_state().unwrap();
+        store.retire_v1_after_offline_upgrade(&before).unwrap();
+        assert_eq!(store.read_state().unwrap(), UpdateState::default());
+        let backups: Vec<_> = fs::read_dir(&store.root).unwrap().flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("offline-v1-state-")).collect();
+        assert_eq!(backups.len(), 1);
+        let saved: UpdateState = serde_json::from_slice(&fs::read(backups[0].path()).unwrap()).unwrap();
+        assert_eq!(saved, before);
+        assert!(store.verify_identity(&old).is_ok());
+        let (source, hash) = fixture.release_with_schema("v2", crate::task_worker::SCHEMA_CONTRACT_V2_HASH);
+        let new = store.stage(&source, &hash).unwrap();
+        let next = store.prepare(new, &Compatibility {
+            worker_protocol: 1, checkpoint_schema: 1, schema_hash: crate::task_worker::schema_hash(),
+        }).unwrap();
+        assert_eq!(next.previous, None);
+        assert_eq!(store.rollback(&next.id).unwrap(), None);
+    }
+
+    #[test]
+    fn offline_upgrade_rejects_stale_pending_uncertain_and_unknown_baselines() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let (source, hash) = fixture.release_with_schema("v1", crate::task_worker::LEGACY_V1_SOURCE_SCHEMA_HASHES[0]);
+        let old = store.stage(&source, &hash).unwrap();
+        store.initialize_active(old.clone()).unwrap();
+        let before = store.read_state().unwrap();
+        let tx = store.prepare(old, &Compatibility {
+            worker_protocol: 1, checkpoint_schema: 1, schema_hash: crate::task_worker::SCHEMA_CONTRACT_V1_HASH.into(),
+        }).unwrap();
+        assert_eq!(store.retire_v1_after_offline_upgrade(&before).unwrap_err(), "update state changed during offline upgrade");
+        for phase in [TransactionPhase::Preparing, TransactionPhase::Ready, TransactionPhase::Activating, TransactionPhase::Failed] {
+            let mut pending = store.read_state().unwrap();
+            pending.transaction.as_mut().unwrap().phase = phase.clone();
+            pending.transaction.as_mut().unwrap().failure_reason = (phase == TransactionPhase::Failed).then_some(FailureReason::CandidateIdentityUnknown);
+            store.persist(&pending).unwrap();
+            assert_eq!(store.retire_v1_after_offline_upgrade(&pending).unwrap_err(), "an update transaction is already pending");
+            assert_eq!(store.read_state().unwrap(), pending);
+        }
+        store.record_failure_reason(&tx.id, FailureReason::CandidateExited).unwrap();
+        store.retire_v1_after_offline_upgrade(&store.read_state().unwrap()).unwrap();
+
+        let (source, hash) = fixture.release("unknown");
+        let unknown = store.stage(&source, &hash).unwrap();
+        store.initialize_active(unknown).unwrap();
+        let before = store.read_state().unwrap();
+        assert_eq!(store.retire_v1_after_offline_upgrade(&before).unwrap_err(), "unsupported offline schema upgrade");
+        assert_eq!(store.read_state().unwrap(), before);
     }
 
     #[test]
@@ -1168,7 +1264,7 @@ mod tests {
         let fixture = Fixture::new();
         let (source, hash) = fixture.release("one");
         let mut candidate = verify_release(&source, &hash, Limits::default()).unwrap();
-        let current = crate::task_worker::schema_hash();
+        let current = crate::task_worker::SCHEMA_CONTRACT_V1_HASH.to_string();
         for &legacy in crate::task_worker::LEGACY_V1_SOURCE_SCHEMA_HASHES {
             candidate.schema_hash = current.clone();
             let expected = Compatibility {
@@ -1184,6 +1280,13 @@ mod tests {
                 schema_hash: current.clone(),
             };
             assert!(check_compatibility(&candidate, &expected_current).is_ok());
+            let expected_v2 = Compatibility {
+                schema_hash: crate::task_worker::schema_hash(),
+                ..expected_current
+            };
+            assert_eq!(check_compatibility(&candidate, &expected_v2).unwrap_err(), "database schema hash mismatch");
+            candidate.schema_hash = crate::task_worker::schema_hash();
+            assert_eq!(check_compatibility(&candidate, &expected).unwrap_err(), "database schema hash mismatch");
         }
         candidate.schema_hash = "c".repeat(64);
         assert_eq!(

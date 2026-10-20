@@ -44,6 +44,10 @@ pub const LEGACY_V1_SOURCE_SCHEMA_HASHES: &[&str] = &[
 pub const SCHEMA_CONTRACT_V1_HASH: &str =
     "93abdf288a9b3a7909507c5ede89c578be7976ba025e054d59160630db0f06fe";
 
+/// Cost approval records and states require a full restart from the v1 worker.
+pub const SCHEMA_CONTRACT_V2_HASH: &str =
+    "9a17d672b37a0dec0ec7e5f1c1b8aee3ee1cea74619bfe88c86d4fcd17123a04";
+
 static SCHEMA_HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 pub fn schema_hash() -> String {
@@ -1789,21 +1793,59 @@ mod tests {
     }
 
     #[test]
-    fn schema_hash_matches_v1_contract_and_recognizes_legacy_equivalent_hashes() {
+    fn schema_hash_matches_v2_contract_and_isolates_v1_legacy_equivalents() {
         let current = schema_hash();
         assert_eq!(
-            current, SCHEMA_CONTRACT_V1_HASH,
+            current, SCHEMA_CONTRACT_V2_HASH,
             "current schema_hash()={current}"
         );
         for legacy in LEGACY_V1_SOURCE_SCHEMA_HASHES {
-            assert!(schemas_compatible(&current, legacy));
-            assert!(schemas_compatible(legacy, &current));
+            assert!(schemas_compatible(SCHEMA_CONTRACT_V1_HASH, legacy));
+            assert!(schemas_compatible(legacy, SCHEMA_CONTRACT_V1_HASH));
+            assert!(!schemas_compatible(&current, legacy));
+            assert!(!schemas_compatible(legacy, &current));
             for other in LEGACY_V1_SOURCE_SCHEMA_HASHES {
                 assert!(schemas_compatible(legacy, other));
             }
             assert!(!schemas_compatible(legacy, &"0".repeat(64)));
         }
         assert!(!schemas_compatible(&current, &"0".repeat(64)));
+        assert!(!schemas_compatible(&"0".repeat(64), &current));
+        assert!(!schemas_compatible(&current, SCHEMA_CONTRACT_V1_HASH));
+        assert!(!schemas_compatible(SCHEMA_CONTRACT_V1_HASH, &current));
+        assert!(schemas_compatible(&current, &current));
+    }
+
+    #[test]
+    fn schema_contract_hash_detects_cost_approval_fields_and_states() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let descriptor = crate::leader::schema_contract_descriptor();
+        assert_eq!(descriptor["branchRecord"]["costApproval"], json!({
+            "requestId": "", "capturedAt": 0, "model": "",
+            "cache": {
+                "ttlSeconds": 0, "startedAt": 0, "observedAt": 0, "source": "",
+                "reference": { "maxTtlSeconds": 0, "cacheReadTokens": 0, "promptTokens": 0 }
+            }
+        }));
+        let baseline = compute_schema_contract_hash(&conn, &[("leader", &descriptor)]).unwrap();
+        for pointer in [
+            "/branchRecord/costApproval",
+            "/branchRecord/costApproval/cache",
+            "/branchRecord/costApproval/cache/reference",
+        ] {
+            for field in descriptor.pointer(pointer).unwrap().as_object().unwrap().keys() {
+                let mut changed = descriptor.clone();
+                changed.pointer_mut(pointer).unwrap().as_object_mut().unwrap().remove(field);
+                assert_ne!(compute_schema_contract_hash(&conn, &[("leader", &changed)]).unwrap(), baseline, "{pointer}/{field}");
+            }
+        }
+        for states in ["branchStates", "requestStates"] {
+            let mut changed = descriptor.clone();
+            let values = changed[states].as_array_mut().unwrap();
+            assert!(values.iter().any(|value| value == "awaiting_cost_approval"));
+            values.retain(|value| value != "awaiting_cost_approval");
+            assert_ne!(compute_schema_contract_hash(&conn, &[("leader", &changed)]).unwrap(), baseline, "{states}");
+        }
     }
 
     #[test]

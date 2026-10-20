@@ -714,7 +714,22 @@ pub(crate) fn schema_contract_descriptor() -> Value {
         result: String::new(),
         result_truncated: false,
         error: Some(String::new()),
-        cost_approval: None,
+        cost_approval: Some(TaskCostApproval {
+            request_id: String::new(),
+            captured_at: 0,
+            cache: Some(crate::history::prompt_cache::CacheWindow {
+                ttl_seconds: 0,
+                started_at: 0,
+                observed_at: 0,
+                source: String::new(),
+                reference: Some(crate::history::prompt_cache::CacheReference {
+                    max_ttl_seconds: 0,
+                    cache_read_tokens: 0,
+                    prompt_tokens: 0,
+                }),
+            }),
+            model: Some(String::new()),
+        }),
     };
     let request = Request {
         parent: identity.clone(),
@@ -738,6 +753,15 @@ pub(crate) fn schema_contract_descriptor() -> Value {
     json!({
         "branchRecord": branch,
         "requestRecord": request,
+        "requestStates": [
+            "starting",
+            "awaiting_cost_approval",
+            "acknowledged",
+            "failed",
+            "cancelled",
+            "unknown",
+            "reclaimed",
+        ],
         "archivedGroupRecord": archived_group,
         "branchStates": [
             "starting",

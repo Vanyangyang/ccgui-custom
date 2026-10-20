@@ -251,6 +251,38 @@ fn launcher_supersedes_committed(
     current_mtime > state_mtime && current_mtime > committed_mtime
 }
 
+/// Full restart is the only supported v1 -> v2 transition. This runs after GUI
+/// ownership and worker discovery, before any application database is opened.
+pub(crate) fn reconcile_offline_upgrade(has_running_workers: bool) -> Result<(), String> {
+    if has_resume() {
+        return Ok(());
+    }
+    let state_path = crate::paths::app_home().join("runtime-updates/state.json");
+    if !state_path.exists() {
+        return Ok(());
+    }
+    let update = store()?;
+    let current = canonical(&std::env::current_exe().map_err(|_| "Read current executable failed")?)?;
+    reconcile_offline_upgrade_in(&update, &current, &state_path, has_running_workers)
+}
+
+fn reconcile_offline_upgrade_in(update: &UpdateStore, current: &Path, state_path: &Path, has_running_workers: bool) -> Result<(), String> {
+    let state = update.read_state()?;
+    let Some(active) = &state.active else { return Ok(()); };
+    if crate::task_worker::schemas_compatible(&active.schema_hash, &crate::task_worker::schema_hash()) {
+        return Ok(());
+    }
+    if has_running_workers {
+        return Err("Finish all running tasks before completing the offline schema upgrade".into());
+    }
+    let executable = canonical(&update.release_path(active)?.join(&active.executable))?;
+    let releases = state_path.parent().ok_or("Update state parent missing")?.join("releases");
+    if !launcher_supersedes_committed(current, &executable, state_path, &releases) {
+        return Err("Finish the previous version and install the new version before upgrading its database contract".into());
+    }
+    update.retire_v1_after_offline_upgrade(&state)
+}
+
 pub(crate) async fn restore_services(
     app: &tauri::AppHandle,
     workers: &[crate::task_worker::WorkerManifest],
@@ -1325,6 +1357,45 @@ pub(crate) mod tests {
             &state_path,
             &releases,
         ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn offline_upgrade_requires_newer_external_launcher_and_no_workers() {
+        let root = std::env::temp_dir().join(format!("ccgui-offline-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let source = root.join("package");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("ccgui-next.exe"), b"v1").unwrap();
+        let manifest = crate::live_update::ReleaseManifest {
+            manifest_version: 1, channel: "protected-custom".into(), release_id: "v1".into(), version: "1.0.0".into(),
+            worker_protocol: 1, checkpoint_schema: 1, schema_hash: crate::task_worker::SCHEMA_CONTRACT_V1_HASH.into(),
+            executable: "ccgui-next.exe".into(), files: vec![crate::live_update::ReleaseFile {
+                path: "ccgui-next.exe".into(), bytes: 2, sha256: format!("{:x}", Sha256::digest(b"v1")),
+            }],
+        };
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        let hash = format!("{:x}", Sha256::digest(&bytes));
+        std::fs::write(source.join("manifest.json"), bytes).unwrap();
+        let launcher = root.join("ccgui-next.exe");
+        std::fs::write(&launcher, b"old launcher").unwrap();
+        std::thread::sleep(Duration::from_millis(25));
+        let update = UpdateStore::open(&root, Limits::default()).unwrap();
+        let old = update.stage(&source, &hash).unwrap();
+        update.initialize_active(old.clone()).unwrap();
+        let before = update.read_state().unwrap();
+        let state_path = root.join("runtime-updates/state.json");
+        let launcher = canonical(&launcher).unwrap();
+        assert!(reconcile_offline_upgrade_in(&update, &launcher, &state_path, false).is_err());
+        std::thread::sleep(Duration::from_millis(25));
+        std::fs::write(&launcher, b"new standalone v2").unwrap();
+        assert!(reconcile_offline_upgrade_in(&update, &launcher, &state_path, true).is_err());
+        let released = canonical(&update.release_path(&old).unwrap().join("ccgui-next.exe")).unwrap();
+        assert!(reconcile_offline_upgrade_in(&update, &released, &state_path, false).is_err());
+        assert_eq!(update.read_state().unwrap(), before);
+        reconcile_offline_upgrade_in(&update, &launcher, &state_path, false).unwrap();
+        assert_eq!(update.read_state().unwrap(), crate::live_update::UpdateState::default());
+        reconcile_offline_upgrade_in(&update, &launcher, &state_path, false).unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 

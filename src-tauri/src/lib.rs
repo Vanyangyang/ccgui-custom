@@ -204,6 +204,12 @@ pub fn run() {
         std::process::exit(1);
     });
     let has_running_workers = !running_workers.is_empty() || handoff::has_resume();
+    if let Err(error) = handoff::reconcile_offline_upgrade(has_running_workers) {
+        eprintln!("[live-update] {error}");
+        #[cfg(windows)]
+        startup::show_single_instance_error(&error);
+        std::process::exit(1);
+    }
     if !has_running_workers { engine::images::sweep_pasted_images(); }
     // Restore workspace .omp/mcp.json files left injected by a crash
     // (computer use writes them per send and restores on run exit).

@@ -4,7 +4,7 @@
   "upstreamRelease": "v1.1.0",
   "upstreamReleaseCommit": "e4fad0fba6f8fae7ff92da253c6975417e13653e",
   "sourceBaseCommit": "82ed167ced9b1f34c65b44afbd5d689f36e00d45",
-  "patchRevision": 34,
+  "patchRevision": 35,
   "proxy": "http://127.0.0.1:7897",
   "minimumClaudeVersion": "2.1.286"
 }

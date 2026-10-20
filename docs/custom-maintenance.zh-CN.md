@@ -81,6 +81,12 @@ TPS 是独立元数据链，不能复用旧 `genMs` 或上下文占用直接相�
 `%USERPROFILE%/AppData/Local/Programs/CCGUI/ccgui-next.exe`。
 通过 Windows 进程查询发现任何 `ccgui-next.exe` 时拒绝安装，不自动结束用户工作。
 
+`1.1.1+protected.35` 的任务缓存成本审批采用 V2 持久化契约，保留全部功能，但与 V1 执行器不能混用。出现 `database schema hash mismatch` 时不要放宽校验或把 V2 哈希加入 V1 等价表。先结束旧任务，正常关闭全部 GUI、worker、supervisor，再安装由 `maint:check` 和 `maint:build` 产生的完整安装包；本维护环境使用 `maint:install`，它会再次确认全部 `ccgui-next.exe` 已退出。不能把使用外置前端的自更新 EXE 单独复制到安装目录。
+
+首次冷启动 V2 时，较新的独立安装入口在取得 GUI 所有权、完成 worker 检查后，核对旧 active 确属已知 V1 契约，备份旧更新元数据为 `runtime-updates/offline-v1-state-<唯一编号>.json`，保存共享通道终态，再清空旧版本指针。应用数据库、会话和旧 release 文件保留。未结束或身份不明的更新事务、旧 worker、未知契约及并发状态变化均拒绝升级。后续 V2 热更新以新安装的 V2 为回退基线；元数据备份不授权重新运行 V1 或降级数据库。
+
+`maint:check` 包含真实 schema 哈希、V1 等价关系、V1/V2 双向拒绝、冷安装基线收敛和自更新事务测试。安装包完成不等于已经运行新版本；安装后仍须核对实际版本和常用任务功能。
+
 旧程序先保存到仓库 `artifacts/custom-install-<唯一编号>/`，复制后再次核验 SHA256；
 复制失败或校验不一致时恢复备份。原有「CC GUI（代理保护）」快捷方式及保护脚本
 保留，成功后只启动该快捷方式。普通 `Desktop/CC GUI.lnk` 如存在则在绝对路径与

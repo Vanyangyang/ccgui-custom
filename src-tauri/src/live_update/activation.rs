@@ -693,6 +693,29 @@ mod tests {
     }
 
     #[test]
+    fn first_update_after_offline_install_rolls_back_to_standalone_not_retained_release() {
+        for launch_fails in [false, true] {
+            let mut fixture = Fixture::new();
+            let retained = fixture.config.previous_executable.clone();
+            let standalone = fixture.root.join("installed-v2.exe");
+            std::fs::write(&standalone, b"standalone v2 baseline").unwrap();
+            let mut state = fixture.store.read_state().unwrap();
+            state.active = None;
+            state.transaction.as_mut().unwrap().previous = None;
+            fixture.store.persist(&state).unwrap();
+            fixture.config.previous_executable = standalone.clone();
+            let mut runtime = FakeRuntime { launch_fails, ..Default::default() };
+            fixture.run(&mut runtime).unwrap();
+            assert_eq!(runtime.launches, vec![fixture.config.candidate_executable.clone(), standalone]);
+            assert!(!runtime.launches.contains(&retained));
+            assert_eq!(runtime.terminated, 0);
+            let state = fixture.store.read_state().unwrap();
+            assert!(state.active.is_none());
+            assert_eq!(state.transaction.unwrap().phase, TransactionPhase::RolledBack);
+        }
+    }
+
+    #[test]
     fn timeout_only_terminates_owned_candidate_and_preserves_failure() {
         let fixture = Fixture::new();
         let mut runtime = FakeRuntime {

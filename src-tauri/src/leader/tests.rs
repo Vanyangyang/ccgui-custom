@@ -1727,6 +1727,34 @@ fn wait_ignores_children_already_ready_and_reports_new_ones() {
 }
 
 #[test]
+fn legacy_v1_branch_without_cost_approval_restores_completed_result() {
+    let f = basic();
+    let (id, run) = spawn(&f, "legacy-v1-result");
+    settle(&f, &id, &run, "legacy-v1-session");
+    let mut legacy = serde_json::to_value(branch(&f, &id)).unwrap();
+    legacy.as_object_mut().unwrap().remove("costApproval");
+    legacy["result"] = json!("Existing result: 中文 👩‍💻\n```text\npreserved\n```");
+    legacy["resultTruncated"] = json!(true);
+    let raw = serde_json::to_string(&legacy).unwrap();
+    let decoded: LeaderBranch = serde_json::from_str(&raw).unwrap();
+    assert!(decoded.cost_approval.is_none());
+    f.manager.db.0.lock().execute(
+        "UPDATE leader_branches SET record_json=?1 WHERE id=?2",
+        params![raw, id],
+    ).unwrap();
+
+    let restored = reload(&f).unwrap();
+    let inner = restored.inner.lock();
+    let branch = &inner.branches[&id].branch;
+    assert_eq!(branch.state, "completed");
+    assert_eq!(branch.result, legacy["result"].as_str().unwrap());
+    assert!(branch.result_truncated);
+    assert_eq!(branch.session_id.as_deref(), Some("legacy-v1-session"));
+    assert!(branch.cost_approval.is_none());
+    assert_eq!(restored.processes.active_run_count(), 0);
+}
+
+#[test]
 fn restart_makes_inflight_unknown_and_never_replays_unacknowledged_launch() {
     let f = basic();
     let (id, _run) = spawn(&f, "stable-key");
