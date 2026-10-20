@@ -334,9 +334,28 @@ test('every production Rust embedded external input invalidates native and full 
   f.put('src/app.ts', 'ordinary UI edit');
   assert.equal((await buildSelfUpdate(f.options(), f.hooks)).nativeCacheHit, true);
 });
+test('test-only embedded skill changes invalidate the package while reusing production builds', async t => {
+  const f = fixture(t);
+  const relative = 'src-tauri/resources/skills/ccgui-collab/SKILL.md';
+  f.put(relative, 'original collaboration skill');
+  const first = await buildSelfUpdate(f.options(), f.hooks);
+  f.put(relative, 'updated collaboration skill');
+  const next = await buildSelfUpdate(f.options(), f.hooks);
+  assert.notEqual(next.inputFingerprint, first.inputFingerprint);
+  assert.equal(next.nativeCacheHit, true);
+  assert.equal(next.frontendCacheHit, true);
+  assert.equal(next.nativeFingerprint, first.nativeFingerprint);
+  assert.equal(next.frontendFingerprint, first.frontendFingerprint);
+  assert.equal(fs.readFileSync(path.join(next.packageRoot, 'skills/ccgui-collab/SKILL.md'), 'utf8'), 'updated collaboration skill');
+});
 test('Rust include audit requires explicit classification outside native source tree', () => {
   const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-  const testOnly = new Set();
+  // host_chat.rs includes this module under #[cfg(test)]. Scope the exception
+  // to its importer so a future production include still requires classification.
+  const testOnly = new Set([
+    'src-tauri/src/host_chat/tests.rs:src-tauri/resources/skills/ccgui-collab/SKILL.md',
+  ]);
+  const seenTestOnly = new Set();
   const seen = new Set();
   function audit(directory) {
     for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
@@ -349,14 +368,18 @@ test('Rust include audit requires explicit classification outside native source 
         const literal = /^"([^"\\]+)"\s*,?\s*$/.exec(match[1]);
         assert.ok(literal, `Review dynamic/concat Rust include in ${filename}`);
         const relative = path.relative(root, path.resolve(path.dirname(filename), literal[1])).split(path.sep).join('/');
+        const importer = path.relative(root, filename).split(path.sep).join('/');
+        const testOnlyPair = `${importer}:${relative}`;
+        if (testOnly.has(testOnlyPair)) seenTestOnly.add(testOnlyPair);
         seen.add(relative);
         const ordinaryNative = relative.startsWith('src-tauri/') && !relative.startsWith('src-tauri/resources/');
-        assert.ok(ordinaryNative || NATIVE_EMBEDDED_INPUTS.includes(relative) || testOnly.has(relative), `Classify native embedded dependency: ${relative}`);
+        assert.ok(ordinaryNative || NATIVE_EMBEDDED_INPUTS.includes(relative) || testOnly.has(testOnlyPair), `Classify native embedded dependency: ${relative}`);
       }
     }
   }
   audit(path.join(root, 'src-tauri'));
   for (const relative of NATIVE_EMBEDDED_INPUTS) assert.ok(seen.has(relative), `Remove stale embedded dependency: ${relative}`);
+  for (const pair of testOnly) assert.ok(seenTestOnly.has(pair), `Remove stale test-only embedded dependency: ${pair}`);
 });
 test('captureSnapshot isolates the frozen batch build from later working-tree edits and preserves unchanged mtimes', async t => {
   const f = fixture(t);

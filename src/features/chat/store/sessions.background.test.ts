@@ -71,7 +71,10 @@ describe("background native session preparation", () => {
     await expect(other.actions.selectSession(target.engine, target.sessionId, target.workspacePath)).resolves.toBeUndefined();
   });
   it("does not treat a past turn error as history failure or reload an already loaded empty session", async () => {
-    const f = fixture(); f.get().bySession[key] = { ...EMPTY_SESSION, messages: page.messages, error: "past engine error" };
+    const f = fixture();
+    // Keep the cached history complete so a legitimate usage backfill is not needed.
+    const usage = { input_tokens: 100, output_tokens: 20 };
+    f.get().bySession[key] = { ...EMPTY_SESSION, messages: page.messages.map((message) => ({ ...message, usage })), usage, error: "past engine error" };
     await f.actions.selectSession(target.engine, target.sessionId, target.workspacePath, { background: true });
     expect(f.load).not.toHaveBeenCalled();
     const empty = fixture(); empty.load.mockResolvedValue({ ...page, messages: [] });
