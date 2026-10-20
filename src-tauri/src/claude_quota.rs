@@ -1519,7 +1519,7 @@ mod tests {
         let mut cache = state.cache.lock().unwrap();
         state.bind_cache(&mut cache, "account-a");
         let snapshot = cache.snapshot.as_mut().unwrap();
-        snapshot.collected_at = Some(now_seconds() - 1);
+        snapshot.collected_at = Some(latest["collectedAt"].as_u64().unwrap() - 1);
         snapshot.windows.five_hour.as_mut().unwrap().used_percentage = 10.0;
         assert!(state.persist_cache(&mut cache, false).is_ok());
         let unchanged: Value = serde_json::from_slice(&std::fs::read(scratch.path()).unwrap()).unwrap();
