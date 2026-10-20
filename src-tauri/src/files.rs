@@ -284,6 +284,63 @@ pub async fn read_file(
         .map_err(|e| e.to_string())?
 }
 
+/// Chat image previews read raw bytes, so the cap only bounds memory, not a
+/// base64/JSON round trip like `read_file`'s 5MB preview limit.
+const MAX_CHAT_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// MIME type of a passive raster image, by content rather than extension;
+/// anything else (SVG, HTML renamed to .png) is refused.
+pub(crate) fn raster_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else if bytes.starts_with(b"BM") {
+        Some("image/bmp")
+    } else if bytes.starts_with(&[0, 0, 1, 0]) {
+        Some("image/x-icon")
+    } else if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" && matches!(&bytes[8..12], b"avif" | b"avis") {
+        Some("image/avif")
+    } else {
+        None
+    }
+}
+
+pub(crate) fn read_image_bytes_blocking(db: &crate::db::Db, path: &str) -> Result<Vec<u8>, String> {
+    let file = ensure_allowed(path, db)?;
+    let meta = std::fs::metadata(&file).map_err(|e| format!("stat {}: {e}", file.display()))?;
+    if !meta.is_file() {
+        return Err(format!("not a file: {}", file.display()));
+    }
+    if meta.len() > MAX_CHAT_IMAGE_BYTES {
+        return Err("image exceeds 64MB preview limit".to_string());
+    }
+    let bytes = std::fs::read(&file).map_err(|e| format!("read {}: {e}", file.display()))?;
+    if raster_mime(&bytes).is_none() {
+        return Err(format!("not a raster image: {}", file.display()));
+    }
+    Ok(bytes)
+}
+
+/// Raw bytes of a local raster image for chat previews, under the same
+/// workspace/grant confinement as `read_file`. Returned as a binary IPC
+/// body, which the webview receives as an ArrayBuffer.
+#[tauri::command]
+pub async fn read_image_bytes(
+    db: tauri::State<'_, Arc<crate::db::Db>>,
+    path: String,
+) -> Result<tauri::ipc::Response, String> {
+    let db = Arc::clone(db.inner());
+    let bytes = tauri::async_runtime::spawn_blocking(move || read_image_bytes_blocking(&db, &path))
+        .await
+        .map_err(|e| e.to_string())??;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
 #[tauri::command]
 pub fn write_file(
     db: tauri::State<'_, Arc<crate::db::Db>>,
@@ -687,5 +744,36 @@ mod tests {
         assert!(!filtered.iter().any(|e| e.rel == "release/app.exe"));
         let all = list_file_index_blocking(&db, &root, true).unwrap();
         assert!(all.iter().any(|e| e.rel == "release/app.exe"));
+    }
+
+    #[test]
+    fn chat_image_bytes_are_confined_sniffed_and_not_capped_at_preview_size() {
+        let scratch = Scratch::new();
+        let db = crate::db::Db::open_at(&scratch.0.join("test.db")).unwrap();
+        // 6MB: over read_file's 5MB data-URL preview cap.
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.resize(6 * 1024 * 1024, 0);
+        let big = scratch.0.join("render.png");
+        std::fs::write(&big, &png).unwrap();
+        let fake = scratch.0.join("fake.png");
+        std::fs::write(&fake, b"<svg onload=alert(1)>").unwrap();
+        let big_str = big.to_string_lossy().to_string();
+
+        let err = read_image_bytes_blocking(&db, &big_str).unwrap_err();
+        assert!(err.starts_with("path is outside the registered workspaces"));
+        db.add_granted_root(&scratch.0.to_string_lossy()).unwrap();
+        assert_eq!(read_image_bytes_blocking(&db, &big_str).unwrap().len(), png.len());
+        assert!(read_image_bytes_blocking(&db, &fake.to_string_lossy()).unwrap_err().starts_with("not a raster image"));
+        assert!(read_image_bytes_blocking(&db, &scratch.0.to_string_lossy()).is_err());
+    }
+
+    #[test]
+    fn raster_mime_matches_content_not_names() {
+        assert_eq!(raster_mime(b"\xFF\xD8\xFF\xE0"), Some("image/jpeg"));
+        assert_eq!(raster_mime(b"GIF89a.."), Some("image/gif"));
+        assert_eq!(raster_mime(b"RIFF\0\0\0\0WEBPVP8 "), Some("image/webp"));
+        assert_eq!(raster_mime(b"\0\0\0\x1cftypavif"), Some("image/avif"));
+        assert_eq!(raster_mime(b"<?xml"), None);
+        assert_eq!(raster_mime(b""), None);
     }
 }

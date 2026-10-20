@@ -28,6 +28,7 @@ export interface CrossSessionParticipant {
 }
 
 export interface CrossSessionCommunicationRecord {
+  leaderCostApproval?: { branchId: string; requestId: string; model?: string | null };
   scopedId: string;
   requestId: string;
   runId?: string;

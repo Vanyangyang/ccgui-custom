@@ -27,6 +27,7 @@ function deferred() {
 }
 
 beforeEach(() => {
+  vi.spyOn(ipc, "taskSnapshot").mockResolvedValue({ leaders: [], branches: [] });
   localStorage.removeItem(HANDOFF_PREFERENCES_KEY);
   localStorage.removeItem(LEGACY_HANDOFF_PREFERENCES_KEY);
   useHandoffStore.setState({ byWorkspace: {} });
@@ -41,12 +42,16 @@ afterEach(() => {
 });
 
 describe("optional handoff model compression", () => {
-  it("defaults to a local summary and issues no model request, including retry while off", () => {
+  it("defaults to a local summary and issues no model request, including retry while off", async () => {
     const summarize = vi.spyOn(ipc, "summarizeSessionHandoff");
     useHandoffStore.getState().startHandoff(args);
     useHandoffStore.getState().retryGrok(workspacePath);
     expect(entry()).toMatchObject({ mode: "local", compressionModel: DEFAULT_HANDOFF_COMPRESSION_MODEL, grokStatus: "idle" });
     expect(draft()).toContain("Local conclusion 中文 😀");
+    expect(summarize).not.toHaveBeenCalled();
+    await Promise.resolve();
+    expect(entry().childrenStatus).toBe("ready");
+    expect(ipc.taskSnapshot).toHaveBeenCalledTimes(1);
     expect(summarize).not.toHaveBeenCalled();
   });
 
@@ -58,6 +63,8 @@ describe("optional handoff model compression", () => {
     useHandoffStore.getState().setCompressionModel(workspacePath, "gemini-3.1-pro");
     expect(summarize).not.toHaveBeenCalled();
     useHandoffStore.getState().setCompressionMode(workspacePath, "grok");
+    expect(summarize).not.toHaveBeenCalled();
+    await Promise.resolve(); // Complete the child snapshot before model inference.
     expect(summarize).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ compressionModel: "gemini-3.1-pro", engine: "codex", sessionId: "source" }));
     summary.resolve("Selected model summary"); await summary.promise;
     expect(draft()).toContain("上一会话交接摘要（模型提炼）：");
@@ -73,10 +80,12 @@ describe("optional handoff model compression", () => {
     useHandoffStore.getState().setCompressionMode(workspacePath, "grok");
     await Promise.resolve();
     useHandoffStore.getState().startHandoff({ ...args, sourceSessionId: "second" });
+    await Promise.resolve();
     expect(summarize).toHaveBeenCalledTimes(2);
     expect(summarize).toHaveBeenLastCalledWith(expect.objectContaining({ compressionModel: "opus-4.6" }));
     useHandoffStore.getState().setCompressionMode(workspacePath, "local");
     useHandoffStore.getState().startHandoff({ ...args, sourceSessionId: "third" });
+    await Promise.resolve();
     expect(summarize).toHaveBeenCalledTimes(2);
     expect(entry()).toMatchObject({ mode: "local", compressionModel: "opus-4.6" });
   });
@@ -85,6 +94,7 @@ describe("optional handoff model compression", () => {
     const summary = deferred();
     vi.spyOn(ipc, "summarizeSessionHandoff").mockReturnValue(summary.promise);
     useHandoffStore.getState().startHandoff({ ...args, initialMode: "grok" });
+    await Promise.resolve();
     useHandoffStore.getState().setCompressionMode(workspacePath, "local");
     const local = draft();
     summary.resolve("Old request must not appear"); await summary.promise;
@@ -96,6 +106,7 @@ describe("optional handoff model compression", () => {
     const first = deferred(); const second = deferred();
     const summarize = vi.spyOn(ipc, "summarizeSessionHandoff").mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
     useHandoffStore.getState().startHandoff({ ...args, initialMode: "grok" });
+    await Promise.resolve();
     useChatStore.getState().setDraft(key, draft() + "保留后续任务 😀");
     useHandoffStore.getState().setCompressionModel(workspacePath, "gemini-3.1-pro");
     expect(summarize).toHaveBeenLastCalledWith(expect.objectContaining({ compressionModel: "gemini-3.1-pro" }));
@@ -110,6 +121,7 @@ describe("optional handoff model compression", () => {
     const first = deferred(); const second = deferred();
     vi.spyOn(ipc, "summarizeSessionHandoff").mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
     useHandoffStore.getState().startHandoff({ ...args, initialMode: "grok" });
+    await Promise.resolve();
     const edited = draft().replace("Local conclusion 中文 😀", "人工核实：保留这个结论 😀");
     useChatStore.getState().setDraft(key, edited);
     if (change === "toggle") {
@@ -176,9 +188,12 @@ describe("optional handoff model compression", () => {
     useHandoffStore.getState().setCompressionSelection(workspacePath, selection);
     expect(summarize).not.toHaveBeenCalled();
     useHandoffStore.getState().setCompressionMode(workspacePath, "grok");
+    expect(summarize).not.toHaveBeenCalled();
+    await Promise.resolve();
     expect(summarize).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ compressionSelection: selection, engine: "codex" }));
     await Promise.resolve();
     useHandoffStore.getState().startHandoff({ ...args, sourceSessionId: "second" });
+    await Promise.resolve();
     expect(summarize).toHaveBeenLastCalledWith(expect.objectContaining({ compressionSelection: selection }));
     expect(entry().compressionSelection).toEqual(selection);
     expect(useChatStore.getState().models).toBe(chat.models);
@@ -194,6 +209,7 @@ describe("optional handoff model compression", () => {
     useHandoffStore.getState().startHandoff(args);
     useHandoffStore.getState().setCompressionSelection(workspacePath, selection);
     useHandoffStore.getState().setCompressionMode(workspacePath, "grok");
+    await Promise.resolve();
     const next = { ...selection, [field]: field === "engine" ? "codex" : field === "providerId" ? "two" : "high" };
     useHandoffStore.getState().setCompressionSelection(workspacePath, next);
     expect(summarize).toHaveBeenCalledTimes(2);

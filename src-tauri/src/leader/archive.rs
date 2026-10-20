@@ -363,7 +363,7 @@ impl LeaderManager {
                 record.stopping
                     || matches!(
                         record.branch.state.as_str(),
-                        "starting" | "running" | "waiting" | "reclaiming" | "stopping"
+                        "starting" | "running" | "waiting" | "awaiting_cost_approval" | "reclaiming" | "stopping"
                     )
                     || self.active(inner, &record.branch)
             })

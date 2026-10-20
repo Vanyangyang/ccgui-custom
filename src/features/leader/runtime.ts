@@ -11,6 +11,7 @@ import { removeLeaderSessions } from "./session-cleanup";
 import { useLeaderStore } from "./store";
 import type { LeaderBranch, LeaderSnapshot } from "./types";
 import { sameLeaderWorkspace } from "./workspace-path";
+import { getSessionCacheHeat } from "@/features/chat/prompt-cache";
 
 function removeReclaimed(branches: LeaderBranch[]) {
   removeLeaderSessions(branches.flatMap((branch) => branch.sessionId ? [{ engine: branch.engine, sessionId: branch.sessionId, workspacePath: branch.workspacePath }] : []), branches, true);
@@ -18,6 +19,8 @@ function removeReclaimed(branches: LeaderBranch[]) {
 
 function branchToCommsStatus(state: LeaderBranch["state"]): CrossSessionCommunicationStatus | null {
   switch (state) {
+    case "awaiting_cost_approval":
+      return "awaiting_cost_approval";
     case "starting":
       return "received";
     case "running":
@@ -78,8 +81,9 @@ export function syncLeaderBranchComms(
       !existing && options?.markInitialTerminalReviewed && isTerminal
         ? [crossSessionParticipantKey(sender), crossSessionParticipantKey(target)]
         : undefined;
-    const acceptedAt =
-      existing && existing.runId === (branch.runId ?? undefined)
+    const acceptedAt = status === "awaiting_cost_approval" && branch.costApproval
+      ? branch.costApproval.capturedAt
+      : existing && existing.runId === (branch.runId ?? undefined)
         ? existing.acceptedAt
         : branch.createdAt || branch.updatedAt || Date.now();
     const replyText =
@@ -89,13 +93,24 @@ export function syncLeaderBranchComms(
         : undefined);
     const record: CrossSessionCommunicationRecord = {
       scopedId,
-      requestId: branch.id,
+      requestId: status === "awaiting_cost_approval" && branch.costApproval ? branch.costApproval.requestId : branch.id,
       runId: branch.runId ?? undefined,
       kind: "subtask",
       sender,
       target,
       message: branch.task || branch.title,
       status,
+      leaderCostApproval: branch.costApproval && status === "awaiting_cost_approval" ? {
+        branchId: branch.id, requestId: branch.costApproval.requestId, model: branch.costApproval.model,
+      } : undefined,
+      costReview: branch.costApproval && status === "awaiting_cost_approval" ? {
+        capturedAt: branch.costApproval.capturedAt,
+        model: branch.costApproval.model ?? undefined,
+        cache: branch.costApproval.cache ?? undefined,
+        cacheHeat: getSessionCacheHeat(branch.costApproval.cache, branch.costApproval.capturedAt),
+        targetStatus: "idle",
+        context: { kind: "unknown", capacityKnown: false, reference: false, modelMismatch: false },
+      } : undefined,
       replyText,
       truncated: branch.resultTruncated || undefined,
       error: branch.error ?? undefined,

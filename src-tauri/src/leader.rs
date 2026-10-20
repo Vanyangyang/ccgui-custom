@@ -25,7 +25,9 @@ const RETIRE_TIMEOUT: Duration = Duration::from_secs(20);
 static MANAGER: OnceLock<Arc<LeaderManager>> = OnceLock::new();
 mod archive;
 mod branch_delete;
+mod cost_approval;
 mod model_policy;
+pub use cost_approval::TaskCostApproval;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -58,6 +60,8 @@ pub struct LeaderBranch {
     pub result: String,
     pub result_truncated: bool,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_approval: Option<TaskCostApproval>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -380,6 +384,7 @@ fn erase_branch_content(record: &mut BranchRecord) {
     record.branch.result.clear();
     record.branch.result_truncated = false;
     record.branch.error = None;
+    record.branch.cost_approval = None;
     record.output = Output::default();
     record.questions.clear();
     record.plans.clear();
@@ -709,6 +714,7 @@ pub(crate) fn schema_contract_descriptor() -> Value {
         result: String::new(),
         result_truncated: false,
         error: Some(String::new()),
+        cost_approval: None,
     };
     let request = Request {
         parent: identity.clone(),
@@ -737,6 +743,7 @@ pub(crate) fn schema_contract_descriptor() -> Value {
             "starting",
             "running",
             "waiting",
+            "awaiting_cost_approval",
             "completed",
             "failed",
             "stopped",
@@ -1196,6 +1203,7 @@ impl LeaderManager {
             result: String::new(),
             result_truncated: false,
             error: None,
+            cost_approval: None,
         };
         let record = BranchRecord {
             branch,
@@ -1268,6 +1276,8 @@ impl LeaderManager {
         if fenced(&previous.branch.state)
             || previous.stopping
             || self.active(&inner, &previous.branch)
+            || previous.branch.cost_approval.is_some()
+            || previous.branch.state == "awaiting_cost_approval"
         {
             return Err(
                 "Child is still running or being reclaimed; wait or stop it before sending".into(),
@@ -1278,6 +1288,25 @@ impl LeaderManager {
                 "Child has no native session identity; inspect it in task management".into(),
             );
         }
+        let cache = self.send_cache(&previous.branch)?;
+        if cost_approval::requires_approval(cache.as_ref(), (self.clock)()) {
+            let response = self.hold_send(&mut inner, parent, permission, args, &arguments, cache)?;
+            drop(inner);
+            self.emit();
+            return Ok(Reservation::Replay(response));
+        }
+        self.start_send(&mut inner, parent, permission, args, arguments)
+    }
+
+    fn start_send(
+        &self,
+        inner: &mut Inner,
+        parent: &LeaderIdentity,
+        permission: &str,
+        args: &SendArgs,
+        arguments: Value,
+    ) -> Result<Reservation<(LeaderBranch, String)>, String> {
+        let previous = self.child(inner, parent, &args.branch_id)?;
         let run_id = uuid::Uuid::new_v4().to_string();
         let mut record = BranchRecord {
             branch: previous.branch.clone(),
@@ -1289,6 +1318,7 @@ impl LeaderManager {
             dirty: false,
         };
         record.branch.run_id = Some(run_id.clone());
+        record.branch.cost_approval = None;
         record.branch.task = args.message.clone();
         record.branch.state = "starting".into();
         record.branch.updated_at = (self.clock)();
@@ -1333,7 +1363,7 @@ impl LeaderManager {
             },
         );
         if let Some(session) = branch.session_id.as_deref() {
-            record_pending_root_foreign_claim(&mut inner, &run_id, &branch.engine, session);
+            record_pending_root_foreign_claim(inner, &run_id, &branch.engine, session);
         }
         inner.branches.insert(branch.id.clone(), record);
         inner
@@ -2180,6 +2210,9 @@ impl LeaderManager {
             if fenced(&record.branch.state) || record.stopping {
                 return Err("This branch is being retired or has been reclaimed".into());
             }
+            if record.branch.cost_approval.is_some() || record.branch.state == "awaiting_cost_approval" {
+                return Err("This branch is awaiting human cost approval; approve or cancel the pending request first".into());
+            }
             if record.branch.run_id.as_deref() != Some(run_id)
                 && self.active(&inner, &record.branch)
             {
@@ -3016,6 +3049,34 @@ pub fn task_snapshot(
     snapshot()
 }
 
+#[tauri::command]
+pub async fn task_resolve_cost_approval(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, crate::AppState>,
+    parent_engine: String,
+    parent_session_id: String,
+    workspace_path: String,
+    branch_id: String,
+    request_id: String,
+    approve: bool,
+    reviewed_model: Option<String>,
+) -> Result<LeaderSnapshot, String> {
+    require_main(&window)?;
+    let manager = manager()?;
+    let parent = identity(&parent_engine, &parent_session_id, &workspace_path);
+    if let Some((branch, run_id, permission)) = manager.resolve_cost_approval(
+        &parent, &branch_id, &request_id, approve, reviewed_model.as_deref(),
+    )? {
+        let result = crate::engine::send_message_inner(
+            &state, branch.engine, branch.workspace_path, branch.session_id,
+            branch.task, None, branch.model, branch.effort, Some(permission),
+            None, Some(run_id.clone()), None, None,
+        ).await;
+        manager.acknowledge(&parent, &request_id, &run_id, result)?;
+    }
+    manager.snapshot()
+}
+
 pub(crate) fn snapshot() -> Result<LeaderSnapshot, String> {
     manager()?.snapshot()
 }
@@ -3260,6 +3321,7 @@ impl LeaderManager {
                 view["needsAttention"] = Value::Bool(
                     r.branch.expired
                         || r.branch.state == "waiting"
+                        || r.branch.state == "awaiting_cost_approval"
                         || r.branch.state == "unknown"
                         || r.branch.state == "failed",
                 );
@@ -3369,6 +3431,12 @@ impl LeaderManager {
             let record = self.child(&inner, parent, id)?;
             if fenced(&record.branch.state) || record.stopping {
                 return Err("Child is already being stopped or reclaimed".into());
+            }
+            if record.branch.cost_approval.is_some() {
+                let branch = self.cancel_held_send(&mut inner, parent, id)?;
+                drop(inner);
+                self.emit();
+                return Ok(branch);
             }
             inner.branches.get_mut(id).ok_or("Unknown branch")?.stopping = true;
         }

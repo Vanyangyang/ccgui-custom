@@ -39,6 +39,21 @@ describe("image annotation target", () => {
     expect(useChatStore.getState().drafts[key]).toMatch(/^已有草稿\n\n\[图片批注\] design\.png/);
   });
 
+  it("attaches an object-URL original from its bytes unless it exceeds the attachment cap", async () => {
+    const render = vi.fn(async () => new Blob(["annotated"], { type: "image/png" }));
+    const small = target(true);
+    const jpeg = new Blob([new Uint8Array(1024)], { type: "image/jpeg" });
+    await submitImageAnnotation(small, { src: "blob:x/1", original: jpeg, name: "shot.jpg", includeOriginal: true }, [box], t, render);
+    expect((small.attachFiles.mock.calls[0][0] as File[]).map((file) => [file.name, file.type, file.size]))
+      .toEqual([["shot.jpg", "image/jpeg", 1024], ["shot-annotated.png", "image/png", 9]]);
+
+    const large = target(true);
+    const huge = new Blob([new Uint8Array(9 * 1024 * 1024)], { type: "image/png" });
+    await submitImageAnnotation(large, { src: "blob:x/2", original: huge, name: "render.png", sourcePath: "G:/w/render.png", includeOriginal: true }, [box], t, render);
+    expect((large.attachFiles.mock.calls[0][0] as File[]).map((file) => file.name)).toEqual(["render-annotated.png"]);
+    expect(useChatStore.getState().drafts[key]).toContain("G:/w/render.png");
+  });
+
   it("adds only the annotated copy for an existing attachment", async () => {
     const into = target(true);
     await submitImageAnnotation(into, { src: PNG, name: "shot.png", includeOriginal: false }, [box], t,

@@ -20,8 +20,10 @@ export function useImageAnnotationTarget(): ImageAnnotationTarget | null {
 }
 
 export interface AnnotatedImage {
-  /** Data URL shown in the lightbox. */
+  /** Data or object URL shown in the lightbox. */
   src: string;
+  /** Bytes behind an object URL; data URLs are decoded instead. */
+  original?: Blob;
   name: string;
   /** Local path when the image came from a file, for the text-only fallback. */
   sourcePath?: string;
@@ -57,6 +59,16 @@ function dataUrlFile(src: string, name: string): File | null {
   return new File([bytes], name, { type: match[1].toLowerCase() });
 }
 
+/** Mirrors the backend's pasted-image cap (engine/images.rs); a larger
+ *  original is left out and the draft text still names its source path. */
+const MAX_ATTACHED_ORIGINAL_BYTES = 8 * 1024 * 1024;
+
+function originalFile(image: AnnotatedImage): File | null {
+  if (!image.original) return dataUrlFile(image.src, image.name);
+  if (image.original.size > MAX_ATTACHED_ORIGINAL_BYTES) return null;
+  return new File([image.original], image.name, { type: image.original.type });
+}
+
 function annotatedName(name: string): string {
   const stem = name.replace(/\.[a-z0-9]+$/i, "") || "image";
   return `${stem}-annotated.png`;
@@ -77,7 +89,7 @@ export async function submitImageAnnotation(
   if (target.supportsImages) {
     const annotated = await render(image.src, boxes);
     const files: File[] = [];
-    const original = image.includeOriginal ? dataUrlFile(image.src, image.name) : null;
+    const original = image.includeOriginal ? originalFile(image) : null;
     if (original) files.push(original);
     files.push(new File([annotated], annotatedName(image.name), { type: "image/png" }));
     target.attachFiles(files);

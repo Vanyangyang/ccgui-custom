@@ -26,7 +26,7 @@ export function branchDeletionState(snapshot: LeaderSnapshot, branchId: string, 
   const members = branches.flatMap((b) => b.sessionId ? [{ engine: b.engine, sessionId: b.sessionId, workspacePath: b.workspacePath }] : []);
   const available = !isWeb && branches.length > 0 && !snapshot.archivedGroups?.some((g) => branches.some((b) => g.branchIds.includes(b.id)))
     && !members.some((m) => chat.archivedSessionKeys[sessionKey(m.engine, m.sessionId, m.workspacePath)] || chat.sessions.some((s) => sameIdentity(s, m) && s.remote));
-  const active = branches.some((b) => ["starting", "running", "waiting", "reclaiming"].includes(b.state)) || members.some((m) => {
+  const active = branches.some((b) => ["starting", "running", "waiting", "awaiting_cost_approval", "reclaiming"].includes(b.state)) || members.some((m) => {
     const key = sessionKey(m.engine, m.sessionId, m.workspacePath), session = chat.bySession[key];
     return chat.streamingByKey[key] || chat.retryingByKey[key] || (session && (session.streaming || session.draftLaunching || session.queue.length > 0 || session.messages.some((message) =>
       message.question?.status === "pending" || message.grant?.status === "pending" || ["awaiting_review", "deferred", "submitting"].includes(message.planReview?.status ?? ""))));

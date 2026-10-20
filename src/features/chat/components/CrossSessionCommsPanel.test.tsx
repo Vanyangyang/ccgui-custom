@@ -227,4 +227,99 @@ describe("cross-session communication details", () => {
     await click(targetButton);
     expect(chat.selectSession).not.toHaveBeenCalled();
   });
+
+  it("defaults to compact density, toggles global compact/detailed mode and per-card expansion, and filters by category", async () => {
+    const longTask = "请独立审查目标设计文档：\n第1行\n第2行\n第3行\n第4行\n第5行";
+    const longReply = "审查结论：\n1. 保留最小闭环\n2. 删除过度设计\n3. 复用协调器结果\n4. 补充测试";
+    store.getState().upsertRecord(record({
+      scopedId: "leader:subtask-1",
+      requestId: "subtask-1",
+      kind: "subtask",
+      message: longTask,
+      replyText: longReply,
+      status: "executing",
+    }));
+    store.getState().upsertRecord(record({
+      scopedId: "consult-2",
+      requestId: "consult-2",
+      kind: "consultation",
+      message: "短问题",
+      replyText: "短回答",
+      status: "completed",
+    }));
+    await act(async () => root.render(<CrossSessionCommsToggleButton />));
+    await click(node.querySelector<HTMLButtonElement>('[data-testid="sidebar-cross-session-btn"]')!);
+
+    const panel = details()!;
+    expect(panel.dataset.density).toBe("compact");
+    const densityBtn = panel.querySelector<HTMLButtonElement>('[data-testid="cross-session-density-btn"]')!;
+    expect(densityBtn.getAttribute("aria-pressed")).toBe("false");
+    expect(densityBtn.textContent).toBe(i18n.t("crossSession.compactMode"));
+
+    const cards = () => Array.from(panel.querySelectorAll<HTMLElement>('[data-testid="cross-session-comm-card"]'));
+    expect(cards()).toHaveLength(2);
+    const subtaskCard = () => cards().find((c) => c.textContent?.includes("请独立审查目标设计文档"))!;
+    const consultCard = () => cards().find((c) => c.textContent?.includes("短问题"))!;
+
+    // Default compact mode clamps long card and shows per-card expand button, while short card has no toggle button
+    expect(subtaskCard().dataset.expanded).toBe("false");
+    expect(subtaskCard().querySelector('[data-testid="cross-session-card-prompt"]')?.className).toContain("line-clamp-3");
+    expect(subtaskCard().querySelector('[data-testid="cross-session-card-reply"]')?.className).toContain("line-clamp-3");
+    expect(consultCard().querySelector('[data-testid="cross-session-card-toggle"]')).toBeNull();
+
+    // Per-card expand / collapse
+    const cardToggle = () => subtaskCard().querySelector<HTMLButtonElement>('[data-testid="cross-session-card-toggle"]')!;
+    expect(cardToggle().getAttribute("aria-expanded")).toBe("false");
+    await click(cardToggle());
+    expect(subtaskCard().dataset.expanded).toBe("true");
+    expect(subtaskCard().querySelector('[data-testid="cross-session-card-prompt"]')?.className).not.toContain("line-clamp-3");
+    expect(cardToggle().getAttribute("aria-expanded")).toBe("true");
+
+    // Global density toggle to detailed expands all cards and resets overrides
+    await click(densityBtn);
+    expect(panel.dataset.density).toBe("detailed");
+    expect(densityBtn.getAttribute("aria-pressed")).toBe("true");
+    expect(densityBtn.textContent).toBe(i18n.t("crossSession.detailedMode"));
+    expect(subtaskCard().dataset.expanded).toBe("true");
+    expect(consultCard().dataset.expanded).toBe("true");
+
+    // In detailed mode, clicking per-card toggle collapses just that card
+    await click(cardToggle());
+    expect(subtaskCard().dataset.expanded).toBe("false");
+    expect(subtaskCard().querySelector('[data-testid="cross-session-card-prompt"]')?.className).toContain("line-clamp-3");
+
+    // Toggling global density back to compact collapses all cards
+    await click(densityBtn);
+    expect(panel.dataset.density).toBe("compact");
+    expect(subtaskCard().dataset.expanded).toBe("false");
+
+    // Category filter buttons
+    const filter = (id: string) => panel.querySelector<HTMLButtonElement>(`[data-testid="cross-session-filter-${id}"]`)!;
+    expect(filter("all").getAttribute("aria-pressed")).toBe("true");
+    await click(filter("active"));
+    expect(filter("active").getAttribute("aria-pressed")).toBe("true");
+    expect(cards()).toHaveLength(1);
+    expect(cards()[0].dataset.commStatus).toBe("executing");
+
+    await click(filter("finished"));
+    expect(cards()).toHaveLength(1);
+    expect(cards()[0].dataset.commStatus).toBe("completed");
+
+    await click(filter("subtask"));
+    expect(cards()).toHaveLength(1);
+    expect(cards()[0].textContent).toContain("请独立审查目标设计文档");
+
+    await click(filter("consultation"));
+    expect(cards()).toHaveLength(1);
+    expect(cards()[0].textContent).toContain("短问题");
+
+    // Empty category state when finished records are cleared while on "finished" filter
+    await click(filter("finished"));
+    await click(panel.querySelector<HTMLButtonElement>('[data-testid="cross-session-clear-btn"]')!);
+    expect(cards()).toHaveLength(0);
+    expect(panel.querySelector('[data-testid="cross-session-filter-empty"]')?.textContent).toBe(i18n.t("crossSession.filterEmpty"));
+
+    await click(filter("all"));
+    expect(cards()).toHaveLength(1);
+  });
 });

@@ -1,14 +1,30 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import ZoomIn from "lucide-react/dist/esm/icons/zoom-in";
 import ZoomOut from "lucide-react/dist/esm/icons/zoom-out";
 import X from "lucide-react/dist/esm/icons/x";
 import PenLine from "lucide-react/dist/esm/icons/pen-line";
+import ChevronLeft from "lucide-react/dist/esm/icons/chevron-left";
+import ChevronRight from "lucide-react/dist/esm/icons/chevron-right";
+import RotateCw from "lucide-react/dist/esm/icons/rotate-cw";
+import Copy from "lucide-react/dist/esm/icons/copy";
+import Check from "lucide-react/dist/esm/icons/check";
+import Download from "lucide-react/dist/esm/icons/download";
+import FolderOpen from "lucide-react/dist/esm/icons/folder-open";
+import Link from "lucide-react/dist/esm/icons/link";
 import { dataUrlBytes, imageMetaText } from "@/utils/image-meta";
 import { useBrowserOcclusion } from "@/features/browser/occlusion";
 import { isModalDialogOpen, showModalDialog } from "@/lib/engine-compat";
+import { ipc } from "@/lib/ipc";
+import { isWeb } from "@/lib/platform";
+import { COPY_FEEDBACK_MS } from "@/hooks/use-copied";
 import { AnnotationOverlay, AnnotationPanel, type PanHandlers } from "./image-annotation/AnnotationLayer";
 import { annotationsComplete, type AnnotationBox } from "./image-annotation/geometry";
+import { copyImageToClipboard, saveImage } from "./image-actions";
+
+/** Gallery keys: arrows in either axis plus Page Up / Page Down. */
+const PREV_KEYS = new Set(["ArrowLeft", "ArrowUp", "PageUp"]);
+const NEXT_KEYS = new Set(["ArrowRight", "ArrowDown", "PageDown"]);
 
 /** Zoom bounds and button step; zoom 1 = fit the viewport. */
 const MIN_ZOOM = 0.25;
@@ -21,22 +37,49 @@ export interface ImageAnnotationOptions {
   onSubmit: (boxes: AnnotationBox[]) => Promise<void>;
 }
 
+/** Previous/next within a gallery; `index` is zero-based. */
+export interface ImageLightboxNav {
+  index: number;
+  count: number;
+  onPrev: () => void;
+  onNext: () => void;
+}
+
+type ImageAction = "copy" | "save" | "path";
+
 /** Full-screen image preview with metadata and zoom. The header shows the
  * name plus "width × height · file size"; the toolbar and the mouse wheel
  * zoom (around the cursor), and dragging pans while zoomed in. Backdrop
- * click, the × button, or Escape closes. With `annotation`, a toolbar toggle
- * switches to drawing numbered boxes with notes; while annotating, backdrop
- * and image presses never close and unsaved notes need confirmation. */
+ * click, the × button, or Escape closes. With `nav`, side arrows and the
+ * arrow / Page keys step through the gallery and each image opens at fit.
+ * The toolbar also rotates the view, copies or saves the image and, for
+ * file-backed images (`sourcePath`), copies the path or shows it in its
+ * folder. `src` null = still loading; `unavailable` = cannot be shown (a string gives the reason).
+ * With `annotation`, a toolbar toggle switches to drawing numbered boxes
+ * with notes; while annotating, backdrop and image presses never close,
+ * the gallery and rotation are locked, and unsaved notes need confirmation. */
 export function ImageLightbox({
   src,
   name,
   onClose,
   annotation,
+  nav,
+  sourcePath,
+  unavailable = false,
+  sizeBytes: knownSize,
+  imageBlob,
 }: {
-  src: string;
+  src: string | null;
   name: string;
   onClose: () => void;
   annotation?: ImageAnnotationOptions;
+  nav?: ImageLightboxNav;
+  sourcePath?: string;
+  unavailable?: boolean | string;
+  /** File size when `src` is not a data URL (e.g. an object URL). */
+  sizeBytes?: number;
+  /** The image bytes behind an object URL, for copying without a re-encode. */
+  imageBlob?: Blob;
 }) {
   const { t } = useTranslation();
   // Only mounted while open; hides the native browser webview so the
@@ -55,10 +98,16 @@ export function ImageLightbox({
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [spaceHeld, setSpaceHeld] = useState(false);
   const [frame, setFrame] = useState<{ left: number; top: number; width: number; height: number } | null>(null);
+  const [rotation, setRotation] = useState(0);
+  const [done, setDone] = useState<ImageAction | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const doneTimer = useRef(0);
   const nextBoxId = useRef(1);
-  // Native listeners read the latest annotation state through this ref.
+  // Native listeners read the latest annotation and gallery state through refs.
   const annotateRef = useRef({ annotating: false, dirty: false });
   annotateRef.current = { annotating, dirty: boxes.length > 0 };
+  const navRef = useRef(nav);
+  navRef.current = nav;
 
   // A modal <dialog> renders in the top layer, so no portal is needed to
   // escape the timeline's transformed virtual rows (a transformed ancestor
@@ -75,6 +124,19 @@ export function ImageLightbox({
     setZoom(nextZoom);
     setOffset({ x, y });
   };
+
+  // Each gallery image opens at fit and unrotated with fresh action feedback;
+  // a layout effect so the next image never paints with the previous view.
+  useLayoutEffect(() => {
+    setView(1, 0, 0);
+    setNatural(null);
+    setRotation(0);
+    setDone(null);
+    setActionError(null);
+    // setView only touches a ref and state setters.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [src]);
+  useEffect(() => () => clearTimeout(doneTimer.current), []);
 
   /** Zoom keeping `center` (client coords, default dialog center) fixed.
    *  Layout keeps the image fit-centered; transform = translate(offset)
@@ -144,9 +206,19 @@ export function ImageLightbox({
     const typing = (e: KeyboardEvent) =>
       e.target instanceof HTMLTextAreaElement || e.target instanceof HTMLInputElement;
     const keyDown = (e: KeyboardEvent) => {
-      if (e.key !== " " || !annotateRef.current.annotating || typing(e)) return;
+      if (typing(e)) return;
+      if (e.key === " " && annotateRef.current.annotating) {
+        e.preventDefault();
+        setSpaceHeld(true);
+        return;
+      }
+      const gallery = navRef.current;
+      if (!gallery || annotateRef.current.annotating || e.altKey || e.ctrlKey || e.metaKey) return;
+      const step = PREV_KEYS.has(e.key) ? -1 : NEXT_KEYS.has(e.key) ? 1 : 0;
+      if (!step) return;
       e.preventDefault();
-      setSpaceHeld(true);
+      if (step < 0 && gallery.index > 0) gallery.onPrev();
+      else if (step > 0 && gallery.index < gallery.count - 1) gallery.onNext();
     };
     const keyUp = (e: KeyboardEvent) => {
       if (e.key === " ") setSpaceHeld(false);
@@ -232,7 +304,28 @@ export function ImageLightbox({
   };
   const leaveAnnotating = () => (boxes.length ? setConfirm("exit") : exitAnnotating());
 
-  const sizeBytes = dataUrlBytes(src);
+  const runAction = async (action: ImageAction) => {
+    if (!src) return;
+    setActionError(null);
+    try {
+      if (action === "copy") await copyImageToClipboard(src, imgRef.current, imageBlob);
+      else if (action === "path") await navigator.clipboard.writeText(sourcePath ?? "");
+      else if (!(await saveImage(src, name, sourcePath))) return;
+      clearTimeout(doneTimer.current);
+      setDone(action);
+      doneTimer.current = window.setTimeout(() => setDone(null), COPY_FEEDBACK_MS);
+    } catch (error) {
+      setActionError(t(`chat.imageActionFailed.${action}`, { message: error instanceof Error ? error.message : String(error) }));
+    }
+  };
+  const reveal = () => {
+    if (!sourcePath) return;
+    setActionError(null);
+    ipc.revealInFileManager(sourcePath).catch((error: unknown) =>
+      setActionError(t("chat.imageActionFailed.reveal", { message: error instanceof Error ? error.message : String(error) })));
+  };
+
+  const sizeBytes = knownSize ?? (src ? dataUrlBytes(src) : null);
   const meta = imageMetaText({
     width: natural?.width,
     height: natural?.height,
@@ -240,8 +333,33 @@ export function ImageLightbox({
   });
   const zoomedIn = zoom > 1;
   const transform = `translate(${offset.x}px, ${offset.y}px) scale(${zoom})`;
+  // A quarter turn swaps the fitted box: bounding the layout box by the
+  // swapped viewport keeps the rotated image fully on screen.
+  const quarterTurn = rotation % 180 !== 0;
   const toolButton =
-    "cursor-pointer rounded-full p-1.5 text-white/80 hover:bg-white/15 hover:text-white";
+    "cursor-pointer rounded-full p-1.5 text-white/80 hover:bg-white/15 hover:text-white disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent";
+  const sideButton =
+    "absolute top-1/2 -translate-y-1/2 cursor-pointer rounded-full bg-black/50 p-2 text-white/85 hover:bg-black/70 hover:text-white disabled:cursor-default disabled:opacity-30 disabled:hover:bg-black/50";
+  /** Copy-style feedback (spec §4.2): Check icon and a "done" name for 1500ms. */
+  const actionButton = (action: ImageAction, label: string, Icon: typeof Copy) => {
+    const finished = done === action;
+    const text = finished
+      ? t(action === "save" ? (isWeb ? "chat.imageDownloadStarted" : "chat.imageSaved") : "chat.imageCopied")
+      : label;
+    const Shown = finished ? Check : Icon;
+    return (
+      <button
+        type="button"
+        onClick={() => void runAction(action)}
+        disabled={!src}
+        aria-label={text}
+        title={text}
+        className={toolButton}
+      >
+        <Shown className="size-4" aria-hidden />
+      </button>
+    );
+  };
 
   return (
     <dialog
@@ -249,7 +367,7 @@ export function ImageLightbox({
       aria-label={name}
       className="fixed inset-0 z-50 flex h-full max-h-none w-full max-w-none items-center justify-center overflow-hidden bg-overlay-backdrop"
     >
-      <img
+      {src ? <img
         ref={imgRef}
         src={src}
         alt={name}
@@ -267,12 +385,17 @@ export function ImageLightbox({
         onPointerUp={(e) => void pan.end(e)}
         onPointerCancel={(e) => void pan.end(e)}
         style={{
-          transform,
+          transform: rotation ? `${transform} rotate(${rotation}deg)` : transform,
           cursor: zoomedIn ? (panning ? "grabbing" : "grab") : "zoom-out",
           touchAction: "none",
+          ...(quarterTurn ? { maxWidth: "100vh", maxHeight: "100vw" } : null),
         }}
         className="max-h-full max-w-full select-none object-contain"
-      />
+      /> : unavailable ? (
+        <span className="max-w-[80%] text-center text-body-regular text-white/70">{typeof unavailable === "string" ? unavailable : t("chat.imageUnavailable")}</span>
+      ) : (
+        <span className="h-48 w-64 max-w-full animate-pulse rounded-lg bg-white/10" aria-hidden />
+      )}
       {annotating && frame && (
         <AnnotationOverlay
           frameStyle={{ left: frame.left, top: frame.top, width: frame.width, height: frame.height, transform }}
@@ -290,6 +413,11 @@ export function ImageLightbox({
           backdrop wheel/press working through the bar; the × re-enables. */}
       <div className="pointer-events-none absolute inset-x-0 top-0 flex items-start justify-between gap-4 bg-gradient-to-b from-black/60 to-black/0 px-4 pt-3 pb-6">
         <div className="flex min-w-0 items-baseline gap-3 pt-1.5 text-white/90">
+          {nav && nav.count > 1 && (
+            <span className="shrink-0 text-caption-1-medium text-white/60 tabular-nums">
+              {t("chat.imagePosition", { index: nav.index + 1, count: nav.count })}
+            </span>
+          )}
           <span className="truncate text-body-medium">{name}</span>
           {meta && (
             <span className="shrink-0 whitespace-nowrap text-caption-1-medium text-white/60">
@@ -307,6 +435,35 @@ export function ImageLightbox({
           <X className="size-5" aria-hidden />
         </button>
       </div>
+      {nav && nav.count > 1 && (
+        <>
+          <button
+            type="button"
+            onClick={nav.onPrev}
+            disabled={annotating || nav.index === 0}
+            aria-label={t("chat.previousImage")}
+            title={t("chat.previousImage")}
+            className={`${sideButton} left-4`}
+          >
+            <ChevronLeft className="size-6" aria-hidden />
+          </button>
+          <button
+            type="button"
+            onClick={nav.onNext}
+            disabled={annotating || nav.index >= nav.count - 1}
+            aria-label={t("chat.nextImage")}
+            title={t("chat.nextImage")}
+            className={`${sideButton} right-4`}
+          >
+            <ChevronRight className="size-6" aria-hidden />
+          </button>
+        </>
+      )}
+      {actionError && (
+        <div role="alert" className="absolute bottom-20 left-1/2 max-w-[80%] -translate-x-1/2 truncate rounded-md bg-black/70 px-3 py-1.5 text-caption-1-medium text-white">
+          {actionError}
+        </div>
+      )}
       {annotating && (
         <AnnotationPanel
           boxes={boxes}
@@ -355,9 +512,10 @@ export function ImageLightbox({
           type="button"
           onClick={() => {
             const img = imgRef.current;
-            // 1:1 = one image pixel per screen pixel, undoing the fit shrink.
-            if (!img || !natural || natural.width === 0) return;
-            zoomTo(img.offsetWidth / natural.width);
+            // 1:1 = one image pixel per screen pixel: the layout box is the
+            // fitted size and the transform scales it, so undo the shrink.
+            if (!img || !natural || img.offsetWidth === 0) return;
+            zoomTo(natural.width / img.offsetWidth);
           }}
           aria-label={t("chat.actualSize")}
           title={t("chat.actualSize")}
@@ -365,10 +523,40 @@ export function ImageLightbox({
         >
           1:1
         </button>
-        {annotation && (
+        <button
+          type="button"
+          onClick={() => setRotation((r) => (r + 90) % 360)}
+          disabled={!src || annotating}
+          aria-label={t("chat.rotateImage")}
+          title={t("chat.rotateImage")}
+          className={toolButton}
+        >
+          <RotateCw className="size-4" aria-hidden />
+        </button>
+        <span className="mx-0.5 h-4 w-px bg-white/25" aria-hidden />
+        {actionButton("copy", t("chat.copyImage"), Copy)}
+        {actionButton("save", t(isWeb ? "chat.downloadImage" : "chat.saveImage"), Download)}
+        {sourcePath && actionButton("path", t("chat.copyImagePath"), Link)}
+        {sourcePath && !isWeb && (
           <button
             type="button"
-            onClick={() => (annotating ? leaveAnnotating() : setAnnotating(true))}
+            onClick={reveal}
+            aria-label={t("chat.revealImage")}
+            title={t("chat.revealImage")}
+            className={toolButton}
+          >
+            <FolderOpen className="size-4" aria-hidden />
+          </button>
+        )}
+        {annotation && src && (
+          <button
+            type="button"
+            onClick={() => {
+              if (annotating) return leaveAnnotating();
+              // Boxes are stored as fractions of the unrotated image.
+              setRotation(0);
+              setAnnotating(true);
+            }}
             aria-pressed={annotating}
             aria-label={t("imageAnnotation.toggle")}
             title={t("imageAnnotation.toggle")}

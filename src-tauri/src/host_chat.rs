@@ -1974,7 +1974,7 @@ mod mcp {
             self.result("task_wait", serde_json::to_value(args).map_err(|_| McpError::internal_error("Encode task wait arguments failed", None))?).await
         }
 
-        #[tool(description = "Continue a direct child chat with a follow-up task, preserving its engine and settings. Busy or approval-waiting children cannot be silently interrupted. Use a stable request_id; an unknown outcome must be inspected before retrying. This tool cannot target arbitrary or sibling chats.")]
+        #[tool(description = "Continue a direct child chat with a follow-up task, preserving its engine and settings. Busy or approval-waiting children cannot be silently interrupted. Cold or unknown prompt cache, or at most 10 seconds until its earliest estimated expiration, requires human cost approval before the target model starts. Hot cache with more than 10 seconds left sends directly. If status is awaiting_cost_approval, report it and stop polling: the human must approve or cancel the chat's cost review card; never bypass it or resend with a new request_id. Use a stable request_id; an unknown outcome must be inspected before retrying. This tool cannot target arbitrary or sibling chats.")]
         async fn task_send(&self, Parameters(args): Parameters<crate::leader::SendArgs>) -> Result<CallToolResult, McpError> {
             self.result("task_send", serde_json::to_value(args).map_err(|_| McpError::internal_error("Encode task send arguments failed", None))?).await
         }

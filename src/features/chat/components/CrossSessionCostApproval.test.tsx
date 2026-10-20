@@ -14,6 +14,9 @@ import { EMPTY_SESSION } from "../store/stream";
 import { sessionKey } from "../store/persistence";
 
 const actions = vi.hoisted(() => ({ approve: vi.fn(), cancel: vi.fn(), send: vi.fn() }));
+const native = vi.hoisted(() => ({ invoke: vi.fn(), refresh: vi.fn() }));
+vi.mock("@/lib/transport", () => ({ invoke: native.invoke, isWeb: false, listen: vi.fn(async () => () => {}) }));
+vi.mock("@/features/leader/store", () => ({ useLeaderStore: { getState: () => ({ refresh: native.refresh }) } }));
 vi.mock("../cross-session", async (original) => ({
   ...await original<typeof import("../cross-session")>(),
   approveCrossSessionMessage: actions.approve,
@@ -43,6 +46,8 @@ beforeEach(async () => {
   chat.sessions = []; chat.bySession = {}; chat.openTabs = [];
   actions.approve.mockResolvedValue(undefined);
   actions.cancel.mockResolvedValue(undefined);
+  native.invoke.mockResolvedValue({ leaders: [], branches: [] });
+  native.refresh.mockResolvedValue(undefined);
   useCrossSessionActivityStore.getState().reset();
   await i18n.changeLanguage("en");
   node = document.createElement("div"); document.body.append(node); root = createRoot(node);
@@ -50,6 +55,64 @@ beforeEach(async () => {
 afterEach(async () => { await act(async () => root.unmount()); node.remove(); vi.useRealTimers(); });
 
 describe("cost approval", () => {
+  it.each([true, false])("resolves native held task approve=%s with its exact identity and model", async (approve) => {
+    const value = { ...record(), kind: "subtask" as const,
+      leaderCostApproval: { branchId: "branch-1", requestId: "held-1", model: "native-model" } };
+    value.costReview!.model = "native-model";
+    chat.sessions = [{ ...target, model: "tab-model" } as SessionMeta];
+    chat.openTabs = [{ ...target, model: "tab-model" } as ActiveSession];
+    chat.bySession[sessionKey(target.engine, target.sessionId, target.workspacePath)] = {
+      ...EMPTY_SESSION, activeModel: "tab-model", messages: [], usage: { input_tokens: 1200, model_context_window: 123456 },
+    };
+    await act(async () => root.render(<CrossSessionCostApproval record={value} />));
+    expect(node.textContent).toContain("native-model");
+    expect(node.textContent).not.toContain("tab-model");
+    expect(node.textContent).not.toContain("123,456");
+    expect(node.textContent).toContain(i18n.t("crossSession.costLastRequest", { used: "1,200" }));
+    expect(node.textContent).not.toContain(i18n.t("crossSession.costReference"));
+    expect(node.textContent).not.toContain(i18n.t("crossSession.costQueueWarning"));
+    expect(native.invoke).not.toHaveBeenCalled();
+    await act(async () => button(approve ? "costApprove" : "costCancel").click());
+    expect(native.invoke).toHaveBeenCalledExactlyOnceWith("task_resolve_cost_approval", {
+      parentEngine: sender.engine, parentSessionId: sender.sessionId, workspacePath: sender.workspacePath,
+      branchId: "branch-1", requestId: "held-1", approve, reviewedModel: "native-model",
+    });
+    expect(native.refresh).toHaveBeenCalledTimes(1);
+    expect(actions.approve).not.toHaveBeenCalled();
+    expect(actions.cancel).not.toHaveBeenCalled();
+  });
+
+  it("locks native approval, exposes errors, and retains the original request on retry", async () => {
+    let reject!: (cause: Error) => void;
+    native.invoke.mockReturnValueOnce(new Promise((_, fail) => { reject = fail; }));
+    const value = { ...record(), kind: "subtask" as const,
+      leaderCostApproval: { branchId: "branch-1", requestId: "held-old", model: null } };
+    await act(async () => root.render(<CrossSessionCostApproval record={value} />));
+    await act(async () => { button("costApprove").click(); button("costApprove").click(); });
+    expect(native.invoke).toHaveBeenCalledTimes(1);
+    expect(button("costCancel").disabled).toBe(true);
+    await act(async () => reject(new Error("stale native request")));
+    expect(node.querySelector('[role="alert"]')?.textContent).toContain("stale native request");
+    await act(async () => button("costCancel").click());
+    expect(native.invoke).toHaveBeenLastCalledWith("task_resolve_cost_approval",
+      expect.objectContaining({ requestId: "held-old", reviewedModel: null, approve: false }));
+    expect(actions.cancel).not.toHaveBeenCalled();
+  });
+
+  it("labels loaded task usage from another model as a last-request sample", async () => {
+    const value = { ...record(), kind: "subtask" as const,
+      leaderCostApproval: { branchId: "branch-1", requestId: "held-1", model: "claude-opus-4-5" } };
+    value.costReview!.model = "claude-opus-4-5";
+    chat.sessions = [{ ...target, model: "claude-sonnet-4-5" } as SessionMeta];
+    chat.bySession[sessionKey(target.engine, target.sessionId, target.workspacePath)] = {
+      ...EMPTY_SESSION, activeModel: "claude-sonnet-4-5", usage: { input_tokens: 1200 },
+      messages: [{ seq: 1, role: "assistant", text: "", ts: null, model: "claude-sonnet-4-5", usage: { input_tokens: 1200 } }],
+    };
+    await act(async () => root.render(<CrossSessionCostApproval record={value} />));
+    expect(node.textContent).toContain(i18n.t("crossSession.costModelChanged", { model: "claude-sonnet-4-5" }));
+    expect(node.textContent).toContain(i18n.t("crossSession.costLastRequest", { used: "1,200" }));
+    expect(native.invoke).not.toHaveBeenCalled();
+  });
   it("refreshes a loaded target's model and usage instead of retaining the original snapshot", async () => {
     chat.sessions = [{ ...target, model: "claude-sonnet-4-5" } as SessionMeta];
     const key = sessionKey(target.engine, target.sessionId, target.workspacePath);
@@ -124,8 +187,9 @@ describe("cost approval", () => {
     expect(actions.cancel).toHaveBeenCalledExactlyOnceWith("approval-1");
   });
 
-  it("shows approval to both exact participants and retains the normal target queue", async () => {
-    useCrossSessionActivityStore.getState().upsertRecord(record());
+  it.each(["consultation", "subtask"] as const)("shows %s approval to both exact participants and retains the normal target queue", async (kind) => {
+    useCrossSessionActivityStore.getState().upsertRecord({ ...record(), kind,
+      leaderCostApproval: kind === "subtask" ? { branchId: "branch-1", requestId: "held-1", model: "model-a" } : undefined });
     useCrossSessionActivityStore.getState().upsertRecord({ ...record(), scopedId: "queued-1", status: "queued", message: "already queued" });
     const render = (active: typeof sender | typeof target) => act(async () => root.render(<CrossSessionQueue active={active as ActiveSession} />));
     await render(sender);

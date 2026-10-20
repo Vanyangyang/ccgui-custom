@@ -98,3 +98,9 @@ export function withGrantRetry<T>(op: () => Promise<T>): Promise<T> {
     return op();
   });
 }
+
+/** True when the backend refused a path for lying outside every registered
+ *  workspace and granted directory (still true after a declined grant). */
+export function isOutsideWorkspaceError(error: unknown): boolean {
+  return errorText(error).startsWith(OUTSIDE_PREFIX);
+}

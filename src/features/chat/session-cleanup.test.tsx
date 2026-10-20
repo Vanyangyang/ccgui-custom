@@ -21,6 +21,13 @@ import { DEFAULT_HANDOFF_COMPRESSION_MODEL, HANDOFF_PREFERENCES_KEY } from "./ha
 
 Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
 
+beforeEach(() => {
+  vi.spyOn(ipc, "taskSnapshot").mockResolvedValue({ leaders: [], branches: [] });
+});
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
 const NOW = 1_900_000_000_000;
 
 function makeSession(overrides: Partial<SessionMeta> = {}): SessionMeta {

@@ -78,7 +78,7 @@ export function HandoffOverlayCard({
       <section
         data-testid="handoff-overlay-card"
         aria-label={t("chat.handoffBannerTitle")}
-        aria-busy={entry.mode === "grok" && entry.grokStatus === "running"}
+        aria-busy={entry.childrenStatus === "loading" || (entry.mode === "grok" && entry.grokStatus === "running")}
         className="flex min-w-0 flex-col gap-2 rounded-xl border border-border-button-default bg-background-secondary-default px-3 py-2.5 shadow-xs"
       >
         {/* Top Row: Source session identity + Live model compression status + Dismiss */}
@@ -137,13 +137,13 @@ export function HandoffOverlayCard({
                     <span>{t("chat.handoffGrokRetry")}</span>
                   </button>
                 </>
-              ) : entry.grokStatus === "error" ? (
+              ) : entry.grokStatus === "error" || entry.grokStatus === "stale" ? (
                 <>
                   <span
                     title={entry.grokError ?? undefined}
                     className="inline-flex items-center gap-1 rounded-full bg-background-tertiary-default px-2 py-0.5 text-caption-1-regular text-text-tertiary"
                   >
-                    <span>{t("chat.handoffGrokFailed")}</span>
+                    <span>{t(entry.grokStatus === "stale" ? "chat.handoffGrokStale" : "chat.handoffGrokFailed")}</span>
                   </span>
                   <button
                     type="button"
@@ -172,6 +172,28 @@ export function HandoffOverlayCard({
             />
           </div>
         </header>
+
+        {(entry.childrenStatus === "loading" || entry.childrenStatus === "error" || !!entry.children?.total) && (
+          <div data-testid="handoff-children-status" role="status" className="text-caption-1-regular text-text-tertiary">
+            {entry.childrenStatus === "loading" ? (
+              <span className="inline-flex items-center gap-1.5">
+                <Loader2 className="size-3 animate-spin" aria-hidden />
+                {t("chat.handoffChildrenLoading")}
+              </span>
+            ) : entry.childrenStatus === "error" ? (
+              <span title={entry.childrenError}>{t("chat.handoffChildrenFailed")}</span>
+            ) : entry.childrenApplied === false ? (
+              t("chat.handoffChildrenNotApplied")
+            ) : (
+              <>
+                <span>{t("chat.handoffChildrenLoaded", { count: entry.children?.included ?? 0, attention: entry.children?.attention ?? 0 })}</span>
+                {!!entry.children?.omitted && (
+                  <span className="ml-2">{t("chat.handoffChildrenOmitted", { count: entry.children.omitted, attention: entry.children.omittedAttention })}</span>
+                )}
+              </>
+            )}
+          </div>
+        )}
 
         <HandoffWorkspaceControl workspacePath={workspacePath} entry={entry} />
 

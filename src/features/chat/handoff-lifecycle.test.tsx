@@ -25,6 +25,7 @@ function deferred<T>() {
 function draft() { return useChatStore.getState().drafts[key]; }
 
 beforeEach(() => {
+  vi.spyOn(ipc, "taskSnapshot").mockResolvedValue({ leaders: [], branches: [] });
   localStorage.removeItem(HANDOFF_PREFERENCES_KEY);
   useHandoffStore.setState({ byWorkspace: {} });
   useChatStore.setState({ ...original, activeEngine: "codex", active: null, openTabs: [], drafts: {}, sessions: [], archivedSessionKeys: {}, streamingByKey: {} });
@@ -57,6 +58,7 @@ describe("handoff lifecycle ownership", () => {
     const summary = deferred<string>();
     vi.spyOn(ipc, "summarizeSessionHandoff").mockReturnValue(summary.promise);
     useHandoffStore.getState().startHandoff(args);
+    await Promise.resolve(); // Let the child snapshot start the model request.
     const edited = draft().replace("original conclusion", "用户手工核实的结论，不可覆盖");
     useChatStore.getState().setDraft(key, edited);
     summary.resolve("background generated summary");
@@ -96,6 +98,7 @@ describe("handoff lifecycle ownership", () => {
     const first = deferred<string>(); const second = deferred<string>();
     vi.spyOn(ipc, "summarizeSessionHandoff").mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
     useHandoffStore.getState().startHandoff(args);
+    await Promise.resolve();
     useHandoffStore.getState().retryGrok(workspacePath);
     second.resolve("latest summary"); await second.promise;
     first.reject(new Error("stale failure")); await first.promise.catch(() => {});
@@ -109,11 +112,13 @@ describe("handoff lifecycle ownership", () => {
     const first = deferred<string>(); const second = deferred<string>();
     vi.spyOn(ipc, "summarizeSessionHandoff").mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
     useHandoffStore.getState().startHandoff(args);
+    await Promise.resolve();
     const before = draft();
     useHandoffStore.getState().dismissHandoff(workspacePath);
     first.resolve("dismissed result"); await first.promise;
     expect(draft()).toBe(before);
     useHandoffStore.getState().startHandoff(args);
+    await Promise.resolve();
     const entry = useHandoffStore.getState().byWorkspace[workspacePath];
     useHandoffStore.getState().setSending(workspacePath, entry.id, true);
     useHandoffStore.getState().setCompressionMode(workspacePath, "detailed");
@@ -300,6 +305,7 @@ describe("handoff lifecycle ownership", () => {
     expect(draft()).toContain("接下来请继续：继续检查\r\n接下来请继续：不要截断用户后续行");
 
     useHandoffStore.getState().setCompressionMode(workspacePath, "grok");
+    await Promise.resolve();
     summary.resolve("- **目标与背景**：二次交接提炼完成");
     await summary.promise;
     expect(draft()).toContain("上一会话交接摘要（模型提炼）：\n> - **目标与背景**：二次交接提炼完成");
@@ -322,6 +328,7 @@ describe("handoff lifecycle ownership", () => {
     });
 
     useHandoffStore.getState().startHandoff(args);
+    await Promise.resolve();
     // Simulate user clicking "View Source" while Grok distillation is still running
     useChatStore.setState({
       active: { engine: "codex", sessionId: "source-session", workspacePath },

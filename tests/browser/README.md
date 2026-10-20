@@ -256,6 +256,15 @@ pending/call counts, last send arguments and the actual draft. Reload for a fres
 scenario. These are manual browser acceptance steps, not recorded pass results;
 they do not verify native persistence, actual compression quality or a model run.
 
+Add `?children=1` for completed/running/failed child tasks whose results do not
+appear in the source timeline. `?children=pending` holds the task snapshot until
+**子任务读取完成** / **子任务读取失败** is clicked. Compression must wait for that
+read and start once with `lastSummary.childContext`; failure keeps the parent
+draft and reports unavailable children. Edit or remove the child quote block
+while compression is pending, then complete it: the stale result must not apply.
+Re-distill uses the edited visible child block (or no child input after deletion).
+Check the child status line at 320 px and in both languages.
+
 Open `/tests/browser/leader-draft.html` (`?engine=codex` or `?lang=en`) for
 the real draft sidebar/menu/composer/store. The retained fixture filename does
 not imply a mode: right-click the unsent chat and verify there is no Leader

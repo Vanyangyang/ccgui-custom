@@ -1,4 +1,5 @@
 import { sameLeaderWorkspace } from "./workspace-path";
+import type { PromptCacheWindow } from "@/lib/ipc";
 
 export interface LeaderIdentity {
   engine: string;
@@ -18,7 +19,8 @@ export interface LeaderBranch {
   model: string | null;
   effort: string | null;
   runId: string | null;
-  state: "starting" | "running" | "waiting" | "completed" | "failed" | "stopped" | "unknown" | "reclaiming" | "reclaimed";
+  state: "starting" | "running" | "waiting" | "awaiting_cost_approval" | "completed" | "failed" | "stopped" | "unknown" | "reclaiming" | "reclaimed";
+  costApproval?: { requestId: string; capturedAt: number; cache?: PromptCacheWindow | null; model?: string | null };
   createdAt: number;
   updatedAt: number;
   lastActivityAt: number;

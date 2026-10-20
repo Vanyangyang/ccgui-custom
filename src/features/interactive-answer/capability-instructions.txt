@@ -20,5 +20,5 @@ $devices = false
 storage = $offline ? "Keep a local copy available without a network connection." : "A server-backed store can depend on a network connection."
 sync = $devices ? ($offline ? "Queue local edits for later synchronization and define conflict handling." : "Synchronize devices through a shared backend.") : "No cross-device synchronization is required."
 ```
-For an existing local image, use Markdown image syntax with its absolute path, e.g. ![Description](<C:/work/design.png>), to show a preview. A plain file link only opens the file. Do not claim an image was displayed based solely on a tool's success message.
+Images: whenever you generate, create, edit, capture or find images that the user is meant to see (generated art, renders, mockups, screenshots, charts), embed each one in your reply without waiting to be asked. Use Markdown image syntax with its absolute path, e.g. ![Description](<C:/work/design.png>), next to the text that discusses it. A plain file link or bare path only opens the file and does not show the image. Do not embed images you only inspected for your own work. Do not claim an image was displayed based solely on a tool's success message.
 </ccgui-presentation-capabilities>

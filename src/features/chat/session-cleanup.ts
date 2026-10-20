@@ -7,6 +7,7 @@ import type { LeaderSnapshot } from "@/features/leader/types";
 import { isLeaderGroupMember } from "@/features/leader/types";
 import { parseDraftSessionKey, sessionKey } from "./store/persistence";
 import { useChatStore } from "./store";
+import { buildHandoffChildren, type HandoffChildrenDigest } from "./handoff-children";
 import {
   isHandoffCompressionModel,
   isHandoffCompressionSelection,
@@ -318,7 +319,7 @@ function extractMarkdownConclusion(raw: string, maxChars = 600): string {
 }
 
 export type HandoffCompressionMode = "grok" | "local" | "detailed";
-export type HandoffGrokStatus = "idle" | "running" | "done" | "error";
+export type HandoffGrokStatus = "idle" | "running" | "done" | "error" | "stale";
 
 export const HANDOFF_SECTION_HEADINGS: Record<HandoffCompressionMode, string> = {
   grok: "上一会话交接摘要（模型提炼）：",
@@ -498,6 +499,20 @@ function handoffSummarySection(currentDraft: string) {
   };
 }
 
+/** Child context is a separate quote block, outside the replaceable main summary. */
+function handoffChildrenBlock(currentDraft: string, heading?: string): string {
+  if (!heading) return "";
+  const section = handoffSummarySection(currentDraft);
+  if (!section) return "";
+  const lines = section.lines.map((line) => line.replace(/\r$/, ""));
+  const start = lines.indexOf(heading);
+  if (start < 0) return "";
+  let end = start + 1;
+  while (end < lines.length && lines[end] === "") end++;
+  while (end < lines.length && /^>($| )/.test(lines[end])) end++;
+  return lines.slice(start, end).join("\n").trim();
+}
+
 export function replaceHandoffDraftSummary(
   currentDraft: string,
   distilledSummary: string,
@@ -534,6 +549,7 @@ export async function upgradeHandoffDraftWithGrok({
   state,
   compressionModel,
   compressionSelection,
+  childContext,
   getCurrentDraft,
   getExpectedSummary,
   applyDraft,
@@ -546,6 +562,7 @@ export async function upgradeHandoffDraftWithGrok({
   state?: SessionState;
   compressionModel?: string;
   compressionSelection?: HandoffCompressionSelection;
+  childContext?: string;
   getCurrentDraft: () => string;
   getExpectedSummary?: () => string | undefined;
   applyDraft: (nextDraft: string) => void;
@@ -560,6 +577,7 @@ export async function upgradeHandoffDraftWithGrok({
       sessionId,
       title,
       transcriptExcerpt: transcriptExcerpt || null,
+      ...(childContext?.trim() ? { childContext } : {}),
       ...(compressionModel ? { compressionModel } : {}),
       ...(compressionSelection ? { compressionSelection } : {}),
     });
@@ -602,6 +620,8 @@ export interface PendingHandoffSession {
   compressionPreferenceError?: boolean;
   grokStatus: HandoffGrokStatus;
   grokSummary: string | null;
+  /** Child block used by the cached summary, to prevent restoring removed content. */
+  grokChildrenBlock?: string;
   grokError: string | null;
   grokStartedAt: number | null;
   grokDurationMs: number | null;
@@ -611,6 +631,10 @@ export interface PendingHandoffSession {
   sending?: boolean;
   /** Last program-authored summary block; manual changes leave this unchanged. */
   managedSummary?: string;
+  childrenStatus?: "loading" | "ready" | "error";
+  children?: HandoffChildrenDigest;
+  childrenApplied?: boolean;
+  childrenError?: string;
   /** Exact generated prefix; remove only this text, preserving user additions. */
   workspaceNotice?: string;
 }
@@ -670,7 +694,8 @@ function applyHandoffModeDraft(
   if (entry.sending || !isHandoffDraft(currentDraft, entry)) return currentDraft;
   const localBody = extractLastAssistantConclusion(entry.sourceState, 600);
   const detailedBody = buildDetailedHandoffSummary(entry.sourceState, 6);
-  const grokBody = entry.grokSummary?.trim() || "";
+  const grokBody = (entry.grokChildrenBlock ?? "") === handoffChildrenBlock(currentDraft, entry.children?.heading)
+    ? entry.grokSummary?.trim() || "" : "";
 
   let heading = HANDOFF_SECTION_HEADINGS.local;
   let body = localBody;
@@ -724,27 +749,63 @@ const movingHandoffs = new Set<string>();
 
 export const useHandoffStore = create<HandoffStoreState>((set, get) => {
   const requests = new Map<string, number>();
+  const insertCapturedChildren = (workspacePath: string, handoffId: string) => {
+    const entry = get().byWorkspace[workspacePath];
+    if (!entry || entry.id !== handoffId || entry.sending || entry.childrenApplied || !entry.children?.block) return;
+    const key = resolveHandoffTargetDraftKey(workspacePath, entry.sourceEngine);
+    const draft = useChatStore.getState().drafts[key] ?? "";
+    const section = handoffSummarySection(draft);
+    if (!isHandoffDraft(draft, entry) || !section
+      || section.lines.some((line) => line.replace(/\r$/, "") === entry.children?.heading)) return;
+    useChatStore.getState().setDraft(key,
+      draft.slice(0, section.footerIdx) + `\n\n${entry.children.block}` + draft.slice(section.footerIdx));
+    set((s) => {
+      const cur = s.byWorkspace[workspacePath];
+      return cur?.id === handoffId
+        ? { byWorkspace: { ...s.byWorkspace, [workspacePath]: { ...cur, childrenApplied: true } } }
+        : s;
+    });
+  };
   const runGrokDistillation = (workspacePath: string, handoffId: string) => {
     const entry = get().byWorkspace[workspacePath];
-    if (!entry || entry.id !== handoffId || entry.mode !== "grok" || entry.sending) return;
+    if (!entry || entry.id !== handoffId || entry.mode !== "grok" || entry.sending || entry.childrenStatus === "loading") return;
+    const draftKey = resolveHandoffTargetDraftKey(workspacePath, entry.sourceEngine);
+    const initialDraft = useChatStore.getState().drafts[draftKey] ?? "";
+    if (!isHandoffDraft(initialDraft, entry)) return;
+    const expectedChildren = handoffChildrenBlock(initialDraft, entry.children?.heading);
+    // Only the untouched generated block can use the longer source excerpt.
+    // Explicit re-distillation after an edit uses exactly the visible child text.
+    const childContext = expectedChildren && expectedChildren === entry.children?.block.trim()
+      ? entry.children.context : expectedChildren;
     const startedAt = Date.now();
     const request = (requests.get(handoffId) ?? 0) + 1;
     requests.set(handoffId, request);
+    set((s) => ({
+      byWorkspace: {
+        ...s.byWorkspace,
+        [workspacePath]: { ...entry, grokStatus: "running", grokStartedAt: startedAt, grokDurationMs: null, grokError: null },
+      },
+    }));
     const isCurrent = () => {
       const currentPath = Object.keys(get().byWorkspace).find((path) => get().byWorkspace[path]?.id === handoffId);
       if (currentPath === undefined || requests.get(handoffId) !== request) return false;
       workspacePath = currentPath;
       return true;
     };
+    const childrenUnchanged = () => {
+      const key = resolveHandoffTargetDraftKey(workspacePath, entry.sourceEngine);
+      return handoffChildrenBlock(useChatStore.getState().drafts[key] ?? "", entry.children?.heading) === expectedChildren;
+    };
     void upgradeHandoffDraftWithGrok({
       engine: entry.sourceEngine,
       sessionId: entry.sourceSessionId,
       title: entry.sourceTitle,
       state: entry.sourceState,
+      childContext,
       compressionModel: entry.compressionModel,
       compressionSelection: entry.compressionSelection ?? legacyHandoffSelection(entry.compressionModel),
       getCurrentDraft: () => {
-        if (!isCurrent() || get().byWorkspace[workspacePath]?.sending) return "";
+        if (!isCurrent() || get().byWorkspace[workspacePath]?.sending || !childrenUnchanged()) return "";
         const key = resolveHandoffTargetDraftKey(workspacePath, entry.sourceEngine);
         const draft = useChatStore.getState().drafts[key] ?? "";
         return isHandoffDraft(draft, entry) ? draft : "";
@@ -764,6 +825,7 @@ export const useHandoffStore = create<HandoffStoreState>((set, get) => {
       },
       onSuccess: (distilled) => {
         if (!isCurrent()) return;
+        const unchanged = childrenUnchanged();
         const durationMs = Math.max(100, Date.now() - startedAt);
         set((s) => {
           const cur = s.byWorkspace[workspacePath];
@@ -773,8 +835,9 @@ export const useHandoffStore = create<HandoffStoreState>((set, get) => {
               ...s.byWorkspace,
               [workspacePath]: {
                 ...cur,
-                grokStatus: "done",
-                grokSummary: distilled,
+                grokStatus: unchanged ? "done" : "stale",
+                grokSummary: unchanged ? distilled : null,
+                grokChildrenBlock: unchanged ? expectedChildren : undefined,
                 grokError: null,
                 grokDurationMs: durationMs,
               },
@@ -902,15 +965,16 @@ export const useHandoffStore = create<HandoffStoreState>((set, get) => {
         mode: initialMode,
         compressionModel: preferences.model,
         compressionSelection: preferences.selection,
-        grokStatus: initialMode === "grok" ? "running" : "idle",
+        grokStatus: "idle",
         grokSummary: null,
         grokError: null,
-        grokStartedAt: initialMode === "grok" ? now : null,
+        grokStartedAt: null,
         grokDurationMs: null,
         archiveSourceOnSend,
         sourceArchived: false,
         createdAt: now,
         managedSummary: handoffSummarySection(mergedDraft)?.snapshot,
+        childrenStatus: "loading",
       };
 
       set((s) => ({
@@ -938,7 +1002,7 @@ export const useHandoffStore = create<HandoffStoreState>((set, get) => {
               const updated: PendingHandoffSession = { ...cur, sourceState: hydratedState };
               const key = resolveHandoffTargetDraftKey(workspacePath, sourceEngine);
               const currentDraft = useChatStore.getState().drafts[key] ?? "";
-              if ((updated.mode !== "grok" || !updated.grokSummary)
+              if (!cur.sending && (updated.mode !== "grok" || !updated.grokSummary)
                 && cur.managedSummary !== undefined
                 && handoffSummarySection(currentDraft)?.snapshot === cur.managedSummary) {
                 const nextDraft = applyHandoffModeDraft(currentDraft, updated, updated.mode);
@@ -958,9 +1022,31 @@ export const useHandoffStore = create<HandoffStoreState>((set, get) => {
           .catch(() => {});
       }
 
-      if (initialMode === "grok") {
-        runGrokDistillation(workspacePath, id);
-      }
+      // Read once for both entry points. Compression waits for this read so it
+      // sees child results on its first call, including those absent from the parent.
+      void (async () => {
+        let children: HandoffChildrenDigest | undefined;
+        let error: string | undefined;
+        try {
+          const snapshot = await ipc.taskSnapshot();
+          children = buildHandoffChildren(snapshot, {
+            engine: sourceEngine, sessionId: sourceSessionId, workspacePath,
+          }, Date.now());
+        } catch (reason) {
+          error = reason instanceof Error ? reason.message : String(reason);
+        }
+        const targetPath = Object.keys(get().byWorkspace).find((path) => get().byWorkspace[path]?.id === id);
+        if (targetPath === undefined) return;
+        set((s) => {
+          const latest = s.byWorkspace[targetPath];
+          if (latest?.id !== id) return s;
+          return { byWorkspace: { ...s.byWorkspace, [targetPath]: {
+            ...latest, childrenStatus: children ? "ready" : "error", children, childrenApplied: !children?.total, childrenError: error,
+          } } };
+        });
+        insertCapturedChildren(targetPath, id);
+        runGrokDistillation(targetPath, id);
+      })();
     },
 
     setCompressionMode: (workspacePath, mode) => {
@@ -979,15 +1065,13 @@ export const useHandoffStore = create<HandoffStoreState>((set, get) => {
       } else if (entry.grokSummary) {
         updated.grokStatus = "done";
       }
-      const shouldRun = mode === "grok" && !entry.grokSummary && entry.grokStatus !== "running";
-      if (shouldRun) {
-        updated.grokStatus = "running";
-        updated.grokStartedAt = Date.now();
-        updated.grokDurationMs = null;
-        updated.grokError = null;
-      }
       const key = resolveHandoffTargetDraftKey(workspacePath, entry.sourceEngine);
       const currentDraft = useChatStore.getState().drafts[key] ?? "";
+      if (entry.grokSummary && (entry.grokChildrenBlock ?? "") !== handoffChildrenBlock(currentDraft, entry.children?.heading)) {
+        updated.grokSummary = null;
+        updated.grokStatus = "idle";
+      }
+      const shouldRun = mode === "grok" && !updated.grokSummary && entry.grokStatus !== "running";
       const canReplaceSummary = entry.managedSummary !== undefined
         && handoffSummarySection(currentDraft)?.snapshot === entry.managedSummary;
       const nextDraft = canReplaceSummary ? applyHandoffModeDraft(currentDraft, updated, mode) : currentDraft;
@@ -1029,10 +1113,10 @@ export const useHandoffStore = create<HandoffStoreState>((set, get) => {
             compressionModel: selection.model,
             compressionSelection: { ...selection },
             compressionPreferenceError,
-            grokStatus: entry.mode === "grok" ? "running" : "idle",
+            grokStatus: "idle",
             grokSummary: null,
             grokError: null,
-            grokStartedAt: entry.mode === "grok" ? Date.now() : null,
+            grokStartedAt: null,
             grokDurationMs: null,
           },
         },
@@ -1045,7 +1129,6 @@ export const useHandoffStore = create<HandoffStoreState>((set, get) => {
     retryGrok: (workspacePath) => {
       const entry = get().byWorkspace[workspacePath];
       if (!entry || entry.sending || entry.mode !== "grok") return;
-      const now = Date.now();
       const key = resolveHandoffTargetDraftKey(workspacePath, entry.sourceEngine);
       const managedSummary = handoffSummarySection(useChatStore.getState().drafts[key] ?? "")?.snapshot;
       set((s) => {
@@ -1057,9 +1140,9 @@ export const useHandoffStore = create<HandoffStoreState>((set, get) => {
             [workspacePath]: {
               ...cur,
               mode: "grok",
-              grokStatus: "running",
+              grokStatus: "idle",
               grokError: null,
-              grokStartedAt: now,
+              grokStartedAt: null,
               managedSummary,
             },
           },
@@ -1152,6 +1235,15 @@ export const useHandoffStore = create<HandoffStoreState>((set, get) => {
       if (entry?.id !== id) return;
       const updated = { ...entry, sending };
       set((s) => ({ byWorkspace: { ...s.byWorkspace, [workspacePath]: updated } }));
+      if (entry.sending && !sending) {
+        // A failed launch releases the draft. Finish the single deferred read /
+        // compression attempt instead of leaving it permanently parked by the lock.
+        insertCapturedChildren(workspacePath, id);
+        const latest = get().byWorkspace[workspacePath];
+        if (latest?.id === id && latest.grokStatus === "idle" && !latest.grokSummary) {
+          runGrokDistillation(workspacePath, id);
+        }
+      }
     },
 
     completeHandoffOnSend: (workspacePath, id) => {

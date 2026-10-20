@@ -4,6 +4,8 @@ import { useTranslation } from "react-i18next";
 import { Dialog, DialogTrigger, Popover, Pressable } from "react-aria-components";
 import { useShallow } from "zustand/react/shallow";
 import ArrowRight from "lucide-react/dist/esm/icons/arrow-right";
+import ChevronDown from "lucide-react/dist/esm/icons/chevron-down";
+import ChevronUp from "lucide-react/dist/esm/icons/chevron-up";
 import MessagesSquare from "lucide-react/dist/esm/icons/messages-square";
 import CircleAlert from "lucide-react/dist/esm/icons/circle-alert";
 import Clock from "lucide-react/dist/esm/icons/clock";
@@ -195,6 +197,13 @@ function CommsPopover({ participant }: { participant?: CrossSessionParticipant }
   </DialogTrigger>;
 }
 
+type CommsCategory = "all" | "active" | "finished" | "subtask" | "consultation";
+
+function isCollapsibleRecord(record: CrossSessionCommunicationRecord): boolean {
+  const text = `${record.message ?? ""}\n${record.replyText ?? ""}`;
+  return text.length > 120 || text.split("\n").length > 3;
+}
+
 function CommsDetails({ records, participant, onClose }: {
   records: CrossSessionCommunicationRecord[];
   participant?: CrossSessionParticipant;
@@ -205,6 +214,9 @@ function CommsDetails({ records, participant, onClose }: {
   const markReviewed = useCrossSessionActivityStore((s) => s.markReviewed);
   const clearFinished = useCrossSessionActivityStore((s) => s.clearFinished);
   const [now, setNow] = useState(Date.now);
+  const [category, setCategory] = useState<CommsCategory>("all");
+  const [detailed, setDetailed] = useState(false);
+  const [expandedIds, setExpandedIds] = useState<Record<string, boolean>>({});
   const active = records.some((record) => isCrossSessionActiveStatus(record.status));
   const [navigationError, setNavigationError] = useState<string>();
   useEffect(() => {
@@ -227,48 +239,112 @@ function CommsDetails({ records, participant, onClose }: {
       setNavigationError(t("crossSession.openFailed"));
     }
   };
-  return <div data-testid="cross-session-details" className="flex select-text flex-col gap-3">
+  const activeCount = records.filter((r) => isCrossSessionActiveStatus(r.status)).length;
+  const finishedCount = records.length - activeCount;
+  const subtaskCount = records.filter((r) => r.kind === "subtask").length;
+  const consultationCount = records.length - subtaskCount;
+  const categories: Array<{ id: CommsCategory; label: string; count: number }> = [
+    { id: "all", label: t("crossSession.filterAll"), count: records.length },
+    { id: "active", label: t("crossSession.filterActive"), count: activeCount },
+    { id: "finished", label: t("crossSession.filterFinished"), count: finishedCount },
+    { id: "subtask", label: t("crossSession.filterSubtask"), count: subtaskCount },
+    { id: "consultation", label: t("crossSession.filterConsultation"), count: consultationCount },
+  ];
+  const filteredRecords = records.filter((record) => {
+    if (category === "active") return isCrossSessionActiveStatus(record.status);
+    if (category === "finished") return !isCrossSessionActiveStatus(record.status);
+    if (category === "subtask") return record.kind === "subtask";
+    if (category === "consultation") return record.kind !== "subtask";
+    return true;
+  });
+  const toggleDensity = () => {
+    setDetailed((prev) => !prev);
+    setExpandedIds({});
+  };
+  const toggleCardExpanded = (scopedId: string, currentExpanded: boolean) => {
+    setExpandedIds((prev) => ({ ...prev, [scopedId]: !currentExpanded }));
+  };
+  const densityLabel = t(detailed ? "crossSession.toggleDensityToCompact" : "crossSession.toggleDensityToDetailed");
+  return <div data-testid="cross-session-details" data-density={detailed ? "detailed" : "compact"} className="flex select-text flex-col gap-3">
     <div className="flex items-center justify-between gap-2">
       <h3 className="text-body-2-medium text-text-primary">{t("crossSession.title")}</h3>
-      <Button size="xs" aria-label={t("crossSession.closePanel")} title={t("crossSession.closePanel")} onClick={onClose}>
-        <X className="size-3" aria-hidden />
-      </Button>
+      <div className="flex items-center gap-1">
+        {records.length > 0 && <Button size="xs" data-testid="cross-session-density-btn"
+          aria-pressed={detailed} aria-label={densityLabel} title={densityLabel} onClick={toggleDensity}>
+          {t(detailed ? "crossSession.detailedMode" : "crossSession.compactMode")}
+        </Button>}
+        <Button size="xs" aria-label={t("crossSession.closePanel")} title={t("crossSession.closePanel")} onClick={onClose}>
+          <X className="size-3" aria-hidden />
+        </Button>
+      </div>
     </div>
+    {records.length > 0 && <div role="group" aria-label={t("crossSession.filterLabel")} data-testid="cross-session-filter-bar" className="flex flex-wrap items-center gap-1">
+      {categories.map((item) => {
+        const selected = category === item.id;
+        return <button key={item.id} type="button" data-testid={`cross-session-filter-${item.id}`}
+          aria-pressed={selected} onClick={() => setCategory(item.id)}
+          className={cx(
+            "inline-flex cursor-pointer items-center gap-1 rounded-full px-2 py-0.5 text-caption-2-medium outline-none transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-border-focus-ring motion-reduce:transition-none",
+            selected
+              ? "bg-background-tertiary-default text-text-primary"
+              : "text-text-tertiary hover:bg-background-tertiary-hover hover:text-text-secondary",
+          )}>
+          <span>{item.label}</span>
+          <span className="text-text-tertiary">{item.count}</span>
+        </button>;
+      })}
+    </div>}
     {navigationError && <p role="alert" className="text-caption-1-regular text-notification-error">{navigationError}</p>}
     {!records.length && <p className="text-caption-1-regular text-text-tertiary">{t("crossSession.empty")}</p>}
-    {records.map((record) => <section key={record.scopedId} data-testid="cross-session-comm-card" data-comm-status={record.status}
-      className="flex flex-col gap-2 rounded-lg border border-border-secondary bg-background-secondary/60 p-2">
-      <div className="flex items-center gap-1 text-caption-2-medium">
-        {[record.sender, record.target].map((target, index) => {
-          const title = resolveParticipantLabel(target, sessions);
-          const pendingTarget = target.sessionId.startsWith("leader-branch:");
-          return <div key={index} className="contents">
-            {index === 1 && <ArrowRight className="size-3 shrink-0 text-foreground-icon-tertiary" aria-hidden />}
-            <button type="button" disabled={pendingTarget} onClick={() => void selectParticipant(target)}
-              aria-label={t(index === 0 ? "crossSession.openSender" : "crossSession.openTarget", { title })}
-              title={title}
-              className="inline-flex min-w-0 flex-1 cursor-pointer items-center gap-1 rounded-sm px-1 py-1 text-left text-text-secondary outline-none hover:bg-background-tertiary-hover focus-visible:ring-2 focus-visible:ring-border-focus-ring disabled:cursor-default disabled:hover:bg-transparent">
-              <EngineIcon engine={target.engine} size={12} className="size-3 shrink-0" />
-              <span className="truncate">{title}</span>
-            </button>
-          </div>;
-        })}
-      </div>
-      <div className="flex items-center justify-between gap-2 text-caption-2-medium text-text-secondary">
-        <span className="inline-flex items-center gap-1.5"><StatusIcon status={record.status} />{t(`crossSession.status.${record.status}`)}</span>
-        <span className="text-text-tertiary">{t("crossSession.elapsedSeconds", { seconds: Math.max(0, Math.floor(((isCrossSessionActiveStatus(record.status) ? now : record.updatedAt) - record.acceptedAt) / 1000)) })}</span>
-      </div>
-      <p className="whitespace-pre-wrap text-caption-1-regular text-text-secondary [overflow-wrap:anywhere]">
-        <span className="font-medium">{t(record.kind === "subtask" ? "crossSession.subtaskPromptLabel" : "crossSession.promptLabel")}： </span>{record.message}
-      </p>
-      {record.status === "awaiting_cost_approval" && <CrossSessionCostApproval record={record} />}
-      {record.replyText && <div className="rounded-md bg-background-primary-default p-2 text-caption-1-regular text-text-secondary">
-        <span className="font-medium">{t(record.status === "executing" ? "crossSession.replyStreamingLabel" : "crossSession.replyDoneLabel")}： </span>
-        <span className="whitespace-pre-wrap [overflow-wrap:anywhere]">{record.replyText}</span>
-        {record.truncated && <span className="text-text-tertiary">{t("crossSession.truncated")}</span>}
-      </div>}
-      {record.error && <p role="alert" className="text-caption-1-regular text-notification-error [overflow-wrap:anywhere]">{record.error}</p>}
-    </section>)}
+    {records.length > 0 && !filteredRecords.length && <p data-testid="cross-session-filter-empty" className="text-caption-1-regular text-text-tertiary">{t("crossSession.filterEmpty")}</p>}
+    {filteredRecords.map((record) => {
+      const cardExpanded = expandedIds[record.scopedId] ?? detailed;
+      const canToggleCard = isCollapsibleRecord(record) || expandedIds[record.scopedId] !== undefined;
+      return <section key={record.scopedId} data-testid="cross-session-comm-card" data-comm-status={record.status} data-expanded={cardExpanded}
+        className="flex flex-col gap-2 rounded-lg border border-border-secondary bg-background-secondary/60 p-2">
+        <div className="flex items-center gap-1 text-caption-2-medium">
+          {[record.sender, record.target].map((target, index) => {
+            const title = resolveParticipantLabel(target, sessions);
+            const pendingTarget = target.sessionId.startsWith("leader-branch:");
+            return <div key={index} className="contents">
+              {index === 1 && <ArrowRight className="size-3 shrink-0 text-foreground-icon-tertiary" aria-hidden />}
+              <button type="button" disabled={pendingTarget} onClick={() => void selectParticipant(target)}
+                aria-label={t(index === 0 ? "crossSession.openSender" : "crossSession.openTarget", { title })}
+                title={title}
+                className="inline-flex min-w-0 flex-1 cursor-pointer items-center gap-1 rounded-sm px-1 py-1 text-left text-text-secondary outline-none hover:bg-background-tertiary-hover focus-visible:ring-2 focus-visible:ring-border-focus-ring disabled:cursor-default disabled:hover:bg-transparent">
+                <EngineIcon engine={target.engine} size={12} className="size-3 shrink-0" />
+                <span className="truncate">{title}</span>
+              </button>
+            </div>;
+          })}
+        </div>
+        <div className="flex items-center justify-between gap-2 text-caption-2-medium text-text-secondary">
+          <span className="inline-flex items-center gap-1.5"><StatusIcon status={record.status} />{t(`crossSession.status.${record.status}`)}</span>
+          <div className="flex items-center gap-1.5">
+            <span className="text-text-tertiary">{t("crossSession.elapsedSeconds", { seconds: Math.max(0, Math.floor(((isCrossSessionActiveStatus(record.status) ? now : record.updatedAt) - record.acceptedAt) / 1000)) })}</span>
+            {canToggleCard && <button type="button" data-testid="cross-session-card-toggle"
+              aria-expanded={cardExpanded}
+              aria-label={t(cardExpanded ? "crossSession.collapseCard" : "crossSession.expandCard")}
+              title={t(cardExpanded ? "crossSession.collapseCard" : "crossSession.expandCard")}
+              onClick={() => toggleCardExpanded(record.scopedId, cardExpanded)}
+              className="inline-flex cursor-pointer items-center gap-0.5 rounded px-1 py-0.5 text-caption-2-medium text-text-tertiary outline-none transition-colors duration-150 hover:bg-background-tertiary-hover hover:text-text-primary focus-visible:ring-2 focus-visible:ring-border-focus-ring motion-reduce:transition-none">
+              <span>{t(cardExpanded ? "crossSession.collapseCard" : "crossSession.expandCard")}</span>
+              {cardExpanded ? <ChevronUp className="size-3 shrink-0" aria-hidden /> : <ChevronDown className="size-3 shrink-0" aria-hidden />}
+            </button>}
+          </div>
+        </div>
+        <p data-testid="cross-session-card-prompt" className={cx("whitespace-pre-wrap text-caption-1-regular text-text-secondary [overflow-wrap:anywhere]", !cardExpanded && "line-clamp-3")}>
+          <span className="font-medium">{t(record.kind === "subtask" ? "crossSession.subtaskPromptLabel" : "crossSession.promptLabel")}： </span>{record.message}
+        </p>
+        {record.status === "awaiting_cost_approval" && <CrossSessionCostApproval record={record} />}
+        {record.replyText && <div data-testid="cross-session-card-reply" className={cx("rounded-md bg-background-primary-default p-2 text-caption-1-regular text-text-secondary", !cardExpanded && "line-clamp-3")}>
+          <span className="font-medium">{t(record.status === "executing" ? "crossSession.replyStreamingLabel" : "crossSession.replyDoneLabel")}： </span>
+          <span className="whitespace-pre-wrap [overflow-wrap:anywhere]">{record.replyText}</span>
+          {record.truncated && <span className="text-text-tertiary">{t("crossSession.truncated")}</span>}
+        </div>}
+        {record.error && <p role="alert" className="text-caption-1-regular text-notification-error [overflow-wrap:anywhere]">{record.error}</p>}
+      </section>;
+    })}
     {!participant && records.some((r) => !isCrossSessionActiveStatus(r.status)) &&
       <Button size="xs" data-testid="cross-session-clear-btn" onClick={clearFinished}>{t("crossSession.clearFinished")}</Button>}
   </div>;

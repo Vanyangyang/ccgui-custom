@@ -2,6 +2,7 @@
 import { invoke, listen } from "./transport";
 import type { NativePerformanceDiagnostics } from "./performance-types";
 import { withGrantRetry } from "./grant";
+import type { LeaderSnapshot } from "@/features/leader/types";
 
 // ==================== Shared types (mirror Rust serde camelCase) ====================
 
@@ -1549,11 +1550,13 @@ export const ipc = {
   autoTitleModels: () => invoke<AutoTitleModel[]>("auto_title_models"),
   predictNextPrompt: (turns: PredictionTurn[]) =>
     invoke<string | null>("predict_next_prompt", { turns }),
+  taskSnapshot: () => invoke<LeaderSnapshot>("task_snapshot", {}),
   summarizeSessionHandoff: (args: {
     engine: string;
     sessionId: string;
     title?: string | null;
     transcriptExcerpt?: string | null;
+    childContext?: string | null;
     /** Legacy Cursor selector; new callers send the complete selection. */
     compressionModel?: string | null;
     compressionSelection?: HandoffCompressionSelection | null;
@@ -1612,6 +1615,9 @@ export const ipc = {
   // rejection becomes a one-click grant prompt + retry (see lib/grant.ts).
   listDir: (path: string) => withGrantRetry(() => invoke<DirEntry[]>("list_dir", { path })),
   readFile: (path: string) => withGrantRetry(() => invoke<FileContent>("read_file", { path })),
+  /** Desktop only: raw bytes of a confined local raster image (up to 64MB),
+   *  without read_file's base64 data URL and 5MB preview cap. */
+  readImageBytes: (path: string) => withGrantRetry(() => invoke<ArrayBuffer>("read_image_bytes", { path })),
   writeFile: (path: string, content: string) =>
     withGrantRetry(() => invoke<void>("write_file", { path, content })),
   createDir: (path: string) => withGrantRetry(() => invoke<void>("create_dir", { path })),
@@ -1799,6 +1805,10 @@ export const ipc = {
     invoke<string | null>("get_program_icon", { executablePath }),
   revealInFileManager: (path: string) =>
     invoke<void>("reveal_in_file_manager", { path }),
+  /** Desktop only: native save dialog, then writes the image (copied from a
+   *  confined `sourcePath`, else decoded from `dataUrl`); null = cancelled. */
+  saveImageAs: (fileName: string, image: { dataUrl?: string; sourcePath?: string }) =>
+    invoke<string | null>("save_image_as", { fileName, dataUrl: image.dataUrl ?? null, sourcePath: image.sourcePath ?? null }),
   // metrics
   appMetrics: () => invoke<AppMetrics>("app_metrics"),
   performanceDiagnostics: () => invoke<NativePerformanceDiagnostics>("performance_diagnostics"),

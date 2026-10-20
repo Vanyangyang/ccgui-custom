@@ -93,7 +93,7 @@ describe("cross-session cost review telemetry", () => {
     });
     expect(requiresCrossSessionCostApproval(f.review())).toBe(true);
   });
-  it("does not require approval solely because target is busy when cache is hot, but requires approval for unknown, elapsed, expiring and model mismatch", () => {
+  it("allows hot targets outside the startup margin and requires approval for unknown or elapsed cache", () => {
     const f = fixture();
     for (const targetStatus of ["busy", "awaiting_permission"] as const) {
       expect(requiresCrossSessionCostApproval(crossSessionCostReview(f.meta, f.state, targetStatus, NOW))).toBe(false);
@@ -102,8 +102,27 @@ describe("cross-session cost review telemetry", () => {
     expect(requiresCrossSessionCostApproval(f.review())).toBe(true);
     f.meta.promptCache = { startedAt: NOW - 3500000, observedAt: NOW - 3490000, ttlSeconds: 3600, source: "anthropic-usage" };
     expect(f.review().cacheHeat).toBe("hot");
-    expect(requiresCrossSessionCostApproval(f.review())).toBe(true);
+    expect(requiresCrossSessionCostApproval(f.review())).toBe(false);
     expect(requiresCrossSessionCostApproval(crossSessionCostReview(f.meta, f.state, "idle", NOW + 7200000))).toBe(true);
+  });
+  it.each([
+    [300, 10_001, false], [1800, 60_000, false], [1800, 180_000, false], [3600, 180_000, false],
+    [1800, 10_000, true], [3600, 10_000, true], [1800, 499, true], [3600, 1, true],
+  ] as const)("uses a fixed startup margin for a %i-second cache with %i ms left (approval=%s)", (ttlSeconds, remainingMs, approval) => {
+    const f = fixture();
+    f.meta.promptCache = { startedAt: NOW - ttlSeconds * 1000 + remainingMs, observedAt: NOW - ttlSeconds * 1000 + remainingMs,
+      ttlSeconds, source: "anthropic-usage" };
+    const review = f.review();
+    expect(review.cacheHeat).toBe("hot");
+    expect(requiresCrossSessionCostApproval(review)).toBe(approval);
+  });
+  it.each([[10_001, false], [10_000, true]] as const)("uses the earliest possible expiry for a reference cache with %i ms left", (remainingMs, approval) => {
+    const f = fixture("agy");
+    f.meta.promptCache = { startedAt: NOW - 300_000 + remainingMs, observedAt: NOW - 290_000 + remainingMs,
+      ttlSeconds: 300, source: "agy-gemini-reference",
+      reference: { maxTtlSeconds: 3600, cacheReadTokens: 100, promptTokens: 200 } };
+    expect(f.review().cacheHeat).toBe("hot");
+    expect(requiresCrossSessionCostApproval(f.review())).toBe(approval);
   });
   it("gates daily session sends and queue drains on cold or model-mismatched context, while letting expiring-soon hot cache send immediately", () => {
     const f = fixture("claude", { input_tokens: 60000, context_window: 200000 });

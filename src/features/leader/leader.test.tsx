@@ -1,7 +1,7 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { AiChatSidebar } from "@/components/application/ai-chat/ai-chat-sidebar";
+import { AiChatSidebar, type AiChatThread } from "@/components/application/ai-chat/ai-chat-sidebar";
 import { ThreadContextMenu } from "@/components/application/ai-chat/thread-context-menu";
 import { paginateThreads } from "@/components/application/ai-chat/repo-pagination";
 import { useChatStore } from "@/features/chat/store";
@@ -21,6 +21,7 @@ import { startLeaderRuntime } from "./runtime";
 import { LeaderManagementHost } from "./LeaderManagementHost";
 import type { LeaderArchivedGroup, LeaderBranch, LeaderSnapshot } from "./types";
 import { isCrossSessionRecordUnread, useCrossSessionActivityStore } from "@/features/chat/cross-session";
+import { CrossSessionQueue } from "@/features/chat/components/CrossSessionQueue";
 
 const runtime = vi.hoisted(() => ({ web: false }));
 vi.mock("@/lib/transport", () => ({ get isWeb() { return runtime.web; }, invoke: vi.fn(), listen: vi.fn(async () => () => {}) }));
@@ -58,6 +59,54 @@ beforeEach(() => {
 afterEach(async () => { await act(async () => root.unmount()); node.remove(); vi.restoreAllMocks(); vi.useRealTimers(); });
 
 describe("Leader sidebar tree", () => {
+  it.each(["workspace", "recent"])("shows each child's own cache evidence alongside task status in the %s list", async (mode) => {
+    const now = Date.now();
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    localStorage.setItem("ccgui-next.sidebarChatListMode:v1", mode);
+    const hotCache = { startedAt: now - 60_000, observedAt: now - 50_000, ttlSeconds: 3600, source: "anthropic-usage" as const };
+    const coldCache = { startedAt: now - 600_000, observedAt: now - 590_000, ttlSeconds: 300, source: "anthropic-usage" as const };
+    const native: LeaderSnapshot = { leaders: [parent], branches: [
+      { ...branch("child", "claude"), state: "completed" },
+      branch("grandchild", "codex", "child", "claude"),
+      { ...branch("unknown", "agy"), state: "failed" },
+      { ...branch("cursor", "cursor"), state: "stopped" },
+      { ...branch("pending"), sessionId: null, state: "starting" },
+    ] };
+    const threads: AiChatThread[] = [
+      { id: "claude/root", engine: "claude", label: "root conversation", time: "root-age", promptCache: hotCache },
+      { id: "claude/child", engine: "claude", label: "child conversation", time: "child-age", promptCache: coldCache },
+      { id: "codex/grandchild", engine: "codex", label: "grandchild conversation", time: "grandchild-age", promptCache: { ...hotCache, ttlSeconds: 1800, source: "openai-policy" } },
+      { id: "agy/unknown", engine: "agy", label: "unknown conversation", time: "unknown-age" },
+      { id: "cursor/cursor", engine: "cursor", label: "cursor conversation", time: "cursor-age", promptCache: hotCache },
+    ];
+    const grouped = groupLeaderThreads(threads, native, "/branches");
+    await act(async () => root.render(<AiChatSidebar
+      repos={[{ id: "ws", label: "workspace", defaultOpen: true, threads: grouped }]}
+      activeThreadId="codex/grandchild"
+    />));
+    const row = (title: string) => node.querySelector<HTMLElement>(`[title="${title}"]`)!.closest("button")!.parentElement!;
+    const chip = (title: string) => row(title).querySelector<HTMLElement>("[data-cache-heat]");
+    expect(chip("root conversation")?.dataset.cacheHeat).toBe("hot");
+    const childChip = chip("child conversation");
+    expect(childChip?.dataset.cacheHeat).toBe("cold");
+    expect(childChip?.textContent).toBe("child-age");
+    expect(childChip?.classList.contains("group-hover:hidden")).toBe(false);
+    expect(row("child conversation").textContent).toContain("leader.state.completed");
+    expect(chip("grandchild conversation")?.dataset.cacheHeat).toBe("hot");
+    expect(row("grandchild conversation").textContent).toContain("leader.state.running");
+    expect(chip("unknown conversation")?.dataset.cacheHeat).toBe("unknown");
+    expect(row("unknown conversation").textContent).toContain("leader.state.failed");
+    expect(chip("cursor conversation")).toBeNull();
+    expect(row("cursor conversation").textContent).toContain("cursor-age");
+    expect(row("cursor conversation").textContent).toContain("leader.state.stopped");
+    expect(chip("task-pending")).toBeNull();
+    expect(row("task-pending").textContent).toContain("leader.state.starting");
+
+    await act(async () => childChip!.focus());
+    const card = document.body.querySelector('[data-testid="cache-window-hover-card"]');
+    expect(card).not.toBeNull();
+    expect(card?.textContent).toContain("chat.cacheHeadlineCold");
+  });
   it("manages a Windows parent from its branches without an enabled mode", async () => {
     const identity = { ...parent, workspacePath: "G:/project" };
     const child = { ...branch("child"), workspacePath: "G:\\project" };
@@ -908,6 +957,64 @@ describe("parent management and lifecycle", () => {
     vi.mocked(listen).mockImplementationOnce(() => new Promise((done) => { resolve = done; }));
     const off = startLeaderRuntime(); off(); resolve(lateOff); await Promise.resolve();
     expect(lateOff).toHaveBeenCalledOnce(); expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("restores a held follow-up to both participants without sending and clears approval after cancellation", async () => {
+    const now = Date.now();
+    const held: LeaderBranch = {
+      ...branch("held"),
+      state: "awaiting_cost_approval",
+      runId: null,
+      model: "task-model",
+      task: "继续核查缓存 👩🏽‍💻\n保留子任务设置",
+      costApproval: {
+        requestId: "followup-1",
+        capturedAt: now,
+        model: "task-model",
+        cache: { startedAt: now - 600_000, observedAt: now - 590_000, ttlSeconds: 300, source: "anthropic-usage" },
+      },
+    };
+    useLeaderStore.setState({ snapshot: { leaders: [parent], branches: [] } });
+    vi.mocked(invoke).mockResolvedValue({ leaders: [parent], branches: [held] });
+    const off = startLeaderRuntime();
+    try {
+      await vi.waitFor(() => {
+        expect(useCrossSessionActivityStore.getState().records.find((r) => r.scopedId === "leader:held")?.status)
+          .toBe("awaiting_cost_approval");
+      });
+      const record = useCrossSessionActivityStore.getState().records.find((r) => r.scopedId === "leader:held")!;
+      expect(record).toMatchObject({
+        kind: "subtask",
+        requestId: "followup-1",
+        message: held.task,
+        acceptedAt: now,
+        leaderCostApproval: { branchId: "held", requestId: "followup-1", model: "task-model" },
+        costReview: { model: "task-model", cacheHeat: "cold", context: { kind: "unknown" } },
+      });
+      for (const active of [parent, { engine: held.engine, sessionId: held.sessionId!, workspacePath: held.workspacePath }]) {
+        await act(async () => root.render(<CrossSessionQueue active={active} />));
+        expect(node.querySelectorAll('[data-testid="cross-session-cost-approval"]')).toHaveLength(1);
+        expect(node.textContent).toContain(held.task);
+        expect(node.textContent).toContain("crossSession.taskCostApprovalPending");
+      }
+      expect(invoke).toHaveBeenCalledExactlyOnceWith("task_snapshot", {});
+      expect(ipc.loadSessionPage).not.toHaveBeenCalled();
+
+      useCrossSessionActivityStore.getState().clearFinished();
+      expect(useCrossSessionActivityStore.getState().records).toHaveLength(1);
+      await act(async () => {
+        useLeaderStore.setState({ snapshot: { leaders: [parent], branches: [{
+          ...held, state: "stopped", costApproval: undefined, updatedAt: now + 1000,
+        }] } });
+      });
+      const cancelled = useCrossSessionActivityStore.getState().records[0];
+      expect(cancelled.status).toBe("failed");
+      expect(cancelled.leaderCostApproval).toBeUndefined();
+      expect(cancelled.costReview).toBeUndefined();
+      expect(node.querySelector('[data-testid="cross-session-cost-approval"]')).toBeNull();
+    } finally {
+      off();
+    }
   });
 
   it("syncs subtask communication UI across live streaming, completion, and archival/reclaim cleanup", async () => {

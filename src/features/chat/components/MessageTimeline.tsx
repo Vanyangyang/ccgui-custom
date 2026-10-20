@@ -14,6 +14,7 @@ import { AgentThinking } from "@/components/application/agent-thinking/agent-thi
 import { useLiveParseInterval, useThrottled } from "@/hooks/use-throttled";
 import { useCopied } from "@/hooks/use-copied";
 import { MessageImages } from "./MessageImages";
+import { ChatImageGalleryProvider } from "./chat-image-gallery";
 import { GrantCard } from "./GrantCard";
 import { QuestionRecord } from "./QuestionCard";
 import { AutoReviewCard } from "./AutoReviewCard";
@@ -626,6 +627,8 @@ export const MessageTimeline = memo(function MessageTimeline({
   );
 
   return (
+    // Chat image previews step through every image in this conversation.
+    <ChatImageGalleryProvider messages={items} workspacePath={workspacePath}>
     <div className="relative flex min-h-0 flex-1 flex-col">
       <MessageAnchorRail
         activeAnchorId={activeAnchorId}
@@ -752,5 +755,6 @@ export const MessageTimeline = memo(function MessageTimeline({
         </div>
       </div>
     </div>
+    </ChatImageGalleryProvider>
   );
 });

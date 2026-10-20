@@ -7,6 +7,7 @@ import { crossSessionCostReview, requiresSessionSendCostApproval, useSessionSend
 import { useHandoffStore } from "../session-cleanup";
 import { sessionKey, useChatStore, type ActiveSession } from "../store";
 import { usePromptCacheHeat } from "../use-prompt-cache";
+import { resolveLeaderCostApproval } from "@/features/leader/cost-approval";
 
 function CostReviewTelemetry({
   review,
@@ -74,13 +75,17 @@ export function CrossSessionCostApproval({ record }: { record: CrossSessionCommu
     tab.sessionId === target.sessionId && tab.workspacePath === target.workspacePath)?.model,
   [tabs, target.engine, target.sessionId, target.workspacePath]);
   const review = useMemo(() => {
-    if (!meta || !inputs[0]) return record.costReview;
+    if (!meta || !inputs[0]) return record.leaderCostApproval && record.costReview
+      ? { ...record.costReview, model: record.leaderCostApproval.model ?? undefined } : record.costReview;
     const state = useChatStore.getState();
     const session = state.bySession[key];
     const awaiting = session.messages.some((m) => m.question?.status === "pending" || m.grant?.status === "pending" ||
       ["awaiting_review", "deferred", "submitting"].includes(m.planReview?.status ?? ""));
-    return crossSessionCostReview(meta, state, awaiting ? "awaiting_permission" : session.streaming || session.queue.length ? "busy" : "idle");
-  }, [meta, inputs, tabModel, key, record.costReview]);
+    const sample = crossSessionCostReview(meta, state, awaiting ? "awaiting_permission" : session.streaming || session.queue.length ? "busy" : "idle",
+      Date.now(), record.leaderCostApproval ? record.leaderCostApproval.model ?? null : undefined);
+    return record.leaderCostApproval && record.costReview
+      ? { ...record.costReview, model: sample.model, capturedAt: sample.capturedAt, context: sample.context } : sample;
+  }, [meta, inputs, tabModel, key, record.costReview, record.leaderCostApproval]);
   const act = async (action: (id: string) => Promise<void>) => {
     if (inFlight.current) return;
     inFlight.current = true;
@@ -102,13 +107,15 @@ export function CrossSessionCostApproval({ record }: { record: CrossSessionCommu
     className="flex min-w-0 flex-col gap-2 rounded-lg border border-border-secondary bg-background-primary-default p-2 text-caption-1-regular text-text-secondary [overflow-wrap:anywhere]">
     <div>
       <p className="font-medium text-text-warning-primary">{t("crossSession.costApprovalTitle")}</p>
-      <p>{t("crossSession.costApprovalPending")}</p>
+      <p>{t(record.leaderCostApproval ? "crossSession.taskCostApprovalPending" : "crossSession.costApprovalPending")}</p>
     </div>
-    <CostReviewTelemetry review={review} snapshotFallback={!meta || !inputs[0]} showQueueWarning />
+    <CostReviewTelemetry review={review} snapshotFallback={!meta || !inputs[0]} showQueueWarning={!record.leaderCostApproval} />
     {error && <p role="alert" className="text-notification-error [overflow-wrap:anywhere]">{error}</p>}
     <div className="flex flex-wrap gap-2">
-      <Button size="xs" variant="primary" disabled={pending} onClick={() => void act((id) => approveCrossSessionMessage(id, undefined, review?.model ?? null))}>{t("crossSession.costApprove")}</Button>
-      <Button size="xs" variant="secondary" disabled={pending} onClick={() => void act(cancelCrossSessionMessage)}>{t("crossSession.costCancel")}</Button>
+      <Button size="xs" variant="primary" disabled={pending} onClick={() => void act((id) => record.leaderCostApproval
+        ? resolveLeaderCostApproval(record, true) : approveCrossSessionMessage(id, undefined, review?.model ?? null))}>{t("crossSession.costApprove")}</Button>
+      <Button size="xs" variant="secondary" disabled={pending} onClick={() => void act((id) => record.leaderCostApproval
+        ? resolveLeaderCostApproval(record, false) : cancelCrossSessionMessage(id))}>{t("crossSession.costCancel")}</Button>
     </div>
   </div>;
 }

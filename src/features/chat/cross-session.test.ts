@@ -67,9 +67,9 @@ describe("host cross-session messaging", () => {
   });
   it.each(["busy", "awaiting_permission"] as const)("queues a %s target with hot cache without approval, and re-evaluates latest cache evidence before sending", async (status) => {
     const f = fixture(status);
-    // Initial cache is hot, even if near the end of its non-expiring window:
+    // The final 10% is a visual warning only; more than 10 seconds still queues normally.
     const now = Date.now();
-    f.rows.sessions[0].promptCache = { startedAt: now - 3000 * 1000, observedAt: now - 2990 * 1000, ttlSeconds: 3600, source: "anthropic-usage" };
+    f.rows.sessions[0].promptCache = { startedAt: now - 3500 * 1000, observedAt: now - 3490 * 1000, ttlSeconds: 3600, source: "anthropic-usage" };
     const receipt = await f.handler(request()) as { status: string };
     expect(receipt.status).toBe("queued"); expect(f.host.send).not.toHaveBeenCalled();
     expect(useCrossSessionActivityStore.getState().records[0].status).toBe("queued");
@@ -77,16 +77,23 @@ describe("host cross-session messaging", () => {
     f.rows.sessions[0].promptCache = { startedAt: Date.now() - 10 * 1000, observedAt: Date.now(), ttlSeconds: 3600, source: "anthropic-usage" };
     f.idle(); await vi.waitFor(() => expect(f.host.send).toHaveBeenCalledTimes(1));
   });
-  it.each(["busy", "awaiting_permission"] as const)("gates a queued %s target before sending when continuous output did not renew an expired cache", async (status) => {
+  it.each([
+    ["busy", "cold"], ["awaiting_permission", "cold"],
+    ["busy", "within-10-seconds"], ["awaiting_permission", "within-10-seconds"],
+  ] as const)("rechecks a queued %s target with %s cache at dispatch when output did not renew it", async (status, cacheState) => {
     const f = fixture(status);
     const receipt = await f.handler(request()) as { status: string };
     expect(receipt.status).toBe("queued"); expect(f.host.send).not.toHaveBeenCalled();
     // Continuous streaming updates updatedAt, but does not renew promptCache.startedAt:
     f.rows.sessions[0].updatedAt = Date.now();
-    f.rows.sessions[0].promptCache = { startedAt: Date.now() - 7200 * 1000, observedAt: Date.now() - 7100 * 1000, ttlSeconds: 3600, source: "anthropic-usage" };
+    f.rows.sessions[0].promptCache = {
+      startedAt: Date.now() - (cacheState === "cold" ? 7200 : 3595) * 1000,
+      observedAt: Date.now() - (cacheState === "cold" ? 7100 : 3594) * 1000,
+      ttlSeconds: 3600, source: "anthropic-usage",
+    };
     f.idle();
     await vi.waitFor(() => expect(useCrossSessionActivityStore.getState().records[0].status).toBe("awaiting_cost_approval"));
-    expect(useCrossSessionActivityStore.getState().records[0].costReview?.cacheHeat).toBe("cold");
+    expect(useCrossSessionActivityStore.getState().records[0].costReview?.cacheHeat).toBe(cacheState === "cold" ? "cold" : "hot");
     expect(f.host.send).not.toHaveBeenCalled();
     await approveCrossSessionMessage(useCrossSessionActivityStore.getState().records[0].scopedId, f.bridge);
     await vi.waitFor(() => expect(f.host.send).toHaveBeenCalledTimes(1));
@@ -278,11 +285,11 @@ describe("host cross-session messaging", () => {
     await expect(pending).rejects.toThrow(/disposed/);
     expect(submit).not.toHaveBeenCalled(); expect(f.host.send).not.toHaveBeenCalled();
   });
-  it.each(["cold", "unknown", "expiring"] as const)("holds a %s target until a human approves and returns context for review", async (heat) => {
+  it.each(["cold", "unknown", "within-10-seconds"] as const)("holds a %s target until a human approves and returns context for review", async (heat) => {
     const f = fixture();
     f.rows.sessions[0].promptCache = heat === "unknown" ? null : {
-      startedAt: Date.now() - (heat === "cold" ? 7200 : 3500) * 1000,
-      observedAt: Date.now() - (heat === "cold" ? 7100 : 3490) * 1000,
+      startedAt: Date.now() - (heat === "cold" ? 7200 : 3595) * 1000,
+      observedAt: Date.now() - (heat === "cold" ? 7100 : 3594) * 1000,
       ttlSeconds: 3600, source: "anthropic-usage",
     };
     vi.mocked(f.state.selectSession).mockImplementationOnce(async () => {

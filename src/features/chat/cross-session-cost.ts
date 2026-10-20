@@ -8,7 +8,7 @@ import { resolveSessionModel, type SessionState } from "./store/stream";
 import { resolveContextMaxInfo } from "./context-window-memory";
 import { hasReadableUsage, parseUsage, selectCursorContext } from "./usage";
 import { readAgyReferenceWindow, selectAgyContext } from "./components/agy-context";
-import { getPromptCacheHeatRatio, getSessionCacheHeat, isPromptCacheExpiringSoon, promptCacheForEngine, type CacheHeat } from "./prompt-cache";
+import { getSessionCacheHeat, promptCacheForEngine, type CacheHeat } from "./prompt-cache";
 
 export interface CrossSessionCostReview {
   /** Time this local snapshot was read, not the upstream usage event time. */
@@ -39,10 +39,12 @@ export function crossSessionCostReview(
   state: ChatStore,
   targetStatus: HostChatSession["status"],
   now = Date.now(),
+  modelOverride?: string | null,
 ): CrossSessionCostReview {
   const session = state.bySession[sessionKey(meta.engine, meta.sessionId, meta.workspacePath)];
   const tab = state.openTabs.find((t) => t.engine === meta.engine && t.sessionId === meta.sessionId && t.workspacePath === meta.workspacePath);
-  const model = resolveSessionModel(tab ?? { engine: meta.engine }, session, meta.model ?? state.models?.[meta.engine]);
+  const model = modelOverride !== undefined ? modelOverride ?? undefined :
+    resolveSessionModel(tab ?? { engine: meta.engine }, session, meta.model ?? state.models?.[meta.engine]);
   const usage = session?.usage;
   // Match latestMessageUsage's source selection: a trailing empty/error report
   // must not relabel an older model's still-displayed occupancy.
@@ -52,7 +54,8 @@ export function crossSessionCostReview(
   const sameLaunchedModel = !!session?.liveLaunch && !!model && !!usageModel &&
     runsModel(session.liveLaunch, model) && runsModel(session.liveLaunch, usageModel);
   const modelMismatch = !!model && !!usageModel && model !== usageModel && !sameLaunchedModel;
-  const window = resolveContextMaxInfo({ engine: meta.engine, model, usage: modelMismatch ? null : usage });
+  const unattributedTaskUsage = modelOverride !== undefined && (!model || !usageModel);
+  const window = resolveContextMaxInfo({ engine: meta.engine, model, usage: modelMismatch || unattributedTaskUsage ? null : usage });
   const context: CrossSessionCostReview["context"] = {
     max: window.known ? window.max : undefined,
     capacityKnown: window.known,
@@ -62,7 +65,7 @@ export function crossSessionCostReview(
     const selection = selectAgyContext(usage, readAgyReferenceWindow(), window.known ? window.max : undefined);
     context.used = finiteTokens(selection.total);
     context.reference = selection.noteKey === "chat.agyReferenceWindowNote";
-    if (!modelMismatch) {
+    if (!modelMismatch && !unattributedTaskUsage) {
       context.max = selection.max;
       context.capacityKnown = selection.capacityKnown;
     }
@@ -74,7 +77,7 @@ export function crossSessionCostReview(
   } else if (meta.engine === "cursor") {
     const selection = selectCursorContext(usage, window.known ? window.max : undefined);
     context.used = finiteTokens(selection.used);
-    if (!modelMismatch && selection.capacityKnown) {
+    if (!modelMismatch && !unattributedTaskUsage && selection.capacityKnown) {
       context.max = selection.max;
       context.capacityKnown = true;
     }
@@ -83,15 +86,25 @@ export function crossSessionCostReview(
     context.used = finiteTokens(parseUsage(usage)?.total);
     context.kind = context.used === undefined ? "unknown" : modelMismatch ? "last_request" : "current_context";
   }
+  // A native held task has a fixed intended model. Without an identified usage
+  // model, its sample cannot establish current occupancy for that model.
+  if (unattributedTaskUsage) {
+    context.kind = context.used === undefined ? "unknown" : "last_request";
+  }
   const cache = promptCacheForEngine(meta.engine, meta.promptCache) ?? undefined;
   return { capturedAt: now, cacheHeat: getSessionCacheHeat(cache, now), cache, targetStatus, model, context };
 }
 
-/** Busy targets queue normally when cache is hot; only cold/unknown/expiring
- * cache or a model mismatch requires human cost approval. */
+// Fixed allowance for starting a request, not a measured engine startup time.
+const CACHE_START_MARGIN_MS = 10_000;
+
+/** Hot cache with more than ten seconds left sends or queues normally. */
 export function requiresCrossSessionCostApproval(review: CrossSessionCostReview): boolean {
-  return review.cacheHeat !== "hot" || review.context.modelMismatch ||
-    isPromptCacheExpiringSoon(getPromptCacheHeatRatio(review.cache, undefined, false, review.capturedAt));
+  if (review.cacheHeat !== "hot" || review.context.modelMismatch || !review.cache) return true;
+  // Use the earliest possible expiration, including reference windows. The
+  // sidebar's rounded percentage is only a visual warning, not a send gate.
+  const remainingMs = review.cache.startedAt + review.cache.ttlSeconds * 1000 - review.capturedAt;
+  return !Number.isFinite(remainingMs) || remainingMs <= CACHE_START_MARGIN_MS;
 }
 
 export const MIN_SESSION_SEND_COST_APPROVAL_TOKENS = 50_000;

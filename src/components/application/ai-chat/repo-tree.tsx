@@ -454,7 +454,7 @@ function ThreadItem({
           {workspaceLabel}
         </span>
       ) : null}
-      {time && !leaderBranch && !comms.active ? (
+      {time && !comms.active ? (
         <CacheHeatHoverBadge
           engine={engine}
           time={time}

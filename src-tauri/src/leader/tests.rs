@@ -358,6 +358,7 @@ fn legacy_request_methods_migrate_durably_without_restarting_spawn_or_send() {
     f.manager.acknowledge(&f.parent, &spawn_args.request_id, &run,
         Ok(crate::engine::SendResult { run_id: run.clone(), session_id: Some("migrated-child".into()) })).unwrap();
     let send_args = SendArgs { branch_id: id.clone(), request_id: "migrated-send".into(), message: "Continue the same task".into() };
+    hot_send_cache(&f, &id);
     let Reservation::Start((_, send_run)) = f.manager.reserve_send(&f.caller, &f.parent, "manual",
         &send_args, encoded(&send_args).unwrap()).unwrap() else { panic!("unexpected replay") };
     observe(&f, &send_run, "migrated-child", "message", json!({"role":"assistant","text":"Retained migration result"}), 1);
@@ -939,6 +940,7 @@ fn leader_model_policy_changes_do_not_interfere_with_send_settings() {
     let settings: crate::settings::AppSettings = serde_json::from_value(json!({"leaderAllowedModels":{"codex":[]}})).unwrap();
     assert!(model_policy::resolve(&settings, "codex", Some("saved-model")).is_err());
     let send = SendArgs { branch_id: id, request_id: "policy-followup".into(), message: "Continue the existing task".into() };
+    hot_send_cache(&f, &send.branch_id);
     let Reservation::Start((branch, _)) = f.manager.reserve_send(
         &f.caller, &f.parent, "manual", &send, encoded(&send).unwrap(),
     ).unwrap() else { panic!("unexpected send replay"); };
@@ -998,6 +1000,264 @@ fn settle(f: &Fixture, id: &str, run: &str, session: &str) {
     observe(f, run, session, "done", json!({}), 2);
     f.manager.finish(run);
     assert_eq!(branch(f, id).state, "completed");
+}
+
+fn hot_send_cache(f: &Fixture, id: &str) {
+    let branch = branch(f, id);
+    let now = f.clock.load(Ordering::SeqCst);
+    crate::history::prompt_cache::set(&f.manager.db.0.lock(), &branch.engine,
+        branch.session_id.as_deref().unwrap(), Some(&crate::history::prompt_cache::CacheWindow {
+            ttl_seconds: 300, started_at: now, observed_at: now,
+            source: "test-observed".into(), reference: None,
+        })).unwrap();
+}
+
+fn held_send(f: &Fixture, id: &str, request_id: &str) -> SendArgs {
+    let args = SendArgs {
+        branch_id: id.into(), request_id: request_id.into(), message: "Continue 中文 😀".into(),
+    };
+    let Reservation::Replay(receipt) = f.manager.reserve_send(
+        &f.caller, &f.parent, "manual", &args, encoded(&args).unwrap(),
+    ).unwrap() else { panic!("cold task continuation started without approval"); };
+    assert_eq!(receipt["status"], "awaiting_cost_approval");
+    assert_eq!(receipt["submitted_to_model"], false);
+    assert_eq!(receipt["mayHaveStarted"], false);
+    args
+}
+
+#[test]
+fn task_cost_approval_cache_evidence_uses_ten_second_start_margin() {
+    use crate::history::prompt_cache::{CacheReference, CacheWindow};
+    let mut cache = CacheWindow {
+        ttl_seconds: 100, started_at: 1_000, observed_at: 1_000,
+        source: "test-observed".into(), reference: None,
+    };
+    assert!(cost_approval::requires_approval(None, 1_000));
+    assert!(!cost_approval::requires_approval(Some(&cache), 1_000));
+    assert!(!cost_approval::requires_approval(Some(&cache), 90_999)); // 10,001 ms remain.
+    assert!(cost_approval::requires_approval(Some(&cache), 91_000));
+    assert!(cost_approval::requires_approval(Some(&cache), 100_999)); // 1 ms remains.
+    assert_eq!(cache.heat(101_000), "cold");
+    assert!(cost_approval::requires_approval(Some(&cache), 101_000));
+    for ttl_seconds in [1800, 3600] {
+        let long_cache = CacheWindow { ttl_seconds, ..cache.clone() };
+        let expires_at = long_cache.started_at + ttl_seconds * 1000;
+        for remaining_ms in [60_000, 120_000, 180_000] {
+            assert!(!cost_approval::requires_approval(Some(&long_cache), expires_at - remaining_ms));
+        }
+        assert!(!cost_approval::requires_approval(Some(&long_cache), expires_at - 10_001));
+        assert!(cost_approval::requires_approval(Some(&long_cache), expires_at - 10_000));
+    }
+    cache.observed_at = 11_000;
+    assert_eq!(cache.heat(105_000), "unknown");
+    assert!(cost_approval::requires_approval(Some(&cache), 105_000));
+    cache.reference = Some(CacheReference { max_ttl_seconds: 200, cache_read_tokens: 10, prompt_tokens: 20 });
+    assert_eq!(cache.heat(91_000), "hot");
+    assert!(!cost_approval::requires_approval(Some(&cache), 90_999));
+    assert!(cost_approval::requires_approval(Some(&cache), 91_000)); // Minimum TTL, not maximum.
+    assert_eq!(cache.heat(105_000), "unknown");
+    assert!(cost_approval::requires_approval(Some(&cache), 105_000));
+    cache.reference.as_mut().unwrap().cache_read_tokens = 0;
+    assert!(cost_approval::requires_approval(Some(&cache), 11_000));
+    cache.started_at = 0;
+    assert!(cost_approval::requires_approval(Some(&cache), 11_000));
+}
+
+#[test]
+fn task_cost_approval_cache_expiry_saturates_without_overflow() {
+    use crate::history::prompt_cache::CacheWindow;
+    let cache = CacheWindow {
+        ttl_seconds: i64::MAX, started_at: 1_000, observed_at: 1_000,
+        source: "test-observed".into(), reference: None,
+    };
+    assert!(!cost_approval::requires_approval(Some(&cache), 1_000));
+    assert!(!cost_approval::requires_approval(Some(&cache), i64::MAX - 10_001));
+    assert!(cost_approval::requires_approval(Some(&cache), i64::MAX - 10_000));
+    let cache = CacheWindow {
+        ttl_seconds: 100, started_at: i64::MAX - 20_000,
+        observed_at: i64::MAX - 20_000, ..cache
+    };
+    assert!(!cost_approval::requires_approval(Some(&cache), i64::MAX - 10_001));
+    assert!(cost_approval::requires_approval(Some(&cache), i64::MAX - 10_000));
+}
+
+#[test]
+fn task_cost_approval_holds_unknown_without_launch_and_retries_cannot_bypass() {
+    let f = basic();
+    let (id, run) = spawn(&f, "approval-spawn");
+    settle(&f, &id, &run, "approval-session");
+    let before = branch(&f, &id);
+    let runs = f.manager.inner.lock().runs.len();
+    let args = held_send(&f, &id, "approval-send");
+    let held = branch(&f, &id);
+    assert_eq!(held.state, "awaiting_cost_approval");
+    assert_eq!(held.run_id, None);
+    assert_eq!(held.deadline_at, before.deadline_at);
+    assert_eq!(held.last_activity_at, before.last_activity_at);
+    assert_eq!(f.manager.inner.lock().runs.len(), runs);
+    assert!(held.cost_approval.as_ref().unwrap().cache.is_none());
+    let Reservation::Replay(receipt) = f.manager.reserve_send(
+        &f.caller, &f.parent, "bypass", &args, encoded(&args).unwrap(),
+    ).unwrap() else { panic!("retry bypassed approval"); };
+    assert_eq!(receipt["status"], "awaiting_cost_approval");
+    assert_eq!(f.manager.inner.lock().branches[&id].permission, "manual");
+    let mut changed = args.clone();
+    changed.message.push('!');
+    assert!(f.manager.reserve_send(&f.caller, &f.parent, "manual", &changed,
+        encoded(&changed).unwrap()).is_err());
+    changed = args.clone();
+    changed.request_id = "fresh-id".into();
+    assert!(f.manager.reserve_send(&f.caller, &f.parent, "manual", &changed,
+        encoded(&changed).unwrap()).is_err());
+    assert!(f.manager.prepare("unapproved-gui-send", "codex", Some("approval-session"),
+        &f.parent.workspace_path, Some("manual")).unwrap_err().contains("cost approval"));
+    observe(&f, &run, "approval-session", "delta", json!("late tail"), 99);
+    f.manager.finish(&run);
+    assert_eq!(encoded(&branch(&f, &id)).unwrap(), encoded(&held).unwrap());
+    let views = f.manager.views(&f.manager.inner.lock(), &f.parent, Some(&[id])).unwrap();
+    assert_eq!(views[0]["needsAttention"], true);
+    assert_eq!(views[0]["processAlive"], false);
+    assert!(wait_mark(&views[0]).0);
+}
+
+#[test]
+fn task_cost_approval_hot_sends_but_cold_and_expiring_evidence_hold() {
+    for (elapsed, holds) in [
+        (0, false), (280_000, false), (289_999, false),
+        (290_000, true), (299_999, true), (300_000, true),
+    ] {
+        let f = basic();
+        let (id, run) = spawn(&f, "cache-spawn");
+        settle(&f, &id, &run, "cache-session");
+        hot_send_cache(&f, &id);
+        f.clock.fetch_add(elapsed, Ordering::SeqCst);
+        let args = SendArgs { branch_id: id.clone(), request_id: "cache-send".into(), message: "Next".into() };
+        let result = f.manager.reserve_send(&f.caller, &f.parent, "manual", &args, encoded(&args).unwrap()).unwrap();
+        assert_eq!(matches!(result, Reservation::Replay(_)), holds);
+        assert_eq!(branch(&f, &id).cost_approval.is_some(), holds);
+    }
+}
+
+#[test]
+fn task_cost_approval_restores_pending_and_approves_once_without_live_parent() {
+    let f = basic();
+    let (id, run) = spawn(&f, "restore-approval-spawn");
+    settle(&f, &id, &run, "restore-approval-session");
+    let args = held_send(&f, &id, "restore-approval-send");
+    let held = branch(&f, &id);
+    let restored = Arc::new(reload(&f).unwrap());
+    assert_eq!(encoded(&restored.snapshot().unwrap().branches[0]).unwrap(), encoded(&held).unwrap());
+    assert!(restored.processes.get(&f.caller.run_id).is_none());
+    assert!(restored.inner.lock().runs.values().all(|r| r.retired));
+    let reviewed = held.cost_approval.unwrap().model;
+    let launches = std::thread::scope(|scope| {
+        let attempts: Vec<_> = (0..2).map(|_| {
+            let manager = restored.clone();
+            let parent = &f.parent;
+            let id = &id;
+            let args = &args;
+            let reviewed = &reviewed;
+            scope.spawn(move || manager.resolve_cost_approval(parent, id, &args.request_id, true, reviewed.as_deref()).unwrap())
+        }).collect();
+        attempts.into_iter().filter_map(|attempt| attempt.join().unwrap()).collect::<Vec<_>>()
+    });
+    assert_eq!(launches.len(), 1);
+    let (started, run_id, permission) = &launches[0];
+    assert_eq!(started.task, args.message);
+    assert_eq!(started.model, reviewed);
+    assert_eq!(permission, "manual");
+    assert_eq!(started.state, "starting");
+    assert!(started.cost_approval.is_none());
+    assert!(restored.inner.lock().runs[run_id].launch_pending);
+    assert!(restored.resolve_cost_approval(&f.parent, &id, &args.request_id, true, reviewed.as_deref()).unwrap().is_none());
+    let recovered_again = reload(&f).unwrap();
+    assert_eq!(recovered_again.inner.lock().requests[&(key(&f.parent), args.request_id.clone())].state, "unknown");
+    assert!(recovered_again.resolve_cost_approval(&f.parent, &id, &args.request_id, true, reviewed.as_deref()).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn task_cost_approval_cancel_stop_and_wrong_identity_never_launch() {
+    for stop in [false, true] {
+        let f = basic();
+        let (id, run) = spawn(&f, "cancel-approval-spawn");
+        settle(&f, &id, &run, "cancel-approval-session");
+        let args = held_send(&f, &id, "cancel-approval-send");
+        let reviewed = branch(&f, &id).model;
+        let wrong_parent = identity("codex", "sibling", &f.parent.workspace_path);
+        assert!(f.manager.resolve_cost_approval(&wrong_parent, &id, &args.request_id, true, reviewed.as_deref()).is_err());
+        let (sibling, sibling_run) = spawn(&f, "approval-sibling");
+        settle(&f, &sibling, &sibling_run, "approval-sibling-session");
+        assert!(f.manager.resolve_cost_approval(&f.parent, &sibling, &args.request_id, true, reviewed.as_deref()).is_err());
+        assert!(f.manager.resolve_cost_approval(&f.parent, &id, &args.request_id, true, Some("different-review-model")).is_err());
+        if stop {
+            assert_eq!(f.manager.stop(&f.parent, &id).await.unwrap().state, "stopped");
+        } else {
+            assert!(f.manager.resolve_cost_approval(&f.parent, &id, &args.request_id, false, None).unwrap().is_none());
+        }
+        assert!(branch(&f, &id).cost_approval.is_none());
+        assert_eq!(branch(&f, &id).state, "stopped");
+        assert!(f.manager.resolve_cost_approval(&f.parent, &id, &args.request_id, true, reviewed.as_deref()).unwrap().is_none());
+        let replay = f.manager.replay(&f.manager.inner.lock(), &f.parent, &args.request_id,
+            "task_send", &encoded(&args).unwrap()).unwrap().unwrap();
+        assert_eq!(replay["requestState"], "cancelled");
+        assert_eq!(replay["submitted_to_model"], false);
+        assert!(reload(&f).unwrap().inner.lock().branches[&id].branch.cost_approval.is_none());
+    }
+}
+
+#[test]
+fn task_cost_approval_busy_and_failed_persistence_keep_request_held() {
+    let f = basic();
+    let (id, run) = spawn(&f, "busy-approval-spawn");
+    let args = SendArgs { branch_id: id.clone(), request_id: "busy-approval-send".into(), message: "Next".into() };
+    assert!(f.manager.reserve_send(&f.caller, &f.parent, "manual", &args, encoded(&args).unwrap()).is_err());
+    settle(&f, &id, &run, "busy-approval-session");
+    let args = held_send(&f, &id, "busy-approval-send");
+    let held = branch(&f, &id);
+    f.manager.processes.insert("busy-approval-session".into(), reservation("foreign"));
+    assert!(f.manager.resolve_cost_approval(&f.parent, &id, &args.request_id, true, held.model.as_deref()).unwrap_err().contains("still running"));
+    f.manager.processes.remove_reservation("busy-approval-session");
+    f.manager.db.0.lock().execute_batch(
+        "CREATE TRIGGER reject_approval BEFORE UPDATE ON leader_requests BEGIN SELECT RAISE(ABORT,'approval write failed'); END;"
+    ).unwrap();
+    assert!(f.manager.resolve_cost_approval(&f.parent, &id, &args.request_id, true, held.model.as_deref()).is_err());
+    assert_eq!(encoded(&branch(&f, &id)).unwrap(), encoded(&held).unwrap());
+    assert!(f.manager.resolve_cost_approval(&f.parent, &id, &args.request_id, false, None).is_err());
+    assert_eq!(encoded(&branch(&f, &id)).unwrap(), encoded(&held).unwrap());
+}
+
+#[test]
+fn task_cost_approval_old_card_cannot_approve_a_new_held_request() {
+    let f = basic();
+    let (id, run) = spawn(&f, "old-card-spawn");
+    settle(&f, &id, &run, "old-card-session");
+    let first = held_send(&f, &id, "old-card-send");
+    let old_model = branch(&f, &id).model;
+    f.manager.resolve_cost_approval(&f.parent, &id, &first.request_id, false, None).unwrap();
+    let second = held_send(&f, &id, "new-card-send");
+    let before = branch(&f, &id);
+    assert!(f.manager.resolve_cost_approval(&f.parent, &id, &first.request_id, true, old_model.as_deref()).unwrap().is_none());
+    assert!(f.manager.resolve_cost_approval(&f.parent, &id, &first.request_id, false, None).unwrap().is_none());
+    assert_eq!(encoded(&branch(&f, &id)).unwrap(), encoded(&before).unwrap());
+    assert!(f.manager.resolve_cost_approval(&f.parent, &id, &second.request_id, true, before.model.as_deref()).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn task_cost_approval_blocks_group_archive_and_deletion_until_cancelled() {
+    let (f, deleted) = recording_fixture();
+    let (child, grand, _sibling, _) = user_delete_tree(&f);
+    let args = held_send(&f, &child, "delete-held-send");
+    f.manager.processes.remove_reservation(&f.caller.run_id);
+    f.manager.finish(&f.caller.run_id);
+    assert!(f.manager.archive_group(&f.parent).unwrap_err().contains("idle"));
+    assert!(f.manager.delete_branch_for_user(&f.parent, &child, &[child.clone(), grand.clone()])
+        .await.unwrap_err().contains("idle"));
+    assert!(deleted.lock().is_empty());
+    f.manager.resolve_cost_approval(&f.parent, &child, &args.request_id, false, None).unwrap();
+    f.manager.delete_branch_for_user(&f.parent, &child, &[child.clone(), grand]).await.unwrap();
+    assert_eq!(branch(&f, &child).state, "reclaimed");
+    assert!(branch(&f, &child).cost_approval.is_none());
+    assert!(f.manager.resolve_cost_approval(&f.parent, &child, &args.request_id, true, None).is_err());
 }
 
 fn reload(f: &Fixture) -> Result<LeaderManager, String> {
@@ -2913,6 +3173,7 @@ async fn reclamation_erases_branch_and_all_requests_without_touching_sibling() {
         request_id: "private-send".into(),
         message: "private-message-sentinel".into(),
     };
+    hot_send_cache(&f, &id);
     let Reservation::Start((_, send_run)) = f
         .manager
         .reserve_send(

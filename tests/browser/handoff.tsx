@@ -12,6 +12,7 @@ import { useHandoffStore } from "../../src/features/chat/session-cleanup";
 import { useAgentStore } from "../../src/features/agents/agent-store";
 import { usePromptStore } from "../../src/features/prompts/prompt-store";
 import type { EngineInfo, SessionMeta, Workspace } from "../../src/lib/ipc";
+import type { LeaderSnapshot } from "../../src/features/leader/types";
 
 declare global { interface Window {
   __HANDOFF_INVOKE__: (command: string, args?: Record<string, unknown>) => Promise<unknown>;
@@ -39,6 +40,18 @@ const engines: EngineInfo[] = ["claude", "codex", "pi", "cursor", "agy"].map(id 
 type Pending = { resolve: (value: unknown) => void; reject: (error: Error) => void; args: Record<string, unknown> };
 const summaries: Pending[] = [];
 const sends: Pending[] = [];
+const snapshots: Pending[] = [];
+const childSnapshot: LeaderSnapshot = {
+  leaders: [], branches: ["completed", "running", "failed"].map((state, index) => ({
+    id: `fixture-child-${index}`, parentEngine: source.engine, parentSessionId: source.sessionId,
+    workspacePath: workspace.path, engine: "codex", sessionId: `fixture-child-session-${index}`,
+    title: ["子任务独立结论 🧩", "子任务回归验证", "子任务失败检查"][index], task: "Synthetic task",
+    state: state as "completed" | "running" | "failed", model: null, effort: null, runId: null,
+    createdAt: 1, updatedAt: 2, lastActivityAt: 2, deadlineAt: 0, expired: false,
+    result: index === 0 ? "独立结果：路径解析已修复，定向测试通过；桌面实测待做。" : index === 1 ? "正在执行回归检查。" : "",
+    resultTruncated: false, error: index === 2 ? "模拟依赖缺失" : null,
+  })),
+};
 const calls: { command: string; args: Record<string, unknown> }[] = [];
 let archived = false;
 let sendSuccesses = 0;
@@ -46,6 +59,12 @@ const notify = () => window.dispatchEvent(new Event("handoff-fixture:change"));
 window.__HANDOFF_INVOKE__ = async (command, args = {}) => {
   calls.push({ command, args });
   notify();
+  if (command === "task_snapshot") {
+    if (params.get("children") === "pending") {
+      return new Promise((resolve, reject) => { snapshots.push({ resolve, reject, args }); notify(); });
+    }
+    return params.has("children") ? childSnapshot : { leaders: [], branches: [] };
+  }
   if (command === "summarize_session_handoff" || command === "send_message") {
     return new Promise((resolve, reject) => {
       (command === "send_message" ? sends : summaries).push({ resolve, reject, args });
@@ -113,6 +132,8 @@ function Fixture() {
     activeWorkspace: chat.active?.workspacePath, sourceWorkspace: entry?.workspacePath,
     mockArchive: archived, sourceVisible: chat.sessions.some(s => s.sessionId === source.sessionId),
     mode: entry?.mode ?? null, grokStatus: entry?.grokStatus ?? null, sending: entry?.sending ?? false,
+    childrenStatus: entry?.childrenStatus ?? null, childrenApplied: entry?.childrenApplied ?? null,
+    pendingSnapshots: snapshots.length,
     compressionModel: entry?.compressionModel ?? null,
     compressionSelection: entry?.compressionSelection ?? null,
     destinationModels: chat.models,
@@ -135,6 +156,8 @@ function Fixture() {
       <button onClick={() => { useChatStore.getState().setDraft(sourceKey, "/handoff 继续验证，并保留用户附加内容 🧩"); ref.current?.focus(); }}>填入 /handoff（仍需发送）</button>
       <button disabled={!summaries.length} onClick={() => settleSummary(true)}>压缩模拟完成</button>
       <button disabled={!summaries.length} onClick={() => settleSummary(false)}>压缩模拟失败</button>
+      <button disabled={!snapshots.length} onClick={() => { snapshots.splice(0).forEach(p => p.resolve(childSnapshot)); notify(); }}>子任务读取完成</button>
+      <button disabled={!snapshots.length} onClick={() => { snapshots.splice(0).forEach(p => p.reject(new Error("Mocked snapshot failure"))); notify(); }}>子任务读取失败</button>
       <button disabled={!sends.length} onClick={() => settleSend(true)}>确认发送成功</button>
       <button disabled={!sends.length} onClick={() => settleSend(false)}>确认发送失败</button>
       <button onClick={() => void useChatStore.getState().selectSession(source.engine, source.sessionId, workspace.path)}>查看来源</button>

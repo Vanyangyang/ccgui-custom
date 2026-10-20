@@ -66,7 +66,7 @@ function LeaderManagement({ parent }: { parent: LeaderIdentity }) {
   const groupTitle = sessions.find((s) => sameIdentity(s, groupRoot));
   const title = groupTitle?.customTitle || groupTitle?.title || archivedGroup?.title || groupRoot.sessionId.slice(0, 8);
   const displayedError = localError ?? error;
-  const hasActivity = descendants.some((b) => ["starting", "running", "waiting", "reclaiming"].includes(b.state))
+  const hasActivity = descendants.some((b) => ["starting", "running", "waiting", "awaiting_cost_approval", "reclaiming"].includes(b.state))
     || [groupRoot, ...descendants.flatMap((b) => b.sessionId ? [{ engine: b.engine, sessionId: b.sessionId, workspacePath: b.workspacePath }] : [])].some((identity) => {
       const session = bySession[sessionKey(identity.engine, identity.sessionId, identity.workspacePath)];
       return session && (session.streaming || session.queue.length > 0 || session.messages.some((m) => m.question?.status === "pending" || m.grant?.status === "pending" || ["awaiting_review", "deferred", "submitting"].includes(m.planReview?.status ?? "")));

@@ -27,6 +27,7 @@ pub mod files;
 pub mod fonts;
 pub mod git;
 pub mod git_worktree;
+pub mod image_export;
 pub mod history;
 pub mod interactive_answer_state;
 mod assistant_notices;
@@ -569,6 +570,7 @@ pub fn run() {
             leader::task_snapshot,
             leader::task_branch_action,
             leader::task_delete_branch,
+            leader::task_resolve_cost_approval,
             leader::task_group_action,
             // config
             config::get_cli_config,
@@ -707,6 +709,8 @@ pub fn run() {
             // files
             files::list_dir,
             files::read_file,
+            files::read_image_bytes,
+            image_export::save_image_as,
             files::write_file,
             files::create_dir,
             files::rename_item,

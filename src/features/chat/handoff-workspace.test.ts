@@ -22,6 +22,7 @@ function deferred<T>() {
   return { promise, resolve };
 }
 beforeEach(() => {
+  vi.spyOn(ipc, "taskSnapshot").mockResolvedValue({ leaders: [], branches: [] });
   localStorage.removeItem(HANDOFF_PREFERENCES_KEY);
   useHandoffStore.setState({ byWorkspace: {} });
   useSidechatStore.setState({ btwBySession: {}, sidechatBySession: {} });
@@ -120,6 +121,7 @@ describe("handoff workspace migration", () => {
     const summary = deferred<string>();
     const summarize = vi.spyOn(ipc, "summarizeSessionHandoff").mockReturnValue(summary.promise);
     useHandoffStore.getState().startHandoff({ ...args, initialMode: "grok" });
+    await Promise.resolve(); // Move an already-started model request.
     expect(move()).toBe(true);
     useHandoffStore.getState().startHandoff({ ...args, sourceSessionId: "successor" });
     const successorDraft = draft(source);
