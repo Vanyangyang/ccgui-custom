@@ -108,7 +108,7 @@ export function CrossSessionCostApproval({ record }: { record: CrossSessionCommu
     {error && <p role="alert" className="text-notification-error [overflow-wrap:anywhere]">{error}</p>}
     <div className="flex flex-wrap gap-2">
       <Button size="xs" variant="primary" disabled={pending} onClick={() => void act((id) => approveCrossSessionMessage(id, undefined, review?.model ?? null))}>{t("crossSession.costApprove")}</Button>
-      <Button size="xs" disabled={pending} onClick={() => void act(cancelCrossSessionMessage)}>{t("crossSession.costCancel")}</Button>
+      <Button size="xs" variant="secondary" disabled={pending} onClick={() => void act(cancelCrossSessionMessage)}>{t("crossSession.costCancel")}</Button>
     </div>
   </div>;
 }
@@ -202,7 +202,7 @@ export function SessionSendCostApproval({ active, className }: { active: ActiveS
         <Button size="xs" variant={canHandoff ? "secondary" : "primary"} data-testid="session-cost-send-btn" onClick={handleSendAnyway}>
           {t("crossSession.selfCostSendAnyway")}
         </Button>
-        <Button size="xs" data-testid="session-cost-cancel-btn" onClick={() => useSessionSendCostGuardStore.getState().dismiss(key)}>
+        <Button size="xs" variant="tertiary" data-testid="session-cost-cancel-btn" onClick={() => useSessionSendCostGuardStore.getState().dismiss(key)}>
           {t("crossSession.costCancel")}
         </Button>
       </div>

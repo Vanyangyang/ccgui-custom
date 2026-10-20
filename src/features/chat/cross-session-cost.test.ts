@@ -117,11 +117,19 @@ describe("cross-session cost review telemetry", () => {
     expect(requiresSessionSendCostApproval(expiringReview, f.meta, f.session, NOW)).toBe(false);
     expect(requiresQueueDrainCostApproval(expiringReview)).toBe(false);
 
-    // Cold cache triggers both daily send and queue drain cost guards
+    // Cold cache >= 50k triggers both daily send and queue drain cost guards
     const coldReview = crossSessionCostReview(f.meta, f.state, "idle", NOW + 7200000);
     expect(coldReview.cacheHeat).toBe("cold");
     expect(requiresSessionSendCostApproval(coldReview, f.meta, f.session, NOW + 7200000)).toBe(true);
     expect(requiresQueueDrainCostApproval(coldReview)).toBe(true);
+
+    // Cold cache < 50k (e.g. 18k tokens) passes through directly without blocking
+    f.session.usage = { input_tokens: 18416, context_window: 570000 };
+    const smallColdReview = crossSessionCostReview(f.meta, f.state, "idle", NOW + 7200000);
+    expect(smallColdReview.cacheHeat).toBe("cold");
+    expect(smallColdReview.context.used).toBe(18416);
+    expect(requiresSessionSendCostApproval(smallColdReview, f.meta, f.session, NOW + 7200000)).toBe(false);
+    expect(requiresQueueDrainCostApproval(smallColdReview)).toBe(false);
 
     // Approving a specific model + cacheStartedAt signature allows that exact state until changed
     const key = sessionKey(f.meta.engine, f.meta.sessionId, f.meta.workspacePath);

@@ -94,31 +94,27 @@ export function requiresCrossSessionCostApproval(review: CrossSessionCostReview)
     isPromptCacheExpiringSoon(getPromptCacheHeatRatio(review.cache, undefined, false, review.capturedAt));
 }
 
-export const LARGE_UNKNOWN_CACHE_CONTEXT_TOKENS = 50_000;
+export const MIN_SESSION_SEND_COST_APPROVAL_TOKENS = 50_000;
+export const LARGE_UNKNOWN_CACHE_CONTEXT_TOKENS = MIN_SESSION_SEND_COST_APPROVAL_TOKENS;
 export const LARGE_UNKNOWN_CACHE_IDLE_MS = 60 * 60 * 1000;
 
-/** Daily composer send cost guard: intercepts when an existing session's
- * recorded cache is already cold, when switching models would rebuild existing
- * context, or when a large non-Cursor session has been idle >= 1h with unknown
- * cache status. Expiring-soon (last 10%) is NOT intercepted so sending can
- * immediately hit and renew the still-hot cache before it expires. */
+/** Daily composer send cost guard: only intercepts when measured context is at
+ * least 50k tokens (< 50k passes through directly) and the recorded cache is
+ * already cold, the model changed, or a non-Cursor session has been idle >= 1h
+ * with unknown cache status. Expiring-soon (last 10%) is NOT intercepted. */
 export function requiresSessionSendCostApproval(
   review: CrossSessionCostReview,
   meta?: SessionMeta,
-  session?: Pick<SessionState, "messages">,
+  _session?: Pick<SessionState, "messages">,
   now = Date.now(),
 ): boolean {
-  const hasContext = (session?.messages.length ?? 0) > 0 ||
-    (review.context.used ?? 0) > 0 ||
-    (meta?.messageCount ?? 0) > 0;
-  if (!hasContext) return false;
+  if ((review.context.used ?? 0) < MIN_SESSION_SEND_COST_APPROVAL_TOKENS) return false;
   if (review.cacheHeat === "cold") return true;
-  if (review.context.modelMismatch && (review.context.used ?? 0) > 0) return true;
+  if (review.context.modelMismatch) return true;
   if (
     review.cacheHeat === "unknown" &&
     meta &&
     meta.engine !== "cursor" &&
-    (review.context.used ?? 0) >= LARGE_UNKNOWN_CACHE_CONTEXT_TOKENS &&
     typeof meta.updatedAt === "number" &&
     Number.isFinite(meta.updatedAt) &&
     now - meta.updatedAt >= LARGE_UNKNOWN_CACHE_IDLE_MS
@@ -128,10 +124,11 @@ export function requiresSessionSendCostApproval(
   return false;
 }
 
-/** Queue auto-drain cost guard: pauses automatic queue drain only if the
- * session's cache window has already become cold by the time the turn settles. */
+/** Queue auto-drain cost guard: pauses automatic queue drain only if measured
+ * context is >= 50k tokens and the session's cache window is already cold. */
 export function requiresQueueDrainCostApproval(review: CrossSessionCostReview): boolean {
-  return review.cacheHeat === "cold";
+  return (review.context.used ?? 0) >= MIN_SESSION_SEND_COST_APPROVAL_TOKENS &&
+    review.cacheHeat === "cold";
 }
 
 export interface PendingSessionSendCostGuard {
