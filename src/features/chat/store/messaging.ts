@@ -34,7 +34,7 @@ import {
   type QueuedMessage,
   type SessionState,
 } from "./stream";
-import { mergeUsage, parseUsage } from "../usage";
+import { latestMessageUsage, mergeUsage, parseUsage } from "../usage";
 import { settleThroughput } from "../throughput";
 import { persistClaudeUltracode } from "./claude-ultracode";
 import { beginRuntimeOperation, guardRuntimeActions, isRuntimeSubmissionPaused } from "@/lib/runtime-checkpoint";
@@ -1710,7 +1710,11 @@ export function createMessagingActions(
       if (targetKey.startsWith("new:") || slashIdx < 1 || !engine || !sessionId) return;
       const before = get().bySession[targetKey];
       if (!before) return;
-      const beforeTotal = parseUsage(before.usage)?.total ?? null;
+      const snapshotTotal = (u: unknown) =>
+        parseUsage((u as Record<string, unknown> | null)?.context_usage)?.total ??
+        parseUsage(u)?.total ??
+        null;
+      const beforeTotal = snapshotTotal(before.usage);
 
       try {
         // The engine flushes a turn's final usage into the transcript file a
@@ -1734,15 +1738,14 @@ export function createMessagingActions(
             targetTab?.workspacePath ?? "",
             100,
           );
-          const latestUsage =
-            [...page.messages].reverse().find((m) => m.usage)?.usage ?? null;
+          const latestUsage = latestMessageUsage(page.messages);
           if (!latestUsage) return;
           const current = get().bySession[targetKey]?.usage;
           // A report that landed while this read was in flight replaced the
           // usage object; anything else left it untouched (patches spread the
           // session and pass `usage` through by reference).
           if (current !== before.usage) return;
-          const latestTotal = parseUsage(latestUsage)?.total ?? null;
+          const latestTotal = snapshotTotal(latestUsage);
           if (beforeTotal !== null && latestTotal === beforeTotal && attempt < 2) {
             const wait = Promise.withResolvers<void>();
             setTimeout(wait.resolve, 300);

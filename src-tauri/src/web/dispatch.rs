@@ -478,6 +478,11 @@ struct EngineSessionArgs {
     session_id: String,
 }
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PredictNextPromptArgs {
+    turns: Vec<crate::composer_prediction::PredictionTurn>,
+}
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SideSessionArgs {
     engine: String,
@@ -1180,6 +1185,10 @@ pub(super) async fn dispatch(
             ser(crate::auto_title::suggest_session_title(app.state(), a.engine, a.session_id).await)
         }
         "auto_title_models" => ser(crate::auto_title::auto_title_models().await),
+        "predict_next_prompt" => {
+            let a: PredictNextPromptArgs = parse_args(&raw)?;
+            ser(crate::composer_prediction::predict_next_prompt(a.turns).await)
+        }
         "remember_session_model" => {
             let a: RememberModelArgs = parse_args(&raw)?;
             ser(crate::history::reader::remember_session_model(

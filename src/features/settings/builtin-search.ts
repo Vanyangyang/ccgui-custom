@@ -122,6 +122,13 @@ const generalEntries: SettingsSearchEntry[] = [
   },
   {
     page: "general",
+    anchor: "composerPrediction",
+    labelKey: "settings.composerPrediction",
+    sectionKey: "settings.behavior",
+    keywords: ["prediction", "suggest", "ghost", "codex", "gpt", "tab", "预测", "补全", "输入框"],
+  },
+  {
+    page: "general",
     anchor: "promptHistory",
     labelKey: "settings.promptHistory",
     sectionKey: "settings.behavior",

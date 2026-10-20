@@ -17,6 +17,8 @@ pub(super) struct AgyThroughput {
     tool_steps: BTreeSet<u64>,
     latest_response_index: Option<u64>,
     context: Option<(u64, Value)>,
+    /// Latest root step of this turn and whether it is a finished model response.
+    last_step: Option<(u64, bool)>,
 }
 
 /// AGY's `input_tokens` is the *uncached* prompt and `cache_read_tokens` is the
@@ -63,6 +65,9 @@ fn valid_usage(usage: &Value) -> bool {
 impl AgyThroughput {
     pub(super) fn ended(&self) -> bool {
         self.ended
+    }
+    pub(super) fn root(&self) -> Option<&str> {
+        self.root.as_deref()
     }
     pub(super) fn is_child(&self, id: Option<&str>) -> bool {
         self.root
@@ -136,6 +141,10 @@ impl AgyThroughput {
         if index <= boundary {
             return;
         }
+        let done = step.get("state").and_then(Value::as_str) == Some("DONE");
+        if self.last_step.is_none_or(|(latest, _)| index >= latest) {
+            self.last_step = Some((index, kind == "agent_response" && done));
+        }
         if kind == "agent_response"
             && self
                 .latest_response_index
@@ -144,7 +153,7 @@ impl AgyThroughput {
             self.latest_response_index = Some(index);
             self.context = None;
         }
-        if step.get("state").and_then(Value::as_str) != Some("DONE") {
+        if !done {
             if matches!(kind, "agent_response" | "checkpoint") && !self.steps.contains_key(&index) {
                 if self.pending_responses.len() >= 4096 {
                     self.invalid_reason.get_or_insert("incomplete");
@@ -187,6 +196,12 @@ impl AgyThroughput {
             self.context = Some((index, usage.clone()));
         }
         self.steps.insert(index, (kind.to_string(), usage));
+    }
+
+    /// This turn's last root step is a finished model response: the turn
+    /// delivered its answer after any tool call or failed request it made.
+    pub(super) fn answered(&self) -> bool {
+        self.last_step.is_some_and(|(_, answered)| answered)
     }
 
     fn totals(&self) -> Option<Value> {

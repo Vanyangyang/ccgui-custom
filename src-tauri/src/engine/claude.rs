@@ -408,7 +408,7 @@ impl Engine for ClaudeEngine {
                     .or_else(|| value.get("model"))
                     .and_then(Value::as_str)
                     .map(str::trim)
-                    .filter(|s| !s.is_empty())
+                    .filter(|s| !s.is_empty() && *s != "<synthetic>")
                 {
                     out.push(EngineEvent::Model(model.to_string()));
                 }

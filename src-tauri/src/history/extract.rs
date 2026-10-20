@@ -1475,6 +1475,10 @@ const CLAUDE_INTERRUPT_MARKERS: [&str; 2] = [
     "[Request interrupted by user for tool use]",
 ];
 
+/// Model name Claude Code stamps on replies it generates without an API
+/// call (rate-limit and other API error notices).
+pub(crate) const CLAUDE_SYNTHETIC_MODEL: &str = "<synthetic>";
+
 fn is_claude_interrupt_text(text: &str) -> bool {
     CLAUDE_INTERRUPT_MARKERS.contains(&text.trim())
 }
@@ -1538,11 +1542,21 @@ fn extract_claude_line(value: &Value, images: ImageMode) -> LineRows {
         return Vec::new();
     }
     let ts = ts_string(value, &["timestamp"]);
-    let usage = message.get("usage").cloned();
-    let model = message
-        .get("model")
-        .and_then(Value::as_str)
-        .map(str::to_string);
+    // Claude Code logs replies it generated locally (an API error such as a
+    // hit usage limit) under the `<synthetic>` model with all-zero usage. No
+    // request reached a model, so neither field describes the session: the
+    // zero snapshot superseded the real occupancy and a reopened session's
+    // context gauge fell back to "unknown". The text itself still shows.
+    let synthetic = message.get("model").and_then(Value::as_str) == Some(CLAUDE_SYNTHETIC_MODEL);
+    let usage = if synthetic { None } else { message.get("usage").cloned() };
+    let model = if synthetic {
+        None
+    } else {
+        message
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
     let effort = value
         .get("effort")
         .or_else(|| message.get("effort"))
@@ -3155,6 +3169,28 @@ mod tests {
         assert_eq!(parsed.messages.len(), 1);
         assert_eq!(parsed.messages[0].images.len(), 1);
         assert_eq!(parsed.messages[0].usage.as_ref().unwrap()["input_tokens"], 10_000);
+    }
+
+    #[test]
+    fn claude_synthetic_error_reply_keeps_text_but_not_zero_usage_or_model() {
+        // Shape of the CLI's local rate-limit notice: no API call happened.
+        let real = claude_usage_line(serde_json::json!([{"type": "text", "text": "real reply"}]), 430_000, "claude-opus-5-5");
+        let synthetic = serde_json::json!({
+            "type": "assistant", "timestamp": "2026-10-04T00:00:01Z",
+            "isApiErrorMessage": true, "apiErrorStatus": 429,
+            "message": {"role": "assistant", "model": "<synthetic>",
+                "content": [{"type": "text", "text": "You've hit your session limit"}],
+                "usage": {"input_tokens": 0, "output_tokens": 0,
+                    "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}}
+        });
+        let parsed = parse_claude_lines(&[real, synthetic]);
+        assert_eq!(parsed.messages.len(), 2);
+        assert_eq!(parsed.messages[1].text, "You've hit your session limit");
+        assert!(parsed.messages[1].usage.is_none(), "zero snapshot must not supersede occupancy");
+        assert!(parsed.messages[1].model.is_none(), "<synthetic> is not a model the session ran");
+        let latest = parsed.messages.iter().rev().find_map(|m| m.usage.as_ref()).unwrap();
+        assert_eq!(latest["input_tokens"], 430_000);
+        assert_eq!(latest["model_context_window"], 200_000);
     }
 
     #[test]

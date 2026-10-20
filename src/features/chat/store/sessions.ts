@@ -42,6 +42,7 @@ import {
 } from "./session-utils";
 import type { ChatStore } from "./types";
 import type { LoadHistoryPage, StoreGet, StoreSet, StoreSubscribe } from "./context";
+import { hasReadableUsage, latestMessageUsage, mergeUsage } from "../usage";
 
 function omitKey(rec: Record<string, boolean>, key: string) {
   const next = { ...rec };
@@ -219,6 +220,9 @@ export function createSessionActions(
       return Promise.resolve();
     }
     if (!refresh && existing && !needsLeaderHistory(key) && (existing.messages.length > 0 || existing.streaming || loadedHistory.has(key))) {
+      if (!existing.streaming && existing.messages.length > 0 && !loadedHistory.has(key) && !hasReadableUsage(existing.usage)) {
+        void get().refreshSessionUsage(key).catch(() => {});
+      }
       return Promise.resolve();
     }
     // A deferred read observes an already live timeline. Keep it reachable
@@ -267,13 +271,14 @@ export function createSessionActions(
         if (!sawActivity && (!refresh || isOpen(refresh)) && current.messages === originalMessages && !current.streaming && !current.queue.length && !interactive && !failedPrompt) {
           const messages = plans?.length ? mergePlanReviewHistory(page.messages, plans) ?? page.messages : page.messages;
           const preserveUsage = refresh?.preserveUsage || current.usage !== originalUsage;
+          const pageUsage = latestMessageUsage(page.messages);
           refreshNeeded.delete(key);
           loadedHistory.add(key);
           leaderHistoryLoaded(key);
           patchSession(set, key, {
             messages, subagentHistory: page.subagentHistory,
             nextBefore: page.nextBefore, loading: false,
-            usage: preserveUsage && current.usage != null ? current.usage : [...page.messages].reverse().find((m) => m.usage)?.usage ?? null,
+            usage: preserveUsage && current.usage != null ? mergeUsage(current.usage, pageUsage) : pageUsage,
             error: refresh?.error === current.error ? null : current.error,
           });
         } else {

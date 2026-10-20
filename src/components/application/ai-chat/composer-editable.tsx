@@ -33,6 +33,7 @@ export function ComposerEditable({
   promptOpen,
   completionSuffix,
   acceptCompletion,
+  dismissCompletion,
   setEditableText,
   handleHistoryKeyDown,
   mentionMenuRef,
@@ -60,10 +61,12 @@ export function ComposerEditable({
   agentOpen: boolean;
   /** A `!` prompt trigger is active: same gating as mentionOpen. */
   promptOpen: boolean;
-  /** Ghost-text history suffix painted after the caret ("" = none). */
+  /** Ghost-text history/prediction suffix painted after the caret ("" = none). */
   completionSuffix: string;
   /** Accept the ghost suggestion: returns the full text, or null. */
   acceptCompletion: () => string | null;
+  /** Dismiss the active post-turn prediction on Escape. */
+  dismissCompletion?: () => boolean;
   setEditableText: (text: string) => void;
   handleHistoryKeyDown: (event: ReactKeyboardEvent<HTMLDivElement>) => boolean;
   mentionMenuRef: MutableRefObject<FileMentionMenuHandle | null>;
@@ -166,7 +169,7 @@ export function ComposerEditable({
           event.preventDefault();
           return;
         }
-        // Tab accepts the ghost-text history completion (never mid-IME).
+        // Tab accepts the ghost-text completion/prediction (never mid-IME).
         if (
           event.key === "Tab" &&
           completionSuffix &&
@@ -177,6 +180,18 @@ export function ComposerEditable({
           event.preventDefault();
           const full = acceptCompletion();
           if (full !== null) setEditableText(full);
+          return;
+        }
+        // Escape dismisses an active post-turn ghost prediction.
+        if (
+          event.key === "Escape" &&
+          completionSuffix &&
+          !event.nativeEvent.isComposing &&
+          !isComposingRef.current &&
+          event.nativeEvent.keyCode !== 229 &&
+          dismissCompletion?.()
+        ) {
+          event.preventDefault();
           return;
         }
         // ArrowUp/ArrowDown recall submitted prompts from history.

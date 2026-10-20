@@ -1128,6 +1128,9 @@ export const zh = {
     autoTitleModelUnavailableDesc: "已保存的来源或模型不在当前可用目录中；保留现有选择，可选择其他可用模型",
     autoTitleModelSonnet: "Sonnet（默认）",
     autoTitleModelHaiku: "Haiku",
+    composerPrediction: "输入框消息预测",
+    composerPredictionDesc:
+      "每轮回复结束后，统一通过 Codex GPT 为所有渠道预测下一条可能发送的消息；输入框为空时以灰字显示，按 Tab 填入输入框（不自动发送），按 Esc 隐藏",
     promptHistory: "历史输入补全",
     promptHistoryDesc:
       "输入时按 Tab 接受历史补全建议；输入框为空时按 ↑↓ 翻阅历史",
@@ -2797,6 +2800,11 @@ export const zh = {
     openFailed: "无法打开该会话，请重试。",
     clearFinished: "清空已结束",
     closePanel: "关闭通信详情",
+    queueTitle: "等待中的对话间咨询",
+    queuedFrom: "来自「{{title}}」：{{message}}",
+    sendNow: "立即发送",
+    sendNowTooltip: "排在本对话的排队消息之前立即发送；正在回复时会先停止当前回复",
+    queueActionFailed: "无法处理这条对话间咨询：{{error}}",
     empty: "暂无通信记录。通信开始后，会在相关会话旁显示状态。",
     promptLabel: "咨询",
     replyStreamingLabel: "实时回复",

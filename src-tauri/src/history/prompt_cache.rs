@@ -174,6 +174,11 @@ impl Tracker {
             if kind != "assistant" {
                 return;
             }
+            if row.pointer("/message/model").and_then(Value::as_str)
+                == Some(super::extract::CLAUDE_SYNTHETIC_MODEL)
+            {
+                return;
+            }
             let Some(usage) = row.pointer("/message/usage") else {
                 return;
             };
@@ -307,6 +312,12 @@ mod tests {
         t.observe(&json!({"type":"user","timestamp":START}));
         t.observe(&json!({"type":"assistant","timestamp":END,"message":{"usage":{"cache_read_input_tokens":10000}}}));
         assert!(t.finish().is_none());
+        let mut t = Tracker::new("claude");
+        t.observe(&json!({"type":"user","timestamp":START}));
+        t.observe(&json!({"type":"assistant","timestamp":END,"message":{"model":"claude-opus-5-5","usage":{"cache_creation":{"ephemeral_1h_input_tokens":1092}}}}));
+        t.observe(&json!({"type":"user","timestamp":"2026-10-17T10:01:05Z"}));
+        t.observe(&json!({"type":"assistant","timestamp":"2026-10-17T10:01:06Z","message":{"model":"<synthetic>","usage":{"cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0}}}}));
+        assert_eq!(t.finish().unwrap().ttl_seconds, 3600);
     }
 
     #[test]

@@ -268,8 +268,8 @@ export function guardClaudeProcess(host: HostChatFacade, deps = {
   let generation = 0;
   let endedReady: Promise<() => void> | undefined;
   let disposed = false;
-  const inspect: HostChatFacade["inspect"] = (target) => {
-    const session = host.inspect(target);
+  const inspect: HostChatFacade["inspect"] = (target, options) => {
+    const session = host.inspect(target, options);
     return session && busy.has(key(target)) && session.status === "idle" ? { ...session, status: "busy" } : session;
   };
   return {
@@ -298,7 +298,7 @@ export function guardClaudeProcess(host: HostChatFacade, deps = {
       await endedReady;
       if (disposed) throw new Error("Native process guard has been disposed");
     },
-    async send(target, prompt, runId) {
+    async send(target, prompt, runId, options) {
       if (target.engine === "claude") {
         if (!endedReady) throw new Error("Native process guard is not subscribed");
         await endedReady;
@@ -315,7 +315,7 @@ export function guardClaudeProcess(host: HostChatFacade, deps = {
         }
       }
       if (disposed) throw new Error("Native process guard has been disposed");
-      return host.send(target, prompt, runId);
+      return host.send(target, prompt, runId, options);
     },
   };
 }
@@ -451,6 +451,39 @@ export function createCrossSessionHandler(deps: Dependencies) {
   };
 }
 
+type CrossSessionQueueControls = Pick<ReturnType<typeof createHostChatBridge>, "prioritize" | "cancel">;
+let queueControls: CrossSessionQueueControls | undefined;
+
+/** The target chat's user sends a waiting cross-session message now: it goes
+ *  ahead of the chat's own queued rows, and a turn in flight is stopped the
+ *  way Stop does (the composer queue stays parked), so the bridge delivers it
+ *  under its original request identity and the sender can still follow it. */
+export async function sendCrossSessionMessageNow(
+  scopedId: string,
+  controls: CrossSessionQueueControls | undefined = queueControls,
+  store: { getState(): ChatStore } = useChatStore,
+): Promise<void> {
+  if (!controls) throw new Error("Host chat runtime is unavailable");
+  const receipt = await controls.prioritize(scopedId);
+  if (!receipt) return;
+  useCrossSessionActivityStore.getState().applyReceipt(receipt);
+  if (receipt.status !== "queued" && receipt.status !== "received") return;
+  const { engine, nativeSessionId: sessionId, workspacePath } = receipt.target;
+  if (store.getState().bySession[sessionKey(engine, sessionId, workspacePath)]?.streaming) {
+    await store.getState().interrupt({ engine, sessionId, workspacePath });
+  }
+}
+
+/** Withdraw a cross-session message that has not reached its target yet. */
+export async function cancelCrossSessionMessage(
+  scopedId: string,
+  controls: CrossSessionQueueControls | undefined = queueControls,
+): Promise<void> {
+  if (!controls) throw new Error("Host chat runtime is unavailable");
+  const receipt = await controls.cancel(scopedId);
+  if (receipt) useCrossSessionActivityStore.getState().applyReceipt(receipt);
+}
+
 // Serial readiness changes prevent StrictMode/re-mount startup acknowledgements
 // from racing an old cleanup and disabling the new subscription.
 let readinessOwner: symbol | undefined;
@@ -468,6 +501,7 @@ export function startCrossSessionRuntime(): () => void {
   const bridge = createHostChatBridge("ccgui-cross-session", storage, {
     host: async () => guardClaudeProcess(await desktopChatFacade()), checkpointReady: () => initialized.promise,
   });
+  queueControls = bridge;
   const handler = createCrossSessionHandler({ store: useChatStore, bridge,
     isActive: () => !disposed,
     catalog: async () => {
@@ -498,6 +532,7 @@ export function startCrossSessionRuntime(): () => void {
   }).catch((error: unknown) => { initialized.reject(error); if (!disposed) console.error("[host-chat] request subscription unavailable"); });
   return () => {
     disposed = true;
+    if (queueControls === bridge) queueControls = undefined;
     initialized.reject(new Error("Host chat runtime has been disposed"));
     off?.();
     bridge.dispose();

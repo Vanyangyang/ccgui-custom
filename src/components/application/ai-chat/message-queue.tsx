@@ -43,10 +43,12 @@ export interface MessageQueueProps {
   onMove?: (id: string, direction: QueueMoveDirection) => void;
   /** Clear every queued message; header button only renders when provided. */
   onClear?: () => void;
+  /** Header text; defaults to the composer queue's title. */
+  title?: string;
   className?: string;
 }
 
-export function MessageQueue({ queue, onRemove, onMove, onSendNow, sendNowLabel, sendNowTitle, onClear, className }: MessageQueueProps) {
+export function MessageQueue({ queue, onRemove, onMove, onSendNow, sendNowLabel, sendNowTitle, onClear, title, className }: MessageQueueProps) {
   const { t } = useTranslation();
   if (queue.length === 0) return null;
 
@@ -60,7 +62,7 @@ export function MessageQueue({ queue, onRemove, onMove, onSendNow, sendNowLabel,
       <div className="flex items-center justify-between gap-2 px-3 pt-2 pb-1">
         <span className="flex min-w-0 items-center gap-1.5 text-caption-1-medium text-text-secondary">
           <ListOrdered className="size-3.5 shrink-0 text-foreground-icon-tertiary" aria-hidden />
-          <span className="truncate">{t("chat.queueTitle")}</span>
+          <span className="truncate">{title ?? t("chat.queueTitle")}</span>
           <span className="shrink-0 rounded-full bg-background-tertiary-default px-1.5 py-px text-caption-2-medium text-text-tertiary">
             {queue.length}
           </span>

@@ -318,4 +318,105 @@ describe("handoff lifecycle ownership", () => {
     expect(draft()).toContain("Grok summary while viewing source");
     expect(useChatStore.getState().drafts[claudeDraftKey]).toBe("unrelated claude draft");
   });
+
+  it("clears draft and completes handoff on send when the user deletes the trailing colon or edits the handoff draft, without inheriting into new chats", async () => {
+    const archive = vi.spyOn(ipc, "archiveSession").mockResolvedValue();
+    vi.spyOn(ipc, "sendMessage").mockResolvedValue({ runId: "run-edited-handoff", sessionId: "new-agy-session" });
+    useChatStore.setState({ refreshSessionUsage: vi.fn().mockResolvedValue(undefined) });
+    useHandoffStore.getState().startHandoff({ ...args, initialMode: "local", archiveSourceOnSend: true });
+
+    // User deletes the trailing fullwidth colon on `接下来请继续：`
+    const withoutColon = draft().replace(/接下来请继续：$/, "接下来请继续");
+    useChatStore.getState().setDraft(key, withoutColon);
+    expect(replaceHandoffDraftSummary(withoutColon, "updated summary")).toContain("> updated summary\n\n接下来请继续");
+
+    let submit!: (value: string) => void;
+    function Harness() {
+      const ref = useRef<ComposerInputHandle>(null);
+      submit = useComposerActions({
+        active: { engine: "codex", sessionId: null, workspacePath },
+        sessionKey: key,
+        streaming: false,
+        images: [],
+        clearImages: vi.fn(),
+        captureImageSubmission: () => vi.fn(),
+        importImageFiles: vi.fn(),
+        supportsImages: true,
+        composerInputRef: ref,
+      }).submit;
+      return null;
+    }
+    const root = createRoot(document.createElement("div"));
+    await act(async () => root.render(<Harness />));
+    try {
+      await act(async () => submit(withoutColon));
+      const migratedKey = sessionKey("codex", "new-agy-session", workspacePath);
+      expect(useHandoffStore.getState().byWorkspace[workspacePath]).toBeUndefined();
+      expect(archive).toHaveBeenCalledExactlyOnceWith(sourceMeta);
+      expect(useChatStore.getState().drafts[key] ?? "").toBe("");
+      expect(useChatStore.getState().drafts[migratedKey] ?? "").toBe("");
+
+      // Opening a brand new chat afterwards must not inherit any stale handoff UI or draft
+      act(() => useChatStore.getState().startNewChat(workspacePath));
+      expect(useHandoffStore.getState().byWorkspace[workspacePath]).toBeUndefined();
+      expect(useChatStore.getState().drafts[key] ?? "").toBe("");
+    } finally {
+      await act(async () => root.unmount());
+    }
+  });
+
+  it("clears a non-handoff pending tab draft on send when another pending tab in the same workspace owns the handoff", async () => {
+    vi.spyOn(ipc, "sendMessage").mockResolvedValue({ runId: "run-claude", sessionId: null });
+    useChatStore.setState({ refreshSessionUsage: vi.fn().mockResolvedValue(undefined) });
+    useHandoffStore.getState().startHandoff({ ...args, initialMode: "local" });
+    const handoffId = useHandoffStore.getState().byWorkspace[workspacePath].id;
+    const claudeTab = { engine: "claude", sessionId: null, workspacePath };
+    const claudeKey = sessionKey("claude", null, workspacePath);
+    useChatStore.setState((s) => ({
+      openTabs: [...s.openTabs, claudeTab],
+      active: claudeTab,
+      drafts: { ...s.drafts, [claudeKey]: "plain claude question" },
+    }));
+
+    let submit!: (value: string) => void;
+    function Harness() {
+      const ref = useRef<ComposerInputHandle>(null);
+      submit = useComposerActions({
+        active: claudeTab,
+        sessionKey: claudeKey,
+        streaming: false,
+        images: [],
+        clearImages: vi.fn(),
+        captureImageSubmission: () => vi.fn(),
+        importImageFiles: vi.fn(),
+        supportsImages: true,
+        composerInputRef: ref,
+      }).submit;
+      return null;
+    }
+    const root = createRoot(document.createElement("div"));
+    await act(async () => root.render(<Harness />));
+    try {
+      await act(async () => submit("plain claude question"));
+      expect(useChatStore.getState().drafts[claudeKey]).toBe("");
+      expect(useHandoffStore.getState().byWorkspace[workspacePath]?.id).toBe(handoffId);
+      expect(draft()).toContain("original conclusion");
+    } finally {
+      await act(async () => root.unmount());
+    }
+  });
+
+  it("dismisses the pending handoff and clears its draft when the handoff pending tab is closed, so a new chat starts clean", () => {
+    useHandoffStore.getState().startHandoff({ ...args, initialMode: "local" });
+    expect(useHandoffStore.getState().byWorkspace[workspacePath]).toBeDefined();
+    expect(draft()).toContain("original conclusion");
+
+    useChatStore.getState().closeTab("codex", null, workspacePath);
+    expect(useHandoffStore.getState().byWorkspace[workspacePath]).toBeUndefined();
+    expect(draft()).toBe("");
+
+    useChatStore.getState().startNewChat(workspacePath);
+    expect(useHandoffStore.getState().byWorkspace[workspacePath]).toBeUndefined();
+    expect(draft() ?? "").toBe("");
+  });
 });

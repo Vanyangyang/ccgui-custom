@@ -1161,6 +1161,9 @@ export const en: Messages = {
     autoTitleModelUnavailableDesc: "The saved source or model is absent from the callable directory. Your selection is retained; you can choose another available model",
     autoTitleModelSonnet: "Sonnet (default)",
     autoTitleModelHaiku: "Haiku",
+    composerPrediction: "Composer prompt prediction",
+    composerPredictionDesc:
+      "After each reply finishes, Codex GPT predicts your next likely prompt across all channels; shown as ghost text when the input is empty — press Tab to accept into the input box without sending, or Esc to dismiss",
     promptHistory: "History completion",
     promptHistoryDesc:
       "Tab accepts a history suggestion while typing; ↑↓ recall history when the input is empty",
@@ -2855,6 +2858,11 @@ export const en: Messages = {
     openFailed: "Could not open this chat. Please try again.",
     clearFinished: "Clear finished",
     closePanel: "Close communication details",
+    queueTitle: "Waiting chat requests",
+    queuedFrom: "From {{title}}: {{message}}",
+    sendNow: "Send now",
+    sendNowTooltip: "Send ahead of this chat's queued messages; a reply in progress is stopped first",
+    queueActionFailed: "Could not handle this chat request: {{error}}",
     empty: "No communication records. Status appears beside the participating chats when communication starts.",
     promptLabel: "Ask",
     replyStreamingLabel: "Live reply",

@@ -1,6 +1,7 @@
 pub mod agent_catalog;
 pub mod app_cache;
 pub mod auto_title;
+pub mod composer_prediction;
 pub mod agents;
 pub mod browser;
 pub mod cc_switch;
@@ -689,6 +690,7 @@ pub fn run() {
             history::reader::rename_session,
             auto_title::suggest_session_title,
             auto_title::auto_title_models,
+            composer_prediction::predict_next_prompt,
             app_cache::summarize_session_handoff,
             app_cache::inspect_app_cache,
             app_cache::prune_app_cache,

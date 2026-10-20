@@ -27,7 +27,11 @@ import {
   type FontPreferences,
 } from "./font";
 import { changeZoom, onZoomChange, readZoomPct, ZOOM_MAX, ZOOM_MIN, ZOOM_STEP } from "@/lib/zoom";
-import { PromptHistoryManager, PromptHistoryToggleRow } from "./PromptHistorySettings";
+import {
+  ComposerPredictionToggleRow,
+  PromptHistoryManager,
+  PromptHistoryToggleRow,
+} from "./PromptHistorySettings";
 import { useChatStore } from "@/features/chat/store";
 import { AutoTitleModelSettings } from "./AutoTitleModelSettings";
 import { useOnboardingStore } from "@/features/onboarding/store";
@@ -641,6 +645,7 @@ function BehaviorCard({
         </SettingsRow>
         <AutoTitleModelSettings settings={settings}
           onModelChange={onAutoTitleModelChange} onEffortChange={onAutoTitleEffortChange} />
+        <ComposerPredictionToggleRow />
         <PromptHistoryToggleRow />
       </SettingsCard>
     </div>

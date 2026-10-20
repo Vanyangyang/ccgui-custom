@@ -162,15 +162,19 @@ fn attach_context_window(mut usage: Value) -> Value {
 /// that is readable it replaces the per-request prompt counts, which are not an
 /// occupancy. Unreadable (not yet flushed, locked, other layout) leaves `usage`
 /// untouched — the post-turn re-read picks the metadata up later.
-fn attach_native_context(mut usage: Value, conversation_id: Option<&str>) -> Value {
-    let Some(id) = conversation_id.filter(|id| !id.is_empty() && !id.contains(['/', '\\', '.'])) else {
-        return usage;
-    };
-    let Ok(Some(db)) = session_db(id) else { return usage };
-    let native = crate::history::agy::read_native_context(&db)
+fn read_native_context_usage(conversation_id: Option<&str>) -> Option<Value> {
+    let id = conversation_id.filter(|id| !id.is_empty() && !id.contains(['/', '\\', '.']))?;
+    let db = session_db(id).ok().flatten()?;
+    crate::history::agy::read_native_context(&db)
         .as_ref()
-        .and_then(crate::history::agy::native_context_usage);
-    if let (Some(native), Some(target)) = (native, usage.as_object_mut()) {
+        .and_then(crate::history::agy::native_context_usage)
+}
+
+fn attach_native_context(mut usage: Value, conversation_id: Option<&str>) -> Value {
+    if let (Some(native), Some(target)) = (
+        read_native_context_usage(conversation_id),
+        usage.as_object_mut(),
+    ) {
         if let Some(object) = native.as_object() {
             for (key, value) in object {
                 target.insert(key.clone(), value.clone());
@@ -408,39 +412,61 @@ impl Engine for AgyEngine {
                             active: true,
                             reason: None,
                         }),
-                        Some("DONE") => out.push(EngineEvent::Compaction {
-                            active: false,
-                            reason: None,
-                        }),
+                        Some("DONE") => {
+                            out.push(EngineEvent::Compaction {
+                                active: false,
+                                reason: None,
+                            });
+                            if let Some(native) =
+                                read_native_context_usage(id.or_else(|| telemetry.root()))
+                            {
+                                out.push(EngineEvent::Usage(native));
+                            }
+                        }
                         _ => {}
                     }
                 }
                 // A multi-step turn used to show nothing until its very end.
-                // Each finished root model response refreshes the live rate.
+                // Each finished root model response refreshes the live rate
+                // and context window occupancy.
                 if string_field(step, "step_type") == Some("agent_response")
                     && string_field(step, "state") == Some("DONE")
                 {
                     if let Some(sample) = telemetry.running_sample(Instant::now()) {
                         out.push(EngineEvent::Throughput(sample));
                     }
+                    if let Some(native) =
+                        read_native_context_usage(id.or_else(|| telemetry.root()))
+                    {
+                        out.push(EngineEvent::Usage(native));
+                    }
                 }
             }
             "result" => {
                 let result = nested(&value, "result");
                 let conversation_id = string_field(result, "conversation_id")
-                    .or_else(|| string_field(&value, "conversation_id"));
+                    .or_else(|| string_field(&value, "conversation_id"))
+                    .or_else(|| telemetry.root());
                 let usage = Some(attach_native_context(
                     attach_context_window(telemetry.usage(result.get("usage"))),
                     conversation_id,
                 ));
-                let partial = !result_succeeded(result)
+                let succeeded = result_succeeded(result) || answered_turn(result, &telemetry);
+                let partial = !succeeded
                     || result.get("interrupted").and_then(Value::as_bool) == Some(true);
                 if let Some(sample) = telemetry.finish(partial, Instant::now()) {
                     out.push(EngineEvent::Throughput(sample));
                 }
-                parse_result(result, usage, out);
+                parse_result(result, usage, succeeded, out);
             }
             "error" => {
+                if let Some(native) = read_native_context_usage(
+                    string_field(&value, "conversation_id")
+                        .or_else(|| string_field(payload, "conversation_id"))
+                        .or_else(|| telemetry.root()),
+                ) {
+                    out.push(EngineEvent::Usage(native));
+                }
                 if let Some(sample) = telemetry.finish(true, Instant::now()) {
                     out.push(EngineEvent::Throughput(sample));
                 }
@@ -456,12 +482,15 @@ impl Engine for AgyEngine {
     }
 
     fn finish_telemetry(&self, _interrupted: bool, out: &mut Vec<EngineEvent>) {
-        if let Some(sample) = self
+        let mut telemetry = self
             .throughput
             .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .finish(true, Instant::now())
-        {
+            .unwrap_or_else(|p| p.into_inner());
+        let root = telemetry.root().map(str::to_string);
+        if let Some(sample) = telemetry.finish(true, Instant::now()) {
+            if let Some(native) = read_native_context_usage(root.as_deref()) {
+                out.push(EngineEvent::Usage(native));
+            }
             out.push(EngineEvent::Throughput(sample));
         }
     }
@@ -563,7 +592,16 @@ fn result_succeeded(result: &Value) -> bool {
     status.is_empty() && result.get("error").is_none_or(Value::is_null)
 }
 
-fn parse_result(result: &Value, usage: Option<Value>, out: &mut Vec<EngineEvent>) {
+/// That same trajectory-wide `result.error` also arrives without a `SUCCESS`
+/// verdict on later turns that finished normally (seen on resumed sessions
+/// whose earlier turn retried past a stream interruption or API error). A turn
+/// whose last root step is a finished model response with a final `response`
+/// delivered its answer; the error belongs to an earlier, recovered step.
+fn answered_turn(result: &Value, telemetry: &AgyThroughput) -> bool {
+    telemetry.answered() && string_field(result, "response").is_some()
+}
+
+fn parse_result(result: &Value, usage: Option<Value>, succeeded: bool, out: &mut Vec<EngineEvent>) {
     push_conversation_id(result, out);
     // Headless denied_actions contains action/display_name, not tool arguments
     // or paths. Surface the refusal without inventing execution or a grant path.
@@ -588,7 +626,7 @@ fn parse_result(result: &Value, usage: Option<Value>, out: &mut Vec<EngineEvent>
     if let Some(usage) = usage.clone() {
         out.push(EngineEvent::Usage(usage));
     }
-    if !result_succeeded(result) {
+    if !succeeded {
         let status = string_field(result, "status").unwrap_or("agy error");
         let message = string_field(result, "error")
             .or_else(|| string_field(result, "message"))
@@ -920,6 +958,61 @@ mod tests {
             EngineEvent::Done { session_id: Some(id), .. } if id == "abc-1"
         )));
         assert!(!ev.iter().any(|e| matches!(e, EngineEvent::Error(_))));
+    }
+
+    fn turn(steps: &[(u64, &str, &str)], result: &str) -> Vec<EngineEvent> {
+        let engine = AgyEngine::new();
+        let mut out = Vec::new();
+        engine.parse_line(r#"{"event":"init","conversation_id":"root","init":{}}"#, &mut out);
+        for (index, kind, state) in steps {
+            let line = serde_json::json!({"event":"step_update","step_update":{
+                "conversation_id":"root","step_index":index,"step_type":kind,"state":state}});
+            engine.parse_line(&line.to_string(), &mut out);
+        }
+        out.clear();
+        engine.parse_line(result, &mut out);
+        out
+    }
+
+    #[test]
+    fn answered_turn_ignores_stale_trajectory_error_without_success_verdict() {
+        let stale = "The stream was interrupted. Please continue the task you were working on.";
+        let answered = [(333, "user_input", "DONE"), (334, "system_message", "DONE"),
+            (335, "agent_response", "ACTIVE"), (335, "agent_response", "DONE")];
+        for result in [
+            serde_json::json!({"event":"result","result":{"conversation_id":"root","response":"答复 ✅","error":stale}}),
+            serde_json::json!({"event":"result","result":{"conversation_id":"root","status":"ERROR","response":"答复 ✅","error":stale}}),
+        ] {
+            let ev = turn(&answered, &result.to_string());
+            assert!(!ev.iter().any(|e| matches!(e, EngineEvent::Error(_))), "{ev:?}");
+            assert!(ev.iter().any(|e| matches!(e, EngineEvent::Done { session_id: Some(id), .. } if id == "root")));
+            assert!(ev.iter().any(|e| matches!(e, EngineEvent::Throughput(sample) if sample["status"] == "complete")));
+        }
+    }
+
+    #[test]
+    fn unanswered_turn_keeps_result_error_terminal() {
+        let failed = r#"{"event":"result","result":{"conversation_id":"root","status":"ERROR","response":"partial","error":"API error (attempt 4): Error 429"}}"#;
+        for steps in [
+            // The failed request came after a tool step: no final model response.
+            &[(10, "user_input", "DONE"), (11, "agent_response", "DONE"), (12, "tool", "DONE")][..],
+            // The final model response never finished.
+            &[(10, "user_input", "DONE"), (11, "agent_response", "ACTIVE")][..],
+            // Nothing of this turn ran at all.
+            &[][..],
+        ] {
+            let ev = turn(steps, failed);
+            assert!(ev.iter().any(|e| matches!(e, EngineEvent::Error(m) if m == "API error (attempt 4): Error 429")), "{ev:?}");
+            assert!(!ev.iter().any(|e| matches!(e, EngineEvent::Done { .. })));
+        }
+        // A finished response with no final text is not an answered turn.
+        let ev = turn(&[(10, "user_input", "DONE"), (11, "agent_response", "DONE")],
+            r#"{"event":"result","result":{"conversation_id":"root","status":"ERROR","error":"RESOURCE_EXHAUSTED"}}"#);
+        assert!(ev.iter().any(|e| matches!(e, EngineEvent::Error(m) if m == "RESOURCE_EXHAUSTED")));
+        // Steps from before this turn's user input never count as its answer.
+        let ev = turn(&[(20, "user_input", "DONE"), (19, "agent_response", "DONE")],
+            r#"{"event":"result","result":{"conversation_id":"root","response":"old","error":"RESOURCE_EXHAUSTED"}}"#);
+        assert!(ev.iter().any(|e| matches!(e, EngineEvent::Error(_))));
     }
 
     #[test]

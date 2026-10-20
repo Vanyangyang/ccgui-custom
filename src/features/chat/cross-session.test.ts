@@ -1,7 +1,7 @@
 import { webcrypto } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { HostChatReceipt, HostChatTarget } from "@ccgui/plugin-sdk";
-import { createCrossSessionHandler, crossSessionParticipantKey, crossSessionRecordMatchesParticipant, guardClaudeProcess, isCrossSessionRecordUnread, startCrossSessionRuntime, useCrossSessionActivityStore, type CrossSessionCommunicationRecord, type CrossSessionRequest } from "./cross-session";
+import { cancelCrossSessionMessage, createCrossSessionHandler, crossSessionParticipantKey, sendCrossSessionMessageNow, crossSessionRecordMatchesParticipant, guardClaudeProcess, isCrossSessionRecordUnread, startCrossSessionRuntime, useCrossSessionActivityStore, type CrossSessionCommunicationRecord, type CrossSessionRequest } from "./cross-session";
 import { createHostChatBridge, type HostChatFacade } from "@/features/plugins/runtime/chat-bridge";
 import { EMPTY_SESSION } from "./store/stream";
 import { sessionKey } from "./store/persistence";
@@ -445,5 +445,50 @@ describe("Claude native process retirement guard", () => {
     f.running.mockResolvedValue(false); f.ended("unregistered-plugin-run");
     await vi.waitFor(() => expect(f.send).toHaveBeenCalledTimes(1));
     expect(f.running).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("sending a waiting cross-session message ahead", () => {
+  const receipt = (status: HostChatReceipt["status"]): HostChatReceipt => ({
+    requestId: "cross:waiting", target: { client: "ccgui", engine: target.engine, nativeSessionId: target.sessionId,
+      guiSessionId: target.sessionId, workspacePath: target.workspacePath, clientInstanceId: "client", windowId: "window" },
+    runId: "run-waiting", status, acceptedAt: 1, updatedAt: 2,
+  });
+  function store(streaming: boolean) {
+    const interrupt = vi.fn(async () => {});
+    const state = { bySession: { [`${target.engine}/${target.sessionId}`]: { ...EMPTY_SESSION, streaming } }, interrupt } as unknown as ChatStore;
+    return { interrupt, store: { getState: () => state } };
+  }
+  beforeEach(() => useCrossSessionActivityStore.getState().reset());
+
+  it("prioritizes first, then stops only the target's running turn", async () => {
+    const order: string[] = [];
+    const controls = { prioritize: vi.fn(async () => { order.push("prioritize"); return receipt("queued"); }), cancel: vi.fn() };
+    const running = store(true);
+    running.interrupt.mockImplementation(async () => { order.push("interrupt"); });
+    await sendCrossSessionMessageNow("cross:waiting", controls, running.store);
+    expect(order).toEqual(["prioritize", "interrupt"]);
+    expect(running.interrupt).toHaveBeenCalledWith(target);
+
+    const idle = store(false);
+    await sendCrossSessionMessageNow("cross:waiting", controls, idle.store);
+    expect(idle.interrupt).not.toHaveBeenCalled();
+  });
+
+  it("never stops the target for a message that already left the queue or is unknown", async () => {
+    for (const result of [receipt("executing"), receipt("completed"), null]) {
+      const running = store(true);
+      await sendCrossSessionMessageNow("cross:waiting", { prioritize: vi.fn(async () => result), cancel: vi.fn() }, running.store);
+      expect(running.interrupt).not.toHaveBeenCalled();
+    }
+  });
+
+  it("reports an unavailable runtime and records a withdrawal", async () => {
+    await expect(sendCrossSessionMessageNow("cross:waiting", undefined)).rejects.toThrow("Host chat runtime is unavailable");
+    useCrossSessionActivityStore.getState().upsertRecord({ scopedId: "cross:waiting", requestId: "waiting", sender, target,
+      message: "m", status: "queued", acceptedAt: 1, updatedAt: 1 });
+    const failed = { ...receipt("failed"), error: "Cancelled by the user before delivery" };
+    await cancelCrossSessionMessage("cross:waiting", { prioritize: vi.fn(), cancel: vi.fn(async () => failed) });
+    expect(useCrossSessionActivityStore.getState().records[0]).toMatchObject({ status: "failed", error: "Cancelled by the user before delivery" });
   });
 });

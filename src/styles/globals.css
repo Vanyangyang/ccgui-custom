@@ -90,7 +90,7 @@
   white-space: pre-wrap;
   word-break: break-word;
 }
-.composer-editable:empty::before {
+.composer-editable:not([data-completion-suffix]):empty::before {
   content: attr(data-placeholder);
   color: var(--color-text-tertiary);
   pointer-events: none;

@@ -58,6 +58,11 @@ import { beginNativeRun, mergeNativeTaskSnapshot, readNativeTasks } from "./nati
 import { followUpGuardActive, runsEffort, runsModel } from "./live-follow-up";
 import { persistClaudeUltracode } from "./claude-ultracode";
 import { beginThroughput, mergeThroughput, parseThroughput, settleThroughput, updateThroughput, type ThroughputState } from "../throughput";
+import {
+  clearComposerPrediction,
+  migrateComposerPredictionSessionKey,
+  requestComposerPrediction,
+} from "../composer-prediction";
 
 // Sequence floors distinguish a new reply delivered to the same native run
 // from samples already observed for its preceding reply. No store writes per delta.
@@ -327,6 +332,7 @@ function onDelta(
 ) {
   resumeThroughput(event, key, deps);
   responseCompletedRuns.delete(event.runId);
+  clearComposerPrediction(key, { resetTurn: true });
   // Content resumed: a re-issued request succeeded, so the retry chip goes.
   if (retryingKeys.has(key)) clearRetry(key, deps);
   bufferStreamPart(
@@ -346,6 +352,7 @@ function onThinking(
 ) {
   resumeThroughput(event, key, deps);
   responseCompletedRuns.delete(event.runId);
+  clearComposerPrediction(key, { resetTurn: true });
   // Content resumed: a re-issued request succeeded, so the retry chip goes.
   if (retryingKeys.has(key)) clearRetry(key, deps);
   bufferStreamPart(
@@ -373,6 +380,7 @@ function onMessage(
   if (data.role !== "assistant") return;
   resumeThroughput(event, key, deps);
   responseCompletedRuns.delete(event.runId);
+  clearComposerPrediction(key, { resetTurn: true });
   // Full-snapshot assistant lines (kimi/codex non-delta) append as settled
   // messages; any live row above is finished growing.
   const pending = drainPending(key);
@@ -620,6 +628,7 @@ function onSession(
   // the next send in this tab injects it again.
   migrateSelectedAgent(workspacePath, nativeId);
   migrateSidechatSessionKey(fromKey, newKey, nativeId);
+  migrateComposerPredictionSessionKey(fromKey, newKey);
   // Sidebar row + tab title pick the new session up immediately instead of
   // waiting for the post-turn rescan.
   const firstUser = (deps.get().bySession[newKey]?.messages ?? []).find(
@@ -1431,9 +1440,17 @@ function onDone(event: ChatEngineEvent, key: string, deps: EngineEventDeps, resp
   // real CLI reports zero for an interrupted response. It must neither replace
   // the meter's occupancy nor be stamped on a row as the reply's cost.
   const tokensReported = turnTotals !== undefined || parseUsage(data.usage) !== null;
+  const rawDoneUsage =
+    data.usage && typeof data.usage === "object"
+      ? (data.usage as Record<string, unknown>)
+      : null;
+  const contextReported =
+    rawDoneUsage?.context_usage != null || reportedContextWindow(data.usage) !== undefined;
   let settledUsage = tokensReported
     ? mergeUsage(turnTotals ? prev.usage : data.usage, prev.usage)
-    : (prev.usage ?? null);
+    : contextReported
+      ? mergeUsage(data.usage, prev.usage)
+      : (prev.usage ?? null);
   const finalWindow = reportedContextWindow(data.usage);
   if (finalWindow && settledUsage && typeof settledUsage === "object") {
     settledUsage = { ...settledUsage, model_context_window: finalWindow };
@@ -1452,6 +1469,7 @@ function onDone(event: ChatEngineEvent, key: string, deps: EngineEventDeps, resp
   // text the user watched arrive *is* the final message.
   const pending = drainPending(key);
   let stampedAssistantSeq: number | undefined;
+  let settledMessages = prev.messages;
   deps.set((s) => {
     const cur = s.bySession[key] ?? EMPTY_SESSION;
     let messages = pending
@@ -1496,6 +1514,7 @@ function onDone(event: ChatEngineEvent, key: string, deps: EngineEventDeps, resp
         break;
       }
     }
+    settledMessages = messages;
     return {
       bySession: {
         ...s.bySession,
@@ -1527,6 +1546,37 @@ function onDone(event: ChatEngineEvent, key: string, deps: EngineEventDeps, resp
       retryingByKey: responseOnly ? s.retryingByKey : setRetryingFlag(s.retryingByKey, key, false),
     };
   });
+  const interruptedTurn = Boolean(data.interrupted || prev.interrupted || prev.queueParked);
+  const hasPendingInteractiveCard = settledMessages.some(
+    (m) =>
+      m.question?.status === "pending" ||
+      m.grant?.status === "pending" ||
+      ["awaiting_review", "deferred", "submitting"].includes(m.planReview?.status ?? ""),
+  );
+  if (
+    !interruptedTurn &&
+    prev.queue.length === 0 &&
+    !hasPendingInteractiveCard
+  ) {
+    requestComposerPrediction(key, settledMessages, () => {
+      const latest = deps.get().bySession[key];
+      return Boolean(
+        latest &&
+          (!latest.streaming ||
+            latest.nativeActivity === "waiting" ||
+            !latest.messages.some((m) => m.live)) &&
+          !latest.draftLaunching &&
+          !latest.interrupted &&
+          latest.queue.length === 0 &&
+          !latest.messages.some(
+            (m) =>
+              m.question?.status === "pending" ||
+              m.grant?.status === "pending" ||
+              ["awaiting_review", "deferred", "submitting"].includes(m.planReview?.status ?? ""),
+          ),
+      );
+    });
+  }
   if (responseOnly) {
     if (data.usage != null) recordTurnUsage(deps, event, key, ledgerUsage);
     responseCompletedRuns.add(event.runId);
@@ -1556,10 +1606,11 @@ function onDone(event: ChatEngineEvent, key: string, deps: EngineEventDeps, resp
     // Claude's result line reports the turn's summed usage (every request of
     // the turn added up), not the occupancy the meter shows — so re-read the
     // latest per-message snapshot from the session file once the engine has
-    // settled it. /compact turns need the same re-read on every engine.
+    // settled it. AGY's SQLite gen_metadata and /compact turns need the same
+    // post-turn re-read.
     const lastUser = [...prev.messages].reverse().find((m) => m.role === "user");
     const compactTurn = Boolean(lastUser?.text.trim().startsWith("/compact"));
-    if (event.engine === "claude" || compactTurn) {
+    if (event.engine === "claude" || event.engine === "agy" || compactTurn) {
       setTimeout(() => {
         deps.refreshSessionUsage?.(key)?.catch(() => {});
       }, USAGE_REREAD_DELAY_MS);
@@ -1634,6 +1685,7 @@ function adoptObservedRun(
     routeAndReconcileRun(deps.set, event.runId, key);
   }
   if (!cur?.streaming) {
+    clearComposerPrediction(key);
     patchSession(deps.set, key, {
       streaming: true,
       turnStartedAt: cur?.turnStartedAt ?? Date.now(),

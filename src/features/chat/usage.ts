@@ -183,16 +183,50 @@ export function selectCursorContext(usage: unknown, modelWindow?: number): Curso
   };
 }
 
+/** True when a usage payload carries non-zero token counts or a native context snapshot. */
+export function hasReadableUsage(usage: unknown): boolean {
+  const raw = asRecord(usage);
+  return Boolean(raw && (parseUsage(raw) !== null || raw.context_usage != null));
+}
+
+/** Latest message usage snapshot on a page that actually reports occupancy.
+ *  Falls back to the last non-null usage (e.g. window-only metadata) when no
+ *  row has token counts yet. */
+export function latestMessageUsage(messages: ReadonlyArray<{ usage?: unknown }>): unknown {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (hasReadableUsage(messages[i].usage)) return messages[i].usage ?? null;
+  }
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].usage != null) return messages[i].usage ?? null;
+  }
+  return null;
+}
+
 /** Keep a previously reported context window when a later snapshot omits it.
- *  【cursor上下文】后到的计费合计如果没带当前占用，沿用上一份，避免仪表退回未知。 */
+ *  【cursor/agy上下文】后到的计费合计或空快照如果没带当前占用，沿用上一份，避免仪表退回未知。 */
 export function mergeUsage(next: unknown, prev: unknown): unknown {
   if (!next) return prev ?? null;
   const nextObj = asRecord(next);
   const prevObj = asRecord(prev);
   if (!nextObj || !prevObj) return next;
+  // An all-zero placeholder (e.g. a locally generated error row or aborted turn)
+  // carries no occupancy of its own and must not wipe a known token snapshot;
+  // only a context window attached to it is worth forwarding.
+  if (!hasReadableUsage(nextObj) && hasReadableUsage(prevObj)) {
+    const nextWindow = reportedContextWindow(nextObj);
+    return nextWindow ? { ...prevObj, model_context_window: nextWindow } : prev;
+  }
   const window = reportedContextWindow(nextObj) ? undefined : reportedContextWindow(prevObj);
   const withWindow = window ? { ...nextObj, model_context_window: window } : nextObj;
-  if (withWindow.context_usage_kind || prevObj.context_usage_kind !== "current_context" || prevObj.context_usage == null) {
+  const nextHasCurrentContext =
+    withWindow.context_usage_kind === "current_context" && withWindow.context_usage != null;
+  const nextHasAnyContext =
+    Boolean(withWindow.context_usage_kind) && withWindow.context_usage != null;
+  if (
+    nextHasCurrentContext ||
+    prevObj.context_usage == null ||
+    (nextHasAnyContext && prevObj.context_usage_kind !== "current_context")
+  ) {
     return withWindow;
   }
   return {

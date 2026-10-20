@@ -6,11 +6,14 @@ import { HostChatBusyError } from "@/features/chat/store/types";
 import { cloneCheckpointValue, runtimeCheckpoint, type RuntimeCheckpoint, type RuntimeCheckpointParticipant } from "@/lib/runtime-checkpoint";
 import type { PluginStorageBackend } from "./context";
 
+/** A request the user chose to send ahead of the target's own queued rows. */
+export interface HostChatDeliveryOptions { priority?: boolean }
+
 /** Host-only seam: plugins see only the SDK facade, never the store. */
 export interface HostChatFacade {
   current(): HostChatSession | null;
-  inspect(target: HostChatTarget): HostChatSession | null;
-  send(target: HostChatTarget, prompt: string, runId: string): Promise<{ runId: string; sessionId: string | null }>;
+  inspect(target: HostChatTarget, options?: HostChatDeliveryOptions): HostChatSession | null;
+  send(target: HostChatTarget, prompt: string, runId: string, options?: HostChatDeliveryOptions): Promise<{ runId: string; sessionId: string | null }>;
   subscribe(callback: () => void): Disposer;
   ready?(): Promise<void>;
   wasInterrupted(target: HostChatTarget): boolean;
@@ -96,7 +99,7 @@ export async function desktopChatFacade(): Promise<HostChatFacade> {
   desktopIdentity ??= { clientInstanceId: `ccgui-${newId()}`, windowId: `window-${newId()}` };
   const identity = desktopIdentity;
   const { useChatStore, sessionKey } = await import("@/features/chat/store");
-  const inspect = (target: HostChatTarget): HostChatSession | null => {
+  const inspect = (target: HostChatTarget, options?: HostChatDeliveryOptions): HostChatSession | null => {
     if (target.clientInstanceId !== identity.clientInstanceId || target.windowId !== identity.windowId) return null;
     const state = useChatStore.getState();
     const tab = state.openTabs.find((t) => t.engine === target.engine && t.sessionId === target.nativeSessionId && t.workspacePath === target.workspacePath);
@@ -105,7 +108,10 @@ export async function desktopChatFacade(): Promise<HostChatFacade> {
     if (!state.initialized || !tab || !session || session.loading || state.archivedSessionKeys[key]) return null;
     const awaiting = session.messages.some((m) => m.question?.status === "pending" || m.grant?.status === "pending" ||
       m.planReview?.status === "awaiting_review" || m.planReview?.status === "deferred" || m.planReview?.status === "submitting");
-    return { ...target, status: awaiting ? "awaiting_permission" : session.streaming || session.queue.length ? "busy" : "idle" };
+    // A prioritized request goes ahead of the composer's queued rows; it still
+    // never overlaps a running turn or an open approval.
+    const queued = !options?.priority && session.queue.length > 0;
+    return { ...target, status: awaiting ? "awaiting_permission" : session.streaming || queued ? "busy" : "idle" };
   };
   return {
     identity,
@@ -117,8 +123,8 @@ export async function desktopChatFacade(): Promise<HostChatFacade> {
         guiSessionId: active.sessionId, workspacePath: active.workspacePath, ...identity })); }
       catch { return null; }
     },
-    async send(target, prompt, runId) {
-      const session = inspect(target);
+    async send(target, prompt, runId, options) {
+      const session = inspect(target, options);
       if (!session) throw new Error("Exact host chat target is no longer reachable");
       if (session.status !== "idle") throw new HostChatBusyError();
       const tab = useChatStore.getState().openTabs.find((t) => t.engine === target.engine && t.sessionId === target.nativeSessionId && t.workspacePath === target.workspacePath)!;
@@ -132,7 +138,7 @@ export async function desktopChatFacade(): Promise<HostChatFacade> {
   };
 }
 
-interface Entry { receipt: HostChatReceipt; prompt: string; fingerprint: string; lastSeq: number }
+interface Entry { receipt: HostChatReceipt; prompt: string; fingerprint: string; lastSeq: number; priority?: true }
 interface Ledger { version: 1; entries: Entry[] }
 interface BridgeCheckpoint {
   version: 1;
@@ -164,6 +170,7 @@ function ledgerEntries(value: unknown, identity?: HostChatIdentity): Entry[] {
     if (!validRequestId(value.receipt?.requestId) || typeof value.prompt !== "string" || value.prompt.length > 131_072 ||
       !statuses.has(value.receipt.status) || typeof value.receipt.runId !== "string" || !value.receipt.runId.startsWith("run-") ||
       !Number.isFinite(value.receipt.acceptedAt) || !Number.isFinite(value.receipt.updatedAt) || !Number.isInteger(value.lastSeq) || value.lastSeq < -1 ||
+      (value.priority !== undefined && value.priority !== true) ||
       value.fingerprint !== JSON.stringify([target, value.prompt]) || requests.has(value.receipt.requestId) ||
       (value.receipt.text !== undefined && typeof value.receipt.text !== "string") ||
       (value.receipt.error !== undefined && typeof value.receipt.error !== "string") ||
@@ -194,7 +201,12 @@ export interface HostChatBridgeDependencies {
  * ambiguity stops automatic execution; this deliberately makes no exactly-once
  * claim. Serial ledger updates also isolate concurrent duplicate submissions. */
 export function createHostChatBridge(pluginId: string, storage: PluginStorageBackend, deps: HostChatBridgeDependencies = {}):
-  PluginContext["chat"] & { dispose: Disposer; ready(): Promise<void> } {
+  PluginContext["chat"] & {
+    dispose: Disposer;
+    ready(): Promise<void>;
+    prioritize(requestId: string): Promise<HostChatReceipt | null>;
+    cancel(requestId: string): Promise<HostChatReceipt | null>;
+  } {
   const now = deps.now ?? Date.now;
   const checkpoint = deps.checkpoint ?? runtimeCheckpoint;
   const participantId = hostChatCheckpointId(pluginId);
@@ -328,14 +340,18 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
     void serial(async () => {
       await ensure();
       const blockedTargets = new Set<string>();
-      for (const entry of entries.values()) {
+      // Per target, a request the user sent ahead goes first; the rest keep
+      // their acceptance order.
+      const ordered = [...entries.values()].sort((x, y) => Number(y.priority === true) - Number(x.priority === true));
+      for (const entry of ordered) {
         if (disposed || fenced || checkpoint.isPaused()) break;
         if (entry.receipt.status !== "queued" && entry.receipt.status !== "received") continue;
         const { target, runId } = entry.receipt;
         const key = targetKey(target);
         if (blockedTargets.has(key)) continue;
         blockedTargets.add(key);
-        const session = host.inspect(target);
+        const delivery = entry.priority ? { priority: true } : undefined;
+        const session = host.inspect(target, delivery);
         if (!session || session.status !== "idle" || reservations.has(key)) continue;
         reservations.add(key);
         pendingStarts.set(runId, entry.receipt.status);
@@ -352,13 +368,13 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
           continue;
         }
         // Revalidate after the durable write; never substitute active.
-        if (!host.inspect(target)) {
+        if (!host.inspect(target, delivery)) {
           await change(entry, { status: "unknown", error: "Exact target became unreachable before native send" });
           reservations.delete(key);
           continue;
         }
         inFlightStarts.add(runId);
-        void host.send(target, entry.prompt, runId).then((result) => serial(async () => {
+        void host.send(target, entry.prompt, runId, delivery).then((result) => serial(async () => {
           if (disposed || terminal.has(entry.receipt.status)) return;
           if (result.runId !== runId || (result.sessionId !== null && result.sessionId !== target.nativeSessionId)) {
             await change(entry, { status: "unknown", error: `Native send ACK identity mismatch: ${clip(JSON.stringify({ actualRunId: result.runId, actualSessionId: result.sessionId }), 768)}` });
@@ -553,8 +569,35 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
   const inherited = restorationCache(checkpoint).get(participantId);
   if (!restored && checkpoint.isPaused() && inherited) restoreCheckpoint(inherited.snapshot);
 
+  /** Host-only queue controls for a request still waiting on its target. A
+   *  started, finished or unknown request is returned unchanged. */
+  const pending = (requestId: string, apply: (entry: Entry) => Promise<void>) => serial(async () => {
+    if (disposed) throw new Error("Host chat bridge has been disposed");
+    const entry = entries.get(requestId);
+    if (!entry) return null;
+    if (entry.receipt.status === "queued" || entry.receipt.status === "received") await apply(entry);
+    return visible(entry.receipt);
+  });
+
   return {
     ready,
+    /** Send ahead of the target's own queued rows at its next idle moment. */
+    async prioritize(requestId: string): Promise<HostChatReceipt | null> {
+      await ensure();
+      const receipt = await pending(requestId, async (entry) => {
+        if (entry.priority) return;
+        if (fenced) throw new Error("Host chat ledger is fenced after an ambiguous storage failure");
+        entry.priority = true;
+        await change(entry, {});
+      });
+      kick();
+      return receipt;
+    },
+    /** Withdraw a request before any native send; the sender sees a failure. */
+    async cancel(requestId: string): Promise<HostChatReceipt | null> {
+      await ensure();
+      return pending(requestId, (entry) => change(entry, { status: "failed", error: "Cancelled by the user before delivery" }));
+    },
     async identity() {
       await ensure();
       if (disposed) throw new Error("Host chat bridge has been disposed");

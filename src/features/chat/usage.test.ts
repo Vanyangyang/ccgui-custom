@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { cursorContextOccupancyKnown, mergeUsage, parseUsage, reportedContextWindow, selectCursorContext } from "./usage";
+import { cursorContextOccupancyKnown, latestMessageUsage, mergeUsage, parseUsage, reportedContextWindow, selectCursorContext } from "./usage";
 import { usageBreakdown } from "./components/usage-breakdown";
 
 describe("cursor context occupancy", () => {
@@ -143,6 +143,63 @@ describe("mergeUsage", () => {
       context_usage: context,
     });
     expect(selectCursorContext(merged, 256_000).pct).toBe(56);
+  });
+
+  it("keeps AGY current_context occupancy when a later result carries null or fallback last_prompt context_usage", () => {
+    const prev = {
+      context_usage_kind: "current_context",
+      context_usage: { input_tokens: 99_350, output_tokens: 0 },
+      model_context_window: 256_000,
+    };
+    const mergedNull = mergeUsage(
+      {
+        usage_scope: "unknown",
+        context_usage_kind: "last_prompt",
+        context_usage: null,
+      },
+      prev,
+    );
+    expect(mergedNull).toMatchObject({
+      context_usage_kind: "current_context",
+      context_usage: { input_tokens: 99_350, output_tokens: 0 },
+      model_context_window: 256_000,
+    });
+
+    const mergedFallback = mergeUsage(
+      {
+        usage_scope: "turn",
+        input_tokens: 1_000,
+        output_tokens: 200,
+        context_usage_kind: "last_prompt",
+        context_usage: { input_tokens: 500, output_tokens: 100 },
+      },
+      prev,
+    );
+    expect(mergedFallback).toMatchObject({
+      input_tokens: 1_000,
+      output_tokens: 200,
+      context_usage_kind: "current_context",
+      context_usage: { input_tokens: 99_350, output_tokens: 0 },
+      model_context_window: 256_000,
+    });
+  });
+
+  it("does not overwrite readable occupancy with an all-zero placeholder", () => {
+    const prev = { input_tokens: 2, cache_read_input_tokens: 433_811, output_tokens: 415, model_context_window: 1_000_000 };
+    const zero = { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 };
+    expect(mergeUsage(zero, prev)).toEqual(prev);
+    expect(mergeUsage({ ...zero, model_context_window: 500_000 }, prev)).toEqual({
+      ...prev,
+      model_context_window: 500_000,
+    });
+  });
+
+  it("picks the last message with readable occupancy over a trailing zero-token row", () => {
+    const real = { input_tokens: 2, cache_read_input_tokens: 433_811, output_tokens: 415 };
+    const zero = { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 };
+    expect(latestMessageUsage([{ usage: real }, { usage: zero }])).toEqual(real);
+    expect(latestMessageUsage([{ usage: zero }])).toEqual(zero);
+    expect(latestMessageUsage([{}])).toBeNull();
   });
 });
 

@@ -6,6 +6,11 @@
 
 import { useCallback, useEffect, useRef, useState, type RefObject } from "react";
 import {
+  clearComposerPrediction,
+  getComposerPrediction,
+  subscribeComposerPrediction,
+} from "@/features/chat/composer-prediction";
+import {
   findPromptCompletion,
   getPromptHistory,
   isPromptHistoryEnabled,
@@ -20,22 +25,41 @@ export interface PromptCompletion {
   suffix: string;
   /** Accept the current suggestion: returns the full text, or null. */
   accept: () => string | null;
+  /** Dismiss the active post-turn prediction (Escape on empty field). */
+  dismiss: () => boolean;
 }
 
 /**
- * Debounced prefix match of `text` against the prompt history. The caller
- * passes "" while an IME composition is in flight so candidates never
- * produce a ghost.
+ * Ghost-text completion for the composer:
+ * 1. When the input is empty (or matches the prefix of the session's post-turn
+ *    Codex GPT prediction), shows the predicted next prompt.
+ * 2. When typing >= 2 chars, debounces prefix match against prompt history.
+ * The caller passes "" and undefined sessionKey while an IME composition is in
+ * flight so candidates never produce a ghost.
  */
-export function usePromptCompletion(text: string, debounceMs = 100): PromptCompletion {
+export function usePromptCompletion(
+  text: string,
+  debounceMs = 100,
+  sessionKey?: string,
+): PromptCompletion {
   const [suggestion, setSuggestion] = useState<string | null>(null);
   const [enabled, setEnabled] = useState(isPromptHistoryEnabled);
+  const [prediction, setPrediction] = useState<string | null>(() =>
+    getComposerPrediction(sessionKey),
+  );
 
   // The settings toggle fires the same change event as history mutations.
   useEffect(
     () => subscribePromptHistory(() => setEnabled(isPromptHistoryEnabled())),
     [],
   );
+
+  useEffect(() => {
+    setPrediction(getComposerPrediction(sessionKey));
+    return subscribeComposerPrediction(() =>
+      setPrediction(getComposerPrediction(sessionKey)),
+    );
+  }, [sessionKey]);
 
   useEffect(() => {
     if (!enabled) {
@@ -51,15 +75,36 @@ export function usePromptCompletion(text: string, debounceMs = 100): PromptCompl
   }, [text, debounceMs, enabled]);
 
   const clean = text.replace(INVISIBLE_CHARS_RE, "").trim();
+  const predictionMatch =
+    prediction !== null &&
+    (clean.length === 0 ||
+      (prediction.length > clean.length &&
+        prediction.toLowerCase().startsWith(clean.toLowerCase())))
+      ? prediction
+      : null;
+  const activeSuggestion = predictionMatch ?? suggestion;
   const suffix =
-    suggestion !== null && suggestion.length > clean.length ? suggestion.slice(clean.length) : "";
+    activeSuggestion !== null && activeSuggestion.length > clean.length
+      ? activeSuggestion.slice(clean.length)
+      : "";
 
   const accept = useCallback((): string | null => {
+    if (prediction !== null && sessionKey) {
+      clearComposerPrediction(sessionKey);
+    }
     setSuggestion(null);
-    return suggestion;
-  }, [suggestion]);
+    return activeSuggestion;
+  }, [activeSuggestion, prediction, sessionKey]);
 
-  return { suffix, accept };
+  const dismiss = useCallback((): boolean => {
+    if (prediction !== null && sessionKey) {
+      clearComposerPrediction(sessionKey);
+      return true;
+    }
+    return false;
+  }, [prediction, sessionKey]);
+
+  return { suffix, accept, dismiss };
 }
 
 interface HistoryKeyEvent {

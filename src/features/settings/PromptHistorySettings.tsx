@@ -12,6 +12,10 @@ import {
   SettingsSectionLabel,
 } from "@/components/application/settings/settings-rows";
 import {
+  isComposerPredictionEnabled,
+  setComposerPredictionEnabled,
+} from "@/features/chat/composer-prediction";
+import {
   clearPromptHistory,
   deletePrompt,
   getPromptHistoryWithCounts,
@@ -23,9 +27,33 @@ import { cx } from "@/utils/cx";
 
 /**
  * Settings entries for composer prompt history (ghost completion + ↑↓
- * recall): a toggle row for the behavior card, and a collapsible manager
- * section listing every recorded prompt with its usage count.
+ * recall) and post-turn composer prompt prediction: toggle rows for the
+ * behavior card, and a collapsible manager section listing every recorded
+ * prompt with its usage count.
  */
+
+/** Behavior-card row: master switch for post-turn Codex GPT prompt prediction. */
+export function ComposerPredictionToggleRow() {
+  const { t } = useTranslation();
+  const [enabled, setEnabled] = useState(isComposerPredictionEnabled);
+  return (
+    <SettingsRow
+      anchor="composerPrediction"
+      label={t("settings.composerPrediction")}
+      description={t("settings.composerPredictionDesc")}
+    >
+      <Switch
+        size="sm"
+        aria-label={t("settings.composerPrediction")}
+        isSelected={enabled}
+        onChange={(next) => {
+          setComposerPredictionEnabled(next);
+          setEnabled(next);
+        }}
+      />
+    </SettingsRow>
+  );
+}
 
 /** Behavior-card row: master switch for completion and history recall. */
 export function PromptHistoryToggleRow() {

@@ -110,13 +110,27 @@ pub struct SessionFile {
 
 pub fn stat_signature(path: &Path) -> Option<(i64, i64)> {
     let meta = std::fs::metadata(path).ok()?;
-    let mtime_ms = meta
+    let mut size = meta.len() as i64;
+    let mut mtime_ms = meta
         .modified()
         .ok()?
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
         .as_millis() as i64;
-    Some((meta.len() as i64, mtime_ms))
+    let mut wal_path = path.as_os_str().to_os_string();
+    wal_path.push("-wal");
+    if let Ok(wal_meta) = std::fs::metadata(Path::new(&wal_path)) {
+        size = size.saturating_add(wal_meta.len() as i64);
+        if let Some(wal_mtime_ms) = wal_meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)
+        {
+            mtime_ms = mtime_ms.max(wal_mtime_ms);
+        }
+    }
+    Some((size, mtime_ms))
 }
 
 /// &str entry point: skips the `Value::String` wrapper allocation the

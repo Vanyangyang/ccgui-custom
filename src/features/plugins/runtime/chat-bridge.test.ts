@@ -90,7 +90,7 @@ describe("planned host chat bridge handoff", () => {
     expect(next.host.send).not.toHaveBeenCalled();
     await expect(next.bridge.submit({ requestId: "new-while-paused", target: a, prompt: "blocked" })).rejects.toThrow(/paused/);
     await checkpoint.resume(); await sent(next);
-    expect(next.host.send).toHaveBeenCalledWith(a, "preserved queue", receipt.runId);
+    expect(next.host.send).toHaveBeenCalledWith(a, "preserved queue", receipt.runId, undefined);
     expect((await next.bridge.submit({ requestId: "queued-cut", target: a, prompt: "preserved queue" })).runId).toBe(receipt.runId);
     expect(next.host.send).toHaveBeenCalledTimes(1);
   });
@@ -478,7 +478,7 @@ describe("desktop existing host chat request ledger", () => {
     await vi.waitFor(async () => expect((await f.bridge.receipt("claude-wire"))?.status).toBe("executing"));
     f.event(receipt, 4, "delta", "wire result"); f.event(receipt, 5, "done", { usage: null });
     await vi.waitFor(async () => expect(await f.bridge.receipt("claude-wire")).toMatchObject({ status: "completed", text: "wire result", target: a }));
-    expect(await f.bridge.current()).toMatchObject(b); expect(f.host.send).toHaveBeenCalledWith(a, "act", receipt.runId);
+    expect(await f.bridge.current()).toMatchObject(b); expect(f.host.send).toHaveBeenCalledWith(a, "act", receipt.runId, undefined);
     expect(changes.mock.calls.filter(([value]) => value.status === "completed")).toHaveLength(1);
   });
 
@@ -585,5 +585,74 @@ describe("desktop existing host chat request ledger", () => {
     await new Promise((r) => setTimeout(r, 0));
     expect(old.data.get(`one:${hostChatLedgerKey(a)}`)).toEqual(saved);
     expect(await replacement.bridge.receipt("new")).not.toBeNull();
+  });
+});
+
+describe("host-only queue controls for waiting requests", () => {
+  /** Target A runs nothing but holds composer-queued rows: busy for ordinary
+   *  requests, idle for one the user sent ahead. */
+  function composerQueued(f: ReturnType<typeof fixture>) {
+    const inspect = f.host.inspect;
+    f.host.inspect = (target, options) => {
+      const session = inspect(target, options);
+      return session && target.nativeSessionId === a.nativeSessionId && !options?.priority ? { ...session, status: "busy" } : session;
+    };
+  }
+
+  it("sends a prioritized request ahead of the target's queued rows and earlier requests, keeping its run identity", async () => {
+    const f = fixture(); composerQueued(f);
+    const first = await f.bridge.submit({ requestId: "first", target: a, prompt: "first" });
+    const second = await f.bridge.submit({ requestId: "second", target: a, prompt: "second" });
+    expect([first.status, second.status]).toEqual(["queued", "queued"]);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(f.host.send).not.toHaveBeenCalled();
+
+    const prioritized = await f.bridge.prioritize("second");
+    expect(prioritized?.status).toBe("queued");
+    await sent(f);
+    expect(vi.mocked(f.host.send).mock.calls[0]).toEqual([a, "second", second.runId, { priority: true }]);
+    expect((await f.bridge.receipt("first"))?.status).toBe("queued");
+    const saved = f.data.get(`one:${hostChatLedgerKey(a)}`) as { entries: Array<{ receipt: HostChatReceipt; priority?: true }> };
+    expect(saved.entries.find((entry) => entry.receipt.requestId === "second")?.priority).toBe(true);
+  });
+
+  it("waits for a running turn even when prioritized", async () => {
+    const f = fixture(); f.sessions.set(a.nativeSessionId, { ...a, status: "busy" });
+    await f.bridge.submit({ requestId: "waits", target: a, prompt: "waits" });
+    await f.bridge.prioritize("waits");
+    await new Promise((r) => setTimeout(r, 0));
+    expect(f.host.send).not.toHaveBeenCalled();
+    f.idle(a);
+    await sent(f);
+  });
+
+  it("cancels only a request that has not started and never sends it", async () => {
+    const f = fixture(); f.sessions.set(a.nativeSessionId, { ...a, status: "busy" });
+    await f.bridge.submit({ requestId: "withdrawn", target: a, prompt: "withdrawn" });
+    const cancelled = await f.bridge.cancel("withdrawn");
+    expect(cancelled).toMatchObject({ status: "failed", error: "Cancelled by the user before delivery" });
+    expect(await f.bridge.prioritize("withdrawn")).toMatchObject({ status: "failed" });
+    f.idle(a);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(f.host.send).not.toHaveBeenCalled();
+
+    await f.bridge.submit({ requestId: "started", target: b, prompt: "started" });
+    await sent(f);
+    await vi.waitFor(async () => expect((await f.bridge.receipt("started"))?.status).toBe("executing"));
+    expect(await f.bridge.cancel("started")).toMatchObject({ status: "executing" });
+    expect(await f.bridge.cancel("missing")).toBeNull();
+  });
+
+  it("rejects a ledger whose priority marker is malformed", async () => {
+    const data = new Map<string, unknown>();
+    const f = fixture("one", data); composerQueued(f);
+    await f.bridge.submit({ requestId: "kept", target: a, prompt: "kept" });
+    const key = `one:${hostChatLedgerKey(a)}`;
+    const ledger = structuredClone(data.get(key)) as { entries: Array<Record<string, unknown>> };
+    ledger.entries[0].priority = "yes";
+    data.set(key, ledger);
+    f.bridge.dispose();
+    const replacement = fixture("one", data);
+    await expect(replacement.bridge.ready()).rejects.toThrow("Invalid host chat request ledger");
   });
 });

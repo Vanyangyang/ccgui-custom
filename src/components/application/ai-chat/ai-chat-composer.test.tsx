@@ -2,6 +2,11 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { HashRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  clearAllComposerPredictions,
+  setComposerPrediction,
+  setComposerPredictionEnabled,
+} from "@/features/chat/composer-prediction";
 import i18n from "@/lib/i18n";
 import { Composer, type ComposerProps } from "./ai-chat-composer";
 import { extractText, getCaretOffset } from "./file-tags";
@@ -101,5 +106,45 @@ describe("Composer 草稿恢复", () => {
     expect(container.querySelector("button[aria-label='停止']")).not.toBeNull();
     expect(container.querySelector("button[aria-label='发送']")).toBeNull();
     expect(container.textContent).not.toContain("引导");
+  });
+
+  it("空输入框展示回合结束后的预测灰字，Tab 填入草稿且不自动发送，Esc 隐藏", async () => {
+    clearAllComposerPredictions();
+    setComposerPredictionEnabled(true);
+    const key = "claude:s-1:/repo";
+    const onValueChange = vi.fn();
+    const onSubmit = vi.fn();
+    setComposerPrediction(key, "提交当前改动");
+
+    const el = await render("", { sessionKey: key, onValueChange, onSubmit });
+    expect(el.getAttribute("data-completion-suffix")).toBe("提交当前改动");
+
+    // Escape dismisses the prediction without altering the empty draft.
+    await act(async () => {
+      el.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    });
+    expect(el.getAttribute("data-completion-suffix")).toBeNull();
+    expect(extractText(el)).toBe("");
+
+    // New post-turn prediction arrives; running state hides it until idle.
+    await act(async () => {
+      setComposerPrediction(key, "运行测试并修复报错");
+    });
+    expect(el.getAttribute("data-completion-suffix")).toBe("运行测试并修复报错");
+
+    await render("", { sessionKey: key, streaming: true, onValueChange, onSubmit });
+    expect(el.getAttribute("data-completion-suffix")).toBeNull();
+
+    // Idle again: Tab accepts into the editable field without submitting.
+    await render("", { sessionKey: key, streaming: false, onValueChange, onSubmit });
+    expect(el.getAttribute("data-completion-suffix")).toBe("运行测试并修复报错");
+    await act(async () => {
+      el.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", bubbles: true }));
+    });
+    expect(extractText(el)).toBe("运行测试并修复报错");
+    expect(getCaretOffset(el)).toBe("运行测试并修复报错".length);
+    expect(onValueChange).toHaveBeenCalledWith("运行测试并修复报错");
+    expect(onSubmit).not.toHaveBeenCalled();
+    expect(el.getAttribute("data-completion-suffix")).toBeNull();
   });
 });

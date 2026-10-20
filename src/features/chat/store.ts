@@ -15,7 +15,7 @@ import { createWorkspaceActions } from "./store/workspaces";
 import { createPreferenceActions } from "./store/preferences";
 import { createComposerActions } from "./store/composer";
 import type { ChatStore } from "./store/types";
-import { registerChatCheckpoint } from "./store/runtime-checkpoint";
+import { hasRestoredChatCheckpoint, registerChatCheckpoint, unreadableUsageKeys } from "./store/runtime-checkpoint";
 
 // Facade re-exports: callers keep importing everything from "../store".
 export { parseDraftSessionKey, sessionKey } from "./store/persistence";
@@ -123,6 +123,13 @@ export const useChatStore = create<ChatStore>((set, get) => {
         ["awaiting_review", "deferred", "submitting"].includes(row.planReview?.status ?? ""))) continue;
       if (!session.streaming) drainQueue(key);
       else if (session.nativeActivity === "waiting") drainQueueLive(key);
+    }
+    // The restored usage came from the previous runtime; re-read the ones the
+    // gauge cannot show so this runtime's history parser gets a say.
+    if (hasRestoredChatCheckpoint(get)) {
+      for (const key of unreadableUsageKeys(get())) {
+        void get().refreshSessionUsage(key).catch(() => {});
+      }
     }
   };
 

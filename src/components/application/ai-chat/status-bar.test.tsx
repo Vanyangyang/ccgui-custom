@@ -32,4 +32,26 @@ describe("status bar context capacity", () => {
     expect(container.textContent).toBe("Context windowUnknown");
     expect(container.textContent).not.toContain("200");
   });
+
+  it("displays measured request counts inside the popover instead of Unknown when occupancy is unknown", async () => {
+    await act(async () =>
+      root.render(
+        <StatusBar
+          contextMax={256_000}
+          contextMaxKnown
+          contextOccupancyKnown={false}
+          contextShowCapacity
+          contextCountsKnown
+          contextLabel="Latest model request"
+          contextSegments={[{ label: "Input", tokens: 54_900 }]}
+        />,
+      ),
+    );
+    const trigger = container.querySelector("button")!;
+    await act(async () => trigger.click());
+    const dialogText = document.querySelector('[role="dialog"]')?.textContent ?? "";
+    expect(dialogText).toContain("Latest model request");
+    expect(dialogText).toContain("54.9k");
+    expect(dialogText).not.toContain("Unknown / 256k");
+  });
 });

@@ -79,6 +79,23 @@ describe("a settled turn re-reads the live occupancy from session history", () =
     expect(refresh).toHaveBeenCalledWith(KEY);
   });
 
+  it("re-reads the latest usage snapshot once an agy turn settles", () => {
+    const refresh = vi.fn(async () => {});
+    const agyTab = { engine: "agy", sessionId: "sess-1", workspacePath: WS };
+    useChatStore.setState({
+      openTabs: [agyTab],
+      active: agyTab,
+      activeEngine: "agy",
+      bySession: { ["agy/sess-1"]: { ...EMPTY_SESSION } },
+    });
+
+    handleEngineEvents([ev("run-agy", 3, { usage: { ...TURN_SUM } }, "agy")], deps(refresh));
+
+    expect(refresh).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(400);
+    expect(refresh).toHaveBeenCalledWith("agy/sess-1");
+  });
+
   it("does not re-read for other engines' plain turns", () => {
     const refresh = vi.fn(async () => {});
 

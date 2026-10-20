@@ -3,6 +3,8 @@ import type { ChatStore } from "./types";
 import { askLoops, type AskLoop } from "./ask-loop";
 import { captureEngineEventRuntime, restoreEngineEventRuntime, engineEventCheckpointBlockers } from "./engine-events";
 import { captureStreamRuntime, restoreStreamRuntime, flushPendingStreams, type StreamRuntimeCheckpoint } from "./stream";
+import { sessionKey } from "./persistence";
+import { hasReadableUsage } from "../usage";
 
 const STATE_KEYS = [
   "workspaces", "sessions", "archivedSessionKeys", "engines", "active", "openTabs", "activeEngine", "permission",
@@ -21,6 +23,30 @@ interface ChatCheckpoint {
 
 const restored = new WeakSet<() => ChatStore>();
 export const hasRestoredChatCheckpoint = (get: () => ChatStore): boolean => restored.has(get);
+
+/** Idle sessions whose restored usage the context gauge cannot read.
+ *  A checkpoint carries the previous renderer's usage verbatim, and a session
+ *  that already has messages never re-reads its history, so a snapshot the
+ *  previous backend mis-parsed (Claude's all-zero `<synthetic>` error notice)
+ *  would keep the gauge on "unknown" until the next turn — even after the
+ *  update that fixed the parser. These keys get one usage re-read on resume. */
+export function unreadableUsageKeys(state: Pick<ChatStore, "bySession" | "openTabs">): string[] {
+  const keys: string[] = [];
+  const seen = new Set<string>();
+  const check = (key: string) => {
+    if (!key || key.startsWith("new:") || seen.has(key)) return;
+    seen.add(key);
+    const session = state.bySession[key];
+    if (!session || session.streaming || session.messages.length === 0) return;
+    if (hasReadableUsage(session.usage)) return;
+    keys.push(key);
+  };
+  for (const tab of state.openTabs) {
+    if (tab.sessionId) check(sessionKey(tab.engine, tab.sessionId, tab.workspacePath));
+  }
+  for (const key of Object.keys(state.bySession)) check(key);
+  return keys;
+}
 
 const object = (value: unknown): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value);
 function parseCheckpoint(value: unknown): ChatCheckpoint {
@@ -75,6 +101,14 @@ export function createChatCheckpointParticipant(store: ChatCheckpointStore, get:
       const snapshot = parseCheckpoint(value);
       // Select only data keys. A malformed checkpoint cannot replace actions.
       const data = Object.fromEntries(STATE_KEYS.map((key) => [key, snapshot.state[key]])) as ChatData;
+      for (const session of Object.values(data.bySession)) {
+        if (session.messages.some((m) => m.model === "<synthetic>")) {
+          session.messages = session.messages.map((m) =>
+            m.model === "<synthetic>" ? { ...m, model: undefined, usage: undefined } : m,
+          );
+        }
+        if (session.activeModel === "<synthetic>") session.activeModel = null;
+      }
       restoreStreamRuntime(snapshot.stream);
       restoreEngineEventRuntime(snapshot.events);
       askLoops.clear(); for (const [key, loop] of snapshot.asks) askLoops.set(key, loop);

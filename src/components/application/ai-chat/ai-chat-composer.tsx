@@ -110,6 +110,8 @@ export interface ComposerProps {
   onPasteImages?: (files: File[]) => void;
   /** Active workspace root: enables the `@` file-mention picker. */
   workspacePath?: string;
+  /** Session identity key for post-turn composer prompt prediction. */
+  sessionKey?: string;
 }
 
 export function Composer({
@@ -128,6 +130,7 @@ export function Composer({
   inputRef,
   onPasteImages,
   workspacePath,
+  sessionKey,
 }: ComposerProps = {}) {
   const editableRef = useRef<HTMLDivElement>(null);
   // IME composition tracking (desktop-cc-gui parity): WKWebView fires
@@ -197,9 +200,13 @@ export function Composer({
     clearSelectedAgent,
   } = pickers;
 
-  // Ghost-text completion from prompt history (desktop-cc-gui parity):
+  // Ghost-text completion from post-turn prediction or prompt history:
   // suffix is painted via data-completion-suffix and accepted with Tab.
-  const completion = usePromptCompletion(isComposing ? "" : (value ?? ""));
+  const completion = usePromptCompletion(
+    isComposing ? "" : (value ?? ""),
+    100,
+    isComposing || streaming ? undefined : sessionKey,
+  );
 
   // Replace the field's content programmatically: rebuild DOM from text and
   // put the caret at its end. Shared by the external-value sync (draft
@@ -326,6 +333,7 @@ export function Composer({
           promptOpen={prompt != null}
           completionSuffix={completion.suffix}
           acceptCompletion={completion.accept}
+          dismissCompletion={completion.dismiss}
           setEditableText={setEditableText}
           handleHistoryKeyDown={handleHistoryKeyDown}
           mentionMenuRef={mentionMenuRef}

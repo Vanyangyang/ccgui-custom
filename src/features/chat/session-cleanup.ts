@@ -4,7 +4,7 @@ import { ipc, type SessionMeta, type HandoffCompressionSelection } from "@/lib/i
 import { EMPTY_SESSION, type SessionState } from "./store/stream";
 import type { LeaderSnapshot } from "@/features/leader/types";
 import { isLeaderGroupMember } from "@/features/leader/types";
-import { sessionKey } from "./store/persistence";
+import { parseDraftSessionKey, sessionKey } from "./store/persistence";
 import { useChatStore } from "./store";
 import {
   isHandoffCompressionModel,
@@ -475,7 +475,7 @@ function handoffSummarySection(currentDraft: string) {
   const headerIdx = findHandoffHeaderIndex(currentDraft);
   if (headerIdx === -1) return null;
   const afterHeader = currentDraft.slice(headerIdx);
-  const footerMatch = /\r?\n\r?\n接下来请继续：|\r?\n接下来请继续：/.exec(afterHeader);
+  const footerMatch = /\r?\n\r?\n接下来请继续(?:[：:]|(?=\r?\n|$))|\r?\n接下来请继续(?:[：:]|(?=\r?\n|$))/.exec(afterHeader);
   if (!footerMatch || footerMatch.index <= 0) return null;
   const footerIdx = headerIdx + footerMatch.index;
 
@@ -637,9 +637,8 @@ export function resolveHandoffTargetDraftKey(
     if (matchingTab) {
       return sessionKey(matchingTab.engine, null, workspacePath);
     }
-    const suffix = `:new:${workspacePath}`;
     for (const [k, text] of Object.entries(s.drafts)) {
-      if (k.endsWith(suffix) && isHandoffDraft(text ?? "", entry)) {
+      if (parseDraftSessionKey(k)?.workspacePath === workspacePath && isHandoffDraft(text ?? "", entry)) {
         return k;
       }
     }
@@ -656,7 +655,7 @@ export function resolveHandoffTargetDraftKey(
 
 export function isHandoffDraft(currentDraft: string, entry: PendingHandoffSession): boolean {
   return currentDraft.includes(`承接上一会话「${entry.sourceTitle}」（${entry.sourceEngine}/${entry.sourceSessionId.slice(0, 8)}）：`)
-    && currentDraft.includes("接下来请继续：");
+    && /(?:^|\r?\n)接下来请继续(?:[：:]|(?=\r?\n|$))/.test(currentDraft);
 }
 
 function applyHandoffModeDraft(
@@ -1119,4 +1118,35 @@ export const useHandoffStore = create<HandoffStoreState>((set, get) => {
       }
     },
   };
+});
+
+useChatStore.subscribe((state, prevState) => {
+  if (state.openTabs === prevState.openTabs) return;
+  const byWorkspace = useHandoffStore.getState().byWorkspace;
+  for (const [workspacePath, entry] of Object.entries(byWorkspace)) {
+    if (!entry || entry.sending) continue;
+    const prevPendingTabs = prevState.openTabs.filter(
+      (t) => t.sessionId === null && t.workspacePath === workspacePath,
+    );
+    const nextPendingTabs = state.openTabs.filter(
+      (t) => t.sessionId === null && t.workspacePath === workspacePath,
+    );
+    if (prevPendingTabs.length > 0 && nextPendingTabs.length === 0) {
+      useHandoffStore.getState().dismissHandoff(workspacePath);
+      const promotedToSession =
+        state.openTabs.length === prevState.openTabs.length &&
+        state.openTabs.some((t) => t.sessionId !== null && t.workspacePath === workspacePath);
+      if (!promotedToSession) {
+        for (const closedTab of prevPendingTabs) {
+          const closedKey = sessionKey(closedTab.engine, null, workspacePath);
+          const closedDraft = useChatStore.getState().drafts[closedKey] ?? "";
+          if (isHandoffDraft(closedDraft, entry)) {
+            useChatStore.getState().setDraft(closedKey, "");
+          }
+        }
+      }
+    } else if (prevPendingTabs.length === 0 && nextPendingTabs.length > 0) {
+      useHandoffStore.getState().dismissHandoff(workspacePath);
+    }
+  }
 });

@@ -14,7 +14,7 @@ use std::sync::Arc;
 pub(super) static SCAN_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 /// Bump when title derivation changes so unchanged files still re-title.
-const TITLE_VERSION: &str = "13";
+const TITLE_VERSION: &str = "14";
 
 /// Titles matching these prefixes were derived before envelope stripping
 /// existed; one migration pass re-derives them even when files are unchanged.

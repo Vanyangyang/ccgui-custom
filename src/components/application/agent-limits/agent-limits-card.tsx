@@ -171,7 +171,7 @@ function ContextHeader({
       <span className="text-body-medium text-text-secondary">{label}</span>
       <span className="flex items-center gap-2">
         <span className="text-body-medium whitespace-nowrap text-text-secondary tabular-nums">
-          {occupancyKnown ? <>{formatTokens(used)} / {capacityKnown ? formatTokens(max) : unknown}{" "}</> : showCapacity && capacityKnown ? <>{unknown} / {formatTokens(max)}{" "}</> : countsKnown ? formatTokens(used) : unknown}
+          {occupancyKnown ? <>{formatTokens(used)} / {capacityKnown ? formatTokens(max) : unknown}{" "}</> : countsKnown ? formatTokens(used) : showCapacity && capacityKnown ? <>{unknown} / {formatTokens(max)}{" "}</> : unknown}
           {capacityKnown && occupancyKnown && <span className="text-text-primary">({Math.round(shareOf(used, max))}%)</span>}
         </span>
         <ChevronDown

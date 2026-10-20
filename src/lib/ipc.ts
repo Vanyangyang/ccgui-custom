@@ -147,6 +147,11 @@ export interface SuggestedSessionTitle {
   changed: boolean;
 }
 
+export interface PredictionTurn {
+  user: string;
+  assistant?: string;
+}
+
 /** Error strings `suggest_session_title` rejects with; anything else counts
  *  as "failed". */
 export type SuggestTitleErrorCode =
@@ -1542,6 +1547,8 @@ export const ipc = {
   suggestSessionTitle: (engine: string, sessionId: string) =>
     invoke<SuggestedSessionTitle>("suggest_session_title", { engine, sessionId }),
   autoTitleModels: () => invoke<AutoTitleModel[]>("auto_title_models"),
+  predictNextPrompt: (turns: PredictionTurn[]) =>
+    invoke<string | null>("predict_next_prompt", { turns }),
   summarizeSessionHandoff: (args: {
     engine: string;
     sessionId: string;

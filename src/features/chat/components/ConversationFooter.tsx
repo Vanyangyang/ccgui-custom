@@ -23,6 +23,7 @@ import { ErrorBanner } from "./ErrorBanner";
 import { sessionKey } from "../store";
 import { BtwOverlayCard } from "@/features/sidechat/BtwOverlayCard";
 import { HandoffOverlayCard } from "./HandoffOverlayCard";
+import { CrossSessionQueue } from "./CrossSessionQueue";
 import { ComposerSlotExtras } from "@/features/plugins/boundary/composer-slot-extras";
 import { COMPOSER_DRAFT_TOPIC, pluginBus } from "@/features/plugins/runtime/events";
 import { cursorContextOccupancyKnown, selectCursorContext } from "../usage";
@@ -230,6 +231,7 @@ function FooterComposer({
       permissionMenu={<>{permissionMenu}<ComposerSlotExtras slot="permissionMenu" /></>}
       onPasteImages={supportsImages ? onPasteImages : undefined}
       workspacePath={active?.workspacePath}
+      sessionKey={active ? sessionKey(active.engine, active.sessionId, active.workspacePath) : undefined}
     />
   );
 }
@@ -612,6 +614,7 @@ export function ConversationFooter({
           onClear={onClearQueued}
           className="mx-auto w-full max-w-3xl"
         />
+        <CrossSessionQueue active={active} className="mx-auto w-full max-w-3xl" />
         <ErrorBanner message={imageError} onDismiss={onDismissImageError} />
         <ErrorBanner message={branchError} onDismiss={onDismissBranchError} />
         <AttachmentChips

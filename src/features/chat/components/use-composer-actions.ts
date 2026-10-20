@@ -22,6 +22,7 @@ import {
 } from "../computer-use";
 import { useMcpPanel } from "@/features/mcp/panel";
 import { recordPrompt } from "../prompt-history";
+import { clearComposerPrediction } from "../composer-prediction";
 import { IMAGE_EXTENSIONS } from "./use-composer-images";
 import { isHandoffDraft, useHandoffStore } from "../session-cleanup";
 
@@ -96,12 +97,36 @@ export function useComposerActions({
           current.bySession[liveKey]?.draftLaunching,
       );
       const dispatch = (prompt: string, computerUse = false) => {
+        clearComposerPrediction(liveKey);
+        if (sessionKey && sessionKey !== liveKey) clearComposerPrediction(sessionKey);
         if (liveActive.sessionId === null && !isStreaming) {
           const clearSubmittedImages = captureImageSubmission(images);
           const pending = useHandoffStore.getState().byWorkspace[liveActive.workspacePath];
-          const handoff = pending && isHandoffDraft(prompt, pending) ? pending : undefined;
+          const ownedByOtherPendingTab =
+            !!pending &&
+            !isHandoffDraft(prompt, pending) &&
+            current.openTabs.some(
+              (tab) =>
+                tab.sessionId === null &&
+                tab.workspacePath === liveActive.workspacePath &&
+                tab.engine !== liveActive.engine &&
+                isHandoffDraft(
+                  current.drafts[toSessionKey(tab.engine, null, tab.workspacePath)] ?? "",
+                  pending,
+                ),
+            );
+          const handoff = pending && !ownedByOtherPendingTab ? pending : undefined;
           if (handoff) useHandoffStore.getState().setSending(liveActive.workspacePath, handoff.id, true);
-          const finishSubmission = () => {
+          let adoptedKey = liveKey;
+          const unsubscribeAdoption = useChatStore.subscribe((s) => {
+            const resolved = resolveLiveSessionKey(liveKey, s.openTabs);
+            if (resolved !== liveKey) adoptedKey = resolved;
+          });
+          const normalizeLf = (text: string) => text.replace(/\r\n/g, "\n");
+          const matchesSubmittedDraft = (draftText: string | undefined) =>
+            draftText !== undefined &&
+            (draftText === value || normalizeLf(draftText) === normalizeLf(value));
+          const finishSubmission = (result?: { runId: string; sessionId: string | null }) => {
             if (handoff) {
               // A dismissed or replaced handoff no longer owns this draft,
               // even if a newer draft happens to contain identical text.
@@ -109,14 +134,28 @@ export function useComposerActions({
               useHandoffStore.getState().completeHandoffOnSend(liveActive.workspacePath, handoff.id);
             }
             const nextHandoff = useHandoffStore.getState().byWorkspace[liveActive.workspacePath];
-            if (nextHandoff && nextHandoff.id !== handoff?.id) return;
+            if (nextHandoff && nextHandoff.id !== pending?.id) return;
             const stateNow = useChatStore.getState();
-            const targetKey = resolveLiveSessionKey(liveKey, stateNow.openTabs);
+            const resultKey = result?.sessionId
+              ? toSessionKey(liveActive.engine, result.sessionId, liveActive.workspacePath)
+              : undefined;
+            const targetKey =
+              adoptedKey !== liveKey
+                ? adoptedKey
+                : resultKey && stateNow.openTabs.some((tab) => toSessionKey(tab.engine, tab.sessionId, tab.workspacePath) === resultKey)
+                  ? resultKey
+                  : resolveLiveSessionKey(liveKey, stateNow.openTabs);
             if (!stateNow.openTabs.some((tab) => toSessionKey(tab.engine, tab.sessionId, tab.workspacePath) === targetKey)) return;
-            if ((stateNow.drafts[targetKey] ?? stateNow.drafts[liveKey] ?? stateNow.drafts[sessionKey]) === value) {
+            if (matchesSubmittedDraft(stateNow.drafts[targetKey] ?? stateNow.drafts[liveKey] ?? stateNow.drafts[sessionKey])) {
               setDraft(targetKey, "");
             }
-            const mountedKey = resolveLiveSessionKey(source.current.key, stateNow.openTabs);
+            if (liveKey !== targetKey && matchesSubmittedDraft(stateNow.drafts[liveKey])) {
+              setDraft(liveKey, "");
+            }
+            const mountedKey =
+              adoptedKey !== liveKey && source.current.key === liveKey
+                ? adoptedKey
+                : resolveLiveSessionKey(source.current.key, stateNow.openTabs);
             if (!source.current.mounted || mountedKey !== targetKey) return;
             clearSubmittedImages();
           };
@@ -125,6 +164,7 @@ export function useComposerActions({
             onCommitted: handoff ? undefined : finishSubmission,
             onRunStarted: handoff ? finishSubmission : undefined,
           }, liveActive).finally(() => {
+            unsubscribeAdoption();
             if (handoff) useHandoffStore.getState().setSending(liveActive.workspacePath, handoff.id, false);
           });
           return;

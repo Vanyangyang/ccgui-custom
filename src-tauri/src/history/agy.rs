@@ -98,7 +98,11 @@ fn parse_agy_session_inner(path: &Path, with_usage: bool) -> ParsedSession {
         return ParsedSession { messages };
     }
     if let Some(usage) = read_native_context(path).as_ref().and_then(native_context_usage) {
-        if let Some(last) = messages.iter_mut().rev().find(|m| m.role == "assistant") {
+        let target_idx = messages
+            .iter()
+            .rposition(|m| m.role == "assistant")
+            .or_else(|| messages.len().checked_sub(1));
+        if let Some(last) = target_idx.and_then(|idx| messages.get_mut(idx)) {
             let target = last.usage.get_or_insert_with(|| serde_json::json!({}));
             if let (Some(target), Some(context)) = (target.as_object_mut(), usage.as_object()) {
                 target.extend(context.iter().map(|(key, value)| (key.clone(), value.clone())));
@@ -1331,6 +1335,23 @@ mod tests {
         assert_eq!(second["context_usage"]["input_tokens"], 1234);
         assert_eq!(second["model_context_window"], 10000);
         assert!(parsed.messages.iter().all(|m| m.duration_ms.is_none()));
+
+        let tool_only_path = root.join("conversations/tool-only.db");
+        let conn2 = rusqlite::Connection::open(&tool_only_path).unwrap();
+        conn2.execute_batch("CREATE TABLE steps(idx INTEGER PRIMARY KEY, step_type INTEGER, step_payload BLOB); CREATE TABLE gen_metadata(idx INTEGER PRIMARY KEY, data BLOB)").unwrap();
+        conn2.execute(
+            "INSERT INTO steps VALUES (0, ?1, ?2)",
+            rusqlite::params![STEP_USER, encode_bytes_field(19, &encode_string_field(2, "run tools"))],
+        ).unwrap();
+        conn2.execute("INSERT INTO gen_metadata VALUES (0,?1)", [encode_bytes_field(1, &meta)]).unwrap();
+        drop(conn2);
+        let parsed_tool_only = parse_agy_session(&tool_only_path);
+        assert_eq!(parsed_tool_only.messages.len(), 1);
+        let user_usage = parsed_tool_only.messages[0].usage.as_ref().unwrap();
+        assert_eq!(user_usage["context_usage_kind"], "current_context");
+        assert_eq!(user_usage["context_usage"]["input_tokens"], 1234);
+        assert_eq!(user_usage["model_context_window"], 10000);
+
         std::fs::remove_dir_all(root).unwrap();
     }
 
