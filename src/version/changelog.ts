@@ -29,6 +29,26 @@ export function changelogEntryFor(version: string): ChangelogEntry | undefined {
 
 export const CHANGELOG_DATA: ChangelogEntry[] = [
   {
+    version: "1.1.1+protected.35",
+    date: "2026-10-21",
+    content: {
+      zh: `定制维护版（Windows x64）
+- **必须完整重启升级**：本版使用 V2 持久化契约，与 protected.34 的 V1 不兼容。请先结束任务、退出全部 CC GUI 实例及相关 worker/supervisor，再运行完整 NSIS 安装包。保留原数据；首次新版启动会受保护地归档旧更新元数据。不能从 V1 无重启热升，也不要绕过 schema hash 校验或直接降回 V1。
+- **交接与子任务上下文**：交接草稿可选择目标工作区，保留人工编辑、引擎与模型选择；受管子任务的状态、结果摘录与待处理事项可进入交接摘要，不转移原有父子管理权限。
+- **发送与任务成本确认**：已有会话咨询和受管任务可进入真实的待成本批准状态，由界面人工批准或取消。普通发送与自动队列派发对达到 50k tokens 的上下文应用相应冷缓存确认规则，普通发送也检查模型变更；小上下文直接放行，未知用量不虚构费用。
+- **图片工具与通信面板**：会话图库支持切换、缩放、旋转、复制和保存；通信面板增加状态/类型筛选与紧凑/详细视图，保留图片批注与失败反馈。
+- **会话可靠性与模型范围**：完善草稿交接、队列控制、Claude/AGY 用量恢复和缓存证据；Cursor 请求遵守已保存的允许模型名单。子任务按实际启动时的模型策略校验。
+- **发行对应关系**：原始安装包对应 GitHub 提交 28dfbbda1，SHA-256 为 ae912a6b180c82627b691d56f2307712a97587b16e082f43417a7105c46d4fc8。本条版本记录为构建后的补记，原始安装包内未包含本条；详见仓库 docs/releases/1.1.1+protected.35.md。`,
+      en: `Maintained custom build (Windows x64)
+- **Full restart required**: this release uses the V2 persistence contract, incompatible with protected.34/V1. Finish tasks, exit every CC GUI instance and related worker/supervisor, then run the complete NSIS installer. Existing data is retained; the first V2 startup safely archives old update metadata. Do not hot-upgrade from V1, bypass schema-hash checks, or directly downgrade to V1.
+- **Handoff and child-task context**: choose a destination workspace while preserving edited drafts and engine/model selections. Managed child-task status, result excerpts and outstanding work can be included in handoff summaries without transferring parent/child management rights.
+- **Send and task cost review**: saved-chat consultations and managed tasks can enter a real pending-cost-approval state for a human to approve or cancel. Ordinary sends and automatic queue dispatch apply their cold-cache checks to contexts of at least 50k tokens; ordinary sends also check model changes. Smaller contexts pass through, and missing usage never becomes an invented cost.
+- **Image tools and communications**: browse chat galleries, zoom, rotate, copy and save images. Filter communications by status/type and switch between compact and detailed views, while preserving annotation and error feedback.
+- **Conversation reliability and model scope**: improve draft handoffs, queue controls, Claude/AGY usage recovery and cache evidence. Cursor requests respect the saved allowed-model list; subtask model policy is checked when work actually starts.
+- **Release provenance**: the original installer corresponds to GitHub commit 28dfbbda1, with SHA-256 ae912a6b180c82627b691d56f2307712a97587b16e082f43417a7105c46d4fc8. This changelog entry was added after that build and is not embedded in the original installer; see docs/releases/1.1.1+protected.35.md.`,
+    },
+  },
+  {
     version: "1.1.1+protected.34",
     date: "2026-10-19",
     content: {

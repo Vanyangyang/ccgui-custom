@@ -1,0 +1,42 @@
+{
+  "version": "1.1.1+protected.35",
+  "tag": "v1.1.1+protected.35",
+  "repository": "https://github.com/Vanyangyang/ccgui-custom",
+  "sourceCommit": "28dfbbda1bc21b6e2896c477c9fdac719401c76b",
+  "sourceTree": "a63a9bb9aaa0afe00a0aabc0759cb64526aedb7a",
+  "builtAt": "2026-10-20T20:37:19.747Z",
+  "platform": "windows-x86_64",
+  "installer": {
+    "name": "CC GUI_1.1.1+protected.35_x64-setup.exe",
+    "size": 16716076,
+    "sha256": "ae912a6b180c82627b691d56f2307712a97587b16e082f43417a7105c46d4fc8",
+    "authenticode": "NotSigned"
+  },
+  "buildExeSha256": "c0afe5367cb204adf86a5509736061dccdf28ff346134de226b920774961b1bd",
+  "packagedExeSha256": "fa5441c872a785174f70ace1dfe1469392692272aad906d42496d7d2f634f05d",
+  "packagedExeDifference": "Only the three-byte Tauri bundle marker changes from UNK to NSS",
+  "compatibility": {
+    "protocol": 1,
+    "checkpointSchema": 1,
+    "schemaHash": "9a17d672b37a0dec0ec7e5f1c1b8aee3ee1cea74619bfe88c86d4fcd17123a04",
+    "launchProtection": 1,
+    "frontendAssets": 1,
+    "frontendPackaging": "embedded",
+    "upgradeFromV1": "full-restart-and-complete-installer-required"
+  },
+  "validation": {
+    "maintenanceCheck": "passed on clean build source",
+    "maintenanceBuild": "passed on the same build source",
+    "vitestFilesPassed": 333,
+    "vitestTestsPassed": 3405,
+    "sendPathTestsPassed": 34,
+    "nativeExistingIgnoredTestsRetained": true,
+    "extractedFilesChecked": 263,
+    "localBuildPathMatches": 0,
+    "bundledSourceRootHintFiles": 0,
+    "packagedExecutableProbe": "passed",
+    "releaseMaintenanceReinstalledApplication": false
+  },
+  "changelogRecordedAfterBuild": true,
+  "notes": "The original installer predates the protected.35 CHANGELOG_DATA entry. Release documentation does not change the tagged build source or installer. No macOS or Linux installer is certified by this record."
+}

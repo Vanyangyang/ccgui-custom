@@ -13,6 +13,12 @@
 
 ---
 
+## 定制版版本与下载
+
+- 当前发布候选：**1.1.1+protected.35（Windows x64）**。查看[版本说明、升级步骤与校验信息](./docs/releases/1.1.1+protected.35.md)。
+- 定制安装包通过[本仓库 Releases](https://github.com/Vanyangyang/ccgui-custom/releases)分发；若尚未列出安装包，表示上传发布尚未完成。Git tag 的 Source code ZIP/TAR 是源码，不是安装包。
+- **从 protected.34/V1 升级须先结束任务并退出全部 CC GUI 实例，再安装完整 NSIS 包**，不能使用无重启热更新。主分支可能包含发布后的改动；安装包对应固定 tag 与 SHA-256，不随 main 自动变化。
+
 ## 原版仓库与鸣谢
 
 - **原版开源仓库**：[**zhukunpenglinyutong/desktop-cc-gui**](https://github.com/zhukunpenglinyutong/desktop-cc-gui)

@@ -13,6 +13,12 @@
 
 ---
 
+## Custom releases and downloads
+
+- Current release candidate: **1.1.1+protected.35 (Windows x64)**. See the [release notes, upgrade steps and checksums](./docs/releases/1.1.1+protected.35.md).
+- Custom installers are distributed through [this repository's Releases](https://github.com/Vanyangyang/ccgui-custom/releases). If no installer is listed yet, upload/publication is still pending. A tag's Source code ZIP/TAR contains source, not an installer.
+- **Upgrading from protected.34/V1 requires finishing tasks and exiting all CC GUI instances before running the complete NSIS installer**; it cannot be done as a restart-free live update. Main may contain later changes; an installer belongs to its fixed tag and SHA-256, not automatically to the latest main.
+
 ## Upstream Repository & Acknowledgments
 
 - **Upstream Open-Source Repository**: [**zhukunpenglinyutong/desktop-cc-gui**](https://github.com/zhukunpenglinyutong/desktop-cc-gui)
