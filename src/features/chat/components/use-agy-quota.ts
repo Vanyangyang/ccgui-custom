@@ -22,6 +22,7 @@ export function useAgyQuota(engine: string, providerId: string | undefined, work
     let pending: Promise<void> | undefined;
     let pendingCacheOnly = true;
     let pendingManual = false;
+    let hasQuota = false;
     let queued: "cache" | "active" | "manual" | undefined;
     let unlisten: (() => void) | undefined;
     let configTimer: number | undefined;
@@ -30,7 +31,7 @@ export function useAgyQuota(engine: string, providerId: string | undefined, work
     const visible = () => document.visibilityState !== "hidden";
     setState({ route, snapshot: EMPTY, loading: false });
     if (!enabled) { request.current = undefined; return; }
-    // Only an explicit click may start a CLI probe. Lifecycle events read cache.
+    // Native events read cache; visible lifecycle activity reads the quota API.
     const read = (cacheOnly = true, manual = false): Promise<void> => {
       if (!current() || !subscribed || (!cacheOnly && !visible())) return Promise.resolve();
       if (pending) {
@@ -53,9 +54,9 @@ export function useAgyQuota(engine: string, providerId: string | undefined, work
               readTimer = window.setTimeout(() => reject(new Error("AGY quota read timed out")), READ_TIMEOUT_MS);
             }),
           ]);
-          const snapshot = result.errorCode === "not_loaded" || result.errorCode === "quota_expired"
-            ? { ...result, errorCode: "probe_requires_manual" } : result;
+          const snapshot = result;
           if (current() && generation === startedGeneration) {
+            hasQuota = validAgyQuotaSnapshot(snapshot).groups.length > 0;
             setNow(Date.now() / 1000);
             setState({ route, snapshot, loading: false });
           }
@@ -68,7 +69,7 @@ export function useAgyQuota(engine: string, providerId: string | undefined, work
             setState(previous => ({ ...previous, loading: false }));
             const next = queued; queued = undefined;
             if (next === "manual") await read(false, true);
-            else if (next === "active") await read(true);
+            else if (next === "active") await read(false);
             else if (next === "cache") await read(true);
           }
         }
@@ -77,7 +78,11 @@ export function useAgyQuota(engine: string, providerId: string | undefined, work
     };
     request.current = { route, refresh: () => read(false, true) };
     const cacheChanged = () => { if (current()) { setNow(Date.now() / 1000); void read(true); } };
-    const refreshVisible = () => { if (visible()) { setNow(Date.now() / 1000); void read(true); } };
+    const refreshVisible = () => { if (visible()) { setNow(Date.now() / 1000); void read(false); } };
+    const bootstrap = async () => {
+      await read(true);
+      if (current() && visible() && !hasQuota) void read(false);
+    };
     const configChanged = () => {
       generation++;
       setState({ route, snapshot: EMPTY, loading: false });
@@ -89,14 +94,16 @@ export function useAgyQuota(engine: string, providerId: string | undefined, work
     };
     void listenAgyQuotaChanged(cacheChanged).then(stop => {
       if (!current()) { stop(); return; }
-      unlisten = stop; subscribed = true; cacheChanged();
-    }).catch(() => { if (current()) { subscribed = true; cacheChanged(); } });
+      unlisten = stop; subscribed = true; void bootstrap();
+    }).catch(() => { if (current()) { subscribed = true; void bootstrap(); } });
+    const pollTimer = window.setInterval(refreshVisible, 60_000);
     window.addEventListener("focus", refreshVisible);
     document.addEventListener("visibilitychange", refreshVisible);
     window.addEventListener(CLI_CONFIG_CHANGED_EVENT, configChanged);
     return () => {
       disposed = true; unlisten?.();
       window.clearTimeout(configTimer); window.clearTimeout(readTimer);
+      window.clearInterval(pollTimer);
       window.removeEventListener("focus", refreshVisible);
       document.removeEventListener("visibilitychange", refreshVisible);
       window.removeEventListener(CLI_CONFIG_CHANGED_EVENT, configChanged);

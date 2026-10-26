@@ -79,9 +79,9 @@ export interface AgyVertexConfigSnapshot {
 
 export interface AgyQuotaSnapshot {
   status: "ready" | "unavailable" | "stale";
-  groups: Array<{ id: "gemini" | "third_party"; windows: ClaudeQuotaSnapshot["windows"] }>;
+  groups: Array<{ id: "gemini" | "gemini_argon" | "third_party"; windows: ClaudeQuotaSnapshot["windows"] }>;
   collectedAt?: number;
-  source?: "agy_usage";
+  source?: "agy_usage" | "agy_quota_api";
   /** AI credits from native `/credits`; absent when the query failed. */
   credits?: { remaining: number };
   errorCode?: string;

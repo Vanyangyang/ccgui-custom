@@ -13,7 +13,7 @@ import {
 } from "@/features/settings/agy-vertex-guardrail";
 import { useDismissOnOutsidePress, useTriggerToggle } from "@/utils/use-dismiss-on-outside-press";
 import { QuotaFact, QuotaMeter } from "./quota-meter";
-import { agyQuotaModelGroup, compactQuotaReset, quotaResetCountdown, validAgyQuotaSnapshot } from "../agy-quota";
+import { agyQuotaErrorKey, agyQuotaModelGroup, compactQuotaReset, quotaResetCountdown, validAgyQuotaSnapshot } from "../agy-quota";
 import { QUOTA_CREDITS_MAX_AGE } from "../subscription-quota";
 
 export function AgyQuotaStatus({ snapshot, model, loading, refresh, now = Date.now() / 1000 }: {
@@ -27,7 +27,7 @@ export function AgyQuotaStatus({ snapshot, model, loading, refresh, now = Date.n
   const allowOpenChange = useTriggerToggle(open, triggerRef);
   const { credits: vertexCredits, sync: syncVertexCredits, syncing: vertexSyncing } = useAgyVertexCredits();
   const quota = snapshot ? validAgyQuotaSnapshot(snapshot, now) : undefined;
-  const activeId = agyQuotaModelGroup(model);
+  const activeId = agyQuotaModelGroup(model, quota?.groups);
   const active = quota?.groups.find(group => group.id === activeId);
   const percentage = (used: number | undefined) => used === undefined ? "—" : `${new Intl.NumberFormat(i18n.language, { maximumFractionDigits: 2 }).format(100 - used)}%`;
   const summary = activeId ? t("chat.agyQuotaRemainingSummary", { fiveHour: percentage(active?.windows.fiveHour?.usedPercentage), sevenDay: percentage(active?.windows.sevenDay?.usedPercentage) }) : t("chat.agyQuotaViewUsage");
@@ -38,11 +38,7 @@ export function AgyQuotaStatus({ snapshot, model, loading, refresh, now = Date.n
   });
   const stale = quota?.status === "stale";
   const error = quota?.errorCode;
-  const errorKey = error === "quota_expired" ? "chat.agyQuotaExpired" : error === "refresh_cooldown" ? "chat.agyQuotaCooldown"
-    : error === "slash_unexpanded" ? "chat.agyQuotaSlashUnexpanded" : error === "probe_requires_manual" ? "chat.agyQuotaProbeManual"
-    : error === "cli_version_unavailable" ? "chat.agyQuotaVersionUnavailable" : error === "probe_history_full" ? "chat.agyQuotaHistoryFull"
-    : error === "probe_history_unavailable" ? "chat.agyQuotaHistoryUnavailable"
-    : error && /query_|read_failed|cli_unavailable/.test(error) ? "chat.agyQuotaQueryFailed" : "chat.agyQuotaUnavailable";
+  const errorKey = agyQuotaErrorKey(error);
   const collectedAt = quota?.collectedAt;
   const validTime = quota?.status !== "unavailable" && collectedAt !== undefined && Number.isFinite(collectedAt) && collectedAt > 0 && collectedAt <= now && Number.isFinite(new Date(collectedAt * 1000).getTime());
 
@@ -60,10 +56,11 @@ export function AgyQuotaStatus({ snapshot, model, loading, refresh, now = Date.n
       className="max-h-[calc(100dvh-2rem)] w-72 max-w-[calc(100vw-2rem)] origin-bottom-right overflow-y-auto rounded-xl border border-border-button-default bg-background-primary-default p-3 shadow-dropdown outline-none transition duration-150 ease-out data-[entering]:scale-95 data-[entering]:opacity-0 data-[exiting]:scale-95 data-[exiting]:opacity-0 motion-reduce:transition-none">
       <Dialog aria-label={t("chat.agyQuotaDetails")} className="flex flex-col gap-3 outline-none">
         <h3 className="text-body-2-medium text-text-secondary">{t("chat.agyQuotaPlan")}</h3>
-        {(["gemini", "third_party"] as const).map(id => {
+        {(["gemini", "gemini_argon", "third_party"] as const).filter(id => id !== "gemini_argon" || activeId === id || quota?.groups.some(group => group.id === id)).map(id => {
           const group = quota?.groups.find(value => value.id === id);
-          return <section key={id} className="flex flex-col gap-2" aria-label={t(id === "gemini" ? "chat.agyQuotaGemini" : "chat.agyQuotaThirdParty")}>
-            <h4 className="text-caption-1-medium text-text-secondary">{t(id === "gemini" ? "chat.agyQuotaGemini" : "chat.agyQuotaThirdParty")}</h4>
+          const label = t(id === "gemini" ? "chat.agyQuotaGemini" : id === "gemini_argon" ? "chat.agyQuotaGeminiArgon" : "chat.agyQuotaThirdParty");
+          return <section key={id} className="flex flex-col gap-2" aria-label={label}>
+            <h4 className="text-caption-1-medium text-text-secondary">{label}</h4>
             <dl className="flex flex-col gap-2">{(["fiveHour", "sevenDay"] as const).map(name => {
               const window = group?.windows[name];
               return <div key={name} className="flex flex-col gap-1">

@@ -31,20 +31,21 @@ describe("AGY quota lifecycle", () => {
   async function render(provider?: string, path?: string, engine?: string, strict = false) {
     await act(async () => root.render(strict ? <StrictMode><Probe provider={provider} path={path} engine={engine} /></StrictMode> : <Probe provider={provider} path={path} engine={engine} />));
   }
-  it("reads only cache on startup and remount, even when no sample exists", async () => {
+  it("bootstraps once through the API when startup or remount has no cached sample", async () => {
     vi.mocked(ipc.agyQuotaRead).mockResolvedValue({ status: "unavailable", groups: [], errorCode: "not_loaded" });
     await render();
-    expect(controls.snapshot?.errorCode).toBe("probe_requires_manual");
+    expect(controls.snapshot?.errorCode).toBe("not_loaded");
     expect(controls.loading).toBe(false);
     await act(async () => changed());
     await render(undefined, "D:/other");
-    expect(vi.mocked(ipc.agyQuotaRead).mock.calls.map(([options]) => options?.cacheOnly)).toEqual([true, true, true]);
+    expect(vi.mocked(ipc.agyQuotaRead).mock.calls.map(([options]) => options?.cacheOnly)).toEqual([true, false, true, true, false]);
     expect(vi.mocked(ipc.agyQuotaRead).mock.calls.every(([options]) => options?.force === false)).toBe(true);
   });
-  it("never polls and uses only cache for focus, visibility and native events", async () => {
+  it("polls the API visibly without force and uses only cache for native events", async () => {
     await render();
     await act(async () => vi.advanceTimersByTimeAsync(60_000));
-    expect(ipc.agyQuotaRead).toHaveBeenCalledOnce();
+    expect(ipc.agyQuotaRead).toHaveBeenCalledTimes(2);
+    expect(ipc.agyQuotaRead).toHaveBeenLastCalledWith({ cacheOnly: false, force: false, providerId: undefined, workspacePath: "C:/project" });
     await act(async () => controls.refresh());
     expect(ipc.agyQuotaRead).toHaveBeenLastCalledWith({ cacheOnly: false, force: true, providerId: undefined, workspacePath: "C:/project" });
     await act(async () => changed());
@@ -56,7 +57,7 @@ describe("AGY quota lifecycle", () => {
     Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
     await act(async () => document.dispatchEvent(new Event("visibilitychange")));
     expect(ipc.agyQuotaRead).toHaveBeenCalledTimes(count + 1);
-    expect(ipc.agyQuotaRead).toHaveBeenLastCalledWith({ cacheOnly: true, force: false, providerId: undefined, workspacePath: "C:/project" });
+    expect(ipc.agyQuotaRead).toHaveBeenLastCalledWith({ cacheOnly: false, force: false, providerId: undefined, workspacePath: "C:/project" });
   });
   it("does not bootstrap hidden, remote, custom-provider or other-engine routes", async () => {
     Object.defineProperty(document, "visibilityState", { configurable: true, value: "hidden" });
@@ -117,7 +118,7 @@ describe("AGY quota lifecycle", () => {
     vi.mocked(ipc.agyQuotaRead).mockReturnValueOnce(hung.promise);
     await render();
     expect(controls.loading).toBe(false);
-    expect(vi.getTimerCount()).toBe(1);
+    expect(vi.getTimerCount()).toBe(2);
     await render("custom");
     expect(vi.getTimerCount()).toBe(0);
     await act(async () => hung.resolve(quota()));
@@ -135,6 +136,7 @@ describe("AGY quota lifecycle", () => {
     expect(controls.snapshot?.groups).toEqual([]);
     await act(async () => vi.advanceTimersByTimeAsync(250));
     expect(ipc.agyQuotaRead).toHaveBeenCalledTimes(3);
+    expect(ipc.agyQuotaRead).toHaveBeenLastCalledWith({ cacheOnly: false, force: false, providerId: undefined, workspacePath: "C:/project" });
   });
   it("retains stale values on transport failure and reset, but honors identity invalidation", async () => {
     vi.mocked(ipc.agyQuotaRead).mockResolvedValueOnce({ ...quota(), groups: [{ id: "gemini", windows: { fiveHour: { usedPercentage: 20, resetsAt: NOW + 5 } } }] });

@@ -1,4 +1,5 @@
-//! Native `/usage` quota query. Credential contents never enter this module.
+//! Read-only native account quota. Access tokens stay in the private access module.
+mod access;
 use crate::claude_quota::{QuotaWindow, QuotaWindows};
 use serde::Serialize;
 use serde_json::Value;
@@ -9,11 +10,9 @@ use std::{
     sync::{Arc, LazyLock, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::io::{AsyncRead, AsyncReadExt};
 
 const COOLDOWN: Duration = Duration::from_secs(60);
 const MAX_AGE: u64 = 3600;
-const MAX_OUTPUT: usize = 256 * 1024;
 const MAX_BINDINGS: usize = 16;
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -54,18 +53,25 @@ impl AgyQuotaSnapshot {
         if self.collected_at.is_none_or(|at| at > now) {
             self.groups.clear();
         }
-        if self.collected_at.is_none_or(|at| at > now || now - at >= MAX_AGE) {
+        if self
+            .collected_at
+            .is_none_or(|at| at > now || now - at >= MAX_AGE)
+        {
             self.credits = None;
         }
         self.groups.retain(|g| g.windows != QuotaWindows::default());
         if self.groups.is_empty() {
             self.status = "unavailable";
             self.error_code.get_or_insert("quota_not_available");
-        } else if self.groups.iter().flat_map(|g| [&g.windows.five_hour, &g.windows.seven_day])
-            .flatten().any(|w| w.resets_at.is_some_and(|at| at <= now))
+        } else if self
+            .groups
+            .iter()
+            .flat_map(|g| [&g.windows.five_hour, &g.windows.seven_day])
+            .flatten()
+            .any(|w| w.resets_at.is_some_and(|at| at <= now))
             || self
-            .collected_at
-            .is_some_and(|at| at > now || now.saturating_sub(at) >= 120)
+                .collected_at
+                .is_some_and(|at| at > now || now.saturating_sub(at) >= 120)
         {
             self.status = "stale";
         }
@@ -184,6 +190,10 @@ fn parse_usage(value: &Value, now: u64) -> Result<Vec<AgyQuotaGroup>, &'static s
             id: "third_party",
             windows: Default::default(),
         },
+        AgyQuotaGroup {
+            id: "gemini_argon",
+            windows: Default::default(),
+        },
     ];
     let mut seen = HashSet::new();
     let mut disabled_count = 0;
@@ -197,7 +207,9 @@ fn parse_usage(value: &Value, now: u64) -> Result<Vec<AgyQuotaGroup>, &'static s
         }
         for bucket in buckets {
             let id = bucket.get("id").and_then(Value::as_str).ok_or(invalid)?;
-            let (index, suffix) = if let Some(s) = id.strip_prefix("gemini-") {
+            let (index, suffix) = if let Some(s) = id.strip_prefix("argon-") {
+                (2, s)
+            } else if let Some(s) = id.strip_prefix("gemini-") {
                 (0, s)
             } else if let Some(s) = id.strip_prefix("3p-") {
                 (1, s)
@@ -256,7 +268,6 @@ fn parse_usage(value: &Value, now: u64) -> Result<Vec<AgyQuotaGroup>, &'static s
 #[derive(Clone)]
 struct Binding {
     stamp: String,
-    bin: String,
     workspace: PathBuf,
     provider: Option<String>,
 }
@@ -322,7 +333,23 @@ fn local_path(path: &Path) -> bool {
         && !text.starts_with("\\\\")
         && !text.starts_with("//")
 }
+fn credential_context_allowed() -> bool {
+    crate::development_profile::root().is_none()
+        && [
+            "ANTIGRAVITY_HOME",
+            "SSH_TTY",
+            "SSH_CONNECTION",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+        ]
+        .iter()
+        .all(|key| std::env::var_os(key).is_none_or(|value| value.is_empty()))
+}
 fn binding(provider: Option<&str>, workspace: Option<&Path>) -> Result<Binding, &'static str> {
+    // A shared native keyring is not evidence of identity in custom/isolated homes.
+    if !credential_context_allowed() {
+        return Err("unsupported_auth_context");
+    }
     let config = crate::config::read_config().map_err(|_| "provider_auth_unavailable")?;
     let section = config.section("agy").ok_or("custom_channel")?;
     if section.current.as_deref() == Some(crate::config::DISABLED_PROVIDER_ID) {
@@ -355,7 +382,8 @@ fn binding(provider: Option<&str>, workspace: Option<&Path>) -> Result<Binding, 
     }
     let settings = crate::settings::read_settings().map_err(|_| "cli_unavailable")?;
     let bin = crate::engine::engine_bin(&settings, "agy");
-    let resolved = dunce::canonicalize(&bin).map_err(|_| "cli_unavailable")?;
+    let resolved = dunce::canonicalize(crate::engine::resolve::resolve_launchable_cli_binary(&bin))
+        .map_err(|_| "cli_unavailable")?;
     if !resolved.is_file() || !local_path(&resolved) {
         return Err("cli_unavailable");
     }
@@ -371,296 +399,81 @@ fn binding(provider: Option<&str>, workspace: Option<&Path>) -> Result<Binding, 
     stamp_context_files(&mut stamp, &home, &user_home, &workspace)?;
     Ok(Binding {
         stamp: format!("{:x}", stamp.finalize()),
-        bin,
         workspace,
         provider: provider.map(str::to_owned),
     })
 }
-async fn read_bounded(reader: impl AsyncRead + Unpin) -> Result<Vec<u8>, &'static str> {
-    let mut bytes = Vec::new();
-    reader
-        .take(MAX_OUTPUT as u64 + 1)
-        .read_to_end(&mut bytes)
-        .await
-        .map_err(|_| "query_failed")?;
-    if bytes.len() > MAX_OUTPUT {
-        return Err("response_too_large");
-    }
-    Ok(bytes)
-}
-async fn run_slash(binding: &Binding, slash: &str, timeout: &str) -> Result<Value, &'static str> {
-    let mut cmd = crate::engine::command_for_binary(&binding.bin);
-    crate::engine::agy::configure_background_command(&mut cmd);
-    cmd.args([
-        "--output-format",
-        "json",
-        "--print-timeout",
-        timeout,
-        "--print",
-        slash,
-    ])
-    .current_dir(&binding.workspace)
-    .stdin(std::process::Stdio::null())
-    .stdout(std::process::Stdio::piped())
-    .stderr(std::process::Stdio::piped())
-    .kill_on_drop(true);
-    #[cfg(windows)]
-    cmd.creation_flags(0x08000000);
-    let mut child = cmd.spawn().map_err(|_| "cli_unavailable")?;
-    #[cfg(windows)]
-    let _job = crate::engine::job::assign_kill_on_close(&child).ok_or("cli_unavailable")?;
-    let stdout = child.stdout.take().ok_or("query_failed")?;
-    let stderr = child.stderr.take().ok_or("query_failed")?;
-    let (output, _, status) =
-        tokio::try_join!(read_bounded(stdout), read_bounded(stderr), async {
-            child.wait().await.map_err(|_| "query_failed")
-        })?;
-    if !status.success() {
-        return Err("query_failed");
-    }
-    serde_json::from_slice(&output).or_else(|_| {
-        output
-            .iter()
-            .position(|&b| b == b'{')
-            .ok_or("invalid_response")
-            .and_then(|i| serde_json::from_slice(&output[i..]).map_err(|_| "invalid_response"))
-    })
-}
-
-/// `/credits` reply: `{"command":{"name":"credits","data":{"remaining_credits":N}}}`.
-fn parse_credits(value: &Value) -> Option<f64> {
-    if value.get("status").and_then(Value::as_str) != Some("SUCCESS")
-        || value.pointer("/command/name").and_then(Value::as_str) != Some("credits")
+// Native API uses camelCase; reuse the strict numeric/window parser without
+// ever invoking the CLI or treating model text as a quota report.
+fn parse_api(value: &Value, now: u64) -> Result<Vec<AgyQuotaGroup>, &'static str> {
+    if value.get("error").is_some()
+        || value.get("code").is_some_and(|code| {
+            !matches!(code.as_i64(), Some(0 | 200)) && code.as_str() != Some("OK")
+        })
     {
-        return None;
+        return Err("invalid_response");
     }
-    value
-        .pointer("/command/data/remaining_credits")
-        .and_then(Value::as_f64)
-        .filter(|n| n.is_finite() && *n >= 0.0)
-}
-
-static CREDITS: LazyLock<Mutex<HashMap<String, (u64, f64)>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-fn remember_credits(stamp: &str, credits: Option<f64>) {
-    let mut map = CREDITS.lock().unwrap_or_else(|p| p.into_inner());
-    match credits {
-        Some(n) => {
-            if map.len() >= MAX_BINDINGS && !map.contains_key(stamp) {
-                if let Some(oldest) = map.iter().min_by_key(|(_, (at, _))| *at).map(|(key, _)| key.clone()) {
-                    map.remove(&oldest);
-                }
-            }
-            map.insert(stamp.to_owned(), (now_seconds(), n));
+    let payload = value
+        .get("response")
+        .or_else(|| value.get("summary"))
+        .unwrap_or(value);
+    let groups = payload
+        .get("groups")
+        .and_then(Value::as_array)
+        .ok_or("invalid_response")?;
+    if groups.len() > 32 {
+        return Err("invalid_response");
+    }
+    let mut mapped = Vec::new();
+    for group in groups {
+        let buckets = group
+            .get("buckets")
+            .and_then(Value::as_array)
+            .ok_or("invalid_response")?;
+        if buckets.len() > 64 {
+            return Err("invalid_response");
         }
-        // A failed or malformed read is unknown, not the previous balance.
-        None => { map.remove(stamp); }
-    }
-}
-
-/// Attach the credits recorded by the last successful `/credits` read for
-/// this exact binding. Unavailable snapshots never carry a balance.
-fn with_credits(mut snapshot: AgyQuotaSnapshot, stamp: &str) -> AgyQuotaSnapshot {
-    if snapshot.status == "unavailable" {
-        return snapshot;
-    }
-    let now = now_seconds();
-    snapshot.credits = CREDITS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .get(stamp)
-        .filter(|(at, _)| *at <= now && now - *at < MAX_AGE)
-        .map(|(_, remaining)| AgyCredits { remaining: *remaining });
-    snapshot
-}
-
-/// agy builds whose print mode sends `/usage` to the model before the slash
-/// command list has loaded (1.4.7: a ~37k input-token turn and no quota data).
-const KNOWN_UNEXPANDED: &[&str] = &["1.4.7"];
-const VERDICT_FILE: &str = "agy-quota-slash-verdicts.json";
-const MAX_VERDICTS: usize = 32;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum SlashVerdict {
-    Expands,
-    NotExpanded,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum Gate {
-    Run,
-    Skip(&'static str),
-}
-
-/// A print-mode probe of an unverified build may become a billed model turn,
-/// so only the user can start it; known or recorded failures never run again.
-fn gate(version: &str, recorded: Option<SlashVerdict>, manual: bool) -> Gate {
-    if !manual {
-        return Gate::Skip("probe_requires_manual");
-    }
-    let Some(base) = version_base(version) else {
-        return Gate::Skip("cli_version_unavailable");
-    };
-    if KNOWN_UNEXPANDED.contains(&base) || recorded == Some(SlashVerdict::NotExpanded) {
-        return Gate::Skip("slash_unexpanded");
-    }
-    Gate::Run
-}
-
-fn version_base(version: &str) -> Option<&str> {
-    let version = version.strip_prefix('v').unwrap_or(version);
-    let base = version.split(['-', '+']).next()?;
-    let parts: Vec<_> = base.split('.').collect();
-    (parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())))
-        .then_some(base)
-}
-
-/// An expanded slash command replies with `command`; a model turn does not.
-fn slash_verdict(value: &Value) -> Option<SlashVerdict> {
-    if value.get("conversation_id").is_some() || value.get("response").is_some() {
-        Some(SlashVerdict::NotExpanded)
-    } else if value.get("command").is_some() {
-        Some(SlashVerdict::Expands)
-    } else {
-        None
-    }
-}
-
-struct VerdictStore {
-    path: PathBuf,
-    key: String,
-}
-static VERDICT_LOCK: Mutex<()> = Mutex::new(());
-// A failed write must not let another request repeat a possibly billed probe.
-// Keep at most MAX_VERDICTS paths, then fail closed for the whole process.
-static FAILED_HISTORY: Mutex<(bool, Vec<PathBuf>)> = Mutex::new((false, Vec::new()));
-impl VerdictStore {
-    fn new(path: PathBuf, bin: &str, version: &str) -> Self {
-        Self { path, key: format!("{version}|{bin}") }
-    }
-    fn load_all(&self) -> Result<HashMap<String, SlashVerdict>, &'static str> {
-        let failed = FAILED_HISTORY.lock().unwrap_or_else(|p| p.into_inner());
-        if failed.0 || failed.1.contains(&self.path) { return Err("probe_history_unavailable"); }
-        drop(failed);
-        match std::fs::read_to_string(&self.path) {
-            Ok(raw) => serde_json::from_str(&raw).map_err(|_| "probe_history_unavailable"),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
-            Err(_) => Err("probe_history_unavailable"),
+        let mut output = Vec::new();
+        for bucket in buckets {
+            let id = bucket
+                .get("bucketId")
+                .or_else(|| bucket.get("id"))
+                .and_then(Value::as_str)
+                .ok_or("invalid_response")?;
+            let id = match id {
+                "gemini-wtu-5h" => "gemini-5h",
+                "gemini-wtu-weekly" => "gemini-weekly",
+                "gemini-argon-wtu-weekly" => "argon-weekly",
+                "gemini-argon-wtu-5h" => "argon-5h",
+                other => other,
+            };
+            let fraction = bucket
+                .get("remainingFraction")
+                .or_else(|| bucket.pointer("/remaining/remainingFraction"));
+            output.push(serde_json::json!({
+                "id": id, "window": bucket.get("window"),
+                "remaining_fraction": fraction, "reset_time": bucket.get("resetTime"),
+                "disabled": bucket.get("disabled"),
+            }));
         }
+        mapped.push(serde_json::json!({"buckets": output}));
     }
-    fn get(&self) -> Result<Option<SlashVerdict>, &'static str> {
-        Ok(self.load_all()?.get(&self.key).copied())
-    }
-    /// Persisted so a restart never repeats a probe that already cost a turn.
-    fn record(&self, verdict: SlashVerdict) -> Result<(), &'static str> {
-        let _lock = VERDICT_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let mut all = self.load_all()?;
-        if all.get(&self.key) == Some(&verdict) {
-            return Ok(());
-        }
-        if all.len() >= MAX_VERDICTS && !all.contains_key(&self.key) {
-            return Err("probe_history_full");
-        }
-        all.insert(self.key.clone(), verdict);
-        let persisted = (|| {
-            if let Some(parent) = self.path.parent() {
-                std::fs::create_dir_all(parent).map_err(|_| "probe_history_unavailable")?;
-            }
-            let text = serde_json::to_string_pretty(&all).map_err(|_| "probe_history_unavailable")?;
-            crate::settings::atomic_write(&self.path, &text).map_err(|_| "probe_history_unavailable")
-        })();
-        if persisted.is_err() {
-            let mut failed = FAILED_HISTORY.lock().unwrap_or_else(|p| p.into_inner());
-            if failed.1.len() >= MAX_VERDICTS { failed.0 = true; }
-            else if !failed.1.contains(&self.path) { failed.1.push(self.path.clone()); }
-        }
-        persisted
-    }
-}
-
-static VERSIONS: LazyLock<Mutex<HashMap<String, (u64, u64, String)>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// `agy --version` starts no language server and no model request.
-async fn cli_version(bin: &str) -> Option<String> {
-    let resolved = crate::engine::resolve::resolve_launchable_cli_binary(bin);
-    let bin = resolved.as_str();
-    let meta = std::fs::metadata(bin).ok()?;
-    let len = meta.len();
-    let mtime = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_secs();
-    if let Some((l, m, version)) = VERSIONS.lock().unwrap_or_else(|p| p.into_inner()).get(bin) {
-        if *l == len && *m == mtime {
-            return Some(version.clone());
-        }
-    }
-    let mut cmd = crate::engine::command_for_binary(bin);
-    crate::engine::agy::configure_background_command(&mut cmd);
-    cmd.arg("--version")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true);
-    #[cfg(windows)]
-    cmd.creation_flags(0x08000000);
-    let mut child = cmd.spawn().ok()?;
-    #[cfg(windows)]
-    let _job = crate::engine::job::assign_kill_on_close(&child)?;
-    let stdout = child.stdout.take()?;
-    let (output, status) = tokio::time::timeout(Duration::from_secs(5), async {
-        tokio::try_join!(read_bounded(stdout), async { child.wait().await.map_err(|_| "query_failed") })
-    }).await.ok()?.ok()?;
-    let version = String::from_utf8_lossy(&output).trim().to_owned();
-    if !status.success()
-        || version.is_empty()
-        || version.len() > 64
-        || !version.bytes().all(|b| b.is_ascii_graphic())
-        || version_base(&version).is_none()
-    {
-        return None;
-    }
-    let mut versions = VERSIONS.lock().unwrap_or_else(|p| p.into_inner());
-    if versions.len() >= MAX_BINDINGS && !versions.contains_key(bin) {
-        if let Some(key) = versions.keys().next().cloned() { versions.remove(&key); }
-    }
-    versions.insert(bin.to_owned(), (len, mtime, version.clone()));
-    Some(version)
-}
-
-async fn query(binding: &Binding, verdicts: &VerdictStore, version: &str, manual: bool) -> Result<Vec<AgyQuotaGroup>, &'static str> {
-    // This future is polled only after read_bound acquires the shared query lock.
-    if let Gate::Skip(code) = gate(version, verdicts.get()?, manual) { return Err(code); }
-    let all = verdicts.load_all()?;
-    if all.len() >= MAX_VERDICTS && !all.contains_key(&verdicts.key) {
-        return Err("probe_history_full");
-    }
-    let started = Instant::now();
-    let usage = tokio::time::timeout(Duration::from_secs(22), run_slash(binding, "/usage", "20s"))
-        .await.map_err(|_| "query_timeout")??;
-    match slash_verdict(&usage) {
-        Some(SlashVerdict::NotExpanded) => {
-            verdicts.record(SlashVerdict::NotExpanded)?;
-            return Err("slash_unexpanded");
-        }
-        _ => {}
-    }
-    let groups = parse_usage(&usage, now_seconds())?;
-    verdicts.record(SlashVerdict::Expands)?;
-    let credits = tokio::time::timeout(
-        Duration::from_secs(12).min(Duration::from_secs(24).saturating_sub(started.elapsed())),
-        run_slash(binding, "/credits", "10s"),
+    parse_usage(
+        &serde_json::json!({"status":"SUCCESS","command":{"name":"usage","data":{"groups":mapped}}}),
+        now,
     )
-    .await
-    .ok()
-    .and_then(Result::ok);
-    if credits.as_ref().and_then(slash_verdict) == Some(SlashVerdict::NotExpanded) {
-        remember_credits(&binding.stamp, None);
-        verdicts.record(SlashVerdict::NotExpanded)?;
-        return Err("slash_unexpanded");
-    }
-    remember_credits(&binding.stamp, credits.as_ref().and_then(parse_credits));
-    Ok(groups)
+}
+
+fn invalidates_account(code: &str) -> bool {
+    matches!(
+        code,
+        "auth_expired"
+            | "auth_changed"
+            | "auth_missing"
+            | "auth_invalid"
+            | "auth_read_failed"
+            | "quota_forbidden"
+    )
 }
 
 #[derive(Default)]
@@ -671,6 +484,8 @@ struct Entry {
 #[derive(Default)]
 pub struct AgyQuotaState {
     cache: Mutex<HashMap<String, Entry>>,
+    identities: Mutex<HashMap<String, (String, u64)>>,
+    identity_generation: std::sync::atomic::AtomicU64,
     query: tokio::sync::Mutex<()>,
     changed: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
@@ -685,21 +500,125 @@ pub(crate) fn install_events(app: &tauri::AppHandle) {
     }));
 }
 impl AgyQuotaState {
-    async fn read_checked(
-        &self, binding: &Binding, manual: bool, cache_only: bool, verdict_path: PathBuf,
-        current: impl Fn() -> bool,
-    ) -> AgyQuotaSnapshot {
-        if cache_only { return self.cached(&binding.stamp, current); }
-        if !manual {
-            let mut snapshot = self.cached(&binding.stamp, current);
-            if snapshot.error_code != Some("auth_changed") {
-                snapshot.error_code = Some("probe_requires_manual");
-            }
-            return snapshot;
+    fn forget_identity(&self, base: &str) {
+        self.forget_identity_if(base, None);
+    }
+
+    fn forget_identity_if(&self, base: &str, generation: Option<u64>) {
+        let mut identities = self.identities.lock().unwrap_or_else(|p| p.into_inner());
+        if generation.is_some_and(|generation| {
+            identities
+                .get(base)
+                .is_none_or(|(_, current)| *current != generation)
+        }) {
+            return;
         }
-        let version = cli_version(&binding.bin).await.unwrap_or_default();
-        let verdicts = VerdictStore::new(verdict_path, &binding.bin, &version);
-        self.read_bound(&binding.stamp, false, query(binding, &verdicts, &version, manual), current).await
+        identities.remove(base);
+        let prefix = format!("{base}:");
+        self.cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|key, _| !key.starts_with(&prefix));
+    }
+
+    fn bind_identity(&self, base: &str, fingerprint: &str) -> u64 {
+        let mut identities = self.identities.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((old, generation)) = identities.get(base) {
+            if old == fingerprint {
+                return *generation;
+            }
+        }
+        let generation = self
+            .identity_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let prefix = format!("{base}:");
+        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        cache.retain(|key, _| !key.starts_with(&prefix));
+        if identities.len() >= MAX_BINDINGS && !identities.contains_key(base) {
+            if let Some(old) = identities.keys().next().cloned() {
+                identities.remove(&old);
+                let prefix = format!("{old}:");
+                cache.retain(|key, _| !key.starts_with(&prefix));
+            }
+        }
+        identities.insert(base.to_owned(), (fingerprint.to_owned(), generation));
+        generation
+    }
+
+    async fn read_access<R, F, Fut>(
+        &self,
+        base_stamp: &str,
+        cache_only: bool,
+        read: R,
+        fetch: F,
+        current: impl Fn() -> bool,
+    ) -> AgyQuotaSnapshot
+    where
+        R: Fn() -> Result<access::Credential, &'static str>,
+        F: Fn(access::Credential) -> Fut,
+        Fut: std::future::Future<Output = Result<Value, &'static str>>,
+    {
+        if !current() {
+            self.forget_identity(base_stamp);
+            return AgyQuotaSnapshot::unavailable("auth_changed");
+        }
+        let mut credential = match read() {
+            Ok(value) => value,
+            Err(code) => {
+                self.forget_identity(base_stamp);
+                return AgyQuotaSnapshot::unavailable(code);
+            }
+        };
+        // AGY may have renewed its own token. Re-read once, never renew it here.
+        if !credential.usable(now_seconds()) {
+            credential = match read() {
+                Ok(value) if value.usable(now_seconds()) => value,
+                _ => {
+                    self.forget_identity(base_stamp);
+                    return AgyQuotaSnapshot::unavailable("auth_expired");
+                }
+            };
+        }
+        let fingerprint = credential.fingerprint.clone();
+        let generation = self.bind_identity(base_stamp, &fingerprint);
+        let stamp = format!("{base_stamp}:{generation}:{fingerprint}");
+        let still_current = || {
+            let same = current()
+                && self
+                    .identities
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get(base_stamp)
+                    .is_some_and(|(identity, epoch)| {
+                        identity == &fingerprint && *epoch == generation
+                    })
+                && read().is_ok_and(|value| {
+                    value.fingerprint == fingerprint && value.usable(now_seconds())
+                });
+            if !same {
+                self.forget_identity_if(base_stamp, Some(generation));
+            }
+            same
+        };
+        let query = async {
+            if !still_current() {
+                return Err("auth_changed");
+            }
+            let value = match fetch(credential).await {
+                Err("quota_unauthorized") => {
+                    // A new token may represent another account: do not replay under
+                    // the old binding. The next read establishes its own cache key.
+                    return Err(match read() {
+                        Ok(value) if value.fingerprint != fingerprint => "auth_changed",
+                        _ => "auth_expired",
+                    });
+                }
+                result => result?,
+            };
+            parse_api(&value, now_seconds())
+        };
+        self.read_bound(&stamp, cache_only, query, still_current)
+            .await
     }
     fn cached(&self, stamp: &str, current: impl Fn() -> bool) -> AgyQuotaSnapshot {
         if !current() {
@@ -761,10 +680,11 @@ impl AgyQuotaState {
                 status: "ready",
                 groups,
                 collected_at: Some(now_seconds()),
-                source: Some("agy_usage"),
+                source: Some("agy_quota_api"),
                 error_code: None,
                 ..Default::default()
             },
+            Err(code) if invalidates_account(code) => AgyQuotaSnapshot::unavailable(code),
             Err(code) => {
                 let mut old = self.cached(stamp, &current);
                 old.status = "stale";
@@ -804,261 +724,346 @@ pub async fn agy_quota_read(
     cache_only: Option<bool>,
     workspace_path: Option<String>,
 ) -> Result<AgyQuotaSnapshot, String> {
-    // `force` marks a user-initiated refresh; all callers share the cooldown.
-    let manual = force.unwrap_or(false);
+    let _ = force; // Manual and automatic API reads share the same cooldown.
     let binding = match binding(
         provider_id.as_deref(),
         workspace_path.as_deref().map(Path::new),
     ) {
-        Ok(b) => b,
+        Ok(value) => value,
         Err(code) => return Ok(AgyQuotaSnapshot::unavailable(code)),
     };
-    let stamp = binding.stamp.clone();
-    let cache_only = cache_only.unwrap_or(false);
-    let snapshot = tokio::time::timeout(
-        // Include the five-second version preflight and the serialized query.
-        Duration::from_secs(35),
-        state.read_checked(
-            &binding,
-            manual,
-            cache_only,
-            crate::paths::app_home().join(VERDICT_FILE),
+    Ok(tokio::time::timeout(
+        Duration::from_secs(15),
+        state.read_access(
+            &binding.stamp,
+            cache_only.unwrap_or(false),
+            access::read,
+            |credential| async move { access::fetch(&credential).await },
             || binding.current(),
         ),
     )
     .await
-    .unwrap_or_else(|_| AgyQuotaSnapshot::unavailable("query_timeout"));
-    Ok(with_credits(snapshot, &stamp))
+    .unwrap_or_else(|_| AgyQuotaSnapshot::unavailable("query_timeout")))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn affected_or_unverified_builds_never_probe_without_the_user() {
-        // Known affected build: skipped even for a manual refresh, so no turn is billed.
-        assert_eq!(gate("1.4.7", None, true), Gate::Skip("slash_unexpanded"));
-        assert_eq!(gate("v1.4.7-preview.1", Some(SlashVerdict::Expands), true), Gate::Skip("slash_unexpanded"));
-        assert_eq!(gate("unknown", Some(SlashVerdict::Expands), true), Gate::Skip("cli_version_unavailable"));
-        // A recorded failure survives restarts and blocks every later probe.
-        assert_eq!(gate("1.5.0", Some(SlashVerdict::NotExpanded), true), Gate::Skip("slash_unexpanded"));
-        // An unverified build is probed only on an explicit refresh.
-        assert_eq!(gate("1.5.0", None, false), Gate::Skip("probe_requires_manual"));
-        assert_eq!(gate("1.5.0", None, true), Gate::Run);
-        assert_eq!(gate("1.4.6", Some(SlashVerdict::Expands), false), Gate::Skip("probe_requires_manual"));
-    }
-
-    #[test]
-    fn model_turn_replies_are_told_apart_from_expanded_commands() {
-        let turn = serde_json::json!({"conversation_id":"c","status":"SUCCESS","response":"","usage":{"input_tokens":36767}});
-        let usage = serde_json::json!({"status":"SUCCESS","command":{"name":"usage","data":{"groups":[]}}});
-        assert_eq!(slash_verdict(&turn), Some(SlashVerdict::NotExpanded));
-        assert_eq!(slash_verdict(&usage), Some(SlashVerdict::Expands));
-        assert_eq!(slash_verdict(&serde_json::json!({"status":"ERROR"})), None);
-    }
-
-    #[test]
-    fn verdicts_persist_per_binary_and_version() {
-        let path = std::env::temp_dir().join(format!("ccgui-agy-verdicts-{}.json", uuid::Uuid::new_v4()));
-        let a = VerdictStore::new(path.clone(), "C:/agy.exe", "1.5.0");
-        let b = VerdictStore::new(path.clone(), "C:/agy.exe", "1.5.1");
-        assert_eq!(a.get().unwrap(), None);
-        a.record(SlashVerdict::NotExpanded).unwrap();
-        b.record(SlashVerdict::Expands).unwrap();
-        // A new store (as after a restart) reads the same verdicts back.
-        assert_eq!(VerdictStore::new(path.clone(), "C:/agy.exe", "1.5.0").get().unwrap(), Some(SlashVerdict::NotExpanded));
-        assert_eq!(VerdictStore::new(path.clone(), "C:/agy.exe", "1.5.1").get().unwrap(), Some(SlashVerdict::Expands));
-        assert_eq!(VerdictStore::new(path.clone(), "D:/other/agy.exe", "1.5.0").get().unwrap(), None);
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[cfg(windows)]
-    #[tokio::test]
-    async fn automatic_reads_never_spawn_even_after_success_or_restart() {
-        let fixture = crate::engine::agy::background_tests::Fixture::new("exit /b 99");
-        let binding = Binding { stamp: "auto".into(), bin: fixture.bin(), workspace: fixture.0.clone(), provider: None };
-        let path = fixture.0.join("verdicts.json");
-        let state = AgyQuotaState::default();
-        let first = state.read_checked(&binding, false, false, path.clone(), || true).await;
-        assert_eq!(first.error_code, Some("probe_requires_manual"));
-        VerdictStore::new(path.clone(), &binding.bin, "1.5.0").record(SlashVerdict::Expands).unwrap();
-        let cached = state.read_bound(&binding.stamp, false, async { Ok(groups()) }, || true).await;
-        let next = state.read_checked(&binding, false, false, path.clone(), || true).await;
-        assert_eq!(next.collected_at, cached.collected_at);
-        assert_eq!(next.groups.len(), cached.groups.len());
-        assert_eq!(next.error_code, Some("probe_requires_manual"));
-        let restarted = AgyQuotaState::default().read_checked(&binding, false, false, path, || true).await;
-        assert_eq!(restarted.error_code, Some("probe_requires_manual"));
-        assert!(!fixture.0.join("calls").exists(), "automatic reads must spawn no CLI process");
-    }
-
-    #[cfg(windows)]
-    #[tokio::test]
-    async fn unsafe_versions_never_reach_print() {
-        for body in ["echo unknown", "echo v1.4.7-preview.1", "exit /b 1"] {
-            let fixture = crate::engine::agy::background_tests::Fixture::new(body);
-            let binding = Binding { stamp: "version".into(), bin: fixture.bin(), workspace: fixture.0.clone(), provider: None };
-            let snapshot = AgyQuotaState::default().read_checked(&binding, true, false, fixture.0.join("verdicts.json"), || true).await;
-            assert!(matches!(snapshot.error_code, Some("cli_version_unavailable" | "slash_unexpanded")));
-            assert_eq!(fixture.calls(), ["--version"]);
-        }
-    }
-
-    #[cfg(windows)]
-    #[tokio::test]
-    async fn corrupt_or_unreadable_history_fails_closed() {
-        for directory in [false, true] {
-            let fixture = crate::engine::agy::background_tests::Fixture::new("echo 1.5.0");
-            let path = fixture.0.join("verdicts.json");
-            if directory { std::fs::create_dir(&path).unwrap(); }
-            else { std::fs::write(&path, "broken json").unwrap(); }
-            let binding = Binding { stamp: "corrupt".into(), bin: fixture.bin(), workspace: fixture.0.clone(), provider: None };
-            let snapshot = AgyQuotaState::default().read_checked(&binding, true, false, path, || true).await;
-            assert_eq!(snapshot.error_code, Some("probe_history_unavailable"));
-            assert_eq!(fixture.calls(), ["--version"]);
-        }
-    }
-
-    #[cfg(windows)]
-    #[tokio::test]
-    async fn failed_negative_write_latches_off_further_probes() {
-        let fixture = crate::engine::agy::background_tests::Fixture::new(
-            "if \"%1\"==\"--version\" (echo 1.5.0& exit /b 0)\r\necho {\"conversation_id\":\"model-turn\",\"response\":\"oops\"}",
-        );
-        let path = fixture.0.join("verdicts.json");
-        // atomic_write cannot write its temporary file over a directory.
-        std::fs::create_dir(path.with_extension("tmp")).unwrap();
-        let binding = Binding { stamp: "write-failure".into(), bin: fixture.bin(), workspace: fixture.0.clone(), provider: None };
-        let first = AgyQuotaState::default().read_checked(&binding, true, false, path.clone(), || true).await;
-        assert_eq!(first.error_code, Some("probe_history_unavailable"));
-        std::fs::remove_dir(path.with_extension("tmp")).unwrap();
-        let second = AgyQuotaState::default().read_checked(&binding, true, false, path, || true).await;
-        assert_eq!(second.error_code, Some("probe_history_unavailable"));
-        assert_eq!(fixture.calls().iter().filter(|s| s.contains("--print ")).count(), 1);
-    }
-
-    #[cfg(windows)]
-    #[tokio::test]
-    async fn full_history_preserves_failures_and_blocks_new_probes() {
-        let fixture = crate::engine::agy::background_tests::Fixture::new("echo 1.5.0");
-        let path = fixture.0.join("verdicts.json");
-        for i in 0..MAX_VERDICTS {
-            VerdictStore::new(path.clone(), &format!("old-{i}"), "1.5.0").record(SlashVerdict::NotExpanded).unwrap();
-        }
-        let binding = Binding { stamp: "full".into(), bin: fixture.bin(), workspace: fixture.0.clone(), provider: None };
-        let snapshot = AgyQuotaState::default().read_checked(&binding, true, false, path.clone(), || true).await;
-        assert_eq!(snapshot.error_code, Some("probe_history_full"));
-        assert_eq!(fixture.calls(), ["--version"]);
-        let store = VerdictStore::new(path, "old-0", "1.5.0");
-        assert_eq!(store.get().unwrap(), Some(SlashVerdict::NotExpanded));
-        assert_eq!(store.load_all().unwrap().len(), MAX_VERDICTS);
-    }
-
-    #[cfg(windows)]
-    #[tokio::test]
-    async fn queued_bindings_recheck_negative_verdict_before_print() {
-        let fixture = crate::engine::agy::background_tests::Fixture::new(
-            "if \"%1\"==\"--version\" (echo 1.5.0& exit /b 0)\r\necho {\"conversation_id\":\"model-turn\",\"status\":\"SUCCESS\",\"response\":\"oops\"}",
-        );
-        let first = Binding { stamp: "first".into(), bin: fixture.bin(), workspace: fixture.0.clone(), provider: None };
-        let second = Binding { stamp: "second".into(), bin: fixture.bin(), workspace: fixture.0.clone(), provider: None };
-        let path = fixture.0.join("verdicts.json");
-        let state = AgyQuotaState::default();
-        let (a, b) = tokio::join!(
-            state.read_checked(&first, true, false, path.clone(), || true),
-            state.read_checked(&second, true, false, path.clone(), || true),
-        );
-        assert_eq!(a.error_code, Some("slash_unexpanded"));
-        assert_eq!(b.error_code, Some("slash_unexpanded"));
-        assert_eq!(VerdictStore::new(path.clone(), &first.bin, "1.5.0").get().unwrap(), Some(SlashVerdict::NotExpanded));
-        let restarted = AgyQuotaState::default().read_checked(&second, true, false, path, || true).await;
-        assert_eq!(restarted.error_code, Some("slash_unexpanded"));
-        let prints: Vec<_> = fixture.calls().into_iter().filter(|s| s.contains("--print ")).collect();
-        assert_eq!(prints.len(), 1);
-        assert!(prints[0].ends_with("/usage"));
-    }
-
-    #[cfg(windows)]
-    #[tokio::test]
-    async fn credits_model_response_blocks_later_probes_and_malformed_usage_is_not_verified() {
-        for valid_usage in [false, true] {
-            let usage = if valid_usage { response(json!(0.75)) } else { json!({"command":{"name":"usage"},"status":"SUCCESS"}) };
-            let fixture = crate::engine::agy::background_tests::Fixture::new(&format!(
-                "if \"%1\"==\"--version\" (echo 1.5.0& exit /b 0)\r\nif \"%6\"==\"/usage\" (echo {usage}& exit /b 0)\r\necho {{\"conversation_id\":\"credits-model-turn\",\"response\":\"oops\"}}"
-            ));
-            let binding = Binding { stamp: "credits-negative".into(), bin: fixture.bin(), workspace: fixture.0.clone(), provider: None };
-            let path = fixture.0.join("verdicts.json");
-            let snapshot = AgyQuotaState::default().read_checked(&binding, true, false, path.clone(), || true).await;
-            let store = VerdictStore::new(path.clone(), &binding.bin, "1.5.0");
-            if valid_usage {
-                assert_eq!(snapshot.error_code, Some("slash_unexpanded"));
-                assert_eq!(store.get().unwrap(), Some(SlashVerdict::NotExpanded));
-                AgyQuotaState::default().read_checked(&binding, true, false, path, || true).await;
-            } else { assert_eq!(store.get().unwrap(), None); }
-            assert_eq!(fixture.calls().iter().filter(|s| s.contains("--print ")).count(), if valid_usage { 2 } else { 1 });
-        }
-    }
-
-    #[cfg(windows)]
-    #[tokio::test]
-    async fn agy_background_usage_and_credits_receive_true() {
-        let fixture = crate::engine::agy::background_tests::Fixture::new(
-            "echo {\"disabled\":\"%AGY_CLI_DISABLE_AUTO_UPDATE%\"}",
-        );
-        let binding = Binding {
-            stamp: "fixture".into(),
-            bin: fixture.bin(),
-            workspace: fixture.0.clone(),
-            provider: None,
-        };
-        for slash in ["/usage", "/credits"] {
-            let result = run_slash(&binding, slash, "1s").await.unwrap();
-            assert_eq!(result["disabled"], "true");
-        }
-        assert_eq!(
-            fixture.calls(),
-            [
-                "--output-format json --print-timeout 1s --print /usage",
-                "--output-format json --print-timeout 1s --print /credits",
-            ]
-        );
-    }
-
-    #[tokio::test]
-    #[ignore = "requires explicit consent and a signed-in native AGY CLI; manual print probes may cause billed model requests"]
-    async fn agy_live_smoke_reads_native_quota() {
-        let workspace = std::env::var("CCGUI_AGY_SMOKE_WORKSPACE").expect("explicit local workspace");
-        let binding = binding(None, Some(Path::new(&workspace))).expect("native local quota binding");
-        let state = AgyQuotaState::default();
-        let snapshot = state.read_checked(&binding, true, false, crate::paths::app_home().join(VERDICT_FILE), || binding.current()).await;
-        assert_eq!(snapshot.status, "ready", "native quota status: {:?}", snapshot.error_code);
-        assert_eq!(snapshot.source, Some("agy_usage"));
-        assert!(!snapshot.groups.is_empty());
-        println!("AGY native /usage validated: {} model groups", snapshot.groups.len());
-    }
     use serde_json::json;
-    #[test]
-    fn credits_parse_strictly_and_attach_only_to_available_bound_snapshots() {
-        let ok = json!({"status":"SUCCESS","command":{"name":"credits","data":{"remaining_credits":250}}});
-        assert_eq!(parse_credits(&ok), Some(250.0));
-        assert_eq!(parse_credits(&json!({"status":"SUCCESS","command":{"name":"credits","data":{"remaining_credits":0}}})), Some(0.0));
-        for bad in [
-            json!({"status":"ERROR","command":{"name":"credits","data":{"remaining_credits":1}}}),
-            json!({"status":"SUCCESS","command":{"name":"usage","data":{"remaining_credits":1}}}),
-            json!({"status":"SUCCESS","command":{"name":"credits","data":{"remaining_credits":-1}}}),
-            json!({"status":"SUCCESS","command":{"name":"credits","data":{"remaining_credits":"9"}}}),
-            json!({"status":"SUCCESS","command":{"name":"credits","data":{}}}),
-        ] {
-            assert_eq!(parse_credits(&bad), None, "{bad}");
+
+    fn api_response(fraction: f64) -> Value {
+        json!({"groups":[{"buckets":[{"bucketId":"gemini-5h", "window":"5h", "remainingFraction":fraction,"resetTime":"2099-01-01T00:00:00Z"}]}]})
+    }
+
+    fn credential(id: usize) -> access::Credential {
+        access::fixture_credential(
+            &format!("fixture-{id}"),
+            reset_time("2099-01-01T00:00:00Z").unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn observed_identity_loss_never_revives_an_old_cache() {
+        for missing in [false, true] {
+            let state = AgyQuotaState::default();
+            state
+                .read_access(
+                    "route",
+                    false,
+                    || Ok(credential(1)),
+                    |_| async { Ok(api_response(0.5)) },
+                    || true,
+                )
+                .await;
+            if missing {
+                state
+                    .read_access(
+                        "route",
+                        true,
+                        || Err("auth_missing"),
+                        |_| async { panic!("cache only") },
+                        || true,
+                    )
+                    .await;
+            } else {
+                state
+                    .read_access(
+                        "route",
+                        true,
+                        || Ok(credential(2)),
+                        |_| async { panic!("cache only") },
+                        || true,
+                    )
+                    .await;
+            }
+            let restored = state
+                .read_access(
+                    "route",
+                    true,
+                    || Ok(credential(1)),
+                    |_| async { panic!("cache only") },
+                    || true,
+                )
+                .await;
+            assert_eq!(restored.error_code, Some("not_loaded"));
+            assert!(restored.groups.is_empty());
         }
-        remember_credits("credits-test", Some(12.5));
-        let ready = AgyQuotaSnapshot { status: "ready", ..Default::default() };
-        assert_eq!(with_credits(ready.clone(), "credits-test").credits, Some(AgyCredits { remaining: 12.5 }));
-        assert_eq!(with_credits(ready.clone(), "other").credits, None);
-        assert_eq!(with_credits(AgyQuotaSnapshot::unavailable("auth_changed"), "credits-test").credits, None);
-        remember_credits("credits-test", None);
-        assert_eq!(with_credits(ready, "credits-test").credits, None);
+    }
+
+    #[tokio::test]
+    async fn invalid_context_never_reads_credentials_and_expiry_during_fetch_discards_reply() {
+        let state = AgyQuotaState::default();
+        let blocked = state
+            .read_access(
+                "route",
+                false,
+                || panic!("must not read credentials"),
+                |_| async { panic!("must not fetch") },
+                || false,
+            )
+            .await;
+        assert_eq!(blocked.error_code, Some("auth_changed"));
+        let expired = AtomicBool::new(false);
+        let result = state
+            .read_access(
+                "route",
+                false,
+                || {
+                    Ok(if expired.load(Ordering::SeqCst) {
+                        access::fixture_credential("fixture-1", 1)
+                    } else {
+                        credential(1)
+                    })
+                },
+                |_| async {
+                    expired.store(true, Ordering::SeqCst);
+                    Ok(api_response(0.5))
+                },
+                || true,
+            )
+            .await;
+        assert_eq!(result.error_code, Some("auth_changed"));
+        assert!(state.cache.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn api_preserves_real_zero_and_separate_argon_windows() {
+        let value = json!({"groups":[{"buckets":[
+            {"bucketId":"gemini-5h","window":"5h","remainingFraction":0.5,"resetTime":"2099-01-01T00:00:00Z"},
+            {"bucketId":"gemini-argon-wtu-weekly","window":"weekly","remainingFraction":0,"resetTime":"2099-01-01T00:00:00Z"},
+            {"bucketId":"3p-5h","window":"5h","disabled":true}
+        ]}]});
+        let parsed = parse_api(&value, now_seconds()).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].id, "gemini");
+        assert_eq!(parsed[1].id, "gemini_argon");
+        assert_eq!(
+            parsed[1]
+                .windows
+                .seven_day
+                .as_ref()
+                .unwrap()
+                .used_percentage,
+            100.0
+        );
+        assert_eq!(
+            parse_api(&json!({"response":value.clone()}), now_seconds()).unwrap(),
+            parsed
+        );
+        assert_eq!(
+            parse_api(&json!({"summary":value}), now_seconds()).unwrap(),
+            parsed
+        );
+        assert!(parse_api(&json!({"error":{"message":"private"},"groups":[]}), 0).is_err());
+        assert!(parse_api(&json!({"groups":[]}), 0).is_err());
+    }
+
+    #[tokio::test]
+    async fn api_bootstrap_is_read_only_and_cache_only_never_fetches() {
+        let state = AgyQuotaState::default();
+        let calls = AtomicUsize::new(0);
+        let fetch = |_| async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(api_response(0.75))
+        };
+        let empty = state
+            .read_access("route", true, || Ok(credential(1)), fetch, || true)
+            .await;
+        assert_eq!(empty.error_code, Some("not_loaded"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let (a, b) = tokio::join!(
+            state.read_access("route", false, || Ok(credential(1)), fetch, || true),
+            state.read_access("route", false, || Ok(credential(1)), fetch, || true),
+        );
+        assert_eq!(a, b);
+        assert_eq!(a.source, Some("agy_quota_api"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(a.credits.is_none());
+    }
+
+    #[tokio::test]
+    async fn expired_or_missing_credentials_never_fetch_or_show_old_quota() {
+        let state = AgyQuotaState::default();
+        state
+            .read_access(
+                "route",
+                false,
+                || Ok(credential(1)),
+                |_| async { Ok(api_response(0.5)) },
+                || true,
+            )
+            .await;
+        let missing = state
+            .read_access(
+                "route",
+                false,
+                || Err("auth_missing"),
+                |_| async { panic!("must not fetch") },
+                || true,
+            )
+            .await;
+        assert_eq!(missing.error_code, Some("auth_missing"));
+        let reads = AtomicUsize::new(0);
+        let expired = state
+            .read_access(
+                "route",
+                false,
+                || {
+                    reads.fetch_add(1, Ordering::SeqCst);
+                    Ok(access::fixture_credential("fixture-1", now_seconds() + 30))
+                },
+                |_| async { panic!("must not fetch") },
+                || true,
+            )
+            .await;
+        assert_eq!(expired.error_code, Some("auth_expired"));
+        assert!(expired.groups.is_empty());
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn agy_renewed_credentials_can_be_reread_without_refreshing_them() {
+        let state = AgyQuotaState::default();
+        let reads = AtomicUsize::new(0);
+        let result = state
+            .read_access(
+                "route",
+                false,
+                || {
+                    if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Ok(access::fixture_credential("old-fixture", 1))
+                    } else {
+                        Ok(credential(2))
+                    }
+                },
+                |_| async { Ok(api_response(0.5)) },
+                || true,
+            )
+            .await;
+        assert_eq!(result.status, "ready");
+    }
+
+    #[tokio::test]
+    async fn unauthorized_never_replays_and_clears_even_unexpired_cached_values() {
+        let state = AgyQuotaState::default();
+        state
+            .read_access(
+                "route",
+                false,
+                || Ok(credential(1)),
+                |_| async { Ok(api_response(0.5)) },
+                || true,
+            )
+            .await;
+        for entry in state.cache.lock().unwrap().values_mut() {
+            entry.last_attempt = None;
+        }
+        let calls = AtomicUsize::new(0);
+        let failed = state
+            .read_access(
+                "route",
+                false,
+                || Ok(credential(1)),
+                |_| async {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Err("quota_unauthorized")
+                },
+                || true,
+            )
+            .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(failed.status, "unavailable");
+        assert_eq!(failed.error_code, Some("auth_expired"));
+        assert!(failed.groups.is_empty());
+        let cache = state
+            .read_access(
+                "route",
+                true,
+                || Ok(credential(1)),
+                |_| async { panic!("cache only") },
+                || true,
+            )
+            .await;
+        assert!(cache.groups.is_empty());
+    }
+
+    #[tokio::test]
+    async fn changed_account_during_fetch_never_enters_new_accounts_cache() {
+        let state = AgyQuotaState::default();
+        let identity = AtomicUsize::new(1);
+        for unauthorized in [false, true] {
+            identity.store(1, Ordering::SeqCst);
+            let result = state
+                .read_access(
+                    if unauthorized { "401" } else { "success" },
+                    false,
+                    || Ok(credential(identity.load(Ordering::SeqCst))),
+                    |_| async {
+                        identity.store(2, Ordering::SeqCst);
+                        if unauthorized {
+                            Err("quota_unauthorized")
+                        } else {
+                            Ok(api_response(0.5))
+                        }
+                    },
+                    || true,
+                )
+                .await;
+            assert_eq!(result.error_code, Some("auth_changed"));
+            assert!(result.groups.is_empty());
+        }
+        let next = state
+            .read_access(
+                "success",
+                true,
+                || Ok(credential(2)),
+                |_| async { panic!("cache only") },
+                || true,
+            )
+            .await;
+        assert_eq!(next.error_code, Some("not_loaded"));
+    }
+
+    #[tokio::test]
+    #[ignore = "reads the user's native access token and performs one read-only Google quota request; never refreshes credentials"]
+    async fn agy_access_live_smoke() {
+        assert!(credential_context_allowed());
+        let credential = access::read().unwrap_or_else(|code| panic!("credential status: {code}"));
+        assert!(
+            credential.usable(now_seconds()),
+            "AGY access token needs renewal by AGY"
+        );
+        let value = access::fetch(&credential)
+            .await
+            .unwrap_or_else(|code| panic!("quota status: {code}"));
+        let groups =
+            parse_api(&value, now_seconds()).unwrap_or_else(|code| panic!("quota schema: {code}"));
+        assert!(!groups.is_empty());
+        println!(
+            "Read-only AGY quota verified: {} groups; credentials unchanged",
+            groups.len()
+        );
     }
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     fn response(fraction: Value) -> Value {
@@ -1121,9 +1126,25 @@ mod tests {
         ]}}});
         let parsed = parse_usage(&v, 0).unwrap();
         assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0].windows.five_hour.as_ref().unwrap().used_percentage, 0.0);
+        assert_eq!(
+            parsed[0]
+                .windows
+                .five_hour
+                .as_ref()
+                .unwrap()
+                .used_percentage,
+            0.0
+        );
         assert!(parsed[0].windows.seven_day.is_some());
-        assert_eq!(parsed[1].windows.seven_day.as_ref().unwrap().used_percentage, 100.0);
+        assert_eq!(
+            parsed[1]
+                .windows
+                .seven_day
+                .as_ref()
+                .unwrap()
+                .used_percentage,
+            100.0
+        );
         assert!(parsed[1].windows.five_hour.is_none());
 
         // Only an explicit true permits the missing reset; enabled/malformed
@@ -1142,7 +1163,9 @@ mod tests {
         let groups = parse_usage(&v, 0).unwrap();
         assert!(groups.is_empty());
         let state = AgyQuotaState::default();
-        let snapshot = state.read_bound("all-disabled", false, async { Ok(groups) }, || true).await;
+        let snapshot = state
+            .read_bound("all-disabled", false, async { Ok(groups) }, || true)
+            .await;
         assert_eq!(snapshot.status, "unavailable");
         assert_eq!(snapshot.error_code, Some("quota_not_available"));
         assert!(snapshot.groups.is_empty());
@@ -1174,7 +1197,10 @@ mod tests {
         assert!(!s.groups.is_empty());
         assert_eq!(s.collected_at, Some(1000));
         assert_eq!(
-            parse_usage(&response(json!(0.5)), reset_time("2099-01-01T00:00:00Z").unwrap()),
+            parse_usage(
+                &response(json!(0.5)),
+                reset_time("2099-01-01T00:00:00Z").unwrap()
+            ),
             Err("quota_not_available")
         );
     }
@@ -1247,13 +1273,7 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn output_limit_and_bounded_cache() {
-        assert_eq!(read_bounded(&b"{}"[..]).await.unwrap(), b"{}");
-        let oversized = vec![b'x'; MAX_OUTPUT + 1];
-        assert_eq!(
-            read_bounded(oversized.as_slice()).await,
-            Err("response_too_large")
-        );
+    async fn bounded_cache_does_not_lose_other_bindings() {
         let state = AgyQuotaState::default();
         for index in 0..(MAX_BINDINGS + 3) {
             state
@@ -1355,7 +1375,9 @@ mod tests {
     fn quota_rejects_missing_and_future_sample_times() {
         for collected_at in [None, Some(2000)] {
             let mut snapshot = AgyQuotaSnapshot {
-                status: "ready", groups: groups(), collected_at,
+                status: "ready",
+                groups: groups(),
+                collected_at,
                 ..Default::default()
             };
             snapshot.expire(1000);
@@ -1366,7 +1388,9 @@ mod tests {
     #[tokio::test]
     async fn old_sample_survives_sparse_and_failed_reads_but_disabled_clears() {
         let state = AgyQuotaState::default();
-        let first = state.read_bound("a", false, async { Ok(groups()) }, || true).await;
+        let first = state
+            .read_bound("a", false, async { Ok(groups()) }, || true)
+            .await;
         {
             let mut cache = state.cache.lock().unwrap();
             let entry = cache.get_mut("a").unwrap();
@@ -1374,13 +1398,33 @@ mod tests {
             entry.snapshot.as_mut().unwrap().collected_at = Some(1);
         }
         let empty = json!({"status":"SUCCESS","command":{"name":"usage","data":{"groups":[]}}});
-        let stale = state.read_bound("a", false, async { parse_usage(&empty, now_seconds()) }, || true).await;
+        let stale = state
+            .read_bound(
+                "a",
+                false,
+                async { parse_usage(&empty, now_seconds()) },
+                || true,
+            )
+            .await;
         assert_eq!(stale.groups, first.groups);
         assert_eq!(stale.collected_at, Some(1));
         assert_eq!(stale.status, "stale");
-        state.cache.lock().unwrap().get_mut("a").unwrap().last_attempt = None;
+        state
+            .cache
+            .lock()
+            .unwrap()
+            .get_mut("a")
+            .unwrap()
+            .last_attempt = None;
         let disabled = json!({"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{"buckets":[{"id":"gemini-5h","window":"5h","disabled":true}]}]}}});
-        let cleared = state.read_bound("a", false, async { parse_usage(&disabled, now_seconds()) }, || true).await;
+        let cleared = state
+            .read_bound(
+                "a",
+                false,
+                async { parse_usage(&disabled, now_seconds()) },
+                || true,
+            )
+            .await;
         assert!(cleared.groups.is_empty());
         assert_eq!(cleared.status, "unavailable");
     }

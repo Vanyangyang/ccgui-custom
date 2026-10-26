@@ -448,7 +448,7 @@ describe("CliEngineSettingsCard official edit entry", () => {
     )!;
     await act(async () => refresh.click());
     expect(section.textContent).not.toContain("500");
-    expect(section.textContent).toContain(i18n.t("settings.agyByokRefreshFailed"));
+    expect(section.textContent).toContain(i18n.t("chat.agyQuotaQueryFailed"));
   });
   it("agy: syncing Vertex credits never starts a native quota probe", async () => {
     await render(makeCli({ engine: "agy" }));
@@ -462,6 +462,16 @@ describe("CliEngineSettingsCard official edit entry", () => {
     expect(vi.mocked(ipc.agyQuotaRead).mock.calls.every(([options]) => options?.force !== true)).toBe(true);
     expect(section.textContent).toContain(i18n.t("chat.agyQuotaManualWarning"));
   });
+  it.each(["auth_expired", "auth_changed"])("agy: explains native credential failure %s", async errorCode => {
+    await render(makeCli({ engine: "agy" }));
+    const section = container.querySelector("[data-testid='agy-byok-section']")!;
+    vi.mocked(ipc.agyQuotaRead).mockResolvedValueOnce({ status: "unavailable", groups: [], errorCode });
+    const refresh = section.querySelector<HTMLButtonElement>(`button[aria-label="${i18n.t("chat.agyQuotaManualRefresh")}"]`)!;
+    await act(async () => refresh.click());
+    expect(section.textContent).toContain(i18n.t(errorCode === "auth_expired" ? "chat.agyQuotaAuthExpired" : "chat.agyQuotaAuthChanged"));
+    expect(section.textContent).not.toContain("500");
+    expect(ipc.agyQuotaRead).toHaveBeenLastCalledWith({ force: true, cacheOnly: false });
+  });
   it("agy: a hung native refresh times out and cannot publish a late balance", async () => {
     await render(makeCli({ engine: "agy" }));
     const section = container.querySelector("[data-testid='agy-byok-section']")!;
@@ -473,7 +483,7 @@ describe("CliEngineSettingsCard official edit entry", () => {
       await act(async () => refresh.click());
       expect(refresh.disabled).toBe(true);
       await act(async () => vi.advanceTimersByTimeAsync(40_000));
-      expect(section.textContent).toContain(i18n.t("settings.agyByokRefreshFailed"));
+      expect(section.textContent).toContain(i18n.t("chat.agyQuotaTimeout"));
       // The shared feedback component finishes its current 600ms spin lap.
       await act(async () => vi.advanceTimersByTimeAsync(600));
       expect(refresh.disabled).toBe(false);

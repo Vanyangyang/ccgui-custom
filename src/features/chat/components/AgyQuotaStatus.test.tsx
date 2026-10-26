@@ -66,16 +66,11 @@ describe("AGY remaining usage status", () => {
           agyQuotaRemaining: "{{percentage}} remaining",
           agyQuotaGemini: "Gemini",
           agyQuotaThirdParty: "Third-party",
-          agyQuotaSource: "Native AGY /usage",
+          agyQuotaSource: "Read-only AGY quota API",
           agyQuotaUnavailable: "AGY usage unavailable",
           agyQuotaCooldown: "Refresh cooldown",
           agyQuotaQueryFailed: "Could not update AGY usage",
-          agyQuotaSlashUnexpanded: "This agy version does not run /usage in print mode",
-          agyQuotaProbeManual: "Click Update info once to check this agy version",
-          agyQuotaManualWarning: "Manual queries may spend tokens; automatic probing stays disabled",
-          agyQuotaVersionUnavailable: "Version check failed; probing blocked",
-          agyQuotaHistoryFull: "Probe history full; probing blocked",
-          agyQuotaHistoryUnavailable: "Probe history unavailable; probing blocked",
+          agyQuotaManualWarning: "Reads existing credentials without refreshing or writing them back",
           agyQuotaCredits: "Antigravity credits",
           agyVertexCredits: "Vertex promotional credits",
           agyQuotaPromoTrial: "Free Trial",
@@ -163,8 +158,8 @@ describe("AGY remaining usage status", () => {
     expect(dialog.textContent).toContain(new Date((NOW + 3660) * 1000).toLocaleString("en"));
     expect(dialog.textContent).toContain("in 1h 1m");
     expect(dialog.textContent).toContain(new Date(NOW * 1000).toLocaleString("en"));
-    expect(dialog.textContent).toContain("Native AGY /usage");
-    expect(dialog.textContent).toContain("Manual queries may spend tokens; automatic probing stays disabled");
+    expect(dialog.textContent).toContain("Read-only AGY quota API");
+    expect(dialog.textContent).toContain("Reads existing credentials without refreshing or writing them back");
     expect(dialog.textContent).not.toContain("Account");
     expect(refresh).not.toHaveBeenCalled();
     await act(async () => dialog.querySelector("button")!.click());
@@ -180,20 +175,13 @@ describe("AGY remaining usage status", () => {
     expect(dialog.textContent).toContain("AGY usage unavailable");
     await render({ ...quota(), status: "stale", errorCode: "query_timeout" });
     expect(container.querySelector("button")?.getAttribute("aria-label")).toContain("Stale");
-    expect(dialog.textContent).toContain("Could not update AGY usage");
+    expect(dialog.textContent).toContain(i18n.t("chat.agyQuotaTimeout"));
     await render({ ...quota(), status: "stale", errorCode: "refresh_cooldown" });
     expect(dialog.textContent).toContain("Refresh cooldown");
-    // Skipped probes explain why instead of a generic failure.
-    await render({ status: "unavailable", groups: [], errorCode: "slash_unexpanded" });
-    expect(dialog.textContent).toContain("This agy version does not run /usage in print mode");
-    await render({ status: "unavailable", groups: [], errorCode: "probe_requires_manual" });
-    expect(dialog.textContent).toContain("Click Update info once to check this agy version");
-    await render({ status: "unavailable", groups: [], errorCode: "cli_version_unavailable" });
-    expect(dialog.textContent).toContain("Version check failed; probing blocked");
-    await render({ status: "unavailable", groups: [], errorCode: "probe_history_full" });
-    expect(dialog.textContent).toContain("Probe history full; probing blocked");
-    await render({ status: "unavailable", groups: [], errorCode: "probe_history_unavailable" });
-    expect(dialog.textContent).toContain("Probe history unavailable; probing blocked");
+    for (const [errorCode, key] of [["auth_missing", "AuthMissing"], ["auth_invalid", "AuthInvalid"], ["auth_read_failed", "AuthReadFailed"], ["auth_expired", "AuthExpired"], ["auth_changed", "AuthChanged"], ["unsupported_auth_context", "UnsupportedContext"], ["unsupported_auth_platform", "UnsupportedPlatform"], ["quota_forbidden", "Forbidden"], ["quota_rate_limited", "RateLimited"], ["invalid_response", "InvalidResponse"]]) {
+      await render({ status: "unavailable", groups: [], errorCode });
+      expect(dialog.textContent).toContain(i18n.t(`chat.agyQuota${key}`));
+    }
     await render(quota(), "gemini-pro", false, NOW + 3600);
     expect(container.textContent).toContain("Stale");
     expect(dialog.textContent).toContain(new Date(NOW * 1000).toLocaleString("en"));
@@ -212,6 +200,34 @@ describe("AGY remaining usage status", () => {
     );
     expect(document.querySelector('[role="dialog"]')).toBeNull();
     expect(refresh).not.toHaveBeenCalled();
+  });
+  it("shows unknown Argon quota with its title when its independent group is missing", async () => {
+    const data = quota();
+    data.groups.push({ id: "gemini_argon", windows: { fiveHour: { usedPercentage: 80 } } });
+    await render(data, "gemini-4-argon");
+    expect(container.textContent).toBe("5h 20% · Week — remaining");
+    const dialog = await open();
+    expect(dialog.querySelector('section[aria-label="Gemini 4 Argon"]')?.textContent).toContain("20% remaining");
+    await render(quota(), "gemini-4-argon");
+    expect(container.textContent).toBe("5h — · Week — remaining");
+    expect(dialog.querySelector('section[aria-label="Gemini 4 Argon"]')?.textContent).toContain("— remaining");
+    expect(dialog.querySelector('section[aria-label="Gemini 4 Argon"]')?.textContent).not.toContain("100%");
+  });
+  it("keeps the Argon title and unknown quota when disabled windows have been omitted", async () => {
+    const data = quota();
+    data.groups.push({ id: "gemini_argon", windows: {} });
+    await render(data, "gemini-4-argon-pro");
+    expect(container.textContent).toBe("5h — · Week — remaining");
+    const dialog = await open();
+    const argon = dialog.querySelector('section[aria-label="Gemini 4 Argon"]');
+    expect(argon).not.toBeNull();
+    expect([...argon!.querySelectorAll("dd")].map(node => node.textContent)).toEqual(["— remaining", "— remaining"]);
+  });
+  it.each(["en", "zh"])("explains expired login in %s without suggesting another OAuth flow", async language => {
+    await i18n.changeLanguage(language);
+    await render({ status: "unavailable", groups: [], errorCode: "auth_expired" });
+    const dialog = await open();
+    expect(dialog.textContent).toContain(language === "zh" ? "请在 AGY 中恢复登录" : "Restore your login in AGY");
   });
 
   it("shows AI credits only for a valid snapshot", async () => {

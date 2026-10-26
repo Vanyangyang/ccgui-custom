@@ -3,7 +3,7 @@
  *
  * 1. 赠金余额与账户额度 (agyByokBalance)：
  *    - 引导用户登录自己的 Google 账号并选择结算账号；未连接或无真实数据时不展示固定余额。
- *    - 展示 Antigravity 原生 `/credits` 与 `/usage` 实时额度摘要，支持遵循 UI 规范的转圈→对号刷新反馈。
+ *    - 只读查询 Antigravity 额度 API，支持遵循 UI 规范的转圈→对号刷新反馈。
  * 2. BYOK 挂载识别与模型接入 (agyByokMount)：
  *    - 自动识别本机 Vertex AI 接入配置与本机密钥文件状态（仅展示路径提示与状态点，绝不读取或回显真实密钥）。
  *    - 支持一键将 Vertex / BYOK 模型挂载到 AGY 聊天模型选择器，并可在「沿用 API 命名」与「自定义显示名称」之间切换。
@@ -32,6 +32,7 @@ import {
   type OfficialConfigFile,
 } from "@/lib/ipc";
 import { openExternal } from "@/lib/platform";
+import { agyQuotaErrorKey } from "@/features/chat/agy-quota";
 import { cx } from "@/utils/cx";
 import {
   agyVertexEndpoint,
@@ -104,9 +105,9 @@ export function AgyByokSection({ cli }: { cli: CliConfigState }) {
           ipc.getAppSettings(),
           ipc.officialConfigRead("agy").catch(() => [] as OfficialConfigFile[]),
           Promise.race([
-            ipc.agyQuotaRead({ force: forceQuota, cacheOnly: !forceQuota }).catch(() => null),
-            new Promise<null>(resolve => {
-              quotaTimer = window.setTimeout(() => resolve(null), 40_000);
+            ipc.agyQuotaRead({ force: forceQuota, cacheOnly: !forceQuota }).catch(() => ({ status: "unavailable", groups: [], errorCode: "query_failed" } as AgyQuotaSnapshot)),
+            new Promise<AgyQuotaSnapshot>(resolve => {
+              quotaTimer = window.setTimeout(() => resolve({ status: "unavailable", groups: [], errorCode: "query_timeout" }), 40_000);
               quotaTimers.current.add(quotaTimer);
             }),
           ]),
@@ -116,11 +117,7 @@ export function AgyByokSection({ cli }: { cli: CliConfigState }) {
         setOfficialFiles(files);
         setQuota(quotaSnap?.status === "ready" ? quotaSnap : null);
         const failed = forceQuota && quotaSnap?.status !== "ready";
-        const errorKey = quotaSnap?.errorCode === "slash_unexpanded" ? "chat.agyQuotaSlashUnexpanded"
-          : quotaSnap?.errorCode === "cli_version_unavailable" ? "chat.agyQuotaVersionUnavailable"
-          : quotaSnap?.errorCode === "probe_history_full" ? "chat.agyQuotaHistoryFull"
-          : quotaSnap?.errorCode === "probe_history_unavailable" ? "chat.agyQuotaHistoryUnavailable"
-          : "settings.agyByokRefreshFailed";
+        const errorKey = agyQuotaErrorKey(quotaSnap?.errorCode ?? "query_timeout");
         setLoadError(failed ? t(errorKey) : null);
         return !failed;
       } catch (e) {
@@ -465,7 +462,7 @@ export function AgyByokSection({ cli }: { cli: CliConfigState }) {
                 {t("settings.agyByokNativeQuotaTitle")}
               </p>
               <code className="w-fit truncate rounded border border-dashed border-border-button-default px-1 py-px text-[11px] text-text-tertiary">
-                /credits · /usage
+                {t("chat.agyQuotaSource")}
               </code>
               <p className="text-caption-1-regular text-text-tertiary">{t("chat.agyQuotaManualWarning")}</p>
             </div>
