@@ -99,7 +99,7 @@ export interface PromptCacheWindow {
   ttlSeconds: number;
   startedAt: number;
   observedAt: number;
-  source: "anthropic-usage" | "anthropic-mixed" | "openai-policy" | "agy-gemini-reference" | "agy-vertex-reference" | "agy-anthropic-reference";
+  source: "anthropic-usage" | "anthropic-mixed" | "openai-policy" | "cursor-policy" | "agy-gemini-reference" | "agy-vertex-reference" | "agy-anthropic-reference";
   reference?: {
     maxTtlSeconds: number;
     cacheReadTokens: number;
@@ -108,6 +108,8 @@ export interface PromptCacheWindow {
 }
 
 export interface SessionMeta {
+  /** Sidebar-only grouping override; workspacePath remains the execution cwd. */
+  sidebarWorkspacePath?: string | null;
   promptCache?: PromptCacheWindow | null;
   auxiliaryKind?: "cursor_cce" | "cursor_do" | null;
   engine: string;
@@ -139,6 +141,15 @@ export interface SessionMeta {
   /** In-app channel this session last ran. Spawn injects that channel's env;
    * native CLI files stay official. Absent until a send remembers one. */
   provider?: string | null;
+}
+
+/** Atomic sidebar-only assignment with compare-and-set source values. */
+export interface SessionSidebarWorkspaceAssignment {
+  engine: string;
+  sessionId: string;
+  expectedWorkspacePath: string;
+  expectedSidebarWorkspacePath: string | null;
+  sidebarWorkspacePath: string | null;
 }
 
 /** `suggest_session_title` result. `changed: false` = the model judged the
@@ -1043,6 +1054,25 @@ export interface UsageRow {
   /** Model responses in this bucket — the request total. */
   requests: number;
 }
+
+/** Millisecond window query for exact rolling quota windows (5h / 7d). */
+export interface UsageWindowSpan {
+  id: string;
+  sinceMs: number;
+  untilMs: number;
+}
+
+/** Ledger totals aggregated over one exact timestamp window. */
+export interface UsageWindowRow {
+  windowId: string;
+  engine: string;
+  model: string;
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  requests: number;
+}
 // ---- DeepSeek Harness local host ----
 
 /** Snapshot of the DSH local host + CLI probe (`dsh_host_status`,
@@ -1349,6 +1379,12 @@ export const ipc = {
     // not answer — one bad value here blanks every settings page.
     settingsPromise = null;
   },
+  /** Atomically patches Cursor selections; removal wins when an ID is in both lists. */
+  updateCursorModelSelection: async (add: string[], remove: string[]): Promise<string[]> => {
+    const selected = await invoke<string[]>("update_cursor_model_selection", { add, remove });
+    settingsPromise = null;
+    return selected;
+  },
   listPets: () => invoke<PetSummary[]>("pet_list"),
   /** Raw bytes of an uploaded font file, base64-encoded (设置 → 外观): the
    *  webview cannot read the native dialog's file itself. */
@@ -1492,6 +1528,8 @@ export const ipc = {
   cursorModelCatalog: () => invoke<CursorCatalogModel[]>("cursor_model_catalog"),
   // history
   listSessions: () => invoke<SessionMeta[]>("list_sessions"),
+  assignSessionSidebarWorkspaces: (requestId: string, assignments: SessionSidebarWorkspaceAssignment[]) =>
+    invoke<void>("assign_session_sidebar_workspaces", { requestId, assignments }),
   listArchivedSessions: () => invoke<SessionMeta[]>("list_archived_sessions"),
   archiveSession: (session: SessionMeta) =>
     invoke<void>("archive_session", { session }),
@@ -1883,6 +1921,8 @@ export const ipc = {
   usageRecord: (entry: UsageEntryInput) => invoke<void>("usage_record", { entry }),
   usageSummary: (days: number, tzOffsetMinutes: number) =>
     invoke<UsageRow[]>("usage_summary", { days, tzOffsetMinutes }),
+  usageWindowTotals: (windows: UsageWindowSpan[]) =>
+    invoke<UsageWindowRow[]>("usage_window_totals", { windows }),
   usageClear: () => invoke<void>("usage_clear"),
   // DeepSeek Harness local host (dsh web --host H --port P)
   dshHostStatus: () => invoke<DshHostStatus>("dsh_host_status"),

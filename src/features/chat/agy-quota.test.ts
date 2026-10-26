@@ -26,19 +26,19 @@ describe("AGY usage validation", () => {
     data.groups.push({ id: "gemini", windows: null } as unknown as AgyQuotaSnapshot["groups"][number]);
     expect(validAgyQuotaSnapshot(data, NOW).groups.map(group => group.id)).toEqual(["third_party"]);
   });
-  it("rejects out-of-range, expired, nonnumeric and missing values", () => {
+  it("rejects out-of-range, nonnumeric and missing values but retains reset windows", () => {
     for (const value of [-1, 101, Infinity, "10", null]) {
       const data = quota();
       data.groups = [{ id: "gemini", windows: { fiveHour: { usedPercentage: value as number } } }];
       expect(validAgyQuotaSnapshot(data, NOW).groups).toEqual([]);
     }
-    expect(validAgyQuotaSnapshot(quota(), NOW + 1).groups).toHaveLength(1);
+    expect(validAgyQuotaSnapshot(quota(), NOW + 1)).toMatchObject({ groups: quota().groups, status: "stale" });
     const malformed = { ...quota(), groups: null } as unknown as AgyQuotaSnapshot;
     expect(validAgyQuotaSnapshot(malformed, NOW).status).toBe("unavailable");
   });
-  it("marks stale at 120 seconds and expires at one hour; invalid timestamps never look fresh", () => {
+  it("marks stale at 120 seconds and keeps the original sample past one hour; invalid timestamps never look fresh", () => {
     expect(validAgyQuotaSnapshot(quota(), NOW + 120).status).toBe("stale");
-    expect(validAgyQuotaSnapshot(quota(), NOW + 3600)).toMatchObject({ status: "unavailable", groups: [], errorCode: "quota_expired" });
+    expect(validAgyQuotaSnapshot(quota(), NOW + 3600)).toEqual({ ...quota(), status: "stale" });
     for (const collectedAt of [undefined, NaN, Infinity, NOW + 1, 0]) expect(validAgyQuotaSnapshot({ ...quota(), collectedAt }, NOW).groups).toEqual([]);
     expect(validAgyQuotaSnapshot({ ...quota(), status: "unavailable" }, NOW).groups).toEqual([]);
     expect(validAgyQuotaSnapshot({ ...quota(), status: "stale", errorCode: "query_timeout" }, NOW)).toMatchObject({ status: "stale", errorCode: "query_timeout" });

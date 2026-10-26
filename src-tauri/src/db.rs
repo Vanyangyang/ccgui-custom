@@ -835,6 +835,8 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         ",
     )?;
     session_auxiliary::migrate_legacy(conn)?;
+    crate::image_preview::migrate_legacy(conn)?;
+    crate::workspace_projects::migrate_legacy(conn)?;
     // NB: no `cache_version` meta row — it was written but never read; cache
     // freshness is carried by the scanner's stat signature (see CACHE_VERSION).
     // Additive migration: usage rows gained a per-turn request count.

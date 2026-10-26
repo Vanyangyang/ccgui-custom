@@ -71,6 +71,17 @@ describe("ImageLightbox", () => {
     expect(container.textContent).toContain("792 × 964 · 187.5 KB");
   });
 
+  it("renders an actionable unavailable slot while retaining the legacy reason fallback", async () => {
+    const allow = vi.fn();
+    await act(async () => root.render(<ImageLightbox src={null} name="locked.png" onClose={onClose}
+      unavailable="Legacy reason" unavailableContent={<button onClick={allow}>Allow preview</button>} />));
+    const button = [...container.querySelectorAll<HTMLButtonElement>("button")].find(item => item.textContent === "Allow preview")!;
+    await act(async () => { button.dispatchEvent(new MouseEvent("mousedown", { bubbles: true })); button.click(); });
+    expect(allow).toHaveBeenCalledOnce(); expect(onClose).not.toHaveBeenCalled();
+    await act(async () => root.render(<ImageLightbox src={null} name="locked.png" onClose={onClose} unavailable="Legacy reason" />));
+    expect(container.textContent).toContain("Legacy reason");
+  });
+
   it("zooms in via toolbar and resets to fit via the percent button", async () => {
     expect(zoomLabel().textContent).toBe("100%");
     const zoomIn = container.querySelector('button[aria-label="Zoom in"]')!;

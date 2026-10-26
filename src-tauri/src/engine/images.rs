@@ -87,16 +87,38 @@ pub fn import_attachments(paths: Vec<String>) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+/// Durable subdirectory inside `pasted-images` for host-managed plugin image attachments.
+pub const PLUGIN_ATTACHMENTS_DIR_NAME: &str = "plugin-attachments";
+
+pub fn plugin_attachments_dir() -> PathBuf {
+    pasted_images_dir().join(PLUGIN_ATTACHMENTS_DIR_NAME)
+}
+
+pub(crate) fn sweep_pasted_images_in(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name() == PLUGIN_ATTACHMENTS_DIR_NAME {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            continue;
+        }
+        let _ = std::fs::remove_file(entry.path());
+    }
+}
+
 /// Queued messages hold pasted-image paths, but the queue lives in memory
 /// only, so nothing references these files after a restart: sweep the dir at
-/// startup to keep app home from growing without bound.
+/// startup to keep app home from growing without bound, while explicitly
+/// preserving durable `plugin-attachments/<pluginId>/` directories.
 pub fn sweep_pasted_images() {
     let dir = pasted_images_dir();
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
+    sweep_pasted_images_in(&dir);
 }
 #[cfg(test)]
 mod tests {
@@ -129,6 +151,27 @@ mod tests {
     fn rejects_garbage_base64_and_empty_payload() {
         assert!(save_pasted_image("!!!not-base64!!!".to_string(), "png".to_string()).is_err());
         assert!(save_pasted_image(String::new(), "png".to_string()).is_err());
+    }
+
+    #[test]
+    fn sweep_removes_temporary_root_files_and_preserves_durable_plugin_attachments() {
+        let root = std::env::temp_dir().join(format!("ccgui-sweep-test-{}", uuid::Uuid::new_v4()));
+        let plugin_dir = root.join(PLUGIN_ATTACHMENTS_DIR_NAME).join("example-dashboard");
+        std::fs::create_dir_all(&plugin_dir).expect("create plugin attachment dir");
+
+        let temp_file = root.join("paste-temp-1.png");
+        let durable_img = plugin_dir.join("img-0123456789abcdef0123456789abcdef.png");
+        let durable_meta = plugin_dir.join("img-0123456789abcdef0123456789abcdef.json");
+        std::fs::write(&temp_file, b"\x89PNG\r\n\x1a\n").expect("write temp file");
+        std::fs::write(&durable_img, b"\x89PNG\r\n\x1a\n").expect("write durable image");
+        std::fs::write(&durable_meta, b"{\"id\":\"img-0123456789abcdef0123456789abcdef\"}").expect("write durable meta");
+
+        sweep_pasted_images_in(&root);
+
+        assert!(!temp_file.exists(), "root temporary pasted image must be swept");
+        assert!(durable_img.exists(), "durable plugin image must be preserved across startup sweep");
+        assert!(durable_meta.exists(), "durable plugin metadata must be preserved across startup sweep");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 

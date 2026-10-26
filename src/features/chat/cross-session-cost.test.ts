@@ -33,6 +33,25 @@ beforeEach(() => {
 });
 
 describe("cross-session cost review telemetry", () => {
+  it.each([0, 43920, 49999, 50000])("applies the cross-session threshold to current context %i", (used) => {
+    const f = fixture("claude", { input_tokens: used });
+    for (const cache of [null, { startedAt: NOW - 7200_000, observedAt: NOW - 7100_000, ttlSeconds: 3600, source: "anthropic-usage" as const },
+      { startedAt: NOW - 3595_000, observedAt: NOW - 3594_000, ttlSeconds: 3600, source: "anthropic-usage" as const }]) {
+      f.meta.promptCache = cache;
+      const review = f.review();
+      expect(requiresCrossSessionCostApproval({ ...review, context: { ...review.context, used, kind: "current_context" } })).toBe(used >= 50000);
+    }
+  });
+  it.each([
+    { used: undefined }, { used: Number.NaN }, { used: -1 }, { used: Infinity },
+    { used: 43920, kind: "last_request" as const }, { used: 43920, kind: "unknown" as const },
+    { used: 43920, modelMismatch: true },
+  ])("does not exempt unreliable or mismatched context %j", (context) => {
+    const f = fixture("claude", { input_tokens: 43920 });
+    f.meta.promptCache = null;
+    const review = f.review();
+    expect(requiresCrossSessionCostApproval({ ...review, context: { ...review.context, ...context } })).toBe(true);
+  });
   it("uses last Claude occupancy including cache, never file size or message count", () => {
     const f = fixture("claude", { input_tokens: 10, cache_read_input_tokens: 800, cache_creation_input_tokens: 100, output_tokens: 90, context_window: 2000 });
     expect(f.review()).toMatchObject({ model: "model-a", cacheHeat: "hot", capturedAt: NOW,
@@ -46,6 +65,41 @@ describe("cross-session cost review telemetry", () => {
       model_context_window: 4000,
     } });
     expect(f.review().context).toMatchObject({ used: 1000, max: 4000, kind: "current_context" });
+  });
+  it.each(["gpt-6-astra", "gpt-5.4", " GPT-6-SOL "])("does not gate Codex %s on old or missing cache evidence", (model) => {
+    const f = fixture("codex", { info: { last_token_usage: { input_tokens: 270274 }, model_context_window: 570000 } });
+    f.meta.model = model;
+    f.state.openTabs[0].model = model;
+    f.meta.updatedAt = NOW - 30 * 24 * 60 * 60_000;
+    for (const cache of [null, { startedAt: NOW - 7200_000, observedAt: NOW - 7100_000, ttlSeconds: 1800, source: "openai-policy" as const }]) {
+      f.meta.promptCache = cache;
+      for (const status of ["idle", "busy", "awaiting_permission"] as const) {
+        const review = crossSessionCostReview(f.meta, f.state, status, NOW);
+        expect(requiresSessionSendCostApproval(review, f.meta, f.session, NOW)).toBe(false);
+        expect(requiresQueueDrainCostApproval(review)).toBe(false);
+        expect(requiresCrossSessionCostApproval(review)).toBe(false);
+        expect(review.cache).toBeUndefined();
+      }
+    }
+  });
+  it("keeps Codex model-change approval independent of cache age", () => {
+    const f = fixture("codex", { info: { last_token_usage: { input_tokens: 270274 } } });
+    f.meta.model = "gpt-6-astra";
+    f.state.openTabs[0].model = "gpt-6-astra";
+    f.session.messages = [{ model: "gpt-6-sol", usage: f.session.usage } as never];
+    f.meta.promptCache = null;
+    expect(requiresSessionSendCostApproval(f.review(), f.meta, f.session, NOW)).toBe(true);
+    expect(requiresCrossSessionCostApproval(f.review())).toBe(true);
+  });
+  it.each(["other-model", "gpt-", undefined])("keeps unknown cache guards for Codex model %s", (model) => {
+    const f = fixture("codex", { info: { last_token_usage: { input_tokens: 270274 } } });
+    f.meta.model = model;
+    f.state.openTabs[0].model = model;
+    f.state.models.codex = model as never;
+    f.meta.promptCache = null;
+    f.meta.updatedAt = NOW - 7200_000;
+    expect(requiresSessionSendCostApproval(f.review(), f.meta, f.session, NOW)).toBe(true);
+    expect(requiresCrossSessionCostApproval(f.review())).toBe(true);
   });
   it("does not turn missing telemetry or the 200k fallback into a known window", () => {
     const f = fixture();
@@ -69,7 +123,14 @@ describe("cross-session cost review telemetry", () => {
   });
   it("uses Cursor measured context, and rejects a billed-only aggregate", () => {
     const f = fixture("cursor", { input_tokens: 2000000, context_usage_kind: "current_context", context_usage: { used_tokens: 50000, context_window: 200000 } });
-    expect(f.review()).toMatchObject({ cacheHeat: "unknown", context: { used: 50000, max: 200000, kind: "current_context" } });
+    f.meta.promptCache = { startedAt: NOW - 1000, observedAt: NOW, ttlSeconds: 300, source: "cursor-policy" };
+    expect(f.review()).toMatchObject({ cacheHeat: "hot", cache: { ttlSeconds: 300, source: "cursor-policy" }, context: { used: 50000, max: 200000, kind: "current_context" } });
+    expect(requiresCrossSessionCostApproval(f.review())).toBe(false);
+    f.meta.promptCache = { ...f.meta.promptCache, startedAt: NOW - 301_000, observedAt: NOW - 300_000 };
+    expect(f.review().cacheHeat).toBe("cold");
+    expect(requiresCrossSessionCostApproval(f.review())).toBe(true);
+    f.meta.promptCache = null;
+    expect(f.review().cacheHeat).toBe("unknown");
     f.session.usage = { input_tokens: 2000000, context_window: 200000 };
     expect(f.review().context.kind).toBe("unknown");
   });

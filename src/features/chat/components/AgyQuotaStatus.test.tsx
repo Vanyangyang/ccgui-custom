@@ -71,7 +71,7 @@ describe("AGY remaining usage status", () => {
     await act(async () => dialog.querySelector("button")!.click());
     expect(refresh).toHaveBeenCalledOnce();
   });
-  it("uses missing dashes, expires percentages, and labels stale and query errors", async () => {
+  it("uses missing dashes, retains old percentages, and labels stale and query errors", async () => {
     await render();
     expect(container.textContent).toBe("5h — · Week — remaining");
     const dialog = await open();
@@ -82,9 +82,8 @@ describe("AGY remaining usage status", () => {
     await render({ ...quota(), status: "stale", errorCode: "refresh_cooldown" });
     expect(dialog.textContent).toContain("Refresh cooldown");
     await render(quota(), "gemini-pro", false, NOW + 3600);
-    expect(container.textContent).toBe("5h — · Week — remaining");
-    expect(dialog.textContent).toContain("over an hour old");
-    expect(dialog.textContent).not.toContain(new Date(NOW * 1000).toLocaleString("en"));
+    expect(container.textContent).toContain("Stale");
+    expect(dialog.textContent).toContain(new Date(NOW * 1000).toLocaleString("en"));
     expect(dialog.textContent).toContain("$348.01 / $383.45 (91%)");
     expect(dialog.textContent).toContain("$51.13 (100%)");
   });
@@ -101,6 +100,9 @@ describe("AGY remaining usage status", () => {
     const dialog = await open();
     expect(dialog.textContent).toContain("Antigravity credits");
     expect(dialog.textContent).toContain("1,250.5");
+    await render({ ...quota(), credits: { remaining: 1250.5 } }, "gemini-pro", false, NOW + 3600);
+    expect(dialog.textContent).not.toContain("1,250.5");
+    expect(container.textContent).toContain("Stale");
     await render({ status: "unavailable", groups: [], errorCode: "auth_changed", credits: { remaining: 9 } });
     expect([...dialog.querySelectorAll("dt")].some(node => node.textContent === "Antigravity credits")).toBe(false);
     await render({ ...quota(), credits: { remaining: 0 } });

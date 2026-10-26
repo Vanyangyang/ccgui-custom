@@ -1,6 +1,7 @@
 import type { ActiveSession } from "./persistence";
 import { sessionKey } from "./persistence";
 import { effectivePermission } from "./permissions";
+import { resolveClaudeHaikuAssist } from "../claude-haiku-assist";
 import {
   resolveSessionEffort,
   resolveClaudeUltracode,
@@ -89,7 +90,7 @@ export function resolveLaunchSettings(
     model: resolveSessionModel(tab, session, state.models[engine]) || null,
     effort: resolveSessionEffort(tab, session, state.efforts[engine], state.models[engine]) ?? null,
     claudeUltracode: resolveClaudeUltracode(tab, session, state.defaultClaudeUltracode),
-    claudeHaikuAssist: tab.engine === "claude" && tab.claudeHaikuAssist === true,
+    claudeHaikuAssist: resolveClaudeHaikuAssist(tab),
     provider: resolveSessionProvider(tab, session, state.providers[engine]) ?? null,
     permission: effectivePermission(state.engines, engine, state.permission),
   };

@@ -1,7 +1,7 @@
 import { act, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import "@/lib/i18n";
+import i18n from "@/lib/i18n";
 import { CliMenu, requestCliMenuOpen } from "./cli-menu";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT =
@@ -283,6 +283,29 @@ describe("CliMenu flyout switching", () => {
     await act(async () => requestCliMenuOpen());
     expect(document.querySelector('[role="dialog"]')).toBeNull();
     expect(props.onModelChange).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("managed Codex hides Fast without changing chat controls (mobile=%s)", async (mobile) => {
+    if (mobile) vi.stubGlobal("matchMedia", (media: string) => ({
+      matches: media.includes("max-width"), media, addEventListener() {}, removeEventListener() {},
+    }));
+    const onTierChange = vi.fn();
+    const props = { ...taskProps(), selectionScope: "chat" as const,
+      codexServiceTier: "priority" as const, onCodexServiceTierChange: onTierChange };
+    act(() => root.render(<CliMenu {...props} />));
+    expect(container.textContent).toContain("Fast");
+    await openMenu();
+    if (mobile) await click(engineRow("Codex")!);
+    const fastToggle = () => document.querySelector(`[aria-label="${i18n.t("chat.ompFastToggle")}"]`);
+    expect(fastToggle()?.getAttribute("aria-pressed")).toBe("true");
+
+    act(() => root.render(<CliMenu {...props} allowCodexFast={false} />));
+    expect(document.body.textContent).not.toContain("Fast");
+    expect(fastToggle()).toBeNull();
+    const effortButtons = [...document.querySelectorAll<HTMLButtonElement>('button')];
+    await click(effortButtons.find(button => button.textContent === "高")!);
+    expect(props.onEffortChange).toHaveBeenCalledWith("codex", "high");
+    expect(onTierChange).not.toHaveBeenCalled();
   });
 
   it("task picker hides chat speed controls while retaining effort and channel callbacks", async () => {

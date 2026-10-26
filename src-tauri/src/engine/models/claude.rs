@@ -84,24 +84,27 @@ fn parse_registry(bytes: &[u8]) -> EmbeddedRegistry {
 /// then degrades to bare family names.
 fn embedded_registry(bin: &std::path::Path) -> Option<EmbeddedRegistry> {
     struct CacheEntry {
+        path: PathBuf,
         len: u64,
         modified: Option<std::time::SystemTime>,
         registry: Option<EmbeddedRegistry>,
     }
     static CACHE: std::sync::LazyLock<parking_lot::Mutex<Option<CacheEntry>>> =
         std::sync::LazyLock::new(|| parking_lot::Mutex::new(None));
-    let meta = std::fs::metadata(bin).ok()?;
+    let resolved_path = std::fs::canonicalize(bin).ok()?;
+    let meta = std::fs::metadata(&resolved_path).ok()?;
     let (len, modified) = (meta.len(), meta.modified().ok());
     if let Some(entry) = CACHE.lock().as_ref() {
-        if entry.len == len && entry.modified == modified {
+        if entry.path == resolved_path && entry.len == len && entry.modified == modified {
             return entry.registry.clone();
         }
     }
-    let registry = std::fs::read(bin)
+    let registry = std::fs::read(&resolved_path)
         .ok()
         .map(|bytes| parse_registry(&bytes))
         .filter(|r| !r.alias_defaults.is_empty());
     *CACHE.lock() = Some(CacheEntry {
+        path: resolved_path,
         len,
         modified,
         registry: registry.clone(),
@@ -183,6 +186,80 @@ fn read_cli_config() -> CliModelConfig {
 /// names makes the request match the display regardless.
 pub(crate) fn resolve_launch_model(selector: &str) -> String {
     resolve_launch_model_from(&read_cli_config(), selector)
+}
+
+/// Discussions persist an explicit launch model and recheck it before every
+/// send. The ordinary CLI launcher may pass an alias through, but that is not
+/// enough for this contract. Pin native family aliases from the selected CLI's
+/// own registry, after applying native model overrides. Never borrow first-party
+/// defaults for a different native routing mode or an app-owned custom channel.
+pub(super) fn resolve_discussion_model(selector: &str, bin: Option<&std::path::Path>) -> String {
+    let bare = selector.strip_suffix("[1m]").unwrap_or(selector);
+    if !matches!(bare, "default" | "opus" | "sonnet" | "haiku" | "fable") {
+        return selector.to_string();
+    }
+    let inherited = FAMILY_ENV_KEYS.iter().map(|(_, key, _)| *key)
+        .chain(["ANTHROPIC_MODEL"])
+        .chain(NATIVE_ROUTING_KEYS.iter().copied())
+        .filter_map(|key| std::env::var(key).ok().map(|value| (key.to_string(), value)))
+        .collect();
+    let (config, registry_allowed) = read_discussion_config(&claude_config_dir(), inherited);
+    let registry = if registry_allowed { bin.and_then(embedded_registry) } else { None };
+    resolve_discussion_model_from(&config, registry.as_ref(), selector)
+}
+
+const NATIVE_ROUTING_KEYS: &[&str] = &[
+    "ANTHROPIC_BASE_URL", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
+];
+
+fn read_discussion_config(dir: &std::path::Path, inherited: std::collections::HashMap<String, String>) -> (CliModelConfig, bool) {
+    // Settings env wins over inherited process env, including an explicit empty
+    // value. Keep only model/routing metadata; no credential or hook is needed.
+    let mut merged = serde_json::json!({"env": inherited});
+    for name in ["settings.json", "settings.local.json"] {
+        let bytes = match std::fs::read(dir.join(name)) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return (CliModelConfig::default(), false),
+        };
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return (CliModelConfig::default(), false); };
+        if !value.is_object() || value.get("model").is_some_and(|v| !v.is_string()) || value.get("env").is_some_and(|v| !v.is_object()) {
+            return (CliModelConfig::default(), false);
+        }
+        if let Some(model) = value.get("model") { merged["model"] = model.clone(); }
+        for key in FAMILY_ENV_KEYS.iter().map(|(_, key, _)| *key).chain(["ANTHROPIC_MODEL"]).chain(NATIVE_ROUTING_KEYS.iter().copied()) {
+            if value.get("env").and_then(|env| env.get(key)).is_some_and(|v| !v.is_string()) { return (CliModelConfig::default(), false); }
+            if let Some(value) = value.get("env").and_then(|env| env.get(key)).and_then(serde_json::Value::as_str) {
+                merged["env"][key] = serde_json::Value::String(value.to_string());
+            }
+        }
+    }
+    let mut config = CliModelConfig::default();
+    merge_settings_json(&mut config, &merged.to_string());
+    let registry_allowed = NATIVE_ROUTING_KEYS.iter().all(|key| {
+        let value = merged["env"][*key].as_str().unwrap_or_default().trim();
+        value.is_empty() || *key != "ANTHROPIC_BASE_URL" && matches!(value.to_ascii_lowercase().as_str(), "0" | "false")
+    });
+    (config, registry_allowed)
+}
+
+fn with_context_suffix(model: &str, wants_1m: bool) -> String {
+    if wants_1m && !model.ends_with("[1m]") { format!("{model}[1m]") } else { model.to_string() }
+}
+
+fn resolve_discussion_model_from(config: &CliModelConfig, registry: Option<&EmbeddedRegistry>, selector: &str) -> String {
+    let bare = selector.strip_suffix("[1m]").unwrap_or(selector);
+    let selected = if bare == "default" {
+        config.env_model.as_deref().or(config.model_key.as_deref())
+            .or_else(|| registry.and_then(|r| r.best.as_deref())).unwrap_or(selector)
+    } else { selector };
+    let family = selected.strip_suffix("[1m]").unwrap_or(selected);
+    let wants_1m = selector.ends_with("[1m]") || selected.ends_with("[1m]");
+    // An explicit override wins even when it is not resolvable. The caller's
+    // strict validation will reject an alias instead of silently changing it.
+    if let Some(model) = config.override_for(family) { return with_context_suffix(model, wants_1m); }
+    let model = registry.and_then(|r| r.alias_defaults.get(family)).map(String::as_str).unwrap_or(selected);
+    with_context_suffix(model, wants_1m)
 }
 
 fn resolve_launch_model_from(config: &CliModelConfig, selector: &str) -> String {
@@ -371,6 +448,93 @@ mod tests {
             resolve_launch_model_from(&CliModelConfig::default(), "default"),
             "default"
         );
+    }
+
+    #[test]
+    fn discussion_pins_native_aliases_and_default_from_the_selected_cli_registry() {
+        let registry = fake_registry();
+        let mut config = CliModelConfig::default();
+        // Ordinary CLI sends still own their alias semantics; discussion sends
+        // need a concrete value that can be persisted and compared next turn.
+        assert_eq!(resolve_launch_model_from(&config, "opus"), "opus");
+        assert_eq!(resolve_discussion_model_from(&config, Some(&registry), "opus"), "claude-opus-5");
+        assert_eq!(resolve_discussion_model_from(&config, Some(&registry), "opus[1m]"), "claude-opus-5[1m]");
+        assert_eq!(resolve_discussion_model_from(&config, Some(&registry), "default"), "claude-fable-5");
+        config.model_key = Some("opus[1m]".into());
+        assert_eq!(resolve_discussion_model_from(&config, Some(&registry), "default"), "claude-opus-5[1m]");
+        config.env_model = Some("explicit-model".into());
+        assert_eq!(resolve_discussion_model_from(&config, Some(&registry), "default[1m]"), "explicit-model[1m]");
+        // A registry/config change must become a different resolved identity.
+        let next = parse_registry(br#"aliases:{opus:{default:"claude-opus-next"}},defaults:{},best:"opus""#);
+        assert_eq!(resolve_discussion_model_from(&config, Some(&next), "opus"), "claude-opus-next");
+    }
+
+    #[test]
+    fn discussion_preserves_explicit_overrides_and_leaves_unknown_aliases_unresolved() {
+        let registry = fake_registry();
+        let mut config = CliModelConfig::default();
+        config.overrides.insert("opus".into(), "channel-model".into());
+        assert_eq!(resolve_discussion_model_from(&config, Some(&registry), "opus[1m]"), "channel-model[1m]");
+        config.overrides.insert("opus".into(), "channel-model[1m]".into());
+        assert_eq!(resolve_discussion_model_from(&config, Some(&registry), "opus[1m]"), "channel-model[1m]");
+        config.overrides.insert("opus".into(), "sonnet".into());
+        assert_eq!(resolve_discussion_model_from(&config, Some(&registry), "opus"), "sonnet");
+        for model in ["default", "opus", "opus[1m]", "sonnet", "haiku", "auto", "opusplan"] {
+            assert_eq!(resolve_discussion_model_from(&CliModelConfig::default(), None, model), model);
+        }
+        assert_eq!(resolve_discussion_model_from(&config, Some(&registry), "an-explicit-id[1m]"), "an-explicit-id[1m]");
+    }
+
+    #[test]
+    fn discussion_native_settings_override_inherited_model_and_routing_metadata() {
+        let dir = std::env::temp_dir().join(format!("ccgui-discussion-config-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let inherited = std::collections::HashMap::from([
+            ("ANTHROPIC_DEFAULT_OPUS_MODEL".into(), "inherited-model".into()),
+            ("CLAUDE_CODE_USE_BEDROCK".into(), "1".into()),
+        ]);
+        let (config, registry_allowed) = read_discussion_config(&dir, inherited.clone());
+        assert!(!registry_allowed);
+        assert_eq!(resolve_discussion_model_from(&config, None, "opus[1m]"), "inherited-model[1m]");
+        std::fs::write(dir.join("settings.json"), r#"{"model":"opus","env":{"ANTHROPIC_DEFAULT_OPUS_MODEL":"user-model"}}"#).unwrap();
+        std::fs::write(dir.join("settings.local.json"), r#"{"env":{"ANTHROPIC_DEFAULT_OPUS_MODEL":"local-model","CLAUDE_CODE_USE_BEDROCK":"false"}}"#).unwrap();
+        let (config, registry_allowed) = read_discussion_config(&dir, inherited.clone());
+        assert!(registry_allowed);
+        assert_eq!(resolve_discussion_model_from(&config, Some(&fake_registry()), "default[1m]"), "local-model[1m]");
+        std::fs::write(dir.join("settings.local.json"), r#"{"env":{"ANTHROPIC_DEFAULT_OPUS_MODEL":"","CLAUDE_CODE_USE_BEDROCK":"0"}}"#).unwrap();
+        let (config, registry_allowed) = read_discussion_config(&dir, inherited);
+        assert!(registry_allowed);
+        assert_eq!(resolve_discussion_model_from(&config, Some(&fake_registry()), "opus"), "claude-opus-5");
+        for key in NATIVE_ROUTING_KEYS {
+            let value = serde_json::json!({"env":{(*key):"1"}});
+            std::fs::write(dir.join("settings.local.json"), value.to_string()).unwrap();
+            let (_, registry_allowed) = read_discussion_config(&dir, Default::default());
+            assert!(!registry_allowed, "must not use first-party defaults with {key}");
+        }
+        for invalid in ["{", r#"{"env":{"ANTHROPIC_DEFAULT_OPUS_MODEL":true}}"#] {
+            std::fs::write(dir.join("settings.local.json"), invalid).unwrap();
+            let (config, registry_allowed) = read_discussion_config(&dir, Default::default());
+            assert!(!registry_allowed);
+            assert_eq!(resolve_discussion_model_from(&config, None, "opus"), "opus");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn embedded_registry_cache_distinguishes_binaries_with_equal_size_and_timestamp() {
+        let dir = std::env::temp_dir().join(format!("ccgui-registry-cache-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.exe");
+        let b = dir.join("b.exe");
+        let stamp = std::time::UNIX_EPOCH + std::time::Duration::from_secs(100000);
+        for (file, model) in [(&a, "claude-opus-a"), (&b, "claude-opus-b")] {
+            std::fs::write(file, format!("aliases:{{opus:{{default:\"{model}\"}}}},defaults:{{}},best:\"opus\"")).unwrap();
+            std::fs::OpenOptions::new().write(true).open(file).unwrap().set_modified(stamp).unwrap();
+        }
+        assert_eq!(std::fs::metadata(&a).unwrap().len(), std::fs::metadata(&b).unwrap().len());
+        assert_eq!(embedded_registry(&a).unwrap().alias_defaults["opus"], "claude-opus-a");
+        assert_eq!(embedded_registry(&b).unwrap().alias_defaults["opus"], "claude-opus-b");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

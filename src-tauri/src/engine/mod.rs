@@ -21,6 +21,7 @@ mod codex_desktop;
 pub(crate) mod codex_provider_env;
 mod codex_read_only;
 mod host_instructions;
+mod plugin_instructions;
 mod codex_usage;
 pub mod dsh;
 mod dsh_images;
@@ -1069,6 +1070,7 @@ async fn send_message_inner_with_sink(
     claude_ultracode: Option<bool>,
     claude_haiku_assist: Option<bool>,
 ) -> Result<SendResult, String> {
+    let _memory_foreground = crate::plugin_memory::foreground();
     let run_id = run_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     if run_id.is_empty()
         || run_id.len() > 128
@@ -1078,15 +1080,16 @@ async fn send_message_inner_with_sink(
     {
         return Err("invalid run id".into());
     }
+    // Ignore legacy opt-ins before handing off to either the worker or local launch path.
+    let claude_haiku_assist = claude_haiku_assist.map(|enabled| enabled && claude_haiku_assist::ENABLED);
     if !DETACHED_WORKER_REQUEST.try_with(|value| *value).unwrap_or(false)
         && crate::worker_host::enabled()
         && Arc::ptr_eq(&sink, &state.sink)
         && allowed_tools.is_none() && !sidechat::is_side_run_id(&run_id)
-        && !crate::leader::is_managed_child(&run_id)
         && computer_use != Some(true)
         && matches!(engine.as_str(), "claude" | "codex" | "agy" | "cursor")
         && wsl_transport::transport_for_workspace(&state.db, &workspace_path).is_none()
-        && crate::leader::validate_worker_session(&state.db, &engine, session_id.as_deref()).is_ok()
+        && crate::leader::validate_host_worker_session(&state.db, &engine, session_id.as_deref()).is_ok()
     {
         return crate::worker_host::start(run_id, crate::task_worker::StartArgs {
             engine, workspace_path, session_id, prompt, image_paths, model, effort, permission,
@@ -1229,21 +1232,24 @@ async fn send_reserved(
     if claude_haiku_assist == Some(true) {
         claude_haiku_assist::validate_scope(&engine, wsl_tp.is_some())?;
     }
-    // This capability belongs to an ordinary local GUI chat, never a plugin
-    // agent, mission node, remote CLI, or explicitly tool-constrained run.
+    // Host tools belong to local GUI chats, never plugin agents, mission nodes,
+    // remote CLIs or explicitly tool-constrained runs. The relay separately
+    // admits executable Sidechat with only the self-development tool scope.
     let is_side_run = sidechat::is_side_run_id(&run_id);
-    let ordinary_local_chat = !is_side_run
-        && matches!(engine.as_str(), "claude" | "codex" | "agy" | "cursor")
+    let local_gui_chat = matches!(engine.as_str(), "claude" | "codex" | "agy" | "cursor")
         && wsl_tp.is_none()
         && allowed_tools.is_none()
         && Arc::ptr_eq(&sink, &state.sink);
+    let ordinary_local_chat = local_gui_chat && !is_side_run;
     let local_title_source = !is_side_run && wsl_tp.is_none() && allowed_tools.is_none()
         && Arc::ptr_eq(&sink, &state.sink)
         && crate::auto_title::origin::local_workspace(&state.db, &workspace_path);
     let session_id = session_id.filter(|session| !session.trim().is_empty());
     let detached_worker = DETACHED_WORKER_REQUEST.try_with(|value| *value).unwrap_or(false);
     if detached_worker {
-        crate::leader::validate_worker_session(&state.db, &engine, session_id.as_deref())?;
+        crate::host_chat::validate_worker_session(
+            &state.db, &run_id, &engine, session_id.as_deref(), &workspace_path,
+        )?;
     }
     if !ordinary_local_chat && !detached_worker && !is_side_run {
         crate::leader::prepare_isolated_run(
@@ -1252,7 +1258,7 @@ async fn send_reserved(
         )?;
         leader_registered.store(true, std::sync::atomic::Ordering::SeqCst);
     }
-    let host_chat_server = if ordinary_local_chat {
+    let host_chat_server = if local_gui_chat {
         crate::host_chat::server_for_run(
             &run_id,
             &engine,
@@ -1280,7 +1286,9 @@ async fn send_reserved(
         allowed_tools,
         wsl_tp.is_some(),
         host_chat_server.as_ref(),
-        claude_ultracode,
+        // The read-only side branch installs one host-owned restrictions
+        // overlay below. Do not create an earlier inline ultracode overlay.
+        if is_side_run && engine == "claude" && sidechat::is_read_only_run(&run_id) { None } else { claude_ultracode },
     )?;
     if is_side_run && engine == "claude" {
         let ephemeral = sidechat::is_ephemeral_run_id(&run_id);
@@ -1289,6 +1297,13 @@ async fn send_reserved(
             .session_id
             .as_deref()
             .is_some_and(|sid| ephemeral || !sidechat::is_hidden_session("claude", sid));
+        if sidechat::is_read_only_run(&run_id) || ephemeral {
+            if let Err(error) = claude_channel::restrict_read_only(&mut launch.built) {
+                cleanup_staged_files(&launch.built.cleanup_files);
+                if let Some(restore) = &launch.built.mcp_restore { restore.restore(); }
+                return Err(error);
+            }
+        }
         sidechat::apply_claude_flags(&mut launch.built.command, fork_session, ephemeral, sidechat::is_read_only_run(&run_id));
         if fork_session {
             launch.built.preassigned_session_id = None;
@@ -1303,8 +1318,10 @@ async fn send_reserved(
         }
         claude_haiku_assist::apply(&mut launch.built.command);
     }
-    if ordinary_local_chat {
-        let instructions = if detached_worker {
+    {
+        let instructions = if !ordinary_local_chat {
+            Ok(None)
+        } else if detached_worker {
             Ok(crate::host_chat::worker_task_instructions())
         } else {
             crate::leader::prepare_run(
@@ -1316,11 +1333,19 @@ async fn send_reserved(
                 launch.req.permission.as_deref(),
             )
         };
-        if !detached_worker && instructions.is_ok() {
+        if ordinary_local_chat && !detached_worker && instructions.is_ok() {
             leader_registered.store(true, std::sync::atomic::Ordering::SeqCst);
         }
         let instructions = instructions.and_then(|instructions| {
-            let instructions = host_instructions::with_chat_presentation(&engine, true, instructions);
+            let plugin = plugin_instructions::lookup(
+                &state.db, &run_id, &engine, &workspace_path, launch.req.session_id.as_deref(),
+            )?;
+            if plugin.is_some() && (wsl_tp.is_some() || !(ordinary_local_chat || is_side_run)) {
+                return Err("Plugin fixed instructions require a local chat or native discussion".into());
+            }
+            let instructions = host_instructions::with_plugin_instructions(
+                host_instructions::with_chat_presentation(&engine, ordinary_local_chat, instructions), plugin,
+            );
             if engine == "claude" {
                 if let Some(text) = instructions.as_deref() {
                     host_instructions::append_claude(&mut launch.built, text)?;
@@ -1351,6 +1376,9 @@ async fn send_reserved(
         );
     }
     mark_leader_child(&mut launch.built.command, &run_id);
+    if engine == "codex" {
+        codex::apply_child_service_tier(&mut launch.built.command, &mut launch.req, &run_id);
+    }
     if mark_native_completion(&mut launch.built.command, &run_id, &engine, &launch.req, local_title_source, &killed) {
         completion_registered.store(true, std::sync::atomic::Ordering::SeqCst);
     }
@@ -1466,6 +1494,8 @@ async fn send_reserved(
     command.env("PATH", resolve::cli_search_path());
     crate::development_profile::enforce_homes(&mut command);
 
+    let request_started_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -1571,6 +1601,7 @@ async fn send_reserved(
     // has the run id, so remember the mapping for the run's lifetime.
     crate::mcp::register_run(&run_id, &launch.req.workspace.to_string_lossy());
     let ctx = RunContext {
+        request_started_at: Some(request_started_at),
         core: TurnCore {
             sink: Arc::clone(&sink),
             registry: Arc::clone(&state.processes),
@@ -1696,6 +1727,45 @@ async fn send_host_stream(
     })
 }
 
+/// Resolve explicit discussion launch values without migrating or writing CLI
+/// configuration. The later send receives the resolved model, not a mutable alias.
+pub(crate) fn resolve_discussion_model(engine: &str, selected: &str, provider_id: &str) -> Result<String, String> {
+    crate::config::ensure_engine_enabled(engine)?;
+    let provider = crate::config::resolve_provider_read_only(engine, Some(provider_id))?;
+    let env = provider.as_ref().map(|value| crate::provider_files::channel_env(engine, value)).transpose()?.unwrap_or_default();
+    resolve_discussion_model_with(engine, selected, provider.as_ref(), &env)
+}
+
+fn resolve_discussion_model_with(engine: &str, selected: &str, provider: Option<&Value>, env: &std::collections::HashMap<String, String>) -> Result<String, String> {
+    if !matches!(engine, "claude" | "codex") || selected.trim().is_empty() { return Err("Unsupported discussion model selection".into()); }
+    let model = if engine == "claude" && provider.is_none() { Some(models::resolve_claude_discussion_model(selected)) }
+        else if engine == "claude" { claude_channel::resolve_model(Some(selected), provider, env) } else { Some(selected.to_owned()) }
+        .ok_or("Discussion model could not be resolved")?;
+    let base = model.strip_suffix("[1m]").unwrap_or(&model);
+    if matches!(base.to_lowercase().as_str(), "default" | "auto" | "automatic" | "latest" | "best") ||
+        (engine == "claude" && matches!(base.to_lowercase().as_str(), "opus" | "sonnet" | "haiku" | "fable" | "opusplan")) {
+        return Err("Select an explicit model; this channel alias has no fixed launch identity".into());
+    }
+    Ok(model)
+}
+
+#[cfg(test)]
+mod discussion_model_tests {
+    use super::*;
+    #[test]
+    fn resolves_channel_alias_without_changing_provider_data() {
+        let provider = serde_json::json!({"settingsConfig":{"model":"opus"}});
+        let before = provider.clone();
+        let env = std::collections::HashMap::from([("ANTHROPIC_DEFAULT_OPUS_MODEL".into(), "explicit-channel-model".into())]);
+        assert_eq!(resolve_discussion_model_with("claude", "opus[1m]", Some(&provider), &env).unwrap(), "explicit-channel-model[1m]");
+        assert_eq!(provider, before);
+        assert!(resolve_discussion_model_with("claude", "sonnet", Some(&provider), &env).is_err());
+        assert!(resolve_discussion_model_with("claude", "opus", Some(&provider), &Default::default()).is_err());
+        assert!(resolve_discussion_model_with("codex", "auto", None, &env).is_err());
+        assert_eq!(resolve_discussion_model_with("codex", "explicit-model", None, &env).unwrap(), "explicit-model");
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_side_message_inner(
     state: &crate::AppState,
@@ -1713,6 +1783,7 @@ pub(crate) async fn send_side_message_inner(
     run_id: Option<String>,
     permission: Option<String>,
 ) -> Result<SendResult, String> {
+    let _memory_foreground = crate::plugin_memory::foreground();
     if !sidechat::is_supported_engine(&engine) {
         return Err(format!(
             "引擎 {engine} 暂不支持 /btw 与 /sidechat（目前仅支持 claude、codex、agy、cursor）"
@@ -2100,6 +2171,7 @@ pub(crate) async fn send_follow_up_inner(
     prompt: &str,
     images: &[String],
 ) -> Result<bool, String> {
+    let _memory_foreground = crate::plugin_memory::foreground();
     if let Some(outcome) = crate::worker_host::control(key, &uuid::Uuid::new_v4().to_string(), crate::task_worker::Command::Followup {
         prompt:prompt.into(), image_paths:Some(images.to_vec()),
     }).await {
@@ -3560,6 +3632,7 @@ mod retry_lifecycle_tests {
         let stdout = child.stdout.take().unwrap();
         let emitter = Arc::new(CollectingEmitter::default());
         let ctx = RunContext {
+            request_started_at: None,
             core: TurnCore {
                 sink: event_sink::EventSink::new(emitter.clone()),
                 registry: Arc::new(ProcessRegistry::default()),
@@ -3609,6 +3682,7 @@ mod retry_lifecycle_tests {
         let stdout = child.stdout.take().unwrap();
         let emitter = Arc::new(CollectingEmitter::default());
         let ctx = RunContext {
+            request_started_at: None,
             core: TurnCore {
                 sink: event_sink::EventSink::new(emitter.clone()),
                 registry: Arc::new(ProcessRegistry::default()),
@@ -3732,6 +3806,7 @@ mod retry_lifecycle_tests {
             );
         }
         let ctx = RunContext {
+            request_started_at: None,
             core: TurnCore {
                 sink: event_sink::EventSink::new(emitter.clone()),
                 registry: Arc::clone(&registry),
@@ -3958,6 +4033,7 @@ mod retry_lifecycle_tests {
         let registry = Arc::new(ProcessRegistry::default());
         registry.insert("run-linger".to_string(), live_entry(&child, pid, "run-linger"));
         let ctx = RunContext {
+            request_started_at: None,
             core: TurnCore {
                 sink: event_sink::EventSink::new(emitter.clone()),
                 registry: Arc::clone(&registry),
@@ -4087,6 +4163,7 @@ mod retry_lifecycle_tests {
         let registry = Arc::new(ProcessRegistry::default());
         registry.insert("run-native".to_string(), live_entry(&child, pid, "run-native"));
         let ctx = RunContext {
+            request_started_at: None,
             core: TurnCore {
                 sink: event_sink::EventSink::new(emitter.clone()),
                 registry: Arc::clone(&registry),

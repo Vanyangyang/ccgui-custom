@@ -26,3 +26,20 @@ it("localizes the Cursor saved-selection gate", async () => {
   await i18n.changeLanguage("en");
   expect(errorText(new Error(message))).toContain("Check a specific model");
 });
+
+it("localizes worker engine errors without displaying the transport envelope", async () => {
+  await i18n.changeLanguage("zh");
+  const message = "Cursor model is not selected in saved settings; select it in Settings → Collaboration and save before sending";
+  const envelope = { code: "engine_error", message, outcomeUnknown: false };
+  for (const error of [envelope, JSON.stringify(envelope), new Error(JSON.stringify(envelope))]) {
+    expect(errorText(error)).toBe(i18n.t("settings.cursorModelNotSelected"));
+  }
+  expect(envelope.outcomeUnknown).toBe(false);
+});
+
+it("preserves unrecognized error envelopes", () => {
+  for (const message of ['{"code":"future","message":"details","outcomeUnknown":false}',
+    '{"code":"engine_error","message":42,"outcomeUnknown":false}', '{malformed']) {
+    expect(errorText(message)).toBe(message);
+  }
+});

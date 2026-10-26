@@ -38,7 +38,7 @@ describe("Claude account quota display", () => {
   it("retains both percentages and collection time across reset boundaries until the next snapshot", () => {
     const data = snapshot({ fiveHour: { usedPercentage: 35, resetsAt: now + 60 }, sevenDay: { usedPercentage: 0, resetsAt: now + 120 } });
     for (const elapsed of [59, 60, 61, 119, 120, 121, 8 * 24 * 3600]) {
-      expect(validClaudeQuotaSnapshot(data, now + elapsed)).toEqual({ ...data, status: elapsed >= 120 ? "stale" : "ready" });
+      expect(validClaudeQuotaSnapshot(data, now + elapsed)).toEqual({ ...data, status: elapsed >= 60 ? "stale" : "ready" });
     }
     const next = snapshot({ fiveHour: { usedPercentage: 5 } }, now + 122);
     expect(validClaudeQuotaSnapshot(next, now + 122)).toEqual(next);

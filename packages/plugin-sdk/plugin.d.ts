@@ -6,7 +6,7 @@
  * 插件仓用法（包未发布 npm 前的过渡方案）：复制本文件为插件仓的
  * `src/ccgui-plugin.d.ts`，首行版本戳必须与所用宿主 SDK 一致。
  *
- * @ccgui/plugin-sdk v0.3.16
+ * @ccgui/plugin-sdk v0.3.28
  */
 
 /** 宿主实现的 SDK 契约版本。 */
@@ -14,6 +14,145 @@ export declare const SDK_VERSION: string;
 
 /** 每次注册的撤销句柄；卸载时逆序执行。 */
 export type Disposer = () => void;
+
+/** Supplementary native system/developer guidance; does not grant permissions.
+ * Omission retains the last profile. Changes wait for a full native turn. */
+export interface HostFixedInstructions {
+  /** [A-Za-z0-9._:-]{1,128}. */
+  version: string;
+  /** Nonblank, <=16000 UTF-16 units, no NUL. */
+  text: string;
+}
+
+export interface MemoryExtractionSource { kind: "conversation" | "coordination"; id: string }
+export interface MemoryExtractionSessionRef { engine: string; sessionId: string; workspacePath: string }
+/** Persist unchanged: native seq, code-point offset (0 means row consumed), digest. */
+export interface MemoryExtractionCursor { sessionId: string; seq: number; offset: number; rowDigest?: string }
+export interface MemoryExtractionContext { id: string; revision: number; kind: string; title: string; text: string; conditions: string[]; authority?: string; updatedAt?: string }
+export interface MemoryExtractionRelation { kind: "supersedes" | "conflicts"; targetId: string; targetRevision: number; reason: string }
+export interface MemoryExtractionEvidence { seq: number; role: "user" | "assistant"; quote: string }
+export interface MemoryExtractionNote {
+  kind: "decision" | "idea" | "observation" | "hypothesis" | "handoff";
+  title: string; text: string; conditions: string[]; relatedIds: string[]; evidence: MemoryExtractionEvidence[];
+  relations?: MemoryExtractionRelation[];
+}
+export interface MemoryExtractionBatch {
+  version: 1 | 2; projectId: string; source: MemoryExtractionSource; sessionRef: MemoryExtractionSessionRef;
+  fromCursor: MemoryExtractionCursor | null; nextCursor: MemoryExtractionCursor; inputDigest: string;
+  partial: boolean; hasMore: boolean; model: "gemini-4-argon"; notes: MemoryExtractionNote[];
+}
+export interface MemoryExtractionDeferred { status: "deferred" | "unavailable" | "invalid_source"; reason: string; retryAfterMs: number }
+export type MemoryExtractionResult = { status: "completed"; batch: MemoryExtractionBatch } | { status: "empty"; cursor: MemoryExtractionCursor | null } | MemoryExtractionDeferred;
+export type MemoryExtractionCheckpoint = { status: "ready"; cursor: MemoryExtractionCursor; sessionRef: MemoryExtractionSessionRef } | MemoryExtractionDeferred;
+export interface MemoryExtractionStatus { available: boolean; busy: boolean; retryAfterMs: number; reason?: string }
+export interface MemoryExtractionSourceRequest { projectId: string; source: MemoryExtractionSource }
+export interface MemoryExtractionRequest extends MemoryExtractionSourceRequest { requestId: string; cursor?: MemoryExtractionCursor | null; context?: MemoryExtractionContext[]; formatVersion?: 2; expectedSourceDigest?: string }
+export interface MemoryExtractionPrepareRequest extends MemoryExtractionSourceRequest { cursor?: MemoryExtractionCursor | null }
+export type MemoryExtractionPreparation = { status: "ready"; query: string; sourceDigest: string; fromCursor: MemoryExtractionCursor | null; nextCursor: MemoryExtractionCursor | null; sessionRef: MemoryExtractionSessionRef; partial: boolean; hasMore: boolean } | MemoryExtractionDeferred;
+/** Desktop owner, host:memory plus source host:chat/host:tasks (0.3.25).
+ * Fixed tool-less Gemini4/Vertex consumes quota; source is read and verified by
+ * the host. Foreground requests cancel background inference. Cancellation does
+ * not guarantee upstream quota refunds. Plugins own queues/atomic saves; never
+ * automatically promote extracted notes to user-confirmed authority. */
+export interface HostMemoryExtractionApi {
+  status(): Promise<MemoryExtractionStatus>;
+  checkpoint(request: MemoryExtractionSourceRequest): Promise<MemoryExtractionCheckpoint>;
+  prepare(request: MemoryExtractionPrepareRequest): Promise<MemoryExtractionPreparation>;
+  extract(request: MemoryExtractionRequest): Promise<MemoryExtractionResult>;
+  cancel(requestId: string): Promise<void>;
+}
+
+export type ConversationEngine = "claude" | "codex";
+export interface ConversationSelection { engine: ConversationEngine; model?: string; effort?: string; providerId?: string }
+export interface ConversationSnapshot {
+  threadId: string; revision: number; workspacePath: string;
+  selection: ConversationSelection; effectiveSelection: ConversationSelection;
+  sessionRef: { engine: ConversationEngine; sessionId: string; workspacePath: string } | null;
+  status: "idle" | "starting" | "running" | "completed" | "failed" | "cancelled" | "unknown";
+  /** Transient host Message projection; never persist or rewrite in plugin state. */
+  messages: unknown[]; error?: string; lastRequestId?: string;
+}
+export interface PluginImageAttachment {
+  id: string;
+  name: string;
+  mimeType: "image/png" | "image/jpeg" | "image/webp" | "image/gif";
+  size: number;
+}
+export interface HostImagesApi {
+  importImage(request: { dataBase64: string; mimeType: string; name?: string }): Promise<PluginImageAttachment>;
+  readPreview(id: string): Promise<{ dataUrl: string }>;
+}
+export interface ConversationCatalog {
+  defaultEngine?: string;
+  capabilities?: { images: boolean; fixedInstructions?: boolean };
+  engines: Array<{ id: ConversationEngine; label: string; available: boolean; supportsImages?: boolean;
+    models: Array<{ id: string; label: string }>; providers: Array<{ id: string; label: string }>; efforts?: Array<{ id: string; label: string }>;
+    defaultModel: string | null; defaultEffort: string | null; defaultProviderId: string }>;
+  workspaces: Array<{ id: string; path: string; name: string }>;
+}
+export interface ConversationViewProps { conversation: unknown; readOnly?: boolean; onAction?: (action: ConversationViewAction) => void }
+export type ConversationViewAction = { type: "openFile"; path: string; sourceId?: string; expectedRevision?: number } | HostTaskConversationAction;
+export type ConversationViewComponent = ComponentLike<ConversationViewProps>;
+/** Desktop owner only, host:chat. Persistent read-only discussion branches;
+ * immutable workspace/selection, no execution mode, no task ledger. */
+export interface HostConversationsApi {
+  catalog(): Promise<ConversationCatalog>;
+  open(request: { threadId: string; workspacePath: string; selection: ConversationSelection }): Promise<ConversationSnapshot>;
+  inspect(threadId: string): Promise<ConversationSnapshot>;
+  send(request: { threadId: string; requestId: string; expectedRevision: number; prompt: string; images?: string[]; fixedInstructions?: HostFixedInstructions }): Promise<ConversationSnapshot>;
+  stop(threadId: string): Promise<ConversationSnapshot>;
+  openFile(threadId: string, path: string): Promise<void>;
+  onEvent(callback: (snapshot: ConversationSnapshot) => void): Disposer;
+}
+
+export interface WorkspaceProjectMemberDefinition {
+  id: string;
+  path: string;
+  label: string;
+  /** Descriptive role; does not enforce OS-level read-only access. */
+  role: "development" | "reference";
+}
+export interface WorkspaceProjectDefinition {
+  name: string;
+  defaultPath: string;
+  members: WorkspaceProjectMemberDefinition[];
+}
+export interface PublishedWorkspaceProject {
+  id: string;
+}
+
+export interface PluginDetachedAction {
+  name: string;
+  args: unknown[];
+}
+export interface PluginDetachedSnapshot {
+  revision: number;
+  state: unknown;
+}
+/** Floating renderer props. Actions run only in the original main document;
+ * unknown outcomes must never be automatically submitted again. */
+export interface PluginDetachedSurfaceProps {
+  snapshot: unknown;
+  /** After queued actions drain, false preserves unconfirmed renderer edits. */
+  registerReturnGuard(guard: () => boolean): Disposer;
+  dispatch(action: PluginDetachedAction): Promise<{
+    sequence: number;
+    value: unknown;
+    snapshot: PluginDetachedSnapshot;
+  }>;
+}
+/** Named main.js export; creates only a view, never a second activation. */
+export type PluginDetachedRenderer = (context: { react: typeof import("react"); ConversationView?: ConversationViewComponent; Images?: HostImagesApi }) => ComponentLike<PluginDetachedSurfaceProps>;
+/** Desktop-only, permission ui:detached-window. Controller/drafts/side effects
+ * remain in main; JSON snapshots/actions cross the native window boundary. */
+export interface PluginDetachedSurfaceDefinition {
+  /** Initial mode when no saved user preference exists; registration alone does not open it. */
+  defaultPresentation?: "docked" | "detached";
+  rendererExport: string;
+  getSnapshot(): unknown;
+  subscribe(listener: () => void): Disposer;
+  dispatch(action: PluginDetachedAction): unknown | Promise<unknown>;
+}
 
 export type PluginConversationProps = {
   conversationId: string;
@@ -66,6 +205,347 @@ export interface HostChatSubmission {
   requestId: string;
   target: HostChatTarget;
   prompt: string;
+}
+/** Host task routing and delivery (`host:tasks`, desktop, 0.3.20). Tasks run
+ * as real GUI chat turns with the user's settings; write paths are a declared
+ * scope for conflict ordering, not an OS sandbox. */
+export interface HostTaskSessionRef {
+  readonly engine: string;
+  readonly sessionId: string;
+  readonly workspacePath: string;
+}
+
+export interface HostTaskCatalogEngine {
+  readonly id: string;
+  readonly available: boolean;
+  readonly enabled: boolean;
+  readonly supportsImages?: boolean;
+  readonly supportsFixedInstructions?: boolean;
+  /** The user's current default model/effort for new chats of this engine. */
+  readonly defaultModel: string | null;
+  readonly defaultEffort: string | null;
+  /** This engine can run the isolated planner used by `plan()`. */
+  readonly planner: boolean;
+  /** Present with `catalog({ includeModels: true })`; null when the catalog could not be read. */
+  readonly models?: ReadonlyArray<{ readonly id: string; readonly name: string | null; readonly provider: string }> | null;
+}
+
+export interface HostTaskCatalogWorkspace {
+  readonly id: string;
+  readonly path: string;
+  readonly name: string;
+  readonly remote: boolean;
+  readonly archived: boolean;
+  /** Registered, local and not archived: a valid plan candidate/submit target. */
+  readonly executable: boolean;
+}
+
+export interface HostTaskCatalogProject {
+  readonly id: string;
+  readonly name: string;
+  readonly defaultPath: string;
+  /** null = the user's own organization; otherwise the publishing plugin. */
+  readonly sourcePluginId: string | null;
+  readonly members: ReadonlyArray<{
+    readonly id: string;
+    readonly path: string;
+    readonly label: string;
+    readonly role: "development" | "reference";
+    readonly status: "available" | "missing" | "changed";
+    /** The member path itself is a registered workspace (executable target). */
+    readonly registered: boolean;
+  }>;
+}
+
+export interface HostTaskCatalog {
+  readonly capabilities?: { readonly nativeCoordination: boolean; readonly images?: boolean; readonly continuousCoordination?: boolean; readonly fixedInstructions?: boolean };
+  readonly defaultEngine: string;
+  readonly engines: readonly HostTaskCatalogEngine[];
+  readonly workspaces: readonly HostTaskCatalogWorkspace[];
+  readonly projects: readonly HostTaskCatalogProject[];
+}
+
+export interface HostTaskHistoryQuery {
+  /** Exactly one registered workspace; rows are never mixed across roots. */
+  workspacePath: string;
+  offset?: number;
+  /** 1-100, default 50. Newest first. */
+  limit?: number;
+}
+
+export interface HostTaskHistoryItem extends HostTaskSessionRef {
+  readonly title: string;
+  /** First-message snippet, at most 160 characters. */
+  readonly preview: string;
+  readonly createdAt: number | null;
+  readonly updatedAt: number | null;
+  readonly messageCount: number;
+  readonly pinned: boolean;
+  readonly model: string | null;
+  readonly effort: string | null;
+  readonly open: boolean;
+  readonly status: "idle" | "busy" | "awaiting_permission" | "closed";
+  /** Native child-task parent, when this chat is a host-managed child. */
+  readonly parent: { readonly engine: string; readonly sessionId: string } | null;
+  readonly childCount: number;
+  /** This plugin's task requests delivered into this chat. */
+  readonly taskRequestIds: readonly string[];
+}
+
+export interface HostTaskHistoryPage {
+  readonly items: readonly HostTaskHistoryItem[];
+  readonly total: number;
+  readonly nextOffset: number | null;
+}
+
+export interface HostTaskExcerptQuery extends HostTaskSessionRef {
+  /** Page cursor from a previous excerpt's `nextBefore`; omit for the newest page. */
+  before?: number | null;
+  /** Raw transcript rows to scan, 1-40 (default 20). Tool rows are skipped. */
+  limit?: number;
+  /** Total text budget, 1000-24000 characters (default 12000). */
+  maxChars?: number;
+}
+
+export interface HostTaskExcerpt {
+  readonly messages: ReadonlyArray<{ readonly seq: number; readonly role: "user" | "assistant"; readonly text: string; readonly truncated: boolean }>;
+  /** Older page cursor; null at the beginning of the conversation. */
+  readonly nextBefore: number | null;
+  /** True when the budget dropped or clipped rows of this page. */
+  readonly truncated: boolean;
+}
+
+export interface HostTaskPlanProject {
+  /** Stable plugin-chosen id ([A-Za-z0-9._:-]{1,128}); steps reference it. */
+  id: string;
+  label: string;
+  /** A registered, local, non-archived workspace path (exact). */
+  workspacePath: string;
+  description?: string;
+}
+
+export interface HostTaskPlanRequest {
+  /** Idempotency key: the same id and input returns the same plan. */
+  requestId: string;
+  goal: string;
+  projects: HostTaskPlanProject[];
+  /** Extra data for routing (decisions, constraints). Never executed. */
+  context?: string;
+  /** Default: the active engine and its current model, when it can plan. */
+  planner?: { engine: string; model?: string; effort?: string; providerId?: string };
+}
+
+export interface HostTaskPlanStep {
+  readonly id: string;
+  readonly title: string;
+  /** Always one of the request's candidate project ids. */
+  readonly projectId: string;
+  readonly instruction: string;
+  /** Earlier step ids whose results this step needs. */
+  readonly dependsOn: readonly string[];
+  readonly contextRefs?: readonly string[];
+  /** Project-relative, forward-slash paths; [] = read-only; "." = whole project. */
+  readonly writePaths?: readonly string[];
+}
+
+export interface HostTaskPlan {
+  readonly requestId: string;
+  readonly status: "ready" | "needs_clarification";
+  readonly question?: string;
+  readonly steps: readonly HostTaskPlanStep[];
+  readonly planner: { readonly engine: string; readonly model: string | null };
+  readonly createdAt: number;
+}
+
+export type HostTaskPlanErrorCode = "invalid_request" | "planner_unavailable" | "timeout" | "bad_output" | "failed" | "cancelled";
+
+export interface HostTaskPlanRecord {
+  readonly requestId: string;
+  readonly status: "running" | "ready" | "needs_clarification" | "failed" | "cancelled";
+  readonly plan?: HostTaskPlan;
+  readonly error?: { readonly code: HostTaskPlanErrorCode; readonly message: string };
+  readonly updatedAt: number;
+}
+
+export type HostTaskHandoff = { requestId: string } | { session: HostTaskSessionRef };
+
+/** Requested or natively resolved launch configuration, not upstream model telemetry. */
+export interface HostTaskSelection {
+  readonly engine: string;
+  readonly model: string;
+  readonly effort: string;
+  readonly providerId: string;
+}
+
+export interface HostTaskSubmission {
+  /** Idempotency key ([A-Za-z0-9._:-]{1,128}); a retry must repeat the exact submission. */
+  requestId: string;
+  /** Plugin's logical task id (groups steps/attempts). */
+  taskId: string;
+  /** Logical execution role, scoped by this plugin and projectId; not a single chat forever. */
+  slotKey: string;
+  projectId: string;
+  /** Registered, local, non-archived workspace: the conversation's cwd. */
+  workspacePath: string;
+  prompt: string;
+  /** Requires advertised native support and an explicit supported engine. */
+  fixedInstructions?: HostFixedInstructions;
+  /** User-authored projection text; native prompt is preserved. */
+  displayText?: string;
+  /** Declared write scope relative to workspacePath. Omitted = unknown (whole workspace, serialized). [] = read-only. */
+  writePaths?: string[];
+  /** References the AI should consult on demand (paths, memory ids). Listed, never expanded. */
+  contextRefs?: string[];
+  /** "auto" reuses the slot's chat when still valid; "new" always starts a chat. */
+  sessionMode: "auto" | "new";
+  /** Exclusive coordinator reservation from acceptance; requires sessionMode new. */
+  coordination?: true;
+  /** Adds a bounded handoff note from an earlier task receipt or chat. */
+  handoffFrom?: HostTaskHandoff;
+  /** Explicit choices must match a reused chat; otherwise a new chat is started. */
+  engine?: string;
+  model?: string;
+  effort?: string;
+  /** Exact channel id; requires explicit engine/model/effort (Claude/Codex). */
+  providerId?: string;
+  /** Up to 8 opaque plugin image attachment IDs owned by this plugin (0.3.23). */
+  images?: string[];
+}
+
+export type HostTaskStatus = "queued" | "starting" | "executing" | "awaiting_permission" | "completed" | "failed" | "cancelled" | "unknown";
+
+export interface HostTaskReceipt {
+  readonly requestedSelection?: HostTaskSelection;
+  readonly effectiveSelection?: HostTaskSelection;
+  readonly requestId: string;
+  readonly taskId: string;
+  readonly executionId: string;
+  readonly projectId: string;
+  readonly slotKey: string;
+  readonly workspacePath: string;
+  /** "starting" = the host may have started the native turn; after a restart it becomes "unknown", never replayed. */
+  readonly status: HostTaskStatus;
+  readonly sessionDecision: "reused" | "new" | null;
+  /** Only native evidence fills this; null while a new chat awaits its session announcement. */
+  readonly session: HostTaskSessionRef | null;
+  readonly runId: string | null;
+  /** Requests whose declared writes or chat this one waits behind. */
+  readonly blockedBy?: readonly string[];
+  /** This request's assistant output, at most 65,536 characters. */
+  readonly text?: string;
+  /** Text is a bounded prefix; open() shows the full conversation. */
+  readonly truncated?: boolean;
+  readonly error?: string;
+  readonly acceptedAt: number;
+  readonly updatedAt: number;
+}
+
+export interface HostTaskSlot {
+  readonly projectId: string;
+  readonly slotKey: string;
+  readonly session: HostTaskSessionRef;
+  readonly lastRequestId: string;
+  readonly updatedAt: number;
+}
+
+export interface HostTaskMessageReceipt {
+  conversationRequestId: string;
+  requestId: string;
+  /** Bounded (280 UTF-16 units, no split surrogate) displayText preview; empty
+   * when displayText was omitted. Never generated from a model response. */
+  preview: string;
+  inputRevision: number;
+  status: "queued" | "starting" | "received" | "completed" | "failed" | "cancelled" | "unknown";
+  delivery: "queued" | "turn" | "steer" | "live" | null;
+  runId: string | null;
+  sessionRef: HostTaskSessionRef | null;
+  acceptedAt: number;
+  updatedAt: number;
+  error?: string;
+}
+export interface HostTaskConversationChild {
+  id: string;
+  title: string;
+  state: string;
+  sessionRef: HostTaskSessionRef | null;
+  delegation?: { requestId?: string; state: string; result?: string | null };
+}
+export interface HostTaskConversationSnapshot {
+  requestId: string;
+  revision: number;
+  inputRevision: number;
+  workspacePath: string;
+  sessionRef: HostTaskSessionRef | null;
+  selection?: HostTaskSelection;
+  effectiveSelection?: HostTaskSelection;
+  status: "starting" | "running" | "waiting" | "idle" | "stopping" | "cancelled" | "failed" | "unknown";
+  /** Transient real host rows, including native sequence, timestamps and pending cards. Never persist these projections. */
+  messages: unknown[];
+  deliveries: HostTaskMessageReceipt[];
+  children: HostTaskConversationChild[];
+  canSend: boolean;
+  /** Sticky stop watch, including when all currently observed runs are cancelled.
+   * Cleared only after an explicit new input is natively accepted. */
+  stopRequested?: boolean;
+  canChangeSelection: boolean;
+  error?: string;
+}
+export interface HostTaskMessageRequest {
+  conversationRequestId: string;
+  requestId: string;
+  expectedInputRevision: number;
+  prompt: string;
+  fixedInstructions?: HostFixedInstructions;
+  /** User-authored display text; native prompt and transcript text are untouched. */
+  displayText?: string;
+  images?: string[];
+}
+/** Displayed pending identity is mandatory for mutating native actions. sourceId
+ * is a renderer routing hint; the owning request and current native record are
+ * independently validated by the host. */
+export type HostTaskConversationAction = {
+  sourceId?: string;
+  conversationRequestId: string;
+  expectedRevision: number;
+} & (
+  | { type: "openFile"; path: string }
+  | { type: "openChild"; childId: string }
+  | { type: "openNative" }
+  | { type: "answerQuestion"; seq: number; runId: string; requestId: string; answers: Record<string, string | string[]> | null }
+  | { type: "answerGrant"; seq: number; accept: boolean }
+  | { type: "answerPlan"; planId: string; planRevision: number; runId: string | null; decision: "approve" | "request_changes" | "defer"; feedback?: string }
+);
+export interface HostTaskConversationsApi {
+  conversation(requestId: string): Promise<HostTaskConversationSnapshot>;
+  sendMessage(request: HostTaskMessageRequest): Promise<HostTaskMessageReceipt>;
+  messageReceipt(conversationRequestId: string, requestId: string): Promise<HostTaskMessageReceipt | null>;
+  cancelMessage(conversationRequestId: string, requestId: string): Promise<HostTaskMessageReceipt | null>;
+  stopConversation(requestId: string): Promise<HostTaskConversationSnapshot>;
+  conversationAction(requestId: string, action: HostTaskConversationAction): Promise<HostTaskConversationSnapshot | void>;
+  onConversationEvent(callback: (snapshot: HostTaskConversationSnapshot) => void): Disposer;
+}
+
+export interface HostTasksApi extends HostTaskConversationsApi {
+  catalog(options?: { includeModels?: boolean }): Promise<HostTaskCatalog>;
+  history(query: HostTaskHistoryQuery): Promise<HostTaskHistoryPage>;
+  excerpt(query: HostTaskExcerptQuery): Promise<HostTaskExcerpt>;
+  /** Isolated, tool-less routing call. Rejects with Error whose `code` is a HostTaskPlanErrorCode. */
+  plan(request: HostTaskPlanRequest): Promise<HostTaskPlan>;
+  getPlan(requestId: string): Promise<HostTaskPlanRecord | null>;
+  cancelPlan(requestId: string): Promise<boolean>;
+  /** Durable acceptance before resolving; delivery continues in the background. */
+  submit(request: HostTaskSubmission): Promise<HostTaskReceipt>;
+  receipt(requestId: string): Promise<HostTaskReceipt | null>;
+  list(query?: { projectId?: string; slotKey?: string; taskId?: string }): Promise<HostTaskReceipt[]>;
+  /** Queued requests are withdrawn; a running turn of this request is interrupted. */
+  cancel(requestId: string): Promise<HostTaskReceipt | null>;
+  /** Focus the request's conversation (user-initiated). */
+  open(requestId: string): Promise<void>;
+  /** Prune large assistant output from a settled receipt while retaining its non-replayable tombstone and identity. */
+  forget(requestId: string): Promise<boolean>;
+  slots(projectId?: string): Promise<HostTaskSlot[]>;
+  /** This plugin's receipts only; disposed on unload. */
+  onEvent(callback: (receipt: HostTaskReceipt) => void): Disposer;
 }
 /** Retained `session://activated`: native focus adds exact target metadata;
  * blur keeps selection, background heartbeats never claim attention. */
@@ -146,6 +626,8 @@ export type ComposerSlotId = "addMenu" | "cliMenu" | "permissionMenu";
 export interface SessionMenuTarget {
   engine: string;
   sessionId: string;
+  /** Exact source cwd when known from the clicked row (0.3.22). */
+  workspacePath?: string;
 }
 
 export type ComponentLike<P = Record<string, never>> = (props: P) => unknown;
@@ -159,6 +641,18 @@ export interface PluginContext {
    *  插件自有子树用自己的 createRoot 挂进容器（双段挂载模式）。 */
   react: typeof import("react");
   ui: {
+    /** SDK 0.3.18, ui:center-tab. Opt in center tabs/selected side panel to
+     * self-update closure. Floating inputs drain through their return guard
+     * first. Freeze new actions and durably save drafts in prepare; reject on
+     * failure and honor signal across awaits. resume releases that freeze on
+     * cancellation/failure and must be idempotent. One handler per plugin;
+     * plugin stays loaded; remembered views restore when maintenance ends,
+     * explicitly closed views stay closed. Pages are excluded.
+     * Loaded handlers also prepare with closed views to settle background work. */
+    registerUpdateCloseHandler(def: {
+      prepare(signal: AbortSignal): Promise<void>;
+      resume(): void;
+    }): Disposer;
     registerConversationMode(def: {
       key?: string;
       label: () => string;
@@ -222,11 +716,11 @@ export interface PluginContext {
       run: () => void;
     }): Disposer;
     /** 侧栏会话右键菜单追加行（权限 ui:session-menu，0.3.5 起）；
-     *  run 收到打开菜单的会话。 */
+     *  run 收到打开菜单的会话；0.3.22 在已知时提供原 workspacePath，不可用当前聊天代填。 */
     registerSessionMenuItem(def: {
       key?: string;
       label: () => string;
-      icon?: ComponentType<{ className?: string }>;
+      icon?: ComponentLike<{ className?: string }>;
       danger?: boolean;
       run: (target: SessionMenuTarget) => void;
     }): Disposer;
@@ -270,6 +764,8 @@ export interface PluginContext {
       icon?: ComponentLike<{ className?: string }>;
       component: ComponentLike;
       order?: number;
+      /** Renderer-only native pop-out; also requires ui:detached-window. */
+      detached?: PluginDetachedSurfaceDefinition;
     }): Disposer;
     /** 打开（或聚焦）本插件已注册的中心页签（权限 ui:center-tab，
      *  0.3.12 起）；页签未注册时抛错——打开失败必须可见。 */
@@ -337,6 +833,11 @@ export interface PluginContext {
    *  TOFU 而非严格 pinning。 */
   workspaces: {
     add(path: string, meta?: Record<string, unknown>): Promise<void>;
+    /** Publish this plugin's stable project view (host:workspace, 0.3.19).
+     * sourceKey may be an existing project UUID. Members must be within
+     * registered local workspaces; no access, cwd or memory changes occur.
+     * Projection persists after unload and can be removed by the user. */
+    publishProject(sourceKey: string, definition: WorkspaceProjectDefinition): Promise<PublishedWorkspaceProject>;
   };
   /** 会话打开 + 外部会话源(权限 host:session;selectSession 0.3.3 起,
    *  registerSource 0.3.4 起)。registerSource:登记异步会话源,宿主在会话
@@ -370,6 +871,9 @@ export interface PluginContext {
    * Ledgers are scoped by plugin AND document. A new document preserves but cannot load or
    * replay old records (the pinned caller reports unknown/unreachable).
    * Preserves original model/effort/provider and GUI permission/question flow. */
+  conversations: HostConversationsApi & { View: ConversationViewComponent };
+  /** Durable host-managed plugin image attachments (`host:chat` or `host:tasks`, 0.3.23). */
+  images: HostImagesApi;
   chat: {
     /** Exact desktop identity even when current() is null; scopes plugin KV. */
     identity(): Promise<HostChatIdentity>;
@@ -381,6 +885,13 @@ export interface PluginContext {
     receipt(requestId: string): Promise<HostChatReceipt | null>;
     onEvent(callback: (receipt: HostChatReceipt) => void): Disposer;
   };
+  /** Goal routing and task delivery into real GUI chats (`host:tasks`,
+   * desktop only, 0.3.20). Reuses the slot's chat or creates a background chat
+   * in a registered local workspace; never changes an existing chat's cwd;
+   * a request that may have started is never replayed (restart = unknown). */
+  tasks: HostTasksApi;
+  /** Project-scoped background inference, desktop owner only. */
+  memoryExtraction: HostMemoryExtractionApi;
   /** Agent 轮次（权限 `agent`，0.3.13 起）：经宿主引擎管线拉起 agent
    *  进程——渠道注入、进程注册与聊天发送同构。事件经 `agent://<pluginId>`
    *  总线话题推送（ctx.events.on 订阅；原样透传的引擎事件信封，
@@ -442,6 +953,9 @@ export interface PluginContext {
     invoke<T>(command: string, args?: Record<string, unknown>): Promise<T>;
   };
   host: {
+    /** SDK 0.3.18: await restored runtime ownership before plugin I/O.
+     * Register UI/chat owners synchronously first; signal cancels an unload wait. */
+    whenReady(signal?: AbortSignal): Promise<void>;
     appVersion: string;
     /** 宿主实现的 SDK 版本（= @ccgui/plugin-sdk version）。 */
     sdkVersion: string;

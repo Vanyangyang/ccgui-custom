@@ -206,6 +206,18 @@ pub(crate) fn resolve_provider(
         .section(engine)
         .ok_or_else(|| format!("unknown engine: {engine}"))?;
     crate::provider_files::migrate_legacy(engine, section)?;
+    resolve_provider_in_section(engine, section, provider_id)
+}
+
+/// Inspect one channel without materializing or migrating native CLI files.
+/// Read-only callers must never use the ordinary launch migration path.
+pub(crate) fn resolve_provider_read_only(engine: &str, provider_id: Option<&str>) -> Result<Option<Value>, String> {
+    let config = read_config()?;
+    let section = config.section(engine).ok_or_else(|| format!("unknown engine: {engine}"))?;
+    resolve_provider_in_section(engine, section, provider_id)
+}
+
+fn resolve_provider_in_section(engine: &str, section: &ProviderSection, provider_id: Option<&str>) -> Result<Option<Value>, String> {
     let explicit = provider_id.map(str::trim).filter(|s| !s.is_empty());
     let id = explicit.unwrap_or_else(|| section.current.as_deref().unwrap_or("").trim());
     if id == DISABLED_PROVIDER_ID {
@@ -428,6 +440,18 @@ fn announce_config(emitter: &dyn crate::event_sink::Emit, engine: &str) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn readonly_provider_resolution_uses_the_supplied_snapshot_without_mutation() {
+        let mut section = ProviderSection::default();
+        section.current = Some("selected".into());
+        section.providers.insert("selected".into(), json!({"settingsConfig":{"env":{"ANTHROPIC_DEFAULT_OPUS_MODEL":"fixed"}}}));
+        let before = serde_json::to_value(&section).unwrap();
+        assert_eq!(resolve_provider_in_section("claude", &section, Some("selected")).unwrap(), Some(section.providers["selected"].clone()));
+        assert_eq!(serde_json::to_value(&section).unwrap(), before);
+        assert!(resolve_provider_in_section("claude", &section, Some("missing")).is_err());
+        assert!(resolve_provider_in_section("claude", &section, Some(LOCAL_PROVIDER_ID)).unwrap().is_none());
+    }
 
     use crate::paths::HOME_ENV_LOCK;
 

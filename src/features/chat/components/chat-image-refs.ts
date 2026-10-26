@@ -1,5 +1,5 @@
 import { decodeFileLink, isFileLinkUrl, resolveFilePath } from "@/lib/fileLinks";
-import { ipc } from "@/lib/ipc";
+import { imagePreview } from "@/features/image-preview/api";
 import { isWeb } from "@/lib/platform";
 
 /** Only passive raster payloads may reach an img, never arbitrary URLs. */
@@ -54,10 +54,10 @@ export function rasterMime(bytes: Uint8Array): string | null {
  *  URL; web keeps the bridge's data URL read. null = not a usable image. */
 export async function loadChatImage(path: string): Promise<LoadedChatImage | null> {
   if (isWeb) {
-    const content = await ipc.readFile(path);
-    return content.kind === "image" && content.dataUrl && isRasterDataUrl(content.dataUrl) ? { url: content.dataUrl } : null;
+    const dataUrl = await imagePreview.readDataUrl(path);
+    return isRasterDataUrl(dataUrl) ? { url: dataUrl } : null;
   }
-  const payload: unknown = await ipc.readImageBytes(path);
+  const payload: unknown = await imagePreview.readBytes(path);
   const bytes = payload instanceof ArrayBuffer ? new Uint8Array(payload)
     : ArrayBuffer.isView(payload) ? new Uint8Array(payload.buffer, payload.byteOffset, payload.byteLength)
     : Array.isArray(payload) ? Uint8Array.from(payload as number[]) : null;

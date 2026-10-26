@@ -38,7 +38,7 @@ type FilterTab = "all" | "recommend" | "attention";
 function CacheTimeBadge({ session, label }: { session: SessionMeta; label: string }) {
   const cache = promptCacheForEngine(session.engine, session.promptCache);
   const heat = usePromptCacheHeat(cache);
-  const ratio = getPromptCacheHeatRatio(cache, session.updatedAt, false);
+  const ratio = getPromptCacheHeatRatio(cache, session.updatedAt, false, undefined, session.engine);
   return (
     <CacheHeatHoverBadge
       engine={session.engine}

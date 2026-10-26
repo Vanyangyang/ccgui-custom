@@ -194,10 +194,10 @@ export function useThreadMenu(
 ) {
   const [threadMenu, setThreadMenu] = useState<ThreadMenuState | null>(null);
   const openThreadMenu = useCallback(
-    (event: ReactMouseEvent<HTMLElement>, threadId: string) => {
+    (event: ReactMouseEvent<HTMLElement>, threadId: string, workspacePath?: string) => {
       if (!onThreadAction && !onCopyThreadId && !hasDisplayActions) return;
       event.preventDefault();
-      setThreadMenu({ x: event.clientX, y: event.clientY, threadId });
+      setThreadMenu({ x: event.clientX, y: event.clientY, threadId, ...(workspacePath ? { workspacePath } : {}) });
     },
     [onThreadAction, onCopyThreadId, hasDisplayActions],
   );

@@ -81,7 +81,7 @@ function focusRow(root: HTMLElement | null, delta: 1 | -1) {
 
 /** Answering state for the docked card; kept JSX-free so the component below
  *  only composes the header, options, and footer. */
-function useQuestionAnswers(questions: QuestionSpec[], seq: number) {
+function useQuestionAnswers(questions: QuestionSpec[], seq: number, onAnswer?: (answers: Record<string, string | string[]> | null) => void) {
   const respondToQuestion = useChatStore((s) => s.respondToQuestion);
   // 会话 key 取自所属栏位：分屏时各格管各格的问答卡。
   const key = useScopedSessionKey();
@@ -117,14 +117,16 @@ function useQuestionAnswers(questions: QuestionSpec[], seq: number) {
   };
 
   const answer = () => {
-    if (!key || !complete) return;
+    if ((!key && !onAnswer) || !complete) return;
     const merged: AnswerMap = {};
     for (const q of questions) merged[q.question] = valueFor(q.question, picked, other);
-    void respondToQuestion(key, seq, merged);
+    if (onAnswer) onAnswer(merged);
+    else if (key) void respondToQuestion(key, seq, merged);
   };
 
   const skip = () => {
-    if (key) void respondToQuestion(key, seq, null);
+    if (onAnswer) onAnswer(null);
+    else if (key) void respondToQuestion(key, seq, null);
   };
 
   return {
@@ -316,7 +318,7 @@ function QuestionOptions({
   );
 }
 
-export function QuestionCard({ message }: { message: Message }) {
+export function QuestionCard({ message, onAnswer }: { message: Message; onAnswer?: (answers: Record<string, string | string[]> | null) => void }) {
   const { t } = useTranslation();
   const rootRef = useRef<HTMLDivElement>(null);
   const question = message.question;
@@ -333,7 +335,7 @@ export function QuestionCard({ message }: { message: Message }) {
     typeOther,
     answer,
     skip,
-  } = useQuestionAnswers(question?.questions ?? EMPTY_QUESTIONS, message.seq);
+  } = useQuestionAnswers(question?.questions ?? EMPTY_QUESTIONS, message.seq, onAnswer);
   if (!question || !current) return null;
   const { questions } = question;
 

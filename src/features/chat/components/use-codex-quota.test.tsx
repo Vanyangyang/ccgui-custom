@@ -81,7 +81,7 @@ describe("Codex quota route isolation", () => {
     await render();
     vi.mocked(ipc.codexQuotaRead).mockRejectedValueOnce(new Error("disconnected"));
     await act(async()=>changed());
-    expect(controls.snapshot?.account).toBeUndefined();
+    expect(controls.snapshot).toMatchObject({ status: "stale", account: quota().account, collectedAt: NOW, errorCode: "read_failed" });
     vi.mocked(ipc.codexQuotaRead).mockResolvedValueOnce(quota(45));
     await act(async()=>connected());
     expect(container.textContent).toBe("45 ready");
@@ -155,13 +155,17 @@ describe("Codex quota route isolation", () => {
     vi.mocked(ipc.codexQuotaRead).mockResolvedValueOnce(quota(0));
     await act(async () => controls.refresh()); expect(container.textContent).toBe("0 ready");
   });
-  it("drops previous percentages when IPC cannot revalidate the account", async () => {
+  it("keeps the last sample stale on IPC failure, then clears on confirmed identity change", async () => {
     await render(); expect(container.textContent).toBe("20 ready");
     expect(controls.snapshot?.account?.email).toBe("reader@example.com");
     vi.mocked(ipc.codexQuotaRead).mockRejectedValueOnce(new Error("transport unavailable"));
     await act(async () => controls.refresh());
+    expect(container.textContent).toBe("20 stale");
+    expect(controls.snapshot?.collectedAt).toBe(NOW);
+    expect(controls.snapshot?.account).toEqual(quota().account);
+    vi.mocked(ipc.codexQuotaRead).mockResolvedValueOnce({ status: "unavailable", windows: {}, errorCode: "auth_changed" });
+    await act(async () => changed());
     expect(container.textContent).toBe("unknown unavailable");
-    expect(controls.snapshot?.collectedAt).toBeUndefined();
     expect(controls.snapshot?.account).toBeUndefined();
   });
   it("does not postpone a reset when the streaming parent rerenders", async () => {
@@ -171,30 +175,33 @@ describe("Codex quota route isolation", () => {
     await render();
     expect(container.textContent).toBe("20 ready");
     await act(async () => vi.advanceTimersByTimeAsync(1_000));
-    expect(container.textContent).toBe("unknown unavailable");
+    expect(container.textContent).toBe("20 stale");
     expect(ipc.codexQuotaRead).toHaveBeenCalledOnce();
   });
-  it("retains native-validated stale data, expires reset windows and clears old cache", async () => {
+  it("retains native-validated stale data across reset boundaries", async () => {
     vi.mocked(ipc.codexQuotaRead).mockResolvedValueOnce({ ...quota(), windows: { fiveHour: { usedPercentage: 20, resetsAt: NOW + 5 } } });
     await render();
     vi.mocked(ipc.codexQuotaRead).mockResolvedValue({ ...quota(), status: "stale", errorCode: "protection_unavailable", windows: { fiveHour: { usedPercentage: 20, resetsAt: NOW + 5 } } });
     await act(async () => controls.refresh());
     expect(container.textContent).toBe("20 stale");
     await act(async () => vi.advanceTimersByTimeAsync(5_000));
-    expect(container.textContent).toBe("unknown unavailable");
+    expect(container.textContent).toBe("20 stale");
     await act(async () => vi.advanceTimersByTimeAsync(595_000));
-    expect(container.textContent).toBe("unknown unavailable");
+    expect(container.textContent).toBe("20 stale");
     expect(vi.mocked(ipc.codexQuotaRead).mock.calls.filter(([options]) => options?.cacheOnly === false)).toHaveLength(1);
   });
-  it("keeps idle usage visibly stale beyond ten minutes and clears it at one hour without active queries", async () => {
+  it("keeps idle usage past one hour and remounts from native cache without active queries", async () => {
     await render();
     await act(async () => vi.advanceTimersByTimeAsync(601_000));
     expect(container.textContent).toBe("20 stale");
     await act(async () => vi.advanceTimersByTimeAsync(2_998_000));
     expect(container.textContent).toBe("20 stale");
     await act(async () => vi.advanceTimersByTimeAsync(1_000));
-    expect(container.textContent).toBe("unknown unavailable");
-    expect(controls.snapshot?.errorCode).toBe("quota_expired");
+    expect(container.textContent).toBe("20 stale");
+    expect(controls.snapshot?.collectedAt).toBe(NOW);
+    await act(async () => root.render(null));
+    await render();
+    expect(container.textContent).toBe("20 stale");
     expect(vi.mocked(ipc.codexQuotaRead).mock.calls.every(([options]) => options?.cacheOnly === true)).toBe(true);
   });
 });

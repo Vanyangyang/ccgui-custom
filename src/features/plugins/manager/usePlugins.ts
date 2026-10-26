@@ -65,7 +65,7 @@ function withBuiltins(installed: PluginInfo[]): PluginInfo[] {
   return merged;
 }
 
-interface PluginsChanged { id: string | null; reload: boolean }
+interface PluginsChanged { id: string | null; reload: boolean; requestId?: string }
 let listenersReady: Promise<void> | null = null;
 let refreshInFlight: Promise<void> | null = null;
 let pendingRefresh = false;
@@ -73,6 +73,30 @@ let reloadAll = false;
 const reloadIds = new Set<string>();
 let syncGeneration = 0;
 let syncUnlisteners: (() => void)[] = [];
+let maintenanceHeld = false;
+const maintenanceRequests = new Set<string>();
+
+/** Coalesce native invalidations with one awaited maintenance refresh. */
+export async function refreshPluginsAfterMaintenance<T>(id: string, requestId: string, operation: () => Promise<T>): Promise<T> {
+  await ensurePluginSync();
+  maintenanceHeld = true;
+  try {
+    // Hold new refresh callers before draining the captured pass: its finally
+    // may clear refreshInFlight before this await continuation runs.
+    if (refreshInFlight) await refreshInFlight;
+    maintenanceRequests.add(requestId);
+    if (maintenanceRequests.size > 128) maintenanceRequests.delete(maintenanceRequests.values().next().value!);
+    const result = await operation();
+    // First bootstrap already reads the committed files; do not activate twice.
+    if (pluginsBootstrapped()) reloadIds.add(id);
+    return result;
+  } finally {
+    maintenanceHeld = false;
+    await refreshSnapshot(true);
+    const error = usePluginsStore.getState().error;
+    if (error) throw new Error(error);
+  }
+}
 
 export function stopPluginSync(): void {
   syncGeneration += 1;
@@ -94,7 +118,7 @@ export function ensurePluginSync(): Promise<void> {
     try {
       unlisteners.push(await listen<PluginsChanged>("plugins://changed", ({ payload }) => {
         if (generation !== syncGeneration) return;
-        if (payload?.reload) {
+        if (payload?.reload && (!payload.requestId || !maintenanceRequests.has(payload.requestId))) {
           if (payload.id) reloadIds.add(payload.id);
           else reloadAll = true;
         }
@@ -125,6 +149,7 @@ export function ensurePluginSync(): Promise<void> {
 async function refreshSnapshot(clearError: boolean): Promise<void> {
   if (clearError) usePluginsStore.setState({ error: null });
   pendingRefresh = true;
+  if (maintenanceHeld) return;
   if (refreshInFlight) return refreshInFlight;
   refreshInFlight = (async () => {
     const generation = syncGeneration;

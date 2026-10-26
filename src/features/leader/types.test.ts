@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { isLeaderGroupMember, type LeaderBranch, type LeaderSnapshot } from "./types";
-import { groupLeaderThreads } from "./tree";
+import { isLeaderGroupMember, isDirectChild, leaderGroupRoot, leaderGroupBranches, parentWorkspacePath, type LeaderBranch, type LeaderSnapshot } from "./types";
+import { groupLeaderThreads, parentOfBranch } from "./tree";
 
 const parent = { engine: "claude", sessionId: "parent", workspacePath: "G:/project" };
 const child = { engine: "codex", sessionId: "child", workspacePath: "G:/project" };
@@ -12,6 +12,25 @@ const branch: LeaderBranch = {
 };
 
 describe("created task membership", () => {
+  it("keeps cross-workspace ancestry separate from child execution identity", () => {
+    const cross = { ...branch, parentWorkspacePath: parent.workspacePath, workspacePath: "G:/game" };
+    const grand = { ...branch, id: "grand", parentEngine: cross.engine, parentSessionId: cross.sessionId!,
+      parentWorkspacePath: cross.workspacePath, sessionId: "grand", workspacePath: "G:/tools" };
+    const snapshot = { leaders: [], branches: [cross, grand] };
+    expect(isDirectChild(cross, parent)).toBe(true);
+    expect(isDirectChild(cross, { ...parent, workspacePath: cross.workspacePath })).toBe(false);
+    expect(leaderGroupRoot(snapshot, { engine: grand.engine, sessionId: grand.sessionId, workspacePath: grand.workspacePath })).toEqual(parent);
+    expect(leaderGroupBranches(snapshot, parent).map(b => b.id)).toEqual([cross.id, grand.id]);
+    expect(parentWorkspacePath(branch)).toBe(branch.workspacePath);
+    expect(isLeaderGroupMember(snapshot, { ...child, workspacePath: cross.workspacePath })).toBe(true);
+    expect(isLeaderGroupMember(snapshot, child)).toBe(false);
+    expect(parentOfBranch(cross)).toEqual(parent);
+    const grouped = groupLeaderThreads([], snapshot, parent.workspacePath);
+    expect(grouped).toHaveLength(1);
+    expect(grouped[0]).toMatchObject({ id: "claude/parent", workspacePath: parent.workspacePath,
+      children: [{ id: "codex/child", workspacePath: cross.workspacePath,
+        children: [{ id: "codex/grand", workspacePath: grand.workspacePath }] }] });
+  });
   it("derives parent and child protection from retained branches without a leader flag", () => {
     const snapshot: LeaderSnapshot = { leaders: [], branches: [branch] };
     expect(isLeaderGroupMember(snapshot, parent)).toBe(true);

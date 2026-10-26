@@ -14,10 +14,12 @@ import {
   type ComposerPickerMenuHandle,
 } from "@/components/application/ai-chat/composer-picker-menu";
 import {
-  matchMentionEntries,
+  matchProjectMentionEntries,
+  ensureMentionRoots,
   useMentionIndexStore,
   type MentionEntry,
 } from "./mention-files";
+import { useProjectContext } from "@/features/projects/store";
 
 /**
  * @-mention file picker, rendered above the composer while a `@` trigger is
@@ -62,9 +64,9 @@ const Row = memo(function Row({
         dangerouslySetInnerHTML={{ __html: icon }}
       />
       <span className="shrink-0 text-body-regular text-text-primary">{entry.name}</span>
-      {dir && (
-        <span className="truncate text-body-regular text-text-tertiary" title={entry.rel}>
-          {dir}
+      {(dir || entry.rootLabel) && (
+        <span className="truncate text-body-regular text-text-tertiary" title={`${entry.root ?? ""}/${entry.rel}`}>
+          {entry.rootLabel ? `${entry.rootLabel} · ` : ""}{dir}
         </span>
       )}
     </PickerOption>
@@ -88,15 +90,15 @@ export function FileMentionMenu({
   menuRef?: MutableRefObject<FileMentionMenuHandle | null>;
 }) {
   const { t } = useTranslation();
-  const index = useMentionIndexStore((s) => (root ? s.byRoot[root] : undefined));
+  const { roots } = useProjectContext(root);
+  const byRoot = useMentionIndexStore((s) => s.byRoot);
   useEffect(() => {
-    if (root) useMentionIndexStore.getState().ensure(root);
-  }, [root]);
+    ensureMentionRoots(roots);
+  }, [roots]);
 
-  const entries = index?.entries;
   const items = useMemo(
-    () => matchMentionEntries(entries ?? [], root, query),
-    [entries, root, query],
+    () => matchProjectMentionEntries(roots, byRoot, query),
+    [roots, byRoot, query],
   );
 
   return (
@@ -105,11 +107,11 @@ export function FileMentionMenu({
       width="w-[320px]"
       ariaLabel={t("chat.mentionFiles")}
       scope={`${root}\n${query}`}
-      loading={index?.status === "loading" && items.length === 0}
+      loading={roots.some((member) => byRoot[member.path]?.status === "loading") && items.length === 0}
       loadingText={t("chat.mentionIndexing")}
       emptyText={t("chat.mentionNoMatches")}
       items={items}
-      rowKey={(entry) => entry.rel}
+      rowKey={(entry) => `${entry.root}/${entry.rel}`}
       onSelect={onSelect}
       onClose={onClose}
       menuRef={menuRef}

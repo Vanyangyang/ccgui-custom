@@ -14,6 +14,14 @@ const CHAT_PRESENTATION: &str = include_str!("../../../src/features/interactive-
 /// its per-run host plugin rules.
 const PRESENTATION_ENGINES: [&str; 3] = ["codex", "claude", "agy"];
 
+pub(super) fn with_plugin_instructions(host: Option<String>, plugin: Option<String>) -> Option<String> {
+    match (host, plugin) {
+        (Some(host), Some(plugin)) => Some(format!("{host}\n\n{plugin}")),
+        (host, None) => host,
+        (None, plugin) => plugin,
+    }
+}
+
 pub(super) fn with_chat_presentation(engine: &str, ordinary_chat: bool, role: Option<String>) -> Option<String> {
     if !ordinary_chat || !PRESENTATION_ENGINES.contains(&engine) { return role; }
     Some(match role.filter(|text| !text.is_empty()) {
@@ -68,6 +76,23 @@ pub(super) fn append_claude(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plugin_policy_preserves_role_presentation_and_staging_cleanup() {
+        for engine in ["claude", "codex"] {
+            let native = with_chat_presentation(engine, true, Some("managed-child role".into()));
+            let combined = with_plugin_instructions(native, Some("plugin policy v2".into())).unwrap();
+            assert!(combined.starts_with("managed-child role\n\n"));
+            assert_eq!(combined.matches(CHAT_PRESENTATION).count(), 1);
+            assert_eq!(combined.matches("plugin policy v2").count(), 1);
+            let root = std::env::temp_dir().join(format!("ccgui-plugin-role-{}", uuid::Uuid::new_v4()));
+            let file = stage(&root, &combined).unwrap();
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), combined);
+            crate::engine::cleanup_staged_files(&[file.clone()]);
+            assert!(!file.exists());
+            std::fs::remove_dir(root).unwrap();
+        }
+    }
 
     #[test]
     fn optional_host_hints_do_not_impersonate_a_managed_task_scope() {

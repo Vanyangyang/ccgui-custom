@@ -5,6 +5,8 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 const ERROR_PREFIX: &str = "CLAUDE_HAIKU_ASSIST_UNAVAILABLE:";
+/// Temporary pause; keep the wire field and implementation compatible with old tabs/workers.
+pub(super) const ENABLED: bool = false;
 pub(super) const AGENT_NAME: &str = "ccgui-haiku-assist";
 
 fn unavailable(detail: &str) -> String {
@@ -32,6 +34,8 @@ pub(super) async fn ensure_supported(bin: &str) -> Result<(), String> {
     super::hide_console(&mut command);
     tokio::time::timeout(Duration::from_secs(10), async {
         let mut child = command.spawn().map_err(|_| unavailable("Could not inspect the selected Claude CLI."))?;
+        #[cfg(windows)]
+        let _job = super::job::assign_kill_on_close(&child);
         let mut help = Vec::new();
         child.stdout.take().ok_or_else(|| unavailable("CLI help output is unavailable."))?
             .take(64 * 1024).read_to_end(&mut help).await

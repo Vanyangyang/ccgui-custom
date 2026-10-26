@@ -14,6 +14,7 @@
     "ui:session-menu",
     "ui:sidebar-entry",
     "ui:center-tab",
+    "ui:detached-window",
     "ui:conversation-mode",
     "agent",
     "theme",
@@ -23,6 +24,8 @@
     "composer:draft",
     "host:session",
     "host:chat",
+    "host:tasks",
+    "host:memory",
     "host:workspace",
     "host:workspace:remote"
   ],

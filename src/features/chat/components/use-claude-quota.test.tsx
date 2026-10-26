@@ -129,7 +129,7 @@ describe("Claude quota route isolation", () => {
     expect(controls.snapshot?.account?.email).toBe("reader@example.com");
     vi.mocked(ipc.claudeQuotaRead).mockRejectedValueOnce(new Error("transport unavailable"));
     await act(async () => controls.refresh());
-    expect(container.textContent).toBe("20 ready");
+    expect(container.textContent).toBe("20 stale");
     expect(controls.snapshot?.collectedAt).toBe(NOW);
     expect(controls.snapshot?.account?.email).toBe("reader@example.com");
   });
@@ -140,7 +140,7 @@ describe("Claude quota route isolation", () => {
     await render();
     expect(container.textContent).toBe("20 ready");
     await act(async () => vi.advanceTimersByTimeAsync(1_000));
-    expect(container.textContent).toBe("20 ready");
+    expect(container.textContent).toBe("20 stale");
     expect(ipc.claudeQuotaRead).toHaveBeenCalledOnce();
   });
   it("retains native-validated stale data until a newer snapshot arrives", async () => {

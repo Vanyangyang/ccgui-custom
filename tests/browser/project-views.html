@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="icon" href="data:,"><title>Project views isolated fixture</title></head>
+<body style="margin:0"><div id="fixture"></div><script>
+const memoryStorage = () => { const data = new Map(); return { get length() { return data.size; }, key: i => [...data.keys()][i] ?? null, getItem: k => data.get(k) ?? null, setItem: (k,v) => data.set(k,String(v)), removeItem: k => data.delete(k), clear: () => data.clear() }; };
+Object.defineProperty(window,"localStorage",{value:memoryStorage()}); Object.defineProperty(window,"sessionStorage",{value:memoryStorage()});
+localStorage.setItem("ccgui-next.language","en");
+window.__fixtureCallbacks = new Map(); window.__fixtureEvents = new Map(); let sequence = 0;
+window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener(_event,id) { window.__fixtureEvents.delete(id); } };
+window.__fixtureEmit = (name,payload=null) => { for (const [id,item] of window.__fixtureEvents) if(item.event===name) window.__fixtureCallbacks.get(item.handler)?.({event:name,id,payload}); };
+window.__TAURI_INTERNALS__ = {
+ transformCallback(callback) { const id=++sequence;window.__fixtureCallbacks.set(id,callback);return id; }, unregisterCallback(id) { window.__fixtureCallbacks.delete(id); }, convertFileSrc: p => p,
+ metadata:{currentWebview:{label:"main"},currentWindow:{label:"main"}},
+ async invoke(command,args={}) {
+  if(command==="plugin:event|listen") { const id=++sequence;window.__fixtureEvents.set(id,args);return id; }
+  if(command==="plugin:event|unlisten") { window.__fixtureEvents.delete(args.eventId);return null; }
+  if(command==="get_app_settings") return {};
+  if(window.__fixtureInvoke) return window.__fixtureInvoke(command,args);
+  throw new Error("Fixture blocked unexpected IPC: "+command);
+ }
+};
+</script><script type="module" src="./project-views.tsx"></script></body></html>

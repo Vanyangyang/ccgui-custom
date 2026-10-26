@@ -8,12 +8,14 @@ import {
 import spec from "../../../../packages/plugin-sdk/spec/permissions.json";
 
 describe("isKnownPermission", () => {
-  it("accepts every base permission (24 项)", () => {
+  it("accepts every base permission (27 项)", () => {
     for (const p of Object.keys(KNOWN_PERMISSIONS)) {
       expect(isKnownPermission(p)).toBe(true);
     }
-    expect(Object.keys(KNOWN_PERMISSIONS)).toHaveLength(24);
+    expect(Object.keys(KNOWN_PERMISSIONS)).toHaveLength(27);
     expect(isKnownPermission("host:chat")).toBe(true);
+    expect(isKnownPermission("host:tasks")).toBe(true);
+    expect(isKnownPermission("host:memory")).toBe(true);
     expect(isKnownPermission("ui:conversation-mode")).toBe(true);
   });
 

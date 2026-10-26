@@ -4,8 +4,9 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 vi.mock("@/lib/transport", () => ({ isWeb: false, pauseWorkerEvents: vi.fn(), resumeWorkerEvents: vi.fn() }));
 vi.mock("@/lib/runtime-checkpoint", () => ({ getRuntimeCheckpointReadiness: vi.fn(), prepareRuntimeCheckpoint: vi.fn(), abortRuntimeCheckpoint: vi.fn() }));
 vi.mock("@/version/distribution", () => ({ IS_CUSTOM_DISTRIBUTION: true }));
+vi.mock("@/features/plugins/runtime/update-close", () => ({ canClosePluginViewsForUpdate: vi.fn(), preparePluginViewsForUpdate: vi.fn(), resumePluginViewsAfterUpdate: vi.fn() }));
 
-import { createLiveUpdateStore, startLiveUpdateRuntime, type LiveUpdateDependencies, type LiveUpdateStatus, type LiveUpdateTransaction } from "./live-update";
+import { createLiveUpdateStore, startLiveUpdateRuntime, type LiveUpdateBlocker, type LiveUpdateDependencies, type LiveUpdateStatus, type LiveUpdateTransaction } from "./live-update";
 
 const transaction: LiveUpdateTransaction = {
   id: "local-transaction", phase: "Preparing", previous: null,
@@ -48,6 +49,169 @@ async function settle() { for (let i = 0; i < 30; i++) await Promise.resolve(); 
 afterEach(() => { for (const store of stores.splice(0)) store.getState().dispose(); vi.useRealTimers(); });
 
 describe("local live update coordinator", () => {
+  function closableFixture() {
+    const f = fixture();
+    let open = true;
+    vi.mocked(f.deps.readiness).mockImplementation(() => open ? [{ participant: "app-ui", reason: "plugin-view-without-checkpoint" }] : []);
+    f.deps.canClosePluginViews = vi.fn((blockers: readonly LiveUpdateBlocker[]) => blockers.length > 0 && blockers.every(b => ["plugin-view-without-checkpoint", "plugin-window-without-checkpoint"].includes(b.reason)));
+    f.deps.preparePluginViews = vi.fn(async () => { f.calls.push("close-views"); open = false; });
+    f.deps.resumePluginViews = vi.fn(() => { f.calls.push("resume-views"); });
+    return { ...f, setOpen(value: boolean) { open = value; } };
+  }
+
+  it("saves and closes opt-in views before native admission, event pause and checkpoint", async () => {
+    const f = closableFixture();
+    f.setStatus(status(transaction, ["plugin-window-without-checkpoint"]));
+    const store = f.create(); await store.getState().refresh(); await settle();
+    expect(f.calls).toEqual(["live_update_status", "close-views", "live_update_begin", "pause", "checkpoint", "live_update_activate"]);
+    expect(store.getState().stage).toBe("handoff");
+    expect(f.deps.resumePluginViews).not.toHaveBeenCalled();
+  });
+
+  it("offers owned service preparation before native admission without bypassing its final blocker check", async () => {
+    const f = fixture();
+    f.setStatus({ ...status(transaction, ["plugin-processes"]), blockerDetails: [{ reason: "plugin-processes", pluginId: "demo" }] });
+    f.deps.canClosePluginViews = vi.fn((blockers: readonly LiveUpdateBlocker[]) => blockers.every(b => b.reason === "plugin-processes" && b.pluginId === "demo"));
+    f.deps.preparePluginViews = vi.fn(async () => { f.calls.push("stop-service"); });
+    f.deps.resumePluginViews = vi.fn();
+    const original = f.native.getMockImplementation()!;
+    f.native.mockImplementation(async command => {
+      if (command === "live_update_begin") { f.calls.push(command); throw new Error("Update is waiting: plugin-processes"); }
+      return original(command);
+    });
+    const store = f.create(); await store.getState().refresh(); await settle();
+    expect(f.calls.slice(0, 3)).toEqual(["live_update_status", "stop-service", "live_update_begin"]);
+    expect(f.calls).not.toContain("live_update_activate");
+    expect(f.deps.resumePluginViews).toHaveBeenCalledOnce();
+    expect(store.getState().stage).toBe("waiting");
+  });
+
+  it("never hides a generic or malformed process blocker behind a cooperative service", async () => {
+    for (const extra of [{ reason: "plugin-processes" }, { reason: "plugin-processes", pluginId: "bad/id" }]) {
+      const f = fixture();
+      f.setStatus({ ...status(transaction, ["plugin-processes"]), blockerDetails: [
+        { reason: "plugin-processes", pluginId: "demo" }, extra,
+      ] });
+      f.deps.canClosePluginViews = vi.fn((blockers: readonly LiveUpdateBlocker[]) => blockers.every(b => b.pluginId === "demo"));
+      f.deps.preparePluginViews = vi.fn(async () => {});
+      const store = f.create(); await store.getState().refresh(); await settle();
+      expect(f.deps.preparePluginViews).not.toHaveBeenCalled();
+      expect(store.getState().blockers).toContainEqual({ reason: "plugin-processes" });
+    }
+  });
+
+  it("prepares loaded plugin controllers even when their views are already closed", async () => {
+    const f = closableFixture(); f.setOpen(false);
+    const store = f.create(); await store.getState().refresh(); await settle();
+    expect(f.calls).toEqual(["live_update_status", "close-views", "live_update_begin", "pause", "checkpoint", "live_update_activate"]);
+    expect(store.getState().stage).toBe("handoff");
+  });
+
+  it("does not close views while another blocker exists or when no update is staged", async () => {
+    for (const value of [status(transaction, ["terminal-sessions"]), status(null)]) {
+      const f = closableFixture(); f.setStatus(value);
+      const store = f.create(); await store.getState().refresh(); await settle();
+      expect(f.deps.preparePluginViews).not.toHaveBeenCalled();
+      expect(f.calls).toEqual(["live_update_status"]);
+    }
+    const f = closableFixture(); vi.mocked(f.deps.canClosePluginViews!).mockReturnValue(false);
+    const store = f.create(); await store.getState().refresh(); await settle();
+    expect(f.deps.preparePluginViews).not.toHaveBeenCalled();
+  });
+
+  it("keeps the staged candidate on save failure, resumes views and exposes its cause", async () => {
+    const f = closableFixture();
+    vi.mocked(f.deps.preparePluginViews!).mockRejectedValue(new Error("Draft storage is unavailable"));
+    const store = f.create(); await store.getState().refresh(); await settle();
+    expect(store.getState()).toMatchObject({ stage: "waiting", canCancel: true, transaction,
+      blockers: [{ participant: "plugin-update-close", reason: "plugin-update-close-failed", detail: "Draft storage is unavailable" }] });
+    expect(f.native).toHaveBeenCalledWith("live_update_abort", { transactionId: transaction.id, defer: true });
+    expect(f.calls).toEqual(["live_update_status", "live_update_abort", "abort-checkpoint", "resume-views", "resume"]);
+    vi.mocked(f.deps.preparePluginViews!).mockImplementation(async () => { f.setOpen(false); });
+    await store.getState().refresh(); await settle();
+    expect(store.getState().stage).toBe("handoff");
+  });
+
+  it("cancels a pending save promptly and never activates after its late completion", async () => {
+    const f = closableFixture(); const pending = Promise.withResolvers<void>();
+    let signal: AbortSignal | undefined;
+    vi.mocked(f.deps.preparePluginViews!).mockImplementation(async value => { signal = value; await pending.promise; });
+    const store = f.create(); await store.getState().refresh(); await settle();
+    expect(store.getState().stage).toBe("applying");
+    await store.getState().cancel();
+    expect(signal?.aborted).toBe(true);
+    expect(store.getState()).toMatchObject({ stage: "idle", cancelled: true });
+    pending.resolve(); await settle();
+    expect(f.calls).not.toContain("live_update_begin");
+    expect(f.calls).not.toContain("live_update_activate");
+    expect(f.deps.resumePluginViews).toHaveBeenCalledTimes(1);
+  });
+
+  it("bounds a non-cooperative preparation and preserves the candidate for retry", async () => {
+    vi.useFakeTimers();
+    const f = closableFixture(); const pending = Promise.withResolvers<void>();
+    vi.mocked(f.deps.preparePluginViews!).mockReturnValue(pending.promise);
+    const store = f.create(); await store.getState().refresh(); await settle();
+    await vi.advanceTimersByTimeAsync(45_000); await settle();
+    expect(store.getState()).toMatchObject({ stage: "waiting", transaction,
+      blockers: [{ reason: "plugin-update-close-timeout" }] });
+    expect(f.deps.resumePluginViews).toHaveBeenCalledTimes(1);
+    pending.resolve(); await settle(); expect(f.calls).not.toContain("live_update_activate");
+  });
+
+  it("rechecks readiness after closing views and releases their freeze if a new blocker appears", async () => {
+    const f = closableFixture();
+    vi.mocked(f.deps.preparePluginViews!).mockImplementation(async () => {
+      vi.mocked(f.deps.readiness).mockReturnValue([{ participant: "app-ui", reason: "open-dialog" }]);
+    });
+    const store = f.create(); await store.getState().refresh(); await settle();
+    expect(store.getState()).toMatchObject({ stage: "waiting", blockers: [{ participant: "app-ui", reason: "open-dialog" }] });
+    expect(f.calls).not.toContain("live_update_begin");
+    expect(f.deps.resumePluginViews).toHaveBeenCalledTimes(1);
+  });
+
+  it("enriches each native run while retaining unrelated native and frontend blockers", async () => {
+    const f = fixture();
+    const details = [
+      { reason: "legacy-runs", runId: "run-a", engine: "codex", sessionId: "session-a", state: "registered" as const },
+      { reason: "legacy-runs", runId: "run-b", state: "reader-finished" as const },
+    ];
+    f.setStatus({ ...status(transaction, ["legacy-runs", "terminal-sessions"]), blockerDetails: [...details, details[0]] });
+    vi.mocked(f.deps.readiness).mockReturnValue([{ participant: "chat", reason: "session-preparing" }]);
+    const store = f.create();
+    await store.getState().refresh();
+    expect(store.getState().blockers).toEqual([...details, { reason: "terminal-sessions" }, { participant: "chat", reason: "session-preparing" }]);
+    expect(store.getState().stage).toBe("waiting");
+    expect(f.calls).toEqual(["live_update_status"]);
+  });
+
+  it.each([undefined, null, {}, [], [null, "bad", { reason: "legacy-runs", runId: 3 },
+    { reason: "legacy-runs", state: "alive" }, { reason: "legacy-runs", runId: "bad\nrun" },
+    { reason: "not-blocking", runId: "irrelevant" }]])("falls back to reason codes for unusable detail payload %j", async (details) => {
+    const f = fixture();
+    f.setStatus({ ...status(transaction, ["legacy-runs", "future-reason"]), blockerDetails: details } as LiveUpdateStatus);
+    const store = f.create();
+    await store.getState().refresh();
+    expect(store.getState().blockers).toEqual([{ reason: "legacy-runs" }, { reason: "future-reason" }]);
+    expect(store.getState().stage).toBe("waiting");
+    expect(f.calls).toEqual(["live_update_status"]);
+  });
+
+  it("accepts unknown reason details only for authoritative reasons and drops extra fields", async () => {
+    const f = fixture();
+    f.setStatus({ ...status(transaction, ["future-reason", "legacy-runs"]), blockerDetails: [
+      { reason: "future-reason", runId: "future-run", token: "must-not-propagate", participant: "forged" },
+      { reason: "legacy-runs", state: "registry-unavailable" },
+      { reason: "worker-unavailable", runId: "not-a-blocker" },
+    ] } as LiveUpdateStatus);
+    const store = f.create();
+    await store.getState().refresh();
+    expect(store.getState().blockers).toEqual([
+      { reason: "future-reason", runId: "future-run" },
+      { reason: "legacy-runs", state: "registry-unavailable" },
+    ]);
+  });
+
   it("adopts committed active identity with its transaction and channel, then replaces or clears it on successful reads", async () => {
     const f = fixture();
     const store = f.create();

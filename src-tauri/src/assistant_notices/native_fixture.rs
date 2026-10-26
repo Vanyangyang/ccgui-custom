@@ -157,7 +157,11 @@ fn install_service(app: &tauri::AppHandle) -> Result<Arc<Service>, String> {
         store: Some(Store::open(home.join("assistant-notices.sqlite"))?),
         outbox: Some(Outbox::open(home.join("fixture-completion-outbox.sqlite"))?),
         observer_probe: |_| false,
-        audio: completion_audio::AudioService::new(now()),
+        audio: {
+            let audio = completion_audio::AudioService::new(now());
+            audio.load(home.join("completion-audio.json"));
+            audio
+        },
         inner: Mutex::new(Inner {
             config: Config {
                 enabled: true,
@@ -342,6 +346,10 @@ pub fn run() -> Result<(), String> {
             assistant_notices_status,
             assistant_notices_configure,
             assistant_notices_displays,
+            // Preview is omitted: fixture runs must stay silent.
+            assistant_notices_audio_settings,
+            assistant_notices_audio_configure,
+            assistant_notices_audio_voices,
             assistant_notices_attach,
             assistant_notices_sync,
             assistant_notices_list,

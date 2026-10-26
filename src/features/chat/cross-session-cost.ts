@@ -8,13 +8,15 @@ import { resolveSessionModel, type SessionState } from "./store/stream";
 import { resolveContextMaxInfo } from "./context-window-memory";
 import { hasReadableUsage, parseUsage, selectCursorContext } from "./usage";
 import { readAgyReferenceWindow, selectAgyContext } from "./components/agy-context";
-import { getSessionCacheHeat, promptCacheForEngine, type CacheHeat } from "./prompt-cache";
+import { getSessionCacheHeat, promptCacheForEngine, usesUnlimitedPromptCache, type CacheHeat } from "./prompt-cache";
 
 export interface CrossSessionCostReview {
   /** Time this local snapshot was read, not the upstream usage event time. */
   capturedAt: number;
   cacheHeat: CacheHeat;
   cache?: PromptCacheWindow;
+  /** No cache-age guard for this target; model-change approval is independent. */
+  cacheExpiryDisabled?: boolean;
   targetStatus: HostChatSession["status"];
   model?: string;
   context: {
@@ -92,14 +94,20 @@ export function crossSessionCostReview(
     context.kind = context.used === undefined ? "unknown" : "last_request";
   }
   const cache = promptCacheForEngine(meta.engine, meta.promptCache) ?? undefined;
-  return { capturedAt: now, cacheHeat: getSessionCacheHeat(cache, now), cache, targetStatus, model, context };
+  return { capturedAt: now, cacheHeat: getSessionCacheHeat(cache, now), cache,
+    cacheExpiryDisabled: usesUnlimitedPromptCache(meta.engine, model), targetStatus, model, context };
 }
 
 // Fixed allowance for starting a request, not a measured engine startup time.
 const CACHE_START_MARGIN_MS = 10_000;
 
-/** Hot cache with more than ten seconds left sends or queues normally. */
+/** Small current contexts bypass cache review; otherwise hot cache needs more
+ * than ten seconds left. Historical or mismatched samples cannot grant a bypass. */
 export function requiresCrossSessionCostApproval(review: CrossSessionCostReview): boolean {
+  if (review.cacheExpiryDisabled) return review.context.modelMismatch;
+  const used = finiteTokens(review.context.used);
+  if (!review.context.modelMismatch && review.context.kind === "current_context" &&
+    used !== undefined && used < MIN_SESSION_SEND_COST_APPROVAL_TOKENS) return false;
   if (review.cacheHeat !== "hot" || review.context.modelMismatch || !review.cache) return true;
   // Use the earliest possible expiration, including reference windows. The
   // sidebar's rounded percentage is only a visual warning, not a send gate.
@@ -122,8 +130,9 @@ export function requiresSessionSendCostApproval(
   now = Date.now(),
 ): boolean {
   if ((review.context.used ?? 0) < MIN_SESSION_SEND_COST_APPROVAL_TOKENS) return false;
-  if (review.cacheHeat === "cold") return true;
   if (review.context.modelMismatch) return true;
+  if (review.cacheExpiryDisabled) return false;
+  if (review.cacheHeat === "cold") return true;
   if (
     review.cacheHeat === "unknown" &&
     meta &&
@@ -140,7 +149,7 @@ export function requiresSessionSendCostApproval(
 /** Queue auto-drain cost guard: pauses automatic queue drain only if measured
  * context is >= 50k tokens and the session's cache window is already cold. */
 export function requiresQueueDrainCostApproval(review: CrossSessionCostReview): boolean {
-  return (review.context.used ?? 0) >= MIN_SESSION_SEND_COST_APPROVAL_TOKENS &&
+  return !review.cacheExpiryDisabled && (review.context.used ?? 0) >= MIN_SESSION_SEND_COST_APPROVAL_TOKENS &&
     review.cacheHeat === "cold";
 }
 

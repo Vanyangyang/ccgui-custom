@@ -18,8 +18,8 @@ describe("useEngineModels task isolation", () => {
   let root: Root;
   let state: EngineModelsState;
   const pinModels = vi.fn(async (_updates: Record<string, string>) => {});
-  function Harness({ scope = "task" }: { scope?: "task" | "chat" }) {
-    state = useEngineModels(engines, models, pinModels, providers, undefined, scope);
+  function Harness({ scope = "task", engineList = engines }: { scope?: "task" | "chat"; engineList?: EngineInfo[] }) {
+    state = useEngineModels(engineList, models, pinModels, providers, undefined, scope);
     return null;
   }
   beforeEach(() => {
@@ -35,6 +35,71 @@ describe("useEngineModels task isolation", () => {
     container = document.createElement("div"); document.body.appendChild(container); root = createRoot(container);
   });
   afterEach(() => { act(() => root.unmount()); container.remove(); });
+
+  it.each(["disabled", "unavailable"])("never probes Cursor automatically or on refresh when %s", async condition => {
+    const engineList = engines.map(engine => engine.id === "cursor"
+      ? { ...engine, enabled: condition !== "disabled", available: condition !== "unavailable" } : engine);
+    await act(async () => root.render(<Harness scope="chat" engineList={engineList} />));
+    await act(async () => state.refresh());
+    expect(mocks.cursorModelCatalog).not.toHaveBeenCalled();
+    expect(mocks.listEngineModels.mock.calls.some(([engine]) => engine === "cursor")).toBe(false);
+    expect(state.cursorPickerModels).toEqual([]);
+    expect(pinModels.mock.calls.some(([updates]) => "cursor" in updates)).toBe(false);
+  });
+
+  it("ignores both late Cursor catalog responses after disabling without publishing or pinning", async () => {
+    const priorCatalog = publishedCursorCatalog();
+    const priorParams = localStorage.getItem("ccgui.cursor.model-parameters");
+    const acp = Promise.withResolvers<unknown>();
+    const text = Promise.withResolvers<unknown>();
+    mocks.cursorModelCatalog.mockReturnValue(acp.promise);
+    mocks.listEngineModels.mockImplementation((engine: string) => engine === "cursor" ? text.promise : Promise.resolve({ models: [] }));
+    try {
+      await act(async () => root.render(<Harness scope="chat" />));
+      expect(mocks.cursorModelCatalog).toHaveBeenCalledOnce();
+      const disabled = engines.map(engine => engine.id === "cursor" ? { ...engine, enabled: false } : engine);
+      await act(async () => root.render(<Harness scope="chat" engineList={disabled} />));
+      const publishedBeforeReply = publishedCursorCatalog();
+      pinModels.mockClear();
+      await act(async () => {
+        acp.resolve([{ id: "opus", name: "Late model", parameters: [] }]);
+        text.resolve({ authoritative: true, models: [{ id: "late-default", name: "Late default" }] });
+      });
+      expect(state.catalogs.cursor).toBeUndefined();
+      expect(state.cursorPickerModels).toEqual([]);
+      expect(state.pendingEngines.cursor).toBeUndefined();
+      expect(pinModels).not.toHaveBeenCalled();
+      expect(publishedCursorCatalog()).toEqual(publishedBeforeReply);
+      expect(localStorage.getItem("ccgui.cursor.model-parameters")).toBe(priorParams);
+      await act(async () => state.refresh());
+      expect(mocks.cursorModelCatalog).toHaveBeenCalledOnce();
+      expect(mocks.listEngineModels.mock.calls.filter(([engine]) => engine === "cursor")).toHaveLength(1);
+    } finally { publishCursorCatalog(priorCatalog); }
+  });
+
+  it("loads and explicitly refreshes enabled Cursor and rejects an older response after re-enabling", async () => {
+    const priorCatalog = publishedCursorCatalog();
+    const priorParams = localStorage.getItem("ccgui.cursor.model-parameters");
+    const older = Promise.withResolvers<unknown>();
+    mocks.cursorModelCatalog.mockReturnValueOnce(older.promise);
+    try {
+      await act(async () => root.render(<Harness scope="chat" />));
+      const disabled = engines.map(engine => engine.id === "cursor" ? { ...engine, enabled: false } : engine);
+      await act(async () => root.render(<Harness scope="chat" engineList={disabled} />));
+      mocks.cursorModelCatalog.mockResolvedValue([{ id: "fresh", name: "Fresh", parameters: [] }]);
+      await act(async () => root.render(<Harness scope="chat" />));
+      expect(state.cursorPickerModels.map(model => model.id)).toEqual(["fresh"]);
+      await act(async () => older.resolve([{ id: "old", name: "Old", parameters: [] }]));
+      expect(state.cursorPickerModels.map(model => model.id)).toEqual(["fresh"]);
+      mocks.cursorModelCatalog.mockResolvedValue([{ id: "refreshed", name: "Refreshed", parameters: [] }]);
+      await act(async () => state.refresh());
+      expect(state.cursorPickerModels.map(model => model.id)).toEqual(["refreshed"]);
+      expect(mocks.cursorModelCatalog).toHaveBeenCalledTimes(3);
+    } finally {
+      publishCursorCatalog(priorCatalog);
+      if (priorParams === null) localStorage.removeItem("ccgui.cursor.model-parameters"); else localStorage.setItem("ccgui.cursor.model-parameters", priorParams);
+    }
+  });
 
   it("does not pin unset or stale models, collapse slugs, seed parameters, or publish a catalog", async () => {
     const previousParams = localStorage.getItem("ccgui.cursor.model-parameters");

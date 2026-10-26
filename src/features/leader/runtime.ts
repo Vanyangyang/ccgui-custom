@@ -10,6 +10,7 @@ import { subscribeLeaderStream } from "./event-state";
 import { removeLeaderSessions } from "./session-cleanup";
 import { useLeaderStore } from "./store";
 import type { LeaderBranch, LeaderSnapshot } from "./types";
+import { parentWorkspacePath } from "./types";
 import { sameLeaderWorkspace } from "./workspace-path";
 import { getSessionCacheHeat } from "@/features/chat/prompt-cache";
 
@@ -53,13 +54,31 @@ export function syncLeaderBranchComms(
   const validScopedIds = new Set<string>();
 
   for (const branch of activeBranches) {
-    const status = branchToCommsStatus(branch.state);
+    const assignment = branch.delegation ?? branch;
+    const status = branchToCommsStatus(assignment.state);
     if (!status) continue;
     const scopedId = `leader:${branch.id}`;
     validScopedIds.add(scopedId);
     const existing = existingById.get(scopedId);
+    // A restored legacy card used child activity time, which can be newer than
+    // its completed assignment. Adopt the first durable assignment regardless
+    // of that timestamp; afterwards never downgrade to a late legacy payload.
+    if (existing?.leaderDelegationId && !branch.delegation) continue;
+    const migratingDelegation = !!branch.delegation && !existing?.leaderDelegationId;
+    // Within one timestamp domain, late snapshots cannot reopen a completion
+    // or replace a newer assignment, including when request ids differ.
+    if (!migratingDelegation && existing?.leaderUpdatedAt !== undefined
+      && assignment.updatedAt > 0 && assignment.updatedAt < existing.leaderUpdatedAt) continue;
+    if (branch.delegation && existing?.leaderDelegationId
+      && assignment.updatedAt === existing.leaderUpdatedAt) {
+      // New assignments have strictly increasing native timestamps. For one
+      // assignment, a terminal sample wins over an active sample in the same ms.
+      if (branch.delegation.requestId !== existing.leaderDelegationId) continue;
+      const wasTerminal = ["completed", "failed", "unknown"].includes(existing.status);
+      if (wasTerminal && !["completed", "failed", "unknown"].includes(status)) continue;
+    }
     const parentMeta = sessions.find(
-      (s) => s.engine === branch.parentEngine && s.sessionId === branch.parentSessionId && sameLeaderWorkspace(s.workspacePath, branch.workspacePath),
+      (s) => s.engine === branch.parentEngine && s.sessionId === branch.parentSessionId && sameLeaderWorkspace(s.workspacePath, parentWorkspacePath(branch)),
     );
     const childMeta = branch.sessionId
       ? sessions.find((s) => s.engine === branch.engine && s.sessionId === branch.sessionId && sameLeaderWorkspace(s.workspacePath, branch.workspacePath))
@@ -67,7 +86,7 @@ export function syncLeaderBranchComms(
     const sender = {
       engine: branch.parentEngine,
       sessionId: branch.parentSessionId,
-      workspacePath: branch.workspacePath,
+      workspacePath: parentWorkspacePath(branch),
       title: parentMeta?.customTitle || parentMeta?.title || undefined,
     };
     const target = {
@@ -81,41 +100,44 @@ export function syncLeaderBranchComms(
       !existing && options?.markInitialTerminalReviewed && isTerminal
         ? [crossSessionParticipantKey(sender), crossSessionParticipantKey(target)]
         : undefined;
-    const acceptedAt = status === "awaiting_cost_approval" && branch.costApproval
-      ? branch.costApproval.capturedAt
-      : existing && existing.runId === (branch.runId ?? undefined)
+    const acceptedAt = branch.delegation?.createdAt ?? (status === "awaiting_cost_approval" && assignment.costApproval
+      ? assignment.costApproval.capturedAt
+      : existing && existing.runId === (assignment.runId ?? undefined)
         ? existing.acceptedAt
-        : branch.createdAt || branch.updatedAt || Date.now();
+        : assignment.createdAt || assignment.updatedAt || Date.now());
     const replyText =
-      branch.result ||
-      (status === "executing" && existing && existing.runId === (branch.runId ?? undefined)
+      assignment.result ||
+      (status === "executing" && existing && existing.runId === (assignment.runId ?? undefined)
+        && (!branch.delegation || existing.requestId === branch.delegation.requestId)
         ? existing.replyText
         : undefined);
     const record: CrossSessionCommunicationRecord = {
       scopedId,
-      requestId: status === "awaiting_cost_approval" && branch.costApproval ? branch.costApproval.requestId : branch.id,
-      runId: branch.runId ?? undefined,
+      requestId: branch.delegation?.requestId ?? (status === "awaiting_cost_approval" && assignment.costApproval ? assignment.costApproval.requestId : branch.id),
+      runId: assignment.runId ?? undefined,
       kind: "subtask",
       sender,
       target,
-      message: branch.task || branch.title,
+      message: assignment.task || branch.title,
       status,
-      leaderCostApproval: branch.costApproval && status === "awaiting_cost_approval" ? {
-        branchId: branch.id, requestId: branch.costApproval.requestId, model: branch.costApproval.model,
+      leaderCostApproval: assignment.costApproval && status === "awaiting_cost_approval" ? {
+        branchId: branch.id, requestId: assignment.costApproval.requestId, model: assignment.costApproval.model,
       } : undefined,
-      costReview: branch.costApproval && status === "awaiting_cost_approval" ? {
-        capturedAt: branch.costApproval.capturedAt,
-        model: branch.costApproval.model ?? undefined,
-        cache: branch.costApproval.cache ?? undefined,
-        cacheHeat: getSessionCacheHeat(branch.costApproval.cache, branch.costApproval.capturedAt),
+      costReview: assignment.costApproval && status === "awaiting_cost_approval" ? {
+        capturedAt: assignment.costApproval.capturedAt,
+        model: assignment.costApproval.model ?? undefined,
+        cache: assignment.costApproval.cache ?? undefined,
+        cacheHeat: getSessionCacheHeat(assignment.costApproval.cache, assignment.costApproval.capturedAt),
         targetStatus: "idle",
         context: { kind: "unknown", capacityKnown: false, reference: false, modelMismatch: false },
       } : undefined,
       replyText,
-      truncated: branch.resultTruncated || undefined,
-      error: branch.error ?? undefined,
+      truncated: assignment.resultTruncated || undefined,
+      error: assignment.error ?? undefined,
       acceptedAt,
-      updatedAt: branch.updatedAt || branch.lastActivityAt || acceptedAt,
+      updatedAt: assignment.updatedAt || (branch.delegation ? acceptedAt : branch.lastActivityAt || acceptedAt),
+      leaderUpdatedAt: assignment.updatedAt,
+      leaderDelegationId: branch.delegation?.requestId,
       ...(initialReviewed ? { reviewedBy: initialReviewed } : {}),
     };
     store.upsertRecord(record);
@@ -159,17 +181,19 @@ export function startLeaderRuntime() {
     knownArchived = nextArchived;
     removeReclaimed([...reclaimed.values()]);
   });
-  const offStream = subscribeLeaderStream((branchId, delta) => {
+  const offStream = subscribeLeaderStream((branchId, runId, delta) => {
     if (disposed) return;
     const scopedId = `leader:${branchId}`;
     const store = useCrossSessionActivityStore.getState();
     const existing = store.records.find((r) => r.scopedId === scopedId);
     if (!existing || (existing.status !== "executing" && existing.status !== "received")) return;
+    if (!existing.runId || (runId !== existing.runId &&
+      !(runId.startsWith(`${existing.runId}-c`) && /^\d+$/.test(runId.slice(existing.runId.length + 2))))) return;
     store.upsertRecord({
       ...existing,
-      status: "executing",
       replyText: `${existing.replyText ?? ""}${delta}`,
-      updatedAt: Date.now(),
+      // Text arrival is not a new native status sample. Keep its timestamp
+      // and status so subsequent snapshots cannot oscillate with this preview.
     });
   });
   const refresh = () => { if (!disposed) void useLeaderStore.getState().refresh(); };

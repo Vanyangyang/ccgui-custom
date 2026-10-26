@@ -11,12 +11,16 @@ import Check from "lucide-react/dist/esm/icons/check";
 import { isWeb } from "./api";
 import { noticeModelKey, useNoticeSettings, vertexModel } from "./use-notice-settings";
 import { NoticeFeedFeedback } from "./AssistantNoticesOverlay";
+import { CompletionAudioSettings } from "./CompletionAudioSettings";
+import { useCompletionAudio } from "./use-completion-audio";
 
 const trigger = "h-8 max-w-72";
 export function AssistantNoticesControl() {
   const { t } = useTranslation();
   const { status, draft, busy, error, models, displays, providers, catalogError, dirty, change, save, retry } = useNoticeSettings();
   const feedback = useActionFeedback();
+  // Audio preferences load only after the service reports itself usable.
+  const audio = useCompletionAudio(Boolean(status?.available && status.voiceAvailable));
   if (isWeb) return null;
   const disabled = !draft || busy;
   const selectedKey = draft ? noticeModelKey({ engine: draft.observerEngine, id: draft.observerModel }) : noticeModelKey(vertexModel);
@@ -54,7 +58,10 @@ export function AssistantNoticesControl() {
       </SettingsRow>
     </SettingsCard>
     <SettingsSectionLabel>{t("assistantNotices.voiceGroup")}</SettingsSectionLabel>
-    <SettingsCard>{toggles(["voiceEnabled"])}<SettingsRow label={t("assistantNotices.voiceRules")} description={t("assistantNotices.voiceRulesDescription")} /></SettingsCard>
+    <SettingsCard>{toggles(["voiceEnabled"])}<CompletionAudioSettings audio={audio} engines={status?.sourceEngines ?? []} disabled={disabled || audio.busy} /></SettingsCard>
+    {audio.previewError && <p role="alert" className="text-body-2-regular text-text-error-primary">{t(audio.previewError)}</p>}
+    {audio.voicesError && audio.draft && <p role="status" className="text-body-2-regular text-text-secondary">{t("assistantNotices.audioVoicesError")}</p>}
+    <NoticeFeedFeedback error={Boolean(audio.error)} retry={audio.reload} errorKey={audio.error || "assistantNotices.audioSettingsError"} retryLabelKey="assistantNotices.audioReload" />
     <SettingsSectionLabel>{t("assistantNotices.displayGroup")}</SettingsSectionLabel>
     <SettingsCard>
       <SettingsRow anchor="displayTarget" label={t("assistantNotices.displayTarget")} description={disconnected ? t("assistantNotices.displayDisconnected") : undefined}>
@@ -80,6 +87,9 @@ export function AssistantNoticesControl() {
     {status && !status.voiceAvailable && <p role="status">{t("assistantNotices.voiceUnavailable")}</p>}
     <NoticeFeedFeedback error={Boolean(error)} retry={retry} errorKey={error || "assistantNotices.settingsError"} retryLabelKey="assistantNotices.reloadSettings" />
     <NoticeFeedFeedback error={catalogError} retry={retry} errorKey="assistantNotices.catalogError" retryLabelKey="assistantNotices.reloadSettings" />
-    <Button size="small" disabled={disabled || (!dirty && status?.reason !== "legacy_preferences_unavailable")} onClick={() => { void feedback.start(save).catch(() => {}); }}><ActionFeedbackIcon icon={Check} feedback={feedback.feedback} />{t("assistantNotices.save")}</Button>
+    <Button size="small" disabled={disabled || audio.busy || (!dirty && !audio.dirty && status?.reason !== "legacy_preferences_unavailable")} onClick={() => { void feedback.start(async () => {
+      if (dirty || status?.reason === "legacy_preferences_unavailable") await save();
+      if (audio.dirty) await audio.save();
+    }).catch(() => {}); }}><ActionFeedbackIcon icon={Check} feedback={feedback.feedback} />{t("assistantNotices.save")}</Button>
   </section>;
 }

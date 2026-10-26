@@ -133,7 +133,9 @@ pub(super) fn apply_turn_read_only(params: &mut Value) {
 }
 
 pub(super) fn fork_params(parent_id: &str, ephemeral: bool) -> Value {
-    let mut params = json!({"threadId": parent_id});
+    // The fork retains its context; only the reply omits the copied history.
+    // Returning every old turn in one JSON line can exceed the reader's cap.
+    let mut params = json!({"threadId": parent_id, "excludeTurns": true});
     // Native forks reject deferGoalContinuation with ephemeral threads,
     // which cannot store goals. Persistent branches still need deferral
     // until the inherited goal is cleared before the first side turn.

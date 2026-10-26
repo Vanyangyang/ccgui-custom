@@ -44,6 +44,11 @@ use std::sync::LazyLock;
 use std::time::Duration;
 use tauri::Manager;
 
+/// Read-only version handshake for the host-owned fixed-instruction resolver.
+/// Older native binaries must not be treated as supporting a newly loaded UI.
+#[tauri::command]
+pub(crate) fn plugin_fixed_instructions_supported() -> bool { true }
+
 use parking_lot::Mutex;
 
 use crate::engine::resolve::{command_for_binary, find_cli_binary, merge_cli_search_path};
@@ -350,7 +355,7 @@ struct TrackedChild {
     /// Kill-on-close job guard (Windows): dropping the entry closes the job
     /// and the kernel sweeps grandchildren the start_kill tree walk missed.
     #[cfg(windows)]
-    _tree_guard: Option<Arc<crate::engine::job::KillOnCloseJob>>,
+    _tree_guard: Arc<crate::engine::job::KillOnCloseJob>,
 }
 
 static TRACKED_CHILDREN: LazyLock<Mutex<HashMap<String, Vec<TrackedChild>>>> =
@@ -360,15 +365,26 @@ fn tracked_children() -> &'static Mutex<HashMap<String, Vec<TrackedChild>>> {
     &TRACKED_CHILDREN
 }
 
-pub(crate) fn has_tracked_children() -> bool {
+pub(crate) fn tracked_child_owners() -> Vec<String> {
     // A completed wrapper can still own grandchildren through its job guard.
-    // Only the existing lifecycle cleanup may release that ownership.
-    tracked_children().lock().values().any(|children| !children.is_empty())
+    // Only lifecycle cleanup may release that ownership.
+    let mut owners: Vec<_> = tracked_children().lock().iter()
+        .filter(|(_, children)| !children.is_empty())
+        .map(|(id, _)| id.clone()).collect();
+    owners.sort();
+    owners
 }
 
-pub(crate) fn register_tracked_child(plugin_id: &str, child: tokio::process::Child) {
+pub(crate) fn register_tracked_child(plugin_id: &str, mut child: tokio::process::Child) -> Result<(), String> {
     #[cfg(windows)]
-    let tree_guard = crate::engine::job::assign_kill_on_close(&child);
+    let tree_guard = match crate::engine::job::assign_kill_on_close(&child) {
+        Some(guard) => guard,
+        None => {
+            if let Some(pid) = child.id() { crate::engine::kill_process_group(pid); }
+            let _ = child.start_kill();
+            return Err(format!("{plugin_id}: plugin service process-tree cleanup is unavailable"));
+        }
+    };
     let mut registry = tracked_children().lock();
     let children = registry.entry(plugin_id.to_string()).or_default();
     // Prune dead handles before pushing: a plugin that respawns a child in
@@ -383,6 +399,7 @@ pub(crate) fn register_tracked_child(plugin_id: &str, child: tokio::process::Chi
         #[cfg(windows)]
         _tree_guard: tree_guard,
     });
+    Ok(())
 }
 
 /// Remove every tracked child of `plugin_id` and SIGKILL each one, returning
@@ -401,6 +418,38 @@ pub(crate) fn kill_tracked_children(plugin_id: &str) -> usize {
         // Entry drops here: on Windows its job guard sweeps the whole tree.
     }
     killed
+}
+
+/// A cooperative shutdown clears ownership only after the exact child handles
+/// have exited. Never turn an unreachable service into a forced termination.
+async fn reap_exited_children(plugin_id: &str, limit: std::time::Duration) -> Result<usize, String> {
+    let deadline = tokio::time::Instant::now() + limit;
+    let mut reaped = 0;
+    loop {
+        let (pending, unconfirmed) = {
+            let mut registry = tracked_children().lock();
+            if let Some(children) = registry.get_mut(plugin_id) {
+                let before = children.len();
+                let mut unconfirmed = 0;
+                children.retain_mut(|entry| match entry.child.try_wait() {
+                    Ok(Some(_)) => false,
+                    Ok(None) => true,
+                    Err(_) => { unconfirmed += 1; true }
+                });
+                reaped += before - children.len();
+                let pending = children.len();
+                if pending == 0 { registry.remove(plugin_id); }
+                (pending, unconfirmed)
+            } else { (0, 0) }
+        };
+        if pending == 0 { return Ok(reaped); }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            let running = pending - unconfirmed;
+            return Err(format!("{plugin_id}: {running} plugin service(s) still running; {unconfirmed} exit status unconfirmed; cleanup was not forced"));
+        }
+        tokio::time::sleep((deadline - now).min(std::time::Duration::from_millis(50))).await;
+    }
 }
 
 /// SIGKILL every tracked child of every plugin. Called from the lib.rs
@@ -613,6 +662,20 @@ pub(crate) async fn plugin_add_workspace(
     crate::history::reader::add_workspace_inner(&state, &path, meta, None, None)
 }
 
+/// A plugin publishes only its own stable project projection. Membership is
+/// validated against registered local workspaces and never grants file access.
+#[tauri::command]
+pub(crate) async fn plugin_publish_workspace_project(
+    state: tauri::State<'_, crate::AppState>,
+    plugin_id: String,
+    source_key: String,
+    input: crate::workspace_projects::ProjectInput,
+) -> Result<crate::workspace_projects::WorkspaceProject, String> {
+    let grants = load_grants(&plugin_id)?;
+    require_workspace_grants(&grants, &plugin_id, None)?;
+    crate::workspace_projects::publish_workspace_project(&state, &plugin_id, &source_key, input)
+}
+
 /// Run a granted binary to completion, capturing stdout/stderr (64KB each).
 /// `timeoutMs` defaults to 30s and is capped at 300s; a timed-out process is
 /// killed (kill_on_drop) and reported as an error.
@@ -768,7 +831,7 @@ pub(crate) async fn plugin_exec_spawn(
             let child = command
                 .spawn()
                 .map_err(|error| format!("{plugin_id}: failed to start {bin}: {error}"))?;
-            register_tracked_child(&plugin_id, child);
+            register_tracked_child(&plugin_id, child)?;
         }
     }
     Ok(())
@@ -780,10 +843,12 @@ pub(crate) async fn plugin_exec_spawn(
 /// and no exec: grant is required because a plugin can only ever reach its
 /// own children.
 #[tauri::command]
-pub(crate) async fn plugin_exec_kill(plugin_id: String) -> Result<PluginExecKillResult, String> {
+pub(crate) async fn plugin_exec_kill(plugin_id: String, only_exited: Option<bool>) -> Result<PluginExecKillResult, String> {
     crate::plugins::plugin_enabled_permissions(&plugin_id)?;
     Ok(PluginExecKillResult {
-        killed: kill_tracked_children(&plugin_id),
+        killed: if only_exited == Some(true) {
+            reap_exited_children(&plugin_id, std::time::Duration::from_secs(2)).await?
+        } else { kill_tracked_children(&plugin_id) },
     })
 }
 
@@ -1229,14 +1294,18 @@ mod tests {
     // so splitting these across tests would race under parallel test runs.
     #[tokio::test]
     async fn tracked_children_kill_semantics() {
-        register_tracked_child("ccgui-test-lifecycle-a", spawn_test_sleeper());
-        register_tracked_child("ccgui-test-lifecycle-a", spawn_test_sleeper());
-        register_tracked_child("ccgui-test-lifecycle-b", spawn_test_sleeper());
+        register_tracked_child("ccgui-test-lifecycle-a", spawn_test_sleeper()).unwrap();
+        register_tracked_child("ccgui-test-lifecycle-a", spawn_test_sleeper()).unwrap();
+        register_tracked_child("ccgui-test-lifecycle-b", spawn_test_sleeper()).unwrap();
+        assert_eq!(tracked_child_owners(), ["ccgui-test-lifecycle-a", "ccgui-test-lifecycle-b"]);
+        assert!(reap_exited_children("ccgui-test-lifecycle-a", std::time::Duration::ZERO).await.is_err());
+        assert_eq!(tracked_child_owners(), ["ccgui-test-lifecycle-a", "ccgui-test-lifecycle-b"]);
 
         // Kills every child of the named plugin and reports the count.
         assert_eq!(kill_tracked_children("ccgui-test-lifecycle-a"), 2);
         // Registry entry is cleared; a second kill finds nothing.
         assert_eq!(kill_tracked_children("ccgui-test-lifecycle-a"), 0);
+        assert_eq!(tracked_child_owners(), ["ccgui-test-lifecycle-b"]);
         // A plugin can never reach another plugin's children.
         assert!(tracked_children()
             .lock()
@@ -1245,10 +1314,21 @@ mod tests {
         // Plugin that never spawned: nothing to kill, no error.
         assert_eq!(kill_tracked_children("ccgui-test-lifecycle-none"), 0);
         assert!(tracked_children().lock().is_empty());
+        assert!(tracked_child_owners().is_empty());
+
+        // Gracefully retired children can release their registry/job ownership;
+        // a concurrently owned live service is neither killed nor removed.
+        register_tracked_child("ccgui-test-lifecycle-retired", spawn_test_sleeper()).unwrap();
+        register_tracked_child("ccgui-test-lifecycle-live", spawn_test_sleeper()).unwrap();
+        tracked_children().lock().get_mut("ccgui-test-lifecycle-retired").unwrap()[0].child.start_kill().unwrap();
+        assert_eq!(reap_exited_children("ccgui-test-lifecycle-retired", std::time::Duration::from_secs(2)).await.unwrap(), 1);
+        assert_eq!(tracked_child_owners(), ["ccgui-test-lifecycle-live"]);
+        assert!(matches!(tracked_children().lock().get_mut("ccgui-test-lifecycle-live").unwrap()[0].child.try_wait(), Ok(None)));
+        kill_tracked_children("ccgui-test-lifecycle-live");
 
         // kill_all (app-exit hook) drains every plugin's children at once.
-        register_tracked_child("ccgui-test-lifecycle-x", spawn_test_sleeper());
-        register_tracked_child("ccgui-test-lifecycle-y", spawn_test_sleeper());
+        register_tracked_child("ccgui-test-lifecycle-x", spawn_test_sleeper()).unwrap();
+        register_tracked_child("ccgui-test-lifecycle-y", spawn_test_sleeper()).unwrap();
         kill_all_tracked_children();
         assert!(tracked_children().lock().is_empty());
     }
@@ -1257,7 +1337,7 @@ mod tests {
     async fn plugin_exec_kill_requires_an_installed_record() {
         // Cleanup needs no exec: grant, but the plugin must exist — a random
         // id can never be in plugins.json.
-        let error = plugin_exec_kill("ccgui-test-never-installed".to_string())
+        let error = plugin_exec_kill("ccgui-test-never-installed".to_string(), None)
             .await
             .unwrap_err();
         assert!(error.contains("ccgui-test-never-installed"), "{error}");

@@ -472,6 +472,14 @@ pub mod profile_runtime_support {
 /// Existing production protocol exposed only by the opt-in debug harness, so
 /// process fixtures can exercise the actual --task-worker binary without GUI.
 pub mod worker_process_support {
+    /// Exercise the same nested launch scope as the desktop, including when
+    /// the test runner itself inherits a restrictive outer Windows Job.
+    #[cfg(windows)]
+    pub fn acquire_launcher_scope() -> Result<impl Drop, String> {
+        crate::engine::job::GuiServiceScope::acquire()
+    }
+
+    pub use crate::leader::LeaderBranch;
     pub use crate::leader::initialize_worker_fixture_schema as initialize_worker_schema;
     pub use crate::task_worker::{schema_hash, Command, Outcome, Request, Response, StartArgs,
         WorkerClient, WorkerConfig, WorkerManifest, PROTOCOL};

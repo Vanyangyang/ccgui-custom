@@ -59,12 +59,13 @@ describe("chat runtime checkpoint with the real store", () => {
     expect(captureEngineEventRuntime().pendingSessionOrigins).toEqual([]);
   });
 
-  it.each(["missing-settled-runs", "malformed-origins"])("keeps checkpoint event validation strict for %s", async (invalid) => {
+  it.each(["missing-settled-runs", "malformed-origins", "malformed-outcomes"])("keeps checkpoint event validation strict for %s", async (invalid) => {
     const first = await boot(); await first.store.getState().init();
     const checkpoint = await first.coordinator.prepareRuntimeCheckpoint();
     const events = (checkpoint.participants.chat as { events: Record<string, unknown> }).events;
     if (invalid === "missing-settled-runs") delete events.settledRuns;
-    else events.pendingSessionOrigins = null;
+    else if (invalid === "malformed-origins") events.pendingSessionOrigins = null;
+    else events.settledRunOutcomes = null;
     await expect(boot(checkpoint)).rejects.toThrow("Incomplete checkpoint event bookkeeping");
   });
 
@@ -79,7 +80,7 @@ describe("chat runtime checkpoint with the real store", () => {
     expect(origins.at(-1)?.[0]).toBe("observed-299");
   });
 
-  it("restores drafts, pending approval, original run identity and unflushed Unicode in order", async () => {
+  it.each(["current", "before-settled-outcomes"])("restores drafts, pending approval, original run identity and unflushed Unicode from %s checkpoints", async (format) => {
     const first = await boot();
     await first.store.getState().init();
     first.store.setState({ active: tab, openTabs: [tab], drafts: { [key]: "草稿🙂" }, streamingByKey: { [key]: true },
@@ -92,9 +93,19 @@ describe("chat runtime checkpoint with the real store", () => {
       } } });
     first.stream.routeRun(runId, key);
     first.stream.bufferStreamPart(key, "delta", "🙂\n```ts\nconst a = 1;", "model", "high");
+    const previousEvents = await import("./engine-events");
+    previousEvents.settledRuns.set("previous-run", "done");
+    previousEvents.settledRunOutcomes.set("previous-run", { key, status: "cancelled" });
     const checkpoint = await first.coordinator.prepareRuntimeCheckpoint();
+    if (format === "before-settled-outcomes") {
+      delete (checkpoint.participants.chat as { events: Record<string, unknown> }).events.settledRunOutcomes;
+    }
     expect(fake.send).not.toHaveBeenCalled();
     const next = await boot(JSON.parse(JSON.stringify(checkpoint)));
+    const nextEvents = await import("./engine-events");
+    expect(nextEvents.settledRuns.get("previous-run")).toBe("done");
+    expect([...nextEvents.settledRunOutcomes]).toEqual(format === "current"
+      ? [["previous-run", { key, status: "cancelled" }]] : []);
     expect(next.store.getState().drafts[key]).toBe("草稿🙂");
     expect(next.store.getState().bySession[key].queue[0].images).toEqual(["G:/fixture/image.png"]);
     expect(next.stream.runRouting.get(runId)).toBe(key);

@@ -6,6 +6,9 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
 
+#[cfg(windows)]
+mod windows;
+
 /// 可执行的假 stdio 服务脚本（unix：/bin/sh 在 CI 与本地都有）。
 #[cfg(unix)]
 fn fake_stdio_script(tag: &str, body: &str) -> PathBuf {

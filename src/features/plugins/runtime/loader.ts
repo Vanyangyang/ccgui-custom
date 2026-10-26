@@ -124,12 +124,25 @@ export function getPluginState(id: string): PluginRuntimeState | undefined {
   return states.get(id)?.state;
 }
 
+/** Version of the live handle, never the current on-disk manifest. */
+export function getLoadedPluginVersion(id: string): string | undefined {
+  return active.get(id)?.handle.manifest.version;
+}
+
 /** Recreate the same authorized lazy bridge before a saved owner can resume. */
 export async function prewarmHostChatBridges(ids: readonly string[]): Promise<void> {
   for (const id of ids) {
     const entry = active.get(id);
     if (!entry) throw new Error(`Plugin chat checkpoint is waiting for its owner: ${id}`);
     await entry.handle.ctx.chat.identity();
+  }
+}
+
+export async function prewarmHostTaskBridges(ids: readonly string[]): Promise<void> {
+  for (const id of ids) {
+    const entry = active.get(id);
+    if (!entry) throw new Error(`Plugin task checkpoint is waiting for its owner: ${id}`);
+    await entry.handle.ctx.tasks.slots();
   }
 }
 
@@ -279,7 +292,8 @@ export async function loadPlugin(
         return;
       }
 
-      const newHandle = createPluginContext(manifest, backend, { appVersion });
+      let detachedBundle: { code: string; css: string; rendererExports: Set<string> } | undefined;
+      const newHandle = createPluginContext(manifest, backend, { appVersion, detachedBundle: () => detachedBundle });
       handle = newHandle;
       if (manifest.tier === "declarative") {
         // Bundle styles.css: injected like the js branch below — it is the
@@ -316,6 +330,7 @@ export async function loadPlugin(
         if (typeof mod.default !== "function") {
           throw new Error("main.js must `export default function activate(ctx)`");
         }
+        detachedBundle = { code, css: stylesCss ?? "", rendererExports: new Set(Object.keys(mod).filter(key => key !== "default" && typeof mod[key] === "function")) };
         builtinCleanup = runAsPlugin(() => (mod.default as (c: unknown) => void | Disposer)(newHandle.ctx));
       }
       if (!isCurrent()) {

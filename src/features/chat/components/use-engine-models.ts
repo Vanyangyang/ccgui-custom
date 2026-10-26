@@ -133,15 +133,35 @@ export function useEngineModels(
   const probedByWs = useRef<Record<string, Set<string>>>({});
   const catalogRequests = useRef(new Map<string, { token: object; promise: Promise<void> }>());
   const catalogRevision = useRef(0);
+  const cursorEnabled = engines.some(engine => engine.id === "cursor" && engine.available && engine.enabled);
+  const cursorEnabledRef = useRef(cursorEnabled);
+  cursorEnabledRef.current = cursorEnabled;
+  const cursorRequest = useRef<object | null>(null);
   const appliedCatalogRevisions = useRef(new Map<string, number>());
   const lastAgyProbeAt = useRef(0);
   useEffect(() => () => {
     catalogRequests.current.clear();
+    cursorRequest.current = null;
     // StrictMode replays mount effects with the same refs. Invalidating a
     // request must also permit its replacement probe in the replayed mount.
     probedByWs.current = {};
     lastAgyProbeAt.current = 0;
   }, []);
+  useEffect(() => {
+    if (cursorEnabled) return;
+    cursorRequest.current = null;
+    for (const key of catalogRequests.current.keys()) {
+      if (JSON.parse(key)[0] === "cursor") catalogRequests.current.delete(key);
+    }
+    for (const probed of Object.values(probedByWs.current)) {
+      for (const key of probed) if (key.startsWith("cursor:")) probed.delete(key);
+    }
+    setPendingByWs(previous => Object.fromEntries(Object.entries(previous).map(([ws, pending]) => {
+      const next = { ...pending };
+      delete next.cursor;
+      return [ws, next];
+    })));
+  }, [cursorEnabled]);
 
   const loadConfig = useCallback(async () => {
     try {
@@ -183,6 +203,7 @@ export function useEngineModels(
   const failedEngines = failedByWs[wsKey] ?? EMPTY_PENDING;
   const cursorRemote = catalogs.cursor?.remote === true;
   const cursorPickerModels = useMemo(() => {
+    if (!cursorEnabled) return [];
     if (selectionScope === "task") return [];
     if (cursorRemote) return [];
     const base = cursorCatalog && cursorCatalog.length > 0
@@ -195,24 +216,28 @@ export function useEngineModels(
       .filter((id) => !matchCursorBase(id, base))
       .map((id) => ({ id, name: customModelLabels.cursor?.[id]?.trim() || id, parameters: [] }));
     return extras.length > 0 ? [...base, ...extras] : base;
-  }, [selectionScope, cursorRemote, cursorCatalog, catalogs.cursor, customModels.cursor, customModelLabels.cursor]);
+  }, [cursorEnabled, selectionScope, cursorRemote, cursorCatalog, catalogs.cursor, customModels.cursor, customModelLabels.cursor]);
   useEffect(() => {
-    if (cursorRemote || selectionScope === "task") return;
+    if (!cursorEnabled || cursorRemote || selectionScope === "task") return;
     publishCursorCatalog(cursorPickerModels);
-  }, [selectionScope, cursorRemote, cursorPickerModels]);
+  }, [cursorEnabled, selectionScope, cursorRemote, cursorPickerModels]);
   const loadCursorCatalog = useCallback(async () => {
     if (selectionScope === "task") return;
-    if (!engines.some((engine) => engine.id === "cursor" && engine.available)) return;
+    if (!cursorEnabled || !cursorEnabledRef.current) return;
+    const token = {};
+    cursorRequest.current = token;
     try {
-      setCursorCatalog(adoptCursorCatalog(await ipc.cursorModelCatalog()));
+      const catalog = await ipc.cursorModelCatalog();
+      if (cursorEnabledRef.current && cursorRequest.current === token) setCursorCatalog(adoptCursorCatalog(catalog));
     } catch {
-      setCursorCatalog([]);
+      if (cursorEnabledRef.current && cursorRequest.current === token) setCursorCatalog([]);
     }
-  }, [engines, selectionScope]);
+  }, [cursorEnabled, selectionScope]);
   useEffect(() => {
     // 【cursor模型】只读本机 CLI。工作区还没确认、或已确认是远程时不套用这份目录。
     if (context !== "local") return;
     void loadCursorCatalog();
+    return () => { cursorRequest.current = null; };
   }, [context, loadCursorCatalog]);
   // File one probe answer. A `remote` flag means the answer came from a distro
   // CLI: that workspace is a remote context and keeps its own bucket — which is
@@ -267,6 +292,7 @@ export function useEngineModels(
   // per-engine model flyouts all read from this map.
   const requestCatalog = useCallback(
     (engineId: string, ws: string, force = false) => {
+      if (engineId === "cursor" && !cursorEnabledRef.current) return Promise.resolve();
       const key = JSON.stringify([engineId, ws]);
       const current = catalogRequests.current.get(key);
       if (current && !force) return current.promise;
@@ -279,7 +305,7 @@ export function useEngineModels(
         .then((list) => {
           // A settings/manual refresh can overtake an older probe. Only the
           // latest request may replace its catalog or clear its spinner.
-          if (catalogRequests.current.get(key)?.token === token) {
+          if (catalogRequests.current.get(key)?.token === token && (engineId !== "cursor" || cursorEnabledRef.current)) {
             applyCatalog(engineId, ws, list, revision);
             setFailedByWs(prev => {
               const next = { ...(prev[ws] ?? {}) };
@@ -289,7 +315,7 @@ export function useEngineModels(
           }
         })
         .catch(error => {
-          if (catalogRequests.current.get(key)?.token === token) {
+          if (catalogRequests.current.get(key)?.token === token && (engineId !== "cursor" || cursorEnabledRef.current)) {
             setFailedByWs(prev => ({ ...prev, [ws]: { ...(prev[ws] ?? {}), [engineId]: true } }));
           }
           if (force && selectionScope === "task") throw error;
@@ -318,12 +344,12 @@ export function useEngineModels(
     // Retrying is explicit (`refresh`) or follows an availability flip.
     const probed = (probedByWs.current[wsKey] ??= new Set<string>());
     engines
-      .filter((engine) => !(engine.id in catalogs) && !probed.has(probeKey(engine)))
+      .filter((engine) => (engine.id !== "cursor" || cursorEnabled) && !(engine.id in catalogs) && !probed.has(probeKey(engine)))
       .forEach((engine) => {
         probed.add(probeKey(engine));
         probeCatalog(engine.id);
       });
-  }, [engines, catalogs, wsKey, probeCatalog]);
+  }, [engines, cursorEnabled, catalogs, wsKey, probeCatalog]);
 
   // Per-engine model lists for the CLI menu flyouts: the backend catalog
   // plus the session (or engine-default) channel's configured model — spawn
@@ -464,7 +490,7 @@ export function useEngineModels(
       // to a local workspace, trip the authoritative-catalog reset below
       // and persist that id over the user's saved default. 远端 catalog
       // 永不触发 pin;用户在远端的模型选择走引擎端 resume,不落地。
-      if (catalogs[engine.id]?.remote === true) continue;
+      if ((engine.id === "cursor" && !cursorEnabled) || catalogs[engine.id]?.remote === true) continue;
       const stored = models[engine.id]?.trim();
       const fallback =
         configuredModel(engine.id, cliConfig) ||
@@ -495,7 +521,7 @@ export function useEngineModels(
       }
     }
     if (Object.keys(updates).length > 0) void pinModels(updates);
-  }, [selectionScope, engines, models, cliConfig, catalogs, wsKey, customModels, knownIdsByEngine, pinModels, cursorPickerModels]);
+  }, [cursorEnabled, selectionScope, engines, models, cliConfig, catalogs, wsKey, customModels, knownIdsByEngine, pinModels, cursorPickerModels]);
 
   // Manual refresh from the flyout: re-read provider configs and re-probe the
   // catalogs. The probe effect skips engines already probed, so settings edits

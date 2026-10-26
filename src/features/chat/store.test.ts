@@ -8,6 +8,7 @@ import {
 import { setPluginSessionEffort, useChatStore } from "./store";
 import { OPEN_TABS_KEY } from "./store/persistence";
 import { EMPTY_SESSION } from "./store/stream";
+import { crossSessionCostReview, requiresCrossSessionCostApproval, requiresQueueDrainCostApproval, requiresSessionSendCostApproval } from "./cross-session-cost";
 
 vi.mock("@/lib/ipc", () => ({
   ipc: {
@@ -659,6 +660,46 @@ describe("model selection is per session", () => {
     expect(vi.mocked(ipc.sendMessage)).toHaveBeenLastCalledWith(
       expect.objectContaining({ effort: "medium" }),
     );
+  });
+
+  it.each(["low", "medium", "high", "xhigh", "max", "ultra"] as const)("keeps GPT session cache and model identity when switching effort to %s", async (effort) => {
+    const now = Date.now();
+    const tab = { engine: "codex", sessionId: "gpt-effort", workspacePath: WS, model: "gpt-6-astra" };
+    const key = "codex/gpt-effort";
+    const cache = { startedAt: now - 7200_000, observedAt: now - 7100_000, ttlSeconds: 1800, source: "openai-policy" as const };
+    const meta = { ...tab, effort: "medium", updatedAt: now - 7200_000, promptCache: cache } as SessionMeta;
+    const usage = { info: { last_token_usage: { input_tokens: 270274, cached_input_tokens: 260000 }, model_context_window: 570000 } };
+    const messages = [{ seq: 1, role: "assistant" as const, text: "previous turn", ts: null, model: tab.model, effort: "medium", usage }];
+    useChatStore.setState({
+      activeEngine: "codex", active: tab, openTabs: [tab], sessions: [meta],
+      bySession: { [key]: { ...EMPTY_SESSION, activeModel: tab.model, activeEffort: "medium", messages, usage } },
+    });
+
+    await useChatStore.getState().setEffort("codex", effort);
+
+    const state = useChatStore.getState();
+    expect(state.sessions[0].promptCache).toBe(cache);
+    expect(state.bySession[key].messages).toBe(messages);
+    expect(state.bySession[key].usage).toBe(usage);
+    expect(state.bySession[key].activeEffort).toBe(effort);
+    const review = crossSessionCostReview(state.sessions[0], state, "idle", now);
+    expect(review.context).toMatchObject({ modelMismatch: false, kind: "current_context", used: 270274 });
+    expect(requiresSessionSendCostApproval(review, state.sessions[0], state.bySession[key], now)).toBe(false);
+    expect(requiresCrossSessionCostApproval(review)).toBe(false);
+    expect(requiresQueueDrainCostApproval(review)).toBe(false);
+
+    await state.send("continue with the selected effort", []);
+    expect(ipc.sendMessage).toHaveBeenLastCalledWith(expect.objectContaining({
+      engine: "codex", sessionId: tab.sessionId, model: tab.model, effort,
+    }));
+
+    // A real model change still requires review of this large historical context.
+    await useChatStore.getState().setModel("codex", "gpt-6-sol");
+    const changed = useChatStore.getState();
+    const changedReview = crossSessionCostReview(changed.sessions[0], changed, "idle", now);
+    expect(changedReview.context.modelMismatch).toBe(true);
+    expect(requiresSessionSendCostApproval(changedReview)).toBe(true);
+    expect(requiresCrossSessionCostApproval(changedReview)).toBe(true);
   });
 
   it("ignores a stale persisted tab effort for a native session", async () => {

@@ -21,8 +21,11 @@ const BASE_LABELS: Record<string, string> = {
   agent: "agent",
   "composer:draft": "composerDraft",
   "host:session": "hostSession",
+  "host:chat": "hostChat",
   "host:workspace": "hostWorkspace",
   "host:workspace:remote": "hostWorkspaceRemote",
+  "host:tasks": "hostTasks",
+  "host:memory": "hostMemory",
   "network:none": "networkNone",
 };
 

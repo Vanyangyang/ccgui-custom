@@ -224,6 +224,27 @@ describe("native run waiting for background tasks", () => {
   });
 
   describe("a message typed while the CLI idles", () => {
+    it("waits for an old Haiku-enabled process to end before launching without assistance", async () => {
+      const legacyTab = { ...TAB, claudeHaikuAssist: true };
+      await launch(legacyTab);
+      // A process adopted from the previous release still owns its original definition.
+      setSession({ liveLaunch: { ...session().liveLaunch!, claudeHaikuAssist: true } });
+      enterWaiting();
+      expect(liveFollowUpBlocker(state(), legacyTab, session())).toBe("settings-changed");
+      await state().sendWhileBusy("continue without Haiku", [], undefined, legacyTab);
+      cliAnswers();
+      expect(ipc.sendFollowUp).not.toHaveBeenCalled();
+      expect(queueTexts()).toEqual(["continue without Haiku"]);
+      expect(session().liveLaunch?.claudeHaikuAssist).toBe(true);
+
+      emit(event("tasks", { tasks: [{ ...task, status: "completed" }] }), event("done", { usage: null }));
+      await flush();
+      expect(ipc.sendMessage).toHaveBeenCalledWith(expect.objectContaining({ prompt: "continue without Haiku", claudeHaikuAssist: false }));
+      expect(session().liveLaunch?.claudeHaikuAssist).toBe(false);
+      expect(state().active?.claudeHaikuAssist).toBe(true);
+      expect(queueTexts()).toEqual([]);
+    });
+
     it("queues an Ultracode change until the next launch and uses the latest pick", async () => {
       await state().setClaudeUltracode(true);
       await launch();

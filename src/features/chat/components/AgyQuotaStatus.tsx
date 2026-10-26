@@ -11,6 +11,7 @@ import { AGY_VERTEX_LINKS, useAgyVertexCredits } from "@/features/settings/agy-v
 import { useDismissOnOutsidePress, useTriggerToggle } from "@/utils/use-dismiss-on-outside-press";
 import { QuotaFact, QuotaMeter } from "./quota-meter";
 import { agyQuotaModelGroup, compactQuotaReset, quotaResetCountdown, validAgyQuotaSnapshot } from "../agy-quota";
+import { QUOTA_CREDITS_MAX_AGE } from "../subscription-quota";
 
 export function AgyQuotaStatus({ snapshot, model, loading, refresh, now = Date.now() / 1000 }: {
   snapshot?: AgyQuotaSnapshot; model?: string; loading: boolean; refresh: () => Promise<void>; now?: number;
@@ -59,13 +60,13 @@ export function AgyQuotaStatus({ snapshot, model, loading, refresh, now = Date.n
                 </div>
                 <QuotaMeter usedPercentage={window?.usedPercentage} remaining />
                 <p className="text-caption-1-regular text-text-tertiary">
-                  {window?.resetsAt === undefined ? t("chat.quotaResetUnknown") : <>{t("chat.quotaResetAt", { time: new Date(window.resetsAt * 1000).toLocaleString(i18n.language) })} · {t("chat.quotaResetCountdown", quotaResetCountdown(window.resetsAt, now))}</>}
+                  {window?.resetsAt === undefined ? t("chat.quotaResetUnknown") : window.resetsAt > now ? <>{t("chat.quotaResetAt", { time: new Date(window.resetsAt * 1000).toLocaleString(i18n.language) })} · {t("chat.quotaResetCountdown", quotaResetCountdown(window.resetsAt, now))}</> : null}
                 </p>
               </div>;
             })}</dl>
           </section>;
         })}
-        {quota && quota.status !== "unavailable" && quota.credits && <dl><QuotaFact label={t("chat.agyQuotaCredits")}
+        {quota && quota.status !== "unavailable" && quota.collectedAt !== undefined && now - quota.collectedAt < QUOTA_CREDITS_MAX_AGE && quota.credits && <dl><QuotaFact label={t("chat.agyQuotaCredits")}
           value={new Intl.NumberFormat(i18n.language, { maximumFractionDigits: 2 }).format(quota.credits.remaining)} /></dl>}
         <div role="status" className="flex flex-col gap-1 text-caption-1-regular text-text-tertiary">
           {stale && <p>{t("chat.quotaStale")}</p>}

@@ -4,6 +4,7 @@ import { EngineIcon, type EngineIconId } from "@/components/foundations/icons/en
 import { CLI_DISPLAY_NAMES } from "@/components/foundations/icons/engine-brands";
 import { ModelBadge } from "@/components/foundations/icons/model-badge";
 import { modelDisplayName } from "./usage-model";
+import { computeModelCost, formatUsd } from "./usage-pricing";
 import { tokensOf } from "./usage-totals";
 import type { UsageBucket } from "./usage-buckets";
 import type { UsageRow } from "@/lib/ipc";
@@ -57,9 +58,11 @@ interface Series {
   engine: string;
   color: string;
   values: number[];
+  costs: number[];
   total: number;
+  totalCost: number;
   /** Models inside this CLI, largest first — the tooltip's second level. */
-  models: { name: string; color: string; values: number[]; total: number }[];
+  models: { name: string; color: string; values: number[]; costs: number[]; total: number; totalCost: number }[];
 }
 
 /** Readable axis step: 1/2/5 × 10^n covering `max` in ~4 ticks. */
@@ -79,16 +82,19 @@ function axisMax(max: number): number {
 function buildTooltipRows(
   series: Series[],
   tokensFor: (values: number[]) => number,
+  costFor: (costs: number[]) => number,
   formatTokens: (n: number) => string,
 ): ReactNode[] {
   const rows: ReactNode[] = [];
   for (const cli of series) {
     const tokens = tokensFor(cli.values);
     if (tokens <= 0) continue;
+    const cliCost = costFor(cli.costs);
     const modelRows: ReactNode[] = [];
     for (const model of cli.models) {
       const modelTokens = tokensFor(model.values);
       if (modelTokens <= 0) continue;
+      const modelCost = costFor(model.costs);
       modelRows.push(
         <span
           key={model.name}
@@ -99,7 +105,7 @@ function buildTooltipRows(
             <span className="truncate text-text-tertiary">{model.name}</span>
           </span>
           <span className="shrink-0 tabular-nums text-text-tertiary">
-            {formatTokens(modelTokens)}
+            {formatTokens(modelTokens)} · {formatUsd(modelCost)}
           </span>
         </span>,
       );
@@ -121,7 +127,7 @@ function buildTooltipRows(
             <span className="truncate text-text-secondary">{cli.model}</span>
           </span>
           <span className="shrink-0 tabular-nums text-text-primary">
-            {formatTokens(tokens)}
+            {formatTokens(tokens)} · {formatUsd(cliCost)}
           </span>
         </span>
         {modelRows}
@@ -160,29 +166,35 @@ export function UsageChart({
     [buckets],
   );
 
-  const { series, bucketTotals, max } = useMemo(() => {
+  const { series, bucketTotals, bucketCostTotals, max } = useMemo(() => {
     // Stack by CLI (the details card's top level), with each CLI's models kept
     // for the tooltip — the chart and 详细数据 then describe the same thing.
-    const byCli = new Map<string, Map<string, number[]>>();
+    const byCli = new Map<string, Map<string, { values: number[]; costs: number[] }>>();
     for (const row of rows) {
       // Same fold as 详细数据: the chart and the details card must describe
       // one model per row, whatever slug the session ran.
       const name = modelDisplayName(row.model) || t("usage.unknownModel");
-      const models = byCli.get(row.engine) ?? new Map<string, number[]>();
-      const perBucket = models.get(name) ?? new Array(buckets.length).fill(0);
+      const models = byCli.get(row.engine) ?? new Map<string, { values: number[]; costs: number[] }>();
+      const perBucket = models.get(name) ?? {
+        values: new Array(buckets.length).fill(0),
+        costs: new Array(buckets.length).fill(0),
+      };
       const index = indexOf.get(bucketOf(row));
       if (index !== undefined) {
-        perBucket[index] += tokensOf(row);
+        perBucket.values[index] += tokensOf(row);
+        perBucket.costs[index] += computeModelCost(row.engine, name, row).actualTotalUsd;
       }
       models.set(name, perBucket);
       byCli.set(row.engine, models);
     }
     const built: Series[] = [...byCli.entries()]
       .map(([engine, models]) => {
-        const entries = [...models.entries()].map(([name, values]) => ({
+        const entries = [...models.entries()].map(([name, slot]) => ({
           name,
-          values,
-          total: values.reduce((acc, n) => acc + n, 0),
+          values: slot.values,
+          costs: slot.costs,
+          total: slot.values.reduce((acc, n) => acc + n, 0),
+          totalCost: slot.costs.reduce((acc, n) => acc + n, 0),
           color: OTHER_COLOR,
         }));
         entries.sort((a, b) => b.total - a.total);
@@ -191,7 +203,9 @@ export function UsageChart({
           engine,
           color: OTHER_COLOR,
           values: buckets.map((_, index) => entries.reduce((acc, e) => acc + (e.values[index] ?? 0), 0)),
+          costs: buckets.map((_, index) => entries.reduce((acc, e) => acc + (e.costs[index] ?? 0), 0)),
           total: entries.reduce((acc, e) => acc + e.total, 0),
+          totalCost: entries.reduce((acc, e) => acc + e.totalCost, 0),
           models: entries,
         };
       })
@@ -207,8 +221,11 @@ export function UsageChart({
     const totals = buckets.map((_bucket, index) =>
       built.reduce((acc, s) => acc + (s.values[index] ?? 0), 0),
     );
+    const costTotals = buckets.map((_bucket, index) =>
+      built.reduce((acc, s) => acc + (s.costs[index] ?? 0), 0),
+    );
     const peak = Math.max(...totals, 0);
-    return { series: built, bucketTotals: totals, max: axisMax(peak) };
+    return { series: built, bucketTotals: totals, bucketCostTotals: costTotals, max: axisMax(peak) };
   }, [rows, buckets, bucketOf, indexOf, t]);
 
   // Fixed viewBox: the panel is a known width, and uniform scaling keeps the
@@ -234,11 +251,26 @@ export function UsageChart({
   const hoverIndex = hoverKey ? indexOf.get(hoverKey) ?? -1 : -1;
   const hoverBucket = hoverIndex >= 0 ? buckets[hoverIndex] : undefined;
   const hoverTotal = hoverIndex >= 0 ? bucketTotals[hoverIndex] : 0;
-  const tooltipRows = hoverIndex >= 0 ? buildTooltipRows(series, (values) => values[hoverIndex] ?? 0, formatTokens) : [];
+  const hoverCostTotal = hoverIndex >= 0 ? bucketCostTotals[hoverIndex] : 0;
+  const tooltipRows =
+    hoverIndex >= 0
+      ? buildTooltipRows(
+          series,
+          (values) => values[hoverIndex] ?? 0,
+          (costs) => costs[hoverIndex] ?? 0,
+          formatTokens,
+        )
+      : [];
   /** Same breakdown, summed over every bucket the range covers. */
   const rangeTotal = bucketTotals.reduce((acc, n) => acc + n, 0);
+  const rangeCostTotal = bucketCostTotals.reduce((acc, n) => acc + n, 0);
   const axisRows = hoverAxis
-    ? buildTooltipRows(series, (values) => values.reduce((acc, n) => acc + n, 0), formatTokens)
+    ? buildTooltipRows(
+        series,
+        (values) => values.reduce((acc, n) => acc + n, 0),
+        (costs) => costs.reduce((acc, n) => acc + n, 0),
+        formatTokens,
+      )
     : [];
 
   useLayoutEffect(() => {
@@ -371,7 +403,7 @@ export function UsageChart({
       {(hoverIndex >= 0 || hoverAxis) && (
         <div
           ref={tipRef}
-          className="pointer-events-none absolute z-10 flex min-w-[150px] flex-col gap-1 rounded-lg border border-separator-border bg-background-primary-default p-2 shadow-dropdown"
+          className="pointer-events-none absolute z-10 flex min-w-[180px] flex-col gap-1 rounded-lg border border-separator-border bg-background-primary-default p-2 shadow-dropdown"
           style={tipPos ? { left: tipPos.left, top: tipPos.top } : { left: 0, top: 0, visibility: "hidden" }}
         >
           <span className="text-body-2-regular text-text-tertiary">
@@ -380,7 +412,7 @@ export function UsageChart({
           <span className="flex items-baseline justify-between gap-3 text-body-2-medium text-text-primary">
             <span>{hoverAxis ? t("usage.rangeTooltipTotal") : bucketTotalLabel}</span>
             <span className="tabular-nums">
-              {formatTokens(hoverAxis ? rangeTotal : hoverTotal)}
+              {formatTokens(hoverAxis ? rangeTotal : hoverTotal)} · {formatUsd(hoverAxis ? rangeCostTotal : hoverCostTotal)}
             </span>
           </span>
           {hoverAxis ? axisRows : tooltipRows}

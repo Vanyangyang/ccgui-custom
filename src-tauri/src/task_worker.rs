@@ -48,6 +48,10 @@ pub const SCHEMA_CONTRACT_V1_HASH: &str =
 pub const SCHEMA_CONTRACT_V2_HASH: &str =
     "9a17d672b37a0dec0ec7e5f1c1b8aee3ee1cea74619bfe88c86d4fcd17123a04";
 
+/// Cross-workspace parent ownership and archive lineage cannot be read by V2.
+pub const SCHEMA_CONTRACT_V3_HASH: &str =
+    "496dde53c20f24f52aa37e33af9852ed7feda178ecfa1f2fb97a56361364a1c0";
+
 static SCHEMA_HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 pub fn schema_hash() -> String {
@@ -83,6 +87,14 @@ fn canonical_schema_hash(hash: &str) -> &str {
 
 pub fn schemas_compatible(a: &str, b: &str) -> bool {
     canonical_schema_hash(a) == canonical_schema_hash(b)
+}
+
+/// Offline adoption is a one-way reader upgrade, never live-worker compatibility.
+pub(crate) fn offline_schema_upgrade_supported(from: &str, to: &str) -> bool {
+    let from = canonical_schema_hash(from);
+    (from == SCHEMA_CONTRACT_V1_HASH
+        && matches!(to, SCHEMA_CONTRACT_V2_HASH | SCHEMA_CONTRACT_V3_HASH))
+        || (from == SCHEMA_CONTRACT_V2_HASH && to == SCHEMA_CONTRACT_V3_HASH)
 }
 
 pub(crate) fn normalize_sql_ddl(sql: &str) -> String {
@@ -357,7 +369,7 @@ fn capabilities() -> Value {
         "maxReassembledEventBytes":protocol::MAX_REASSEMBLED_EVENT_BYTES,
         "commandDeduplication": true,
         "hostChat": true, "hostChatRequiresContext":true, "leader": false, "computerUse": false,
-        "launchProtection": 1, "frontendAssets": 1,
+        "launchProtection": 1, "frontendAssets": 1, "managedTaskHandoff": 1,
         "frontendFingerprint": crate::frontend_assets::compiled_fingerprint()})
 }
 
@@ -841,6 +853,7 @@ impl Worker {
                     "physicalComplete":!auto_title_pending && matches!(phase, "retired" | "failed") && self.app.processes.active_run_count() == 0,
                     "autoTitlePending":auto_title_pending,"schemaHash":schema_hash(),
                     "nativeComplete":native_complete,
+                    "managedTask":self.config.host_context.as_ref().and_then(|context| context.managed_branch_id()).is_some(),
                     "streamId":self.config.worker_id,"head":head,"durableThrough":durable,
                     "journalFault":fault,"receiptFault":*self.receipt_fault.lock().unwrap_or_else(|p| p.into_inner()),
                     "capabilities":capabilities()}),
@@ -1793,10 +1806,10 @@ mod tests {
     }
 
     #[test]
-    fn schema_hash_matches_v2_contract_and_isolates_v1_legacy_equivalents() {
+    fn schema_hash_matches_v3_contract_and_isolates_older_contracts() {
         let current = schema_hash();
         assert_eq!(
-            current, SCHEMA_CONTRACT_V2_HASH,
+            current, SCHEMA_CONTRACT_V3_HASH,
             "current schema_hash()={current}"
         );
         for legacy in LEGACY_V1_SOURCE_SCHEMA_HASHES {
@@ -1813,7 +1826,82 @@ mod tests {
         assert!(!schemas_compatible(&"0".repeat(64), &current));
         assert!(!schemas_compatible(&current, SCHEMA_CONTRACT_V1_HASH));
         assert!(!schemas_compatible(SCHEMA_CONTRACT_V1_HASH, &current));
+        assert!(!schemas_compatible(&current, SCHEMA_CONTRACT_V2_HASH));
+        assert!(!schemas_compatible(SCHEMA_CONTRACT_V2_HASH, &current));
         assert!(schemas_compatible(&current, &current));
+    }
+
+    #[test]
+    fn schema_contract_stays_v3_after_session_sidebar_assign_and_replay() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        crate::leader::ensure_schema(&db).unwrap();
+        db.0.lock().execute_batch("INSERT INTO workspaces(id,path,name) VALUES('source','C:/source','Source'),('target','D:/target','Target');
+            INSERT INTO sessions(engine,session_id,workspace_path,file_path,file_size,file_mtime_ms)
+            VALUES('codex','schema-sidebar-session','C:/source','C:/history/session.jsonl',1,1);").unwrap();
+        let assignment = crate::session_sidebar::Assignment {
+            engine: "codex".into(), session_id: "schema-sidebar-session".into(),
+            expected_workspace_path: "C:/source".into(), expected_sidebar_workspace_path: None,
+            sidebar_workspace_path: Some("D:/target".into()),
+        };
+        crate::session_sidebar::assign(&db, "schema-sidebar".into(), vec![assignment.clone()]).unwrap();
+        assert!(crate::session_sidebar::assign(&db, "schema-sidebar".into(), vec![assignment]).unwrap().replayed);
+        let conn = db.0.lock();
+        let actual = compute_schema_contract_hash(&conn, &[
+            ("leader", &crate::leader::schema_contract_descriptor()),
+            ("plan-review", &crate::engine::plan_review::schema_contract_descriptor()),
+        ]).unwrap();
+        assert_eq!(actual, SCHEMA_CONTRACT_V3_HASH, "Sidebar metadata must not require changing the live worker database contract");
+        let added_tables: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name IN ('session_sidebar_workspaces','session_sidebar_requests')",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(added_tables, 0);
+    }
+
+    #[test]
+    fn offline_schema_upgrade_is_explicit_one_way_and_does_not_allow_hot_switching() {
+        for from in [SCHEMA_CONTRACT_V1_HASH, LEGACY_V1_SOURCE_SCHEMA_HASHES[0], SCHEMA_CONTRACT_V2_HASH] {
+            assert!(offline_schema_upgrade_supported(from, SCHEMA_CONTRACT_V3_HASH));
+            assert!(!offline_schema_upgrade_supported(SCHEMA_CONTRACT_V3_HASH, from));
+            assert!(!schemas_compatible(from, SCHEMA_CONTRACT_V3_HASH));
+            assert!(!schemas_compatible(SCHEMA_CONTRACT_V3_HASH, from));
+        }
+        assert!(offline_schema_upgrade_supported(SCHEMA_CONTRACT_V1_HASH, SCHEMA_CONTRACT_V2_HASH));
+        assert!(!offline_schema_upgrade_supported(SCHEMA_CONTRACT_V2_HASH, SCHEMA_CONTRACT_V1_HASH));
+        assert!(!offline_schema_upgrade_supported(SCHEMA_CONTRACT_V3_HASH, SCHEMA_CONTRACT_V3_HASH));
+        assert!(!offline_schema_upgrade_supported(&"0".repeat(64), SCHEMA_CONTRACT_V3_HASH));
+        assert!(!offline_schema_upgrade_supported(SCHEMA_CONTRACT_V2_HASH, &"0".repeat(64)));
+    }
+
+    #[test]
+    fn schema_contract_keeps_host_receipt_projection_out_of_shared_v3_records() {
+        let descriptor = crate::leader::schema_contract_descriptor();
+        assert!(descriptor["branchRecord"].get("delegation").is_none());
+        assert!(descriptor["requestRecord"].get("projection").is_none());
+        assert!(descriptor["requestRecord"].get("projection_invalid").is_none());
+        assert_eq!(descriptor["requestRecord"]["response"], Value::Null);
+        assert_eq!(schema_hash(), SCHEMA_CONTRACT_V3_HASH);
+        // Actual shared record additions must still change the contract hash.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let original = compute_schema_contract_hash(&conn, &[("leader", &descriptor)]).unwrap();
+        let mut changed = descriptor;
+        changed["branchRecord"]["delegation"] = json!({"requestId":""});
+        assert_ne!(compute_schema_contract_hash(&conn, &[("leader", &changed)]).unwrap(), original);
+    }
+
+    #[test]
+    fn cross_workspace_parent_field_is_the_explicit_v2_to_v3_contract_change() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        crate::leader::ensure_schema(&db).unwrap();
+        let conn = db.0.lock();
+        let mut descriptor = crate::leader::schema_contract_descriptor();
+        assert_eq!(descriptor["branchRecord"]["parentWorkspacePath"], json!(""));
+        // preserve_order is part of the historical descriptor; remove without swapping keys.
+        descriptor["branchRecord"].as_object_mut().unwrap().shift_remove("parentWorkspacePath");
+        assert_eq!(compute_schema_contract_hash(&conn, &[
+            ("leader", &descriptor),
+            ("plan-review", &crate::engine::plan_review::schema_contract_descriptor()),
+        ]).unwrap(), SCHEMA_CONTRACT_V2_HASH);
     }
 
     #[test]

@@ -7,6 +7,8 @@ import { ipc, type AppSettings } from "@/lib/ipc";
 import { AiChatSidebar } from "./ai-chat-sidebar";
 import type { AiChatRepo } from "./ai-chat-sidebar";
 import { useCrossSessionActivityStore } from "@/features/chat/cross-session";
+import { CacheHeatHoverBadge } from "./repo-tree";
+import { cacheHeatChipStyle } from "@/features/chat/session-cleanup";
 
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({ t: (key: string) => key }),
@@ -36,6 +38,7 @@ beforeEach(() => {
 afterEach(async () => {
   await act(async () => root.unmount());
   node.remove();
+  vi.useRealTimers();
 });
 
 /** The row body is the toggle button carrying aria-expanded + the label. */
@@ -52,7 +55,23 @@ async function render(repos: AiChatRepo[]) {
   });
 }
 
-it("shows AGY reference evidence, opens the gradient-synced cache hover card, and keeps Cursor cache styling disabled", async () => {
+it("keeps the Codex time badge permanently red after its old cache window expires", async () => {
+  vi.useFakeTimers();
+  const props = { engine: "codex", time: "codex-age", cacheHeat: "cold" as const, heatRatio: 0,
+    cache: { startedAt: Date.now(), observedAt: Date.now(), ttlSeconds: 300, source: "anthropic-usage" as const } };
+  await act(async () => root.render(<CacheHeatHoverBadge {...props} />));
+  const badge = node.querySelector("span")!;
+  expect(badge.style.color).toBe(cacheHeatChipStyle(1).color);
+  expect(badge.title).toBe("chat.cachePermanent");
+  await act(async () => vi.advanceTimersByTimeAsync(86_400_000));
+  await act(async () => root.render(<CacheHeatHoverBadge {...props} />));
+  expect(badge.style.color).toBe(cacheHeatChipStyle(1).color);
+  expect(badge.dataset.cacheHeatRatio).toBe("1");
+  expect(node.querySelector('[data-cache-expiring-soon]')).toBeNull();
+  expect(document.querySelector('[data-testid="cache-window-hover-card"]')).toBeNull();
+});
+
+it("shows AGY reference evidence, keeps Codex permanently hot, and shows Cursor's five-minute cache", async () => {
   const cache = { startedAt: Date.now() - 120_000, observedAt: Date.now() - 60_000, ttlSeconds: 900,
     source: "agy-vertex-reference" as const, reference: { maxTtlSeconds: 1200, cacheReadTokens: 900, promptTokens: 1000 } };
   const expiringCache = { startedAt: Date.now() - 55 * 60_000, observedAt: Date.now() - 55 * 60_000 + 10_000, ttlSeconds: 3600,
@@ -60,7 +79,9 @@ it("shows AGY reference evidence, opens the gradient-synced cache hover card, an
   await render([{ ...repo("cache", true), threads: [
     { id: "agy/reference", engine: "agy", label: "AGY reference", time: "agy-age", promptCache: cache },
     { id: "claude/expiring", engine: "claude", label: "Claude expiring", time: "expiring-age", promptCache: expiringCache },
-    { id: "cursor/disabled", engine: "cursor", label: "Cursor disabled", time: "cursor-age", updatedAt: Date.now(), streaming: true, promptCache: cache },
+    { id: "cursor/cached", engine: "cursor", label: "Cursor cached", time: "cursor-age", updatedAt: Date.now(), streaming: true,
+      promptCache: { startedAt: Date.now() - 120_000, observedAt: Date.now() - 60_000, ttlSeconds: 300, source: "cursor-policy" } },
+    { id: "codex/disabled", engine: "codex", label: "Codex disabled", time: "codex-age", updatedAt: Date.now(), streaming: true, promptCache: expiringCache },
   ] }]);
   const age = (text: string) => [...node.querySelectorAll<HTMLElement>("[data-cache-heat], span")].find(
     (el) => el.textContent === text && (el.hasAttribute("data-cache-heat") || el.tagName === "SPAN"),
@@ -95,9 +116,15 @@ it("shows AGY reference evidence, opens the gradient-synced cache hover card, an
   const expiringCard = document.body.querySelector<HTMLElement>("[data-testid=\"cache-window-hover-card\"]");
   expect(expiringCard?.querySelector('[data-testid="cache-card-expiring-hourglass"]')).not.toBeNull();
 
-  expect(age("cursor-age").hasAttribute("data-cache-heat")).toBe(false);
-  expect(age("cursor-age").hasAttribute("data-cache-heat-ratio")).toBe(false);
-  expect(age("cursor-age").hasAttribute("title")).toBe(false);
+  expect(age("cursor-age").getAttribute("data-cache-heat")).toBe("hot");
+  expect(age("cursor-age").getAttribute("data-cache-heat-ratio")).toBe("0.6");
+  await act(async () => age("cursor-age").focus());
+  const cursorCard = document.body.querySelector<HTMLElement>('[data-testid="cache-window-hover-card"]');
+  expect(cursorCard?.querySelector<HTMLElement>('[data-testid="cache-window-progress-bar"]')?.style.width).toBe("60%");
+  expect(age("codex-age").hasAttribute("data-cache-heat")).toBe(false);
+  expect(age("codex-age").getAttribute("data-cache-heat-ratio")).toBe("1");
+  expect(age("codex-age").getAttribute("title")).toBe("chat.cachePermanent");
+  expect(age("codex-age").querySelector('[data-testid="cache-expiring-hourglass"]')).toBeNull();
 });
 
 it("remembers which workspaces the user expanded", async () => {
@@ -349,7 +376,7 @@ it("opens the thread context menu on right-click and dispatches its entries", as
   expect(onThreadAction).toHaveBeenCalledWith("claude/abc-123", "delete");
 });
 
-it("renders plugin session-menu items and dispatches the parsed target", async () => {
+it("renders plugin session-menu items and dispatches the clicked source workspace", async () => {
   const run = vi.fn();
   const dispose = sessionMenuRegistry.register({
     id: "plugin:auto-title:rename",
@@ -357,7 +384,7 @@ it("renders plugin session-menu items and dispatches the parsed target", async (
     run,
   });
   try {
-    const thread = { id: "omp/sid-42", label: "拖入分组", time: "1分钟" };
+    const thread = { id: "omp/sid-42", label: "拖入分组", time: "1分钟", workspacePath: "G:/source-game" };
     await act(async () => {
       root.render(
         <AiChatSidebar
@@ -370,7 +397,7 @@ it("renders plugin session-menu items and dispatches the parsed target", async (
     await rightClick(threadRow("拖入分组"));
     const menu = openMenu();
     await act(async () => menuItem(menu, "AI Rename").click());
-    expect(run).toHaveBeenCalledWith({ engine: "omp", sessionId: "sid-42" });
+    expect(run).toHaveBeenCalledWith({ engine: "omp", sessionId: "sid-42", workspacePath: "G:/source-game" });
     expect(document.body.querySelector("[role='menu']")).toBeNull();
   } finally {
     dispose();

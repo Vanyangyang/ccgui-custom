@@ -13,6 +13,8 @@ use std::time::Duration;
 use tauri::Manager;
 
 static HOST: LazyLock<Mutex<Option<Arc<Host>>>> = LazyLock::new(|| Mutex::new(None));
+mod diagnostics;
+pub(crate) use diagnostics::{blocker_snapshot, BlockerSnapshot};
 static PAUSED: AtomicBool = AtomicBool::new(false);
 const MAX_SOURCES: usize = 4096;
 static ARCHIVES: LazyLock<Mutex<VecDeque<(String, Arc<crate::worker_archive::Archive>)>>> =
@@ -22,15 +24,21 @@ struct Host {
     workers: Mutex<HashMap<String, Arc<Route>>>,
     ready: AtomicBool,
     paused: AtomicBool,
+    observers_paused: AtomicBool,
     stopped: AtomicBool,
     admission: tokio::sync::Mutex<()>,
     controls: tokio::sync::RwLock<()>,
+    task_actions: Arc<tokio::sync::RwLock<()>>,
 }
 struct Route {
     client: WorkerClient,
+    engine: Option<String>,
+    binding: Mutex<()>,
     session_id: Mutex<Option<String>>,
     run_aliases: Mutex<HashSet<String>>,
     head: AtomicU64,
+    observed: AtomicU64,
+    observation_fault: AtomicBool,
     physically_complete: AtomicBool,
     native_complete: AtomicBool,
     archived: AtomicBool,
@@ -70,9 +78,11 @@ pub(crate) async fn initialize(
         workers: Mutex::new(HashMap::new()),
         ready: AtomicBool::new(false),
         paused: AtomicBool::new(PAUSED.load(Ordering::SeqCst)),
+        observers_paused: AtomicBool::new(false),
         stopped: AtomicBool::new(false),
         admission: tokio::sync::Mutex::new(()),
         controls: tokio::sync::RwLock::new(()),
+        task_actions: Arc::new(tokio::sync::RwLock::new(())),
     });
     for manifest in workers {
         let client = WorkerClient::new(manifest);
@@ -81,14 +91,17 @@ pub(crate) async fn initialize(
             .await
             .map_err(error)?;
         let session = status["sessionId"].as_str().map(str::to_string);
-        let route = owner.install(client, session.clone())?;
-        if status["nativeComplete"] == true {
-            owner.finish_native(&route);
-        } else {
-            crate::host_chat::restore_worker_tasks(
-                &route.client.manifest().run_id,
-                status["engine"].as_str(), status["workspacePath"].as_str(), session.as_deref(),
-            )?;
+        let route = owner.install(client, session.clone(), status["engine"].as_str().map(str::to_owned))?;
+        // Restore before replay even if the native process finished while the
+        // desktop was away: its final journal tail still owns the task result.
+        let restored = crate::host_chat::restore_worker_tasks(
+            &route.client.manifest().run_id,
+            status["engine"].as_str(), status["workspacePath"].as_str(), session.as_deref(),
+        )?;
+        if status["managedTask"] == true && !restored && status["nativeComplete"] != true {
+            return Err("Managed worker has no trusted coordinator checkpoint".into());
+        }
+        if status["nativeComplete"] != true {
             if let Some(session) = session.as_deref() {
                 owner.bind_session(&route, session)?;
             }
@@ -107,9 +120,13 @@ pub(crate) fn paused() -> bool {
     PAUSED.load(Ordering::SeqCst)
 }
 pub(crate) fn set_paused(paused: bool) {
+    if paused { crate::plugin_memory::cancel_all(false); }
     PAUSED.store(paused, Ordering::SeqCst);
     if let Some(host) = host() {
         host.paused.store(paused, Ordering::SeqCst);
+        if !paused {
+            host.observers_paused.store(false, Ordering::SeqCst);
+        }
     }
 }
 
@@ -121,16 +138,50 @@ pub(crate) fn required_sources() -> HashMap<String, u64> {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .iter()
-                .map(|(id, route)| (id.clone(), route.head.load(Ordering::SeqCst)))
+                .map(|(id, route)| (id.clone(), route.observed.load(Ordering::SeqCst)))
                 .collect()
         })
         .unwrap_or_default()
 }
 
+pub(crate) fn requires_managed_handoff() -> bool {
+    host().is_some_and(|owner| owner.workers.lock().unwrap_or_else(|p| p.into_inner()).values()
+        .any(|route| !route.native_complete.load(Ordering::SeqCst)
+            && crate::leader::is_managed_child(&route.client.manifest().run_id)))
+}
+
+/// Opening the restored relay before its task projection catches up would let
+/// tools read stale results or launch a successor before the previous tail.
+pub(crate) async fn restore_observers(required: &HashMap<String, u64>) -> Result<(), String> {
+    let owner = host().ok_or("Task host unavailable")?;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let ready = {
+                let routes = owner.workers.lock().unwrap_or_else(|p| p.into_inner());
+                let mut ready = true;
+                for (stream, through) in required {
+                    let route = routes.get(stream).ok_or("Recovered task source is unavailable")?;
+                    if route.observation_fault.load(Ordering::SeqCst) {
+                        return Err("Recovered task projection failed".to_string());
+                    }
+                    ready &= route.observed.load(Ordering::SeqCst) >= *through;
+                }
+                ready
+            };
+            if ready { return Ok(()); }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }).await.map_err(|_| "Recovered task projection has not caught up".to_string())?
+}
+
 pub(crate) async fn quiesce() -> Result<(), String> {
     let owner = host().ok_or("Task host unavailable")?;
-    set_paused(true);
     let result = tokio::time::timeout(Duration::from_secs(15), async {
+        // Drain UI task actions before pausing controls they may still need.
+        // Once released, new actions observe paused and fail before mutation.
+        let _actions = owner.task_actions.write().await;
+        set_paused(true);
+        owner.observers_paused.store(true, Ordering::SeqCst);
         let _starts = owner.admission.lock().await;
         let _controls = owner.controls.write().await;
     })
@@ -142,53 +193,17 @@ pub(crate) async fn quiesce() -> Result<(), String> {
     Ok(())
 }
 
+pub(crate) async fn task_action_guard() -> Result<Option<tokio::sync::OwnedRwLockReadGuard<()>>, String> {
+    let Some(owner) = host() else { return Ok(None); };
+    let guard = owner.task_actions.clone().read_owned().await;
+    if owner.paused.load(Ordering::SeqCst) {
+        return Err("runtime_updating: task actions are paused briefly".into());
+    }
+    Ok(Some(guard))
+}
+
 pub(crate) async fn blockers(registry: &crate::engine::ProcessRegistry) -> Vec<String> {
-    let Some(owner) = host() else {
-        return vec!["worker-unavailable".into()];
-    };
-    let routes: Vec<_> = owner
-        .workers
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .values()
-        .cloned()
-        .collect();
-    let managed: HashSet<_> = routes
-        .iter()
-        .map(|route| route.client.manifest().run_id.clone())
-        .collect();
-    let mut blockers = Vec::new();
-    if registry
-        .0
-        .lock()
-        .map(|map| map.values().any(|entry| !managed.contains(&entry.run_id)))
-        .unwrap_or(true)
-    {
-        blockers.push("legacy-runs".into());
-    }
-    for route in routes {
-        if route.archived.load(Ordering::SeqCst) {
-            continue;
-        }
-        match tokio::time::timeout(
-            Duration::from_secs(3),
-            route
-                .client
-                .request(&uuid::Uuid::new_v4().to_string(), Command::Status),
-        )
-        .await
-        {
-            Ok(Ok(status)) => {
-                if status["journalFault"] == true || status["receiptFault"] == true {
-                    blockers.push("worker-journal-fault".into());
-                }
-            }
-            _ => blockers.push("worker-unavailable".into()),
-        }
-    }
-    blockers.sort();
-    blockers.dedup();
-    blockers
+    blocker_snapshot(registry).await.blockers
 }
 
 impl Host {
@@ -201,28 +216,32 @@ impl Host {
     }
 
     fn bind_session(&self, route: &Route, session: &str) -> Result<(), String> {
+        let _binding = route.binding.lock().unwrap_or_else(|p| p.into_inner());
         let manifest = route.client.manifest();
         let state = self.app.state::<crate::AppState>();
-        let engine = crate::host_chat::worker_task_engine(&manifest.run_id);
+        if state.processes.get(&manifest.run_id).is_some_and(|entry|
+            entry.pid == manifest.pid && entry.killed.load(Ordering::SeqCst))
+            && !crate::leader::is_managed_child(&manifest.run_id)
+        {
+            return Ok(());
+        }
+        let engine = route.engine.clone().or_else(|| crate::host_chat::worker_task_engine(&manifest.run_id));
         let already_owned = state.processes.get(session).is_some_and(|entry|
             entry.run_id == manifest.run_id && entry.pid == manifest.pid);
-        if let Some(engine) = engine.as_deref() {
-            match crate::leader::reserve_session_binding(&manifest.run_id, engine, session)? {
-                crate::leader::SessionBinding::Adopt => {},
-                crate::leader::SessionBinding::CleanupOnly => {
-                    crate::leader::release_session_binding(&manifest.run_id, engine, session);
-                    return Err("Worker parent cannot bind a retiring child identity".into());
-                }
-            }
-        }
+        let cleanup_only = if let Some(engine) = engine.as_deref() {
+            crate::leader::reserve_session_binding(&manifest.run_id, engine, session)?
+                == crate::leader::SessionBinding::CleanupOnly
+        } else { false };
+        let mut stopped = false;
         let claim = (|| {
             let entry = state.processes.get(&manifest.run_id).ok_or("Worker run has retired before session binding")?;
-            if entry.pid != manifest.pid || entry.killed.load(Ordering::SeqCst) {
+            stopped = entry.killed.load(Ordering::SeqCst);
+            if entry.pid != manifest.pid || (stopped && !crate::leader::is_managed_child(&manifest.run_id)) {
                 return Err("Worker session binding has no active owned proxy".into());
             }
             state.processes.rekey(&manifest.run_id, session.into())?;
             let alias = state.processes.get(session).ok_or("Worker session alias was not retained")?;
-            if alias.run_id != manifest.run_id || alias.pid != manifest.pid || alias.killed.load(Ordering::SeqCst) {
+            if alias.run_id != manifest.run_id || alias.pid != manifest.pid {
                 return Err("Worker session alias belongs to another run".into());
             }
             if let Some(engine) = engine.as_deref() {
@@ -242,7 +261,11 @@ impl Host {
             }
             return Err(error);
         }
-        crate::host_chat::adopt_session(&manifest.run_id, session);
+        // A stopped/reclaiming child's late native identity is needed for
+        // cleanup and result projection, never to recreate tool authority.
+        if !stopped && !cleanup_only {
+            crate::host_chat::adopt_session(&manifest.run_id, session);
+        }
         *route.session_id.lock().unwrap_or_else(|p| p.into_inner()) = Some(session.into());
         Ok(())
     }
@@ -251,6 +274,7 @@ impl Host {
         self: &Arc<Self>,
         client: WorkerClient,
         session: Option<String>,
+        engine: Option<String>,
     ) -> Result<Arc<Route>, String> {
         let manifest = client.manifest();
         let registry = &self.app.state::<crate::AppState>().processes;
@@ -277,9 +301,13 @@ impl Host {
         let aliases = HashSet::from([manifest.run_id.clone()]);
         let route = Arc::new(Route {
             client,
+            engine,
+            binding: Mutex::new(()),
             session_id: Mutex::new(session),
             run_aliases: Mutex::new(aliases),
             head: AtomicU64::new(0),
+            observed: AtomicU64::new(0),
+            observation_fault: AtomicBool::new(false),
             physically_complete: AtomicBool::new(false),
             native_complete: AtomicBool::new(false),
             archived: AtomicBool::new(false),
@@ -299,39 +327,27 @@ impl Host {
             let mut checked_status = tokio::time::Instant::now() - Duration::from_secs(2);
             let mut retirement_id: Option<String> = None;
             while !owner.stopped.load(Ordering::SeqCst) {
+                // Admission and native observation share the handoff barrier.
+                // Worker journals keep advancing while this desktop projection
+                // is frozen; the replacement replays the unseen suffix.
+                let observation = owner.controls.read().await;
+                if owner.observers_paused.load(Ordering::SeqCst) {
+                    drop(observation);
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    continue;
+                }
                 match route.client.events_after(cursor, 128).await {
                     Ok(page) => {
                         route.head.store(page.head, Ordering::SeqCst);
-                        let state = owner.app.state::<crate::AppState>();
                         for envelope in page.events {
-                            if envelope.name == crate::codex_quota::OBSERVATION_EVENT {
-                                crate::codex_quota::ingest_worker_observation(&envelope.payload);
-                            }
-                            if envelope.name == crate::event_sink::ENGINE_EVENT_NAME {
-                                for event in envelope.payload.as_array().into_iter().flatten() {
-                                    if let Some(run_id) = event["runId"].as_str() {
-                                        route
-                                            .run_aliases
-                                            .lock()
-                                            .unwrap_or_else(|p| p.into_inner())
-                                            .insert(run_id.into());
-                                    }
-                                    if event["kind"] == "session" && !route.native_complete.load(Ordering::SeqCst) {
-                                        if let Some(session) = event["sessionId"].as_str() {
-                                            if let Err(cause) = owner.bind_session(&route, session) {
-                                                eprintln!(
-                                                    "[worker-host] session route rejected: {cause}"
-                                                );
-                                                revoke_task_authority(&route.client.manifest().run_id);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            if let Ok(raw) = serde_json::to_string(&envelope) {
-                                state.emitters.emit_json("runtime://worker-event", &raw);
+                            if let Err(cause) = owner.observe_envelope(&route, &envelope) {
+                                route.observation_fault.store(true, Ordering::SeqCst);
+                                eprintln!("[worker-host] native task observation failed: {cause}");
+                                revoke_task_authority(&route.client.manifest().run_id);
+                                return;
                             }
                             cursor = envelope.seq;
+                            route.observed.store(cursor, Ordering::SeqCst);
                         }
                         delay = if cursor < page.head {
                             Duration::ZERO
@@ -346,7 +362,7 @@ impl Host {
                                 .request(&uuid::Uuid::new_v4().to_string(), Command::Status)
                                 .await
                             {
-                                if status["nativeComplete"] == true {
+                                if native_tail_observed(&status, cursor) {
                                     owner.finish_native(&route);
                                 }
                                 if matches!(status["phase"].as_str(), Some("retired" | "failed"))
@@ -396,6 +412,25 @@ impl Host {
                     Err(cause) => {
                         if let Ok(saved) = archive(&route.client.manifest().worker_id).await {
                             route.head.store(saved.head(), Ordering::SeqCst);
+                            while cursor < saved.head() {
+                                let page = match saved.replay(cursor, 128) {
+                                    Ok(page) if !page.events.is_empty() => page,
+                                    _ => {
+                                        route.observation_fault.store(true, Ordering::SeqCst);
+                                        return;
+                                    }
+                                };
+                                for envelope in page.events {
+                                    if let Err(cause) = owner.observe_envelope(&route, &envelope) {
+                                        route.observation_fault.store(true, Ordering::SeqCst);
+                                        eprintln!("[worker-host] archived task observation failed: {cause}");
+                                        revoke_task_authority(&route.client.manifest().run_id);
+                                        return;
+                                    }
+                                    cursor = envelope.seq;
+                                    route.observed.store(cursor, Ordering::SeqCst);
+                                }
+                            }
                             owner.finish_native(&route);
                             route.physically_complete.store(true, Ordering::SeqCst);
                             route.archived.store(true, Ordering::SeqCst);
@@ -412,15 +447,68 @@ impl Host {
                         );
                     }
                 }
+                drop(observation);
                 tokio::time::sleep(delay).await;
             }
         });
+    }
+
+    fn observe_envelope(&self, route: &Route, envelope: &crate::runtime_events::EventEnvelope) -> Result<(), String> {
+        if envelope.name == crate::codex_quota::OBSERVATION_EVENT {
+            crate::codex_quota::ingest_worker_observation(&envelope.payload);
+        }
+        if envelope.name == crate::event_sink::ENGINE_EVENT_NAME {
+            let events = envelope.payload.as_array().ok_or("Worker engine batch is invalid")?;
+            let base_run_id = &route.client.manifest().run_id;
+            for event in events {
+                let run_id = event["runId"].as_str().filter(|id| worker_event_belongs_to(base_run_id, id))
+                    .ok_or("Worker event belongs to another run")?.to_owned();
+                if route.engine.as_ref().is_some_and(|engine| event["engine"].as_str() != Some(engine.as_str())) {
+                    return Err("Worker event engine differs from its admission".into());
+                }
+                if crate::leader::is_managed_child(base_run_id) && event["seq"].as_u64().is_none() {
+                    return Err("Managed worker event has no replay sequence".into());
+                }
+                route.run_aliases.lock().unwrap_or_else(|p| p.into_inner()).insert(run_id);
+                let stopped = self.app.state::<crate::AppState>().processes.get(base_run_id)
+                    .is_some_and(|entry| entry.killed.load(Ordering::SeqCst));
+                if event["kind"] == "session" && !route.native_complete.load(Ordering::SeqCst)
+                    && (!stopped || crate::leader::is_managed_child(base_run_id)) {
+                    if let Some(session) = event["sessionId"].as_str().or_else(|| event["data"].as_str()) {
+                        self.bind_session(route, session)?;
+                    }
+                }
+                // This journal is the only native observer for detached runs.
+                // Its sequence is preserved across reconnects; Leader's saved
+                // per-turn sequence prevents duplicate projection on replay.
+                let mut projection = event.clone();
+                crate::leader::observe_event(&mut projection);
+                if projection["leader"]["identityRejected"] == true {
+                    return Err("Worker event native identity was rejected".into());
+                }
+            }
+        }
+        let raw = serde_json::to_string(envelope).map_err(|_| "Encode worker event failed")?;
+        route.observed.store(envelope.seq, Ordering::SeqCst);
+        self.app.state::<crate::AppState>().emitters.emit_json("runtime://worker-event", &raw);
+        Ok(())
     }
 
     fn route(&self, key: &str) -> Option<Arc<Route>> {
         let workers = self.workers.lock().unwrap_or_else(|p| p.into_inner());
         find_route(&workers, key)
     }
+}
+
+fn worker_event_belongs_to(base: &str, event_run: &str) -> bool {
+    event_run == base || event_run.strip_prefix(base).and_then(|tail| tail.strip_prefix("-c"))
+        .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn native_tail_observed(status: &Value, observed: u64) -> bool {
+    status["nativeComplete"] == true
+        && status["head"].as_u64() == Some(observed)
+        && status["durableThrough"].as_u64() == Some(observed)
 }
 
 fn find_route(workers: &HashMap<String, Arc<Route>>, key: &str) -> Option<Arc<Route>> {
@@ -507,9 +595,13 @@ pub(crate) async fn ensure_sources(cursors: &HashMap<String, u64>) -> Result<(),
         }
         let route = Arc::new(Route {
             client: WorkerClient::new(saved.manifest().clone()),
+            engine: None,
+            binding: Mutex::new(()),
             session_id: Mutex::new(saved.session_id()),
             run_aliases: Mutex::new(saved.run_ids().into_iter().collect()),
             head: AtomicU64::new(saved.head()),
+            observed: AtomicU64::new(saved.head()),
+            observation_fault: AtomicBool::new(false),
             physically_complete: AtomicBool::new(true),
             native_complete: AtomicBool::new(true),
             archived: AtomicBool::new(true),
@@ -568,10 +660,12 @@ pub(crate) async fn start(
     run_id: String,
     args: StartArgs,
 ) -> Result<crate::engine::SendResult, String> {
+    let memory_foreground = crate::plugin_memory::foreground();
     let owner = host().ok_or("Task host has not initialized")?;
     // Accepted launches outlive a disconnected caller, including the window
     // between child spawn, stable Start receipt, and returning the session id.
     tauri::async_runtime::spawn(async move {
+        let _memory_foreground = memory_foreground;
         let _admission = loop {
             if owner.stopped.load(Ordering::SeqCst) {
                 return Err("Task host is closing".into());
@@ -599,7 +693,7 @@ pub(crate) async fn start(
                             .request(&uuid::Uuid::new_v4().to_string(), Command::Status)
                             .await
                             .map_err(error)?;
-                        if status["nativeComplete"] == true {
+                        if native_tail_observed(&status, route.observed.load(Ordering::SeqCst)) {
                             owner.finish_native(&route);
                             break;
                         }
@@ -675,7 +769,7 @@ pub(crate) async fn start(
                     .await;
                 return Err("Task host closed during worker launch".into());
             }
-            let route = owner.install(WorkerClient::new(manifest), args.session_id.clone())?;
+            let route = owner.install(WorkerClient::new(manifest), args.session_id.clone(), Some(args.engine.clone()))?;
             reservation.committed = true;
             owner.poll(route.clone());
             route
@@ -688,7 +782,7 @@ pub(crate) async fn start(
             .get(&run_id)
             .is_some_and(|entry| entry.killed.load(Ordering::SeqCst))
         {
-            revoke_task_authority(&run_id);
+            crate::host_chat::revoke_run(&run_id);
             route
                 .client
                 .request(&format!("launch-stop-{run_id}"), Command::Interrupt)
@@ -736,17 +830,17 @@ pub(crate) async fn runtime_worker_start(
     run_id: String,
     mut args: StartArgs,
 ) -> Result<Value, String> {
+    let _memory_foreground = crate::plugin_memory::foreground();
     while paused() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     if !enabled()
-        || crate::leader::is_managed_child(&run_id)
         || args.computer_use == Some(true)
         || args.require_leader
         || !matches!(args.engine.as_str(), "claude" | "codex" | "agy" | "cursor")
         || crate::engine::wsl_transport::transport_for_workspace(&state.db, &args.workspace_path)
             .is_some()
-        || crate::leader::validate_worker_session(
+        || crate::leader::validate_host_worker_session(
             &state.db,
             &args.engine,
             args.session_id.as_deref(),
@@ -789,6 +883,7 @@ pub(crate) async fn control(
     request_id: &str,
     command: Command,
 ) -> Option<Result<Value, String>> {
+    let _memory_foreground = matches!(command, Command::Followup { .. }).then(crate::plugin_memory::foreground);
     let owner = host()?;
     let route = owner.route(key)?;
     let _control = loop {
@@ -800,12 +895,13 @@ pub(crate) async fn control(
         tokio::time::sleep(Duration::from_millis(25)).await;
     };
     if matches!(command, Command::Interrupt) {
+        let _binding = route.binding.lock().unwrap_or_else(|p| p.into_inner());
         // Fence the desktop capability before the RPC can race a late tool call.
         // InterruptTurn and StopTask keep the parent run alive.
         if let Some(entry) = owner.app.state::<crate::AppState>().processes.get(&route.client.manifest().run_id) {
             entry.killed.store(true, Ordering::SeqCst);
         }
-        revoke_task_authority(&route.client.manifest().run_id);
+        crate::host_chat::revoke_run(&route.client.manifest().run_id);
     }
     Some(route_request(&route, request_id, command).await)
 }
@@ -836,7 +932,7 @@ pub(crate) async fn runtime_worker_sources(
                 .map(|route| Source {
                     stream_id: route.client.manifest().worker_id.clone(),
                     run_id: route.client.manifest().run_id.clone(),
-                    head: route.head.load(Ordering::SeqCst),
+                    head: route.observed.load(Ordering::SeqCst),
                     active: !route.physically_complete.load(Ordering::SeqCst),
                     session_id: route
                         .session_id
@@ -867,16 +963,23 @@ pub(crate) async fn runtime_worker_events(
     if route.archived.load(Ordering::SeqCst) {
         return archive(&stream_id).await?.replay(after, limit);
     }
+    let observed = route.observed.load(Ordering::SeqCst);
+    if after > observed { return Err("Worker replay cursor is ahead of its validated task projection".into()); }
     let page = route
         .client
         .events_after(after, limit)
         .await
         .map_err(error)?;
-    Ok(crate::runtime_events::ReplayBatch {
-        stream_id: page.stream_id,
-        through: page.through,
-        events: page.events,
-    })
+    // Publication follows native validation. During handoff, observers are
+    // frozen while the worker continues; do not expose that unseen suffix to
+    // the frontend checkpoint or rewrite any payload to make it fit.
+    Ok(validated_replay(page.stream_id, after, observed, page.events))
+}
+
+fn validated_replay(stream_id: String, after: u64, observed: u64, mut events: Vec<crate::runtime_events::EventEnvelope>) -> crate::runtime_events::ReplayBatch {
+    events.retain(|event| event.seq <= observed);
+    let through = events.last().map_or(after, |event| event.seq);
+    crate::runtime_events::ReplayBatch { stream_id, through, events }
 }
 
 #[derive(Deserialize)]
@@ -905,6 +1008,7 @@ pub(crate) async fn runtime_worker_control(request: ControlRequest) -> Result<Va
 }
 
 pub(crate) async fn shutdown(preserve: bool) {
+    crate::plugin_memory::cancel_all(true);
     let Some(owner) = host() else {
         return;
     };
@@ -942,6 +1046,39 @@ pub(crate) async fn shutdown(preserve: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn replay_exposes_only_validated_events_and_preserves_their_original_payload() {
+        let event = crate::runtime_events::EventEnvelope {
+            stream_id: "worker".into(), seq: 1, name: crate::event_sink::ENGINE_EVENT_NAME.into(),
+            payload: json!([{"runId":"child","kind":"session","leader":{"branchId":"branch","title":"原任务","assignment":"原任务 中文😀"}}]),
+        };
+        let unseen = crate::runtime_events::EventEnvelope { seq: 2, payload: json!([{"kind":"done"}]), ..event.clone() };
+        let page = validated_replay("worker".into(), 0, 1, vec![event.clone(), unseen]);
+        assert_eq!(page.through, 1);
+        assert_eq!(page.events, vec![event]);
+        let paused = validated_replay("worker".into(), 1, 1, Vec::new());
+        assert_eq!(paused.through, 1);
+        assert!(paused.events.is_empty());
+    }
+    #[test]
+    fn native_completion_cannot_retire_an_unobserved_or_unflushed_tail() {
+        let status = json!({"nativeComplete":true,"head":12,"durableThrough":12});
+        assert!(!native_tail_observed(&status, 11));
+        assert!(native_tail_observed(&status, 12));
+        assert!(!native_tail_observed(&json!({"nativeComplete":true,"head":12,"durableThrough":11}), 12));
+        assert!(!native_tail_observed(&json!({"nativeComplete":false,"head":12,"durableThrough":12}), 12));
+        assert!(!native_tail_observed(&json!({"nativeComplete":true}), 0));
+    }
+
+    #[test]
+    fn worker_event_ownership_accepts_only_its_exact_run_and_continuations() {
+        assert!(worker_event_belongs_to("run-a", "run-a"));
+        assert!(worker_event_belongs_to("run-a", "run-a-c2"));
+        for wrong in ["run-b", "run-a-extra", "run-a-c", "run-a-c2-extra", "run-a-c-2"] {
+            assert!(!worker_event_belongs_to("run-a", wrong));
+        }
+    }
+
     fn route(id: &str, completed: bool) -> Arc<Route> {
         Arc::new(Route {
             client: WorkerClient::new(task_worker::WorkerManifest {
@@ -956,9 +1093,13 @@ mod tests {
                 token: String::new(),
                 schema_hash: String::new(),
             }),
+            engine: Some("claude".into()),
+            binding: Mutex::new(()),
             session_id: Mutex::new(Some("same-session".into())),
             run_aliases: Mutex::new(HashSet::from([id.into(), format!("{id}-c1")])),
             head: AtomicU64::new(1),
+            observed: AtomicU64::new(1),
+            observation_fault: AtomicBool::new(false),
             physically_complete: AtomicBool::new(completed),
             native_complete: AtomicBool::new(completed),
             archived: AtomicBool::new(completed),

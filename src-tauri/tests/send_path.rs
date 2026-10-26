@@ -75,8 +75,70 @@ fn haiku_cli_args(fixture: &TestHarness) -> Vec<String> {
 }
 
 #[tokio::test]
+async fn fixed_instructions_claude_are_staged_on_fresh_and_resumed_turns() {
+    let fixture = TestHarness::new().unwrap();
+    write_fake_cli(&fixture, "claude", false);
+    let workspace = fixture.root().join("ws").to_string_lossy().to_string();
+    let (app, events) = build_app(&fixture);
+    let state = app.state::<AppState>();
+    let mut ledger = serde_json::json!({"version":1,"entries":[{
+        "receipt":{"requestId":"root","runId":"policy-first","workspacePath":workspace,"session":null},
+        "newEngine":"claude","conversationOwner":true,
+        "fixedInstructions":{"version":"v1","text":"KEEP_FIXED_POLICY_中文😀"}
+    }]});
+    state.db.plugin_kv_set("workbench", "__host_tasks_v1:index", &ledger).unwrap();
+    for (run, session) in [("policy-first", None), ("policy-resume", Some("fake-session-123"))] {
+        events.lock().unwrap().clear();
+        if session.is_some() {
+            let reference = serde_json::json!({"engine":"claude","sessionId":"fake-session-123","workspacePath":workspace});
+            ledger["entries"][0]["receipt"]["session"] = reference.clone();
+            ledger["entries"][0]["conversationSession"] = reference;
+            ledger["entries"][0]["sessionProven"] = Value::Bool(true);
+            state.db.plugin_kv_set("workbench", "__host_tasks_v1:index", &ledger).unwrap();
+        }
+        engine::send_message(app.state::<AppState>(), "claude".into(), workspace.clone(), session.map(str::to_owned), "user-original".into(),
+            None, Some("opus".into()), None, Some("manual".into()), None, Some(run.into()), None, None, None).await.unwrap();
+        wait_for_settlement(&app, &events).await;
+        let system = std::fs::read_to_string(fixture.root().join("ws/claude-system.txt")).unwrap();
+        assert_eq!(system.matches("KEEP_FIXED_POLICY_中文😀").count(), 1);
+        assert!(system.contains("ccgui-ui"), "native presentation must remain composed");
+        let args = haiku_cli_args(&fixture);
+        let at = args.iter().position(|a| a == "--append-system-prompt-file").unwrap();
+        assert_eq!(args.iter().filter(|a| *a == "--append-system-prompt-file").count(), 1);
+        assert!(!std::path::Path::new(&args[at + 1]).exists(), "staging must be cleaned after settlement");
+    }
+    let input = std::fs::read_to_string(fixture.root().join("ws/claude-tasks.ndjson")).unwrap();
+    assert_eq!(input.lines().count(), 2);
+    assert!(input.lines().all(|line| line.contains("user-original") && !line.contains("KEEP_FIXED_POLICY")));
+}
+
+#[tokio::test]
+async fn fixed_instructions_claude_discussion_keeps_read_only_flags() {
+    let fixture = TestHarness::new().unwrap();
+    write_fake_cli(&fixture, "claude", false);
+    let workspace = fixture.root().join("ws").to_string_lossy().to_string();
+    let (app, events) = build_app(&fixture);
+    let run = "sidechat-policy-discussion";
+    app.state::<AppState>().db.plugin_kv_set("workbench", "__host_conversations_v1:discussion", &serde_json::json!({
+        "snapshot":{"threadId":"discussion","workspacePath":workspace,"selection":{"engine":"claude"},"sessionRef":null},
+        "runId":run,"fixedInstructions":{"version":"chat-v1","text":"DISCUSSION_FIXED_POLICY"}
+    })).unwrap();
+    engine::send_side_message(app.state::<AppState>(), "claude".into(), workspace, None, None, "read-only-question".into(),
+        None, false, None, Some("opus".into()), None, None, Some(run.into()), None).await.unwrap();
+    wait_for_settlement(&app, &events).await;
+    let system = std::fs::read_to_string(fixture.root().join("ws/claude-system.txt")).unwrap();
+    assert_eq!(system.matches("DISCUSSION_FIXED_POLICY").count(), 1);
+    let args = haiku_cli_args(&fixture);
+    assert!(args.windows(2).any(|pair| pair == ["--tools", "Read,Grep,Glob"]));
+    assert!(args.iter().any(|arg| arg == "--strict-mcp-config"));
+    assert!(!args.iter().any(|arg| arg == "--dangerously-skip-permissions"));
+    let input = std::fs::read_to_string(fixture.root().join("ws/claude-tasks.ndjson")).unwrap();
+    assert!(input.contains("read-only-question") && !input.contains("DISCUSSION_FIXED_POLICY"));
+}
+
+#[tokio::test]
 #[allow(clippy::await_holding_lock)]
-async fn haiku_assist_default_on_off_and_session_isolation_reach_fake_cli() {
+async fn haiku_assist_disabled_ignores_legacy_choices_without_changing_launch() {
     let fixture = TestHarness::new().unwrap();
     write_fake_haiku_cli(&fixture, true);
     let workspace = fixture.root().join("ws").to_string_lossy().to_string();
@@ -112,39 +174,30 @@ async fn haiku_assist_default_on_off_and_session_isolation_reach_fake_cli() {
         assert!(args.windows(2).any(|w| w == ["--permission-mode", "default"]));
         assert!(args.windows(2).any(|w| w == ["--effort", "high"]));
         assert!(!args.iter().any(|arg| arg == "--dangerously-skip-permissions"));
-        if enabled == Some(true) {
-            let position = args.iter().position(|arg| arg == "--agents").unwrap();
-            let agents: Value = serde_json::from_str(&args[position + 1]).unwrap();
-            assert_eq!(agents["ccgui-haiku-assist"]["model"], "haiku");
-            assert!(agents["ccgui-haiku-assist"].get("permissionMode").is_none());
-            args.drain(position..position + 2);
-            assert_eq!(args, original, "enabling changed arguments beyond the optional definition");
-        } else {
-            assert!(!args.iter().any(|arg| arg == "--agents"));
-            if index == 0 { original = args.clone(); }
-            if index == 3 { assert_eq!(args, original, "turning off must restore the original argv"); }
-        }
+        assert!(!args.iter().any(|arg| arg == "--agents"), "legacy opt-in must not inject Haiku agents");
+        if index == 0 { original = args.clone(); }
+        if session == "session-a" { assert_eq!(args, original, "legacy choices must not change the launch arguments"); }
     }
-    assert_eq!(std::fs::read_to_string(fixture.root().join("help-probes.txt")).unwrap().lines().count(), 1);
+    assert!(!fixture.root().join("help-probes.txt").exists(), "disabled assistance must not probe the CLI");
 }
 
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
-async fn haiku_assist_unsupported_cli_refuses_launch_and_off_recovers() {
+async fn haiku_assist_disabled_does_not_probe_or_reject_an_unsupported_cli() {
     let fixture = TestHarness::new().unwrap();
     write_fake_haiku_cli(&fixture, false);
     let workspace = fixture.root().join("ws").to_string_lossy().to_string();
     let (app, events) = build_app(&fixture);
-    let error = engine::send_message(app.state::<AppState>(), "claude".into(), workspace.clone(), None, "fake task".into(),
-        None, Some("opus".into()), None, Some("manual".into()), None, Some("haiku-unsupported".into()), None, None, Some(true)).await.err().unwrap();
-    assert!(error.starts_with("CLAUDE_HAIKU_ASSIST_UNAVAILABLE:"), "{error}");
-    assert!(!fixture.root().join("ws/fixture-started.txt").exists(), "model process launched after failed capability probe");
-    assert!(app.state::<AppState>().processes.0.lock().unwrap().is_empty(), "failed probe leaked a reservation");
+    engine::send_message(app.state::<AppState>(), "claude".into(), workspace.clone(), None, "fake task".into(),
+        None, Some("opus".into()), None, Some("manual".into()), None, Some("haiku-unsupported".into()), None, None, Some(true)).await.unwrap();
+    wait_for_settlement(&app, &events).await;
+    assert!(!haiku_cli_args(&fixture).iter().any(|arg| arg == "--agents"));
+    events.lock().unwrap().clear();
     engine::send_message(app.state::<AppState>(), "claude".into(), workspace, None, "fake recovery".into(),
         None, Some("opus".into()), None, Some("manual".into()), None, Some("haiku-off-recovery".into()), None, None, Some(false)).await.unwrap();
     wait_for_settlement(&app, &events).await;
     assert!(!haiku_cli_args(&fixture).iter().any(|arg| arg == "--agents"));
-    assert_eq!(std::fs::read_to_string(fixture.root().join("help-probes.txt")).unwrap().lines().count(), 1);
+    assert!(!fixture.root().join("help-probes.txt").exists(), "disabled assistance must not probe the CLI");
 }
 
 /// Holds the first protocol event and the final process exit independently,
@@ -285,12 +338,12 @@ fn write_fake_codex_responses(fixture: &TestHarness, extra: Vec<(&str, Vec<Value
     #[cfg(windows)]
     let (path, mut script) = (
         fixture.root().join("bin/codex.ps1"),
-        format!("{mark}while ($null -ne ($line = [Console]::In.ReadLine())) {{\r\n[IO.File]::AppendAllText('codex-requests.ndjson', $line + [Environment]::NewLine)\r\n$frame = $line | ConvertFrom-Json\r\nswitch ($frame.method) {{\r\n"),
+        format!("{mark}[IO.File]::WriteAllText('codex-args.json', (ConvertTo-Json -Compress -InputObject @($args)))\r\nwhile ($null -ne ($line = [Console]::In.ReadLine())) {{\r\n[IO.File]::AppendAllText('codex-requests.ndjson', $line + [Environment]::NewLine)\r\n$frame = $line | ConvertFrom-Json\r\nswitch ($frame.method) {{\r\n"),
     );
     #[cfg(unix)]
     let (path, mut script) = (
         fixture.root().join("bin/codex"),
-        format!("#!/bin/sh\n{mark}while IFS= read -r line; do\nprintf '%s\\n' \"$line\" >> codex-requests.ndjson\nid=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([^,}}]*\\).*/\\1/p')\ncase \"$line\" in\n"),
+        format!("#!/bin/sh\n{mark}printf '%s\\n' \"$@\" > codex-args.json\nwhile IFS= read -r line; do\nprintf '%s\\n' \"$line\" >> codex-requests.ndjson\nid=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([^,}}]*\\).*/\\1/p')\ncase \"$line\" in\n"),
     );
     for (method, frames) in responses {
         #[cfg(windows)]
@@ -660,6 +713,59 @@ fn register_root_workspace(state: &AppState, workspace: &str) {
 fn fake_requests(fixture: &TestHarness) -> Vec<Value> {
     std::fs::read_to_string(fixture.root().join("ws/codex-requests.ndjson"))
         .unwrap_or_default().lines().map(|line| serde_json::from_str(line).unwrap()).collect()
+}
+
+#[tokio::test]
+async fn fixed_instructions_codex_resume_after_compaction_preserves_user_config_and_replaces_policy() {
+    let fixture = TestHarness::new().unwrap();
+    write_fake_codex_responses(&fixture, vec![
+        ("config/read", vec![serde_json::json!({"id":REPLY_ID,"result":{"config":{"developer_instructions":"USER_CONFIG_GUIDANCE"}}})]),
+        ("thread/resume", vec![auto_review_thread_reply()]),
+        ("turn/start", vec![
+            serde_json::json!({"id":REPLY_ID,"result":{"turn":{"id":"fake-codex-turn"}}}),
+            serde_json::json!({"method":"item/started","params":{"threadId":"fake-codex-thread","turnId":"fake-codex-turn","item":{"id":"compact","type":"contextCompaction"}}}),
+            serde_json::json!({"method":"item/completed","params":{"threadId":"fake-codex-thread","turnId":"fake-codex-turn","item":{"id":"compact","type":"contextCompaction"}}}),
+            serde_json::json!({"method":"item/agentMessage/delta","params":{"threadId":"fake-codex-thread","turnId":"fake-codex-turn","delta":"after compact"}}),
+            serde_json::json!({"method":"turn/completed","params":{"threadId":"fake-codex-thread","turn":{"id":"fake-codex-turn","status":"completed"}}}),
+        ]),
+    ]);
+    let workspace = fixture.root().join("ws").to_string_lossy().to_string();
+    let (app, events) = build_app(&fixture);
+    let reference = serde_json::json!({"engine":"codex","sessionId":"fake-codex-thread","workspacePath":workspace});
+    let mut ledger = serde_json::json!({"version":1,"entries":[{
+        "receipt":{"requestId":"root","runId":"policy-codex-first","workspacePath":workspace,"session":null},
+        "newEngine":"codex","conversationOwner":true,"fixedInstructions":{"version":"v1","text":"POLICY_V1"}
+    }]});
+    app.state::<AppState>().db.plugin_kv_set("workbench", "__host_tasks_v1:index", &ledger).unwrap();
+    for (run, session) in [("policy-codex-first", None), ("policy-codex-next", Some("fake-codex-thread"))] {
+        events.lock().unwrap().clear();
+        if session.is_some() {
+            ledger["entries"][0]["receipt"]["session"] = reference.clone();
+            ledger["entries"][0]["conversationSession"] = reference.clone();
+            ledger["entries"][0]["sessionProven"] = Value::Bool(true);
+            app.state::<AppState>().db.plugin_kv_set("workbench", "__host_tasks_v1:index", &ledger).unwrap();
+            app.state::<AppState>().db.plugin_kv_set("workbench", "__host_tasks_v1:conversations", &serde_json::json!({"version":1,"records":[{
+                "requestId":"root","sessionRef":reference,"fixedInstructions":{"version":"v2","text":"POLICY_V2"},
+                "inputs":[{"receipt":{"runId":run,"delivery":"turn","status":"starting","sessionRef":reference}}]
+            }]})).unwrap();
+        }
+        engine::send_message(app.state::<AppState>(), "codex".into(), workspace.clone(), session.map(str::to_owned), "user-original".into(),
+            None, None, None, None, None, Some(run.into()), None, None, None).await.unwrap();
+        wait_for_settlement(&app, &events).await;
+        assert!(events.lock().unwrap().iter().any(|e| e["runId"] == run && e["kind"] == "compaction"));
+    }
+    let frames = fake_requests(&fixture);
+    let threads: Vec<_> = frames.iter().filter(|f| f["method"] == "thread/start" || f["method"] == "thread/resume").collect();
+    assert_eq!(threads.len(), 2);
+    for (index, frame) in threads.iter().enumerate() {
+        let instructions = frame["params"]["developerInstructions"].as_str().unwrap();
+        assert!(instructions.contains("USER_CONFIG_GUIDANCE") && instructions.contains("ccgui-ui"));
+        assert_eq!(instructions.matches(if index == 0 { "POLICY_V1" } else { "POLICY_V2" }).count(), 1);
+        assert!(!instructions.contains(if index == 0 { "POLICY_V2" } else { "POLICY_V1" }));
+    }
+    let turns: Vec<_> = frames.iter().filter(|f| f["method"] == "turn/start").collect();
+    assert_eq!(turns.len(), 2, "compaction events must not trigger an extra input or replay");
+    assert!(turns.iter().all(|f| f["params"]["input"].to_string().contains("user-original") && !f["params"]["input"].to_string().contains("POLICY_")));
 }
 
 fn claude_args(fixture: &TestHarness) -> String {
@@ -1365,8 +1471,11 @@ async fn coordinator_marks_only_managed_child_processes() {
     let fixture = TestHarness::new().unwrap();
     write_fake_cli(&fixture, "claude", false);
     write_fake_codex_app_server(&fixture);
+    let mut settings = ccgui_next_lib::settings::read_settings().unwrap();
+    settings.codex_service_tier = Some("priority".into());
     let workspace = fixture.root().join("ws").to_string_lossy().to_string();
     let (app, _chat_events) = build_app(&fixture);
+    ccgui_next_lib::settings::update_app_settings(app.handle().clone(), settings).unwrap();
     let state = app.state::<AppState>();
     ccgui_next_lib::leader::prepare_run(&state.db, "schema-only", "pi", None, &workspace, None).unwrap();
     {
@@ -1388,14 +1497,19 @@ async fn coordinator_marks_only_managed_child_processes() {
     ccgui_next_lib::leader::prepare_run(&state.db, &caller.run_id, "claude", Some("managed-root"), &workspace, Some("auto")).unwrap();
     state.processes.0.lock().unwrap().insert(caller.run_id.clone(), routed_entry(&caller.run_id, 4100));
 
+    let mut codex_branch = String::new();
     for engine in ["claude", "codex"] {
         let spawned = ccgui_next_lib::leader::dispatch(state.inner(), caller.clone(), "task_spawn", serde_json::json!({
             "request_id": format!("mark-{engine}"), "engine": engine, "title": "fixture child", "task": "fixture task",
+            "model": if engine == "codex" { "gpt-6-astra" } else { "sonnet" },
         })).await.unwrap();
+        if engine == "codex" { codex_branch = spawned["branch"]["id"].as_str().unwrap().to_string(); }
         let run = spawned["branch"]["runId"].as_str().unwrap().to_string();
         wait_until(&format!("{engine} child retirement"), || retired(&run) == Some(true)).await;
     }
     assert_eq!(leader_marks(&fixture), ["claude:[1]", "codex:[1]"]);
+    assert_codex_service_tier(&fixture, "default");
+    assert_eq!(fake_requests(&fixture).iter().find(|frame| frame["method"] == "thread/start").unwrap()["params"]["config"]["service_tier"], "default");
 
     // The user writes in the child's own tab, then in the ordinary parent.
     for (session, run) in [("fake-session-123", "child-tab-run"), ("managed-root", "root-run")] {
@@ -1407,6 +1521,170 @@ async fn coordinator_marks_only_managed_child_processes() {
         wait_until(run, || retired(run) == Some(true)).await;
     }
     assert_eq!(leader_marks(&fixture), ["claude:[1]", "codex:[1]", "claude:[1]", "claude:[]"]);
+
+    // Resuming from the child's own tab must also override global Fast.
+    write_fake_codex_responses(&fixture, vec![("thread/resume", vec![auto_review_thread_reply()])]);
+    let continuation = ccgui_next_lib::leader::dispatch(state.inner(), caller.clone(), "task_send", serde_json::json!({
+        "request_id":"codex-continue", "branch_id":codex_branch, "message":"parent follow-up",
+    })).await.unwrap();
+    let continued_run = continuation["branch"]["runId"].as_str().unwrap();
+    wait_until("Codex task_send retirement", || retired(continued_run) == Some(true)).await;
+    assert_codex_service_tier(&fixture, "default");
+
+    // Null app preference must still emit an explicit default over CLI config.
+    let mut settings = ccgui_next_lib::settings::read_settings().unwrap();
+    settings.codex_service_tier = None;
+    ccgui_next_lib::settings::update_app_settings(app.handle().clone(), settings.clone()).unwrap();
+    engine::send_message_inner(
+        state.inner(), "codex".into(), workspace.clone(), Some("fake-codex-thread".into()),
+        "child follow-up".into(), None, None, None, Some("auto".into()), None,
+        Some("codex-child-tab".into()), None, None,
+    ).await.unwrap();
+    wait_until("Codex child tab retirement", || retired("codex-child-tab") == Some(true)).await;
+    assert_codex_service_tier(&fixture, "default");
+    assert!(fake_requests(&fixture).iter().filter(|frame| frame["method"] == "thread/resume")
+        .all(|frame| frame["params"]["config"]["service_tier"] == "default"));
+    assert_eq!(leader_marks(&fixture).last().unwrap(), "codex:[1]");
+    assert_eq!(ccgui_next_lib::settings::read_settings().unwrap().codex_service_tier, None);
+
+    // The ordinary Codex root still honors the user's Fast selection.
+    settings.codex_service_tier = Some("priority".into());
+    ccgui_next_lib::settings::update_app_settings(app.handle().clone(), settings).unwrap();
+    let mut root_reply = auto_review_thread_reply();
+    root_reply["result"]["thread"]["id"] = serde_json::json!("ordinary-codex-root");
+    write_fake_codex_responses(&fixture, vec![
+        ("thread/start", vec![root_reply]),
+        ("turn/start", vec![
+            serde_json::json!({"id":REPLY_ID,"result":{"turn":{"id":"root-turn"}}}),
+            serde_json::json!({"method":"turn/completed","params":{"threadId":"ordinary-codex-root","turn":{"id":"root-turn","status":"completed"}}}),
+        ]),
+    ]);
+    engine::send_message_inner(
+        state.inner(), "codex".into(), workspace, None, "root turn".into(),
+        None, None, None, Some("auto".into()), None, Some("codex-root-fast".into()), None, None,
+    ).await.unwrap();
+    wait_until("Codex root retirement", || retired("codex-root-fast") == Some(true)).await;
+    assert_codex_service_tier(&fixture, "priority");
+    assert_eq!(leader_marks(&fixture).last().unwrap(), "codex:[]");
+    assert_eq!(fake_requests(&fixture).iter().rev().find(|frame| frame["method"] == "thread/start").unwrap()["params"]["config"]["service_tier"], "priority");
+}
+
+fn assert_codex_service_tier(fixture: &TestHarness, expected: &str) {
+    let raw = std::fs::read_to_string(fixture.root().join("ws/codex-args.json")).unwrap();
+    #[cfg(windows)]
+    let args: Vec<String> = serde_json::from_str(&raw).unwrap();
+    #[cfg(unix)]
+    let args: Vec<String> = raw.lines().map(str::to_string).collect();
+    let tier = args.windows(2).filter(|pair| pair[0] == "-c")
+        .filter_map(|pair| pair[1].strip_prefix("service_tier="))
+        .last();
+    assert_eq!(tier, Some(format!("\"{expected}\"").as_str()), "effective CLI tier: {args:?}");
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn completed_delegation_remains_readable_while_human_continues_child() {
+    if !in_coordinator_child("completed_delegation_remains_readable_while_human_continues_child") {
+        return;
+    }
+    let fixture = TestHarness::new().unwrap();
+    write_fake_codex_responses(&fixture, vec![
+        ("turn/start", vec![
+            serde_json::json!({"id":REPLY_ID,"result":{"turn":{"id":"fake-codex-turn"}}}),
+            serde_json::json!({"method":"item/agentMessage/delta","params":{"threadId":"fake-codex-thread","turnId":"fake-codex-turn","delta":"delegated reply "}}),
+        ]),
+        ("turn/steer", vec![
+            serde_json::json!({"id":REPLY_ID,"result":{"turnId":"fake-codex-turn"}}),
+            serde_json::json!({"method":"item/agentMessage/delta","params":{"threadId":"fake-codex-thread","turnId":"fake-codex-turn","delta":"after guidance"}}),
+            serde_json::json!({"method":"turn/completed","params":{"threadId":"fake-codex-thread","turn":{"id":"fake-codex-turn","status":"completed"}}}),
+        ]),
+    ]);
+    let workspace = fixture.root().join("ws").to_string_lossy().to_string();
+    let (app, events) = build_app(&fixture);
+    let state = app.state::<AppState>();
+    ccgui_next_lib::leader::prepare_run(&state.db, "schema-only", "pi", None, &workspace, None).unwrap();
+    {
+        let conn = state.db.0.lock();
+        conn.execute("INSERT INTO workspaces(id,path,name) VALUES('fixture-ws',?1,'ws')", [&workspace]).unwrap();
+        conn.execute("INSERT INTO sessions(engine,session_id,workspace_path,file_path,file_size,file_mtime_ms)
+            VALUES('claude','delegating-parent',?1,'fixture',0,0)", [&workspace]).unwrap();
+    }
+    install_recording_coordinator(state.inner());
+    let caller = ccgui_next_lib::leader::Caller {
+        run_id: "parent-waiting".into(), engine: "claude".into(),
+        session_id: "delegating-parent".into(), workspace_path: workspace.clone(),
+    };
+    ccgui_next_lib::leader::prepare_run(&state.db, &caller.run_id, &caller.engine,
+        Some(&caller.session_id), &workspace, Some("auto")).unwrap();
+    state.processes.0.lock().unwrap().insert(caller.run_id.clone(), routed_entry(&caller.run_id, 4100));
+    let spawn_args = serde_json::json!({
+        "request_id":"original-delegation", "engine":"codex", "model":"gpt-6-astra",
+        "title":"bounded task", "task":"original parent assignment",
+    });
+    let spawned = ccgui_next_lib::leader::dispatch(state.inner(), caller.clone(), "task_spawn", spawn_args.clone()).await.unwrap();
+    let branch_id = spawned["branch"]["id"].as_str().unwrap().to_string();
+    let delegated_run = spawned["branch"]["runId"].as_str().unwrap().to_string();
+    wait_until("delegated turn initial output", || count(&events, &delegated_run, &["delta"]) == 1).await;
+    // Human guidance stays in the active delegated turn and releases its parent's wait.
+    let (waited, guided) = tokio::join!(
+        ccgui_next_lib::leader::dispatch(state.inner(), caller.clone(), "task_wait",
+            serde_json::json!({"branch_ids":[branch_id],"timeout_seconds":10})),
+        engine::send_follow_up(app.state::<AppState>(), "fake-codex-thread".into(), "codex".into(),
+            workspace.clone(), "human guidance within the assignment".into(), None),
+    );
+    assert!(guided.unwrap());
+    let waited = waited.unwrap();
+    assert_eq!(waited["timedOut"], false);
+    assert_eq!(waited["branches"][0]["delegation"]["requestId"], "original-delegation");
+    assert_eq!(waited["branches"][0]["delegation"]["state"], "completed");
+    assert_eq!(waited["branches"][0]["delegation"]["result"], "delegated reply after guidance");
+    assert_eq!(fake_requests(&fixture).iter().filter(|request| request["method"] == "turn/start").count(), 1);
+    wait_until("delegated turn finished", || retired(&delegated_run) == Some(true)).await;
+
+    // A separate human turn stays alive, with different output on the same native thread.
+    write_fake_codex_responses(&fixture, vec![
+        ("thread/resume", vec![auto_review_thread_reply()]),
+        ("turn/start", vec![
+            serde_json::json!({"id":REPLY_ID,"result":{"turn":{"id":"human-turn"}}}),
+            serde_json::json!({"method":"item/agentMessage/delta","params":{"threadId":"fake-codex-thread","turnId":"human-turn","delta":"human-only follow-up"}}),
+        ]),
+    ]);
+    engine::send_message_inner(state.inner(), "codex".into(), workspace.clone(), Some("fake-codex-thread".into()),
+        "independent human follow-up".into(), None, None, None, Some("auto".into()), None,
+        Some("human-child-run".into()), None, None).await.unwrap();
+    wait_until("human child output", || events.lock().unwrap().iter().any(|event|
+        event["runId"] == "human-child-run" && event["kind"] == "delta"
+        && event["data"] == "human-only follow-up")).await;
+    let waited = ccgui_next_lib::leader::dispatch(state.inner(), caller.clone(), "task_wait",
+        serde_json::json!({"branch_ids":[branch_id],"timeout_seconds":1})).await.unwrap();
+    assert_eq!(waited["timedOut"], false, "human work must not keep the original parent waiting: {waited}");
+    let branch = &waited["branches"][0];
+    assert_eq!(branch["state"], "running", "the child activity remains truthful");
+    assert_eq!(branch["runId"], "human-child-run");
+    assert_eq!(branch["delegation"]["requestId"], "original-delegation");
+    assert_eq!(branch["delegation"]["runId"], delegated_run);
+    assert_eq!(branch["delegation"]["state"], "completed");
+    assert_eq!(branch["delegation"]["result"], "delegated reply after guidance");
+    assert_eq!(branch["delegation"]["task"], "original parent assignment");
+
+    let processes = Arc::clone(&state.processes);
+    assert!(tokio::task::spawn_blocking(move || processes.kill("human-child-run")).await.unwrap());
+    wait_until("human child retirement", || retired("human-child-run") == Some(true)).await;
+    write_fake_codex_responses(&fixture, vec![("thread/resume", vec![auto_review_thread_reply()])]);
+    let second = ccgui_next_lib::leader::dispatch(state.inner(), caller.clone(), "task_send", serde_json::json!({
+        "request_id":"second-delegation", "branch_id":branch_id, "message":"second parent assignment",
+    })).await.unwrap();
+    let second_run = second["branch"]["runId"].as_str().unwrap().to_string();
+    wait_until("second delegated turn finished", || retired(&second_run) == Some(true)).await;
+    let latest = ccgui_next_lib::leader::dispatch(state.inner(), caller.clone(), "task_wait",
+        serde_json::json!({"branch_ids":[branch_id],"timeout_seconds":1})).await.unwrap();
+    assert_eq!(latest["branches"][0]["delegation"]["requestId"], "second-delegation");
+    assert_eq!(latest["branches"][0]["delegation"]["runId"], second_run);
+    assert_eq!(latest["branches"][0]["delegation"]["state"], "completed");
+    let replay = ccgui_next_lib::leader::dispatch(state.inner(), caller, "task_spawn", spawn_args).await.unwrap();
+    assert_eq!(replay["branch"]["delegation"]["requestId"], "original-delegation");
+    assert_eq!(replay["branch"]["delegation"]["runId"], delegated_run);
+    assert_eq!(replay["branch"]["delegation"]["state"], "completed");
 }
 
 #[tokio::test]

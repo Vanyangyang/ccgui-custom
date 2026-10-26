@@ -1,5 +1,121 @@
 # @ccgui/plugin-sdk changelog
 
+## 0.3.28 — 2026-10-26
+
+- 更新准备可识别 `lifecycle: "plugin"` 服务的所属插件：只有所属插件全部登记关闭钩子、且没有其他阻塞时，才先调用 `prepare` 排空操作并关闭服务；随后仍由原生入口检查进程已退出。正在执行的一次性命令保持阻塞。
+- Windows 插件附属进程必须成功加入退出回收 Job，失败则终止启动并报告错误，不能以无回收保护的状态继续运行。
+- `plugin_exec_kill({ onlyExited: true })` 只清退已确认退出的本插件子进程登记，最多等 2 秒；任何仍活跃或无法确认退出的进程都会拒绝清理，不以网络不可达代替退出事实。省略参数保持既有主动终止语义。
+
+## 0.3.27 — 2026-10-26
+
+- `tasks.submit`, `tasks.sendMessage`, and `conversations.send` accept versioned `fixedInstructions` after an explicit native capability handshake. Local Claude/Codex launches and resumes load the owned policy through native system/developer instructions, preserving user configuration, task roles and read-only boundaries.
+- Profiles are durable and included in request fingerprints. Matching guidance allows live input; changed coordinator guidance stays queued until a full native turn. Omission retains prior guidance. No extra input is sent to restore policy after compaction, and old binaries do not advertise the capability.
+
+## 0.3.26 — 2026-10-25
+
+- `memoryExtraction.prepare` provides a bounded local retrieval hint and a native source digest without model inference. Format 2 extraction fences the selected batch with `expectedSourceDigest` and returns evidence-bound replacement/conflict relations; format 1 clients keep their original response shape.
+- Relations remain assistant interpretations, cannot replace user-recorded authority, and require exact offered IDs/revisions plus source evidence. Foreground preemption, project ownership and original cursor semantics remain in force.
+
+## 0.3.25 — 2026-10-25
+
+- `host:memory` adds desktop-owner `ctx.memoryExtraction`: metadata checkpoints, bounded extraction and cancellation for this plugin's owned project discussions/coordinators. Native source validation and fixed Gemini4/Vertex inference do not accept arbitrary transcript input or inject anything into the main chat.
+- Foreground admission cancels background inference; quiet-time, request budget and provider backoff limit interference. Results retain exact source evidence and opaque cursors. Plugins own durable queues and atomic saves; generated notes must not silently replace user-confirmed or withdrawn records. Local cancellation does not guarantee an upstream quota refund.
+
+## 0.3.24 — 2026-10-24
+
+- `host:tasks` adds `continuousCoordination`, owned-task `conversation`, `sendMessage`, `messageReceipt`, `cancelMessage`, `stopConversation`, `conversationAction`, and `onConversationEvent`. Follow-ups keep the coordinator's proven native session and use durable input CAS/fences; native acceptance is not requirement application. Unknown outcomes are never replayed.
+- Coordinator snapshots project the real host timeline and managed descendants. Stopping and selection locks retain native ownership beyond the initial parent turn; native pending question/plan/grant actions are revalidated against the displayed revision.
+- Conversation views support identifiable composite sources, native pending states and source-routed actions. Read-only discussion remains independent of coordinator execution.
+
+## 0.3.23 — 2026-10-24
+- `ctx.images` and detached `Images` provide durable, per-plugin host image
+  attachments (`importImage` and `readPreview`, up to 8 MiB per raster image)
+  under `host:chat` or `host:tasks`, returning opaque descriptors without
+  exposing local paths or bloating persisted state/actions with base64.
+- `ctx.conversations.send` and `ctx.tasks.submit` accept `images?: string[]`
+  (up to 8 owned attachment IDs per turn) and resolve them natively in the main
+  owner window before multimodal delivery.
+- `ctx.conversations.catalog()` and `ctx.tasks.catalog()` advertise
+  `capabilities.images` and per-engine `supportsImages`.
+
+## 0.3.22 — 2026-10-24
+- Detached center tabs remember presentation, open state and native geometry.
+  `defaultPresentation` chooses the initial mode; user choices take precedence.
+  Close, return and maintenance preserve distinct intents and one editor owner.
+- Task submissions accept an exact `providerId` with explicit launch choices.
+  Native resolution is exposed separately from the requested selection; queue
+  waits and slot reuse cannot silently change it. Opening a task raises its host window.
+- `catalog().capabilities.nativeCoordination` advertises launch pinning and
+  host-managed child routing to registered development members of the same project.
+- Session-menu targets include the clicked source's `workspacePath` when known,
+  allowing explicit object links without scanning the full chat catalog.
+
+## 0.3.21 — 2026-10-24
+- `ctx.conversations` provides persistent read-only native discussion branches
+  under `host:chat`, with explicit model/channel choices and independent thread
+  identity. It does not create task executions or change global defaults.
+- `ctx.conversations.View` and the detached renderer's `ConversationView` reuse
+  the host's message presentation without creating a second chat runtime.
+- Native window ownership, durable request revisions and exact-run settlement
+  protect reload, cancellation and duplicate delivery. Closing a surface does
+  not stop its conversation. Unconfirmed recovered runs remain unknown.
+
+## 0.3.20 — 2026-10-23
+- `ctx.tasks` (new permission `host:tasks`, desktop only) routes a goal and
+  delivers tasks into real GUI conversations. `catalog()` lists engines, local
+  workspaces and project organization; `history()`/`excerpt()` read bounded,
+  paged chat metadata and text for task indexes and handoffs without copying
+  whole histories or changing any chat's cwd or parent/child edges.
+- `plan()` runs one isolated, tool-less planner call (claude/codex/pi, the
+  active engine by default). Steps can only name candidate project ids, which
+  must be registered local workspaces; write paths are normalized into their
+  project. Planner output is data and is never executed. Plans are idempotent
+  per request id, cancellable, and fail with explicit error codes.
+- `submit()` reuses the slot's chat (`sessionMode: "auto"`) or creates a
+  background chat without taking focus or touching drafts, with the user's
+  model and permission settings. Receipts carry only native session evidence.
+  Declared write sets order conflicting requests across plugins (unknown =
+  whole workspace, `[]` = read-only); a new chat does not lift a conflict.
+  Requests that may have started are never replayed: after a restart they
+  become `unknown` and `open()` shows the conversation.
+- `ctx.chat` and its receipt contract are unchanged.
+
+## 0.3.19 — 2026-10-23
+- `workspaces.publishProject(sourceKey, definition)` publishes a stable project
+  view under `host:workspace`. Existing local workspace roots and their children
+  can be associated without moving sessions, changing cwd, granting access, or
+  migrating the publisher's memory. The source key preserves its project identity;
+  the host stores a separate projection owned by the publishing plugin.
+- Members have labels and descriptive development/reference roles. The user can
+  remove a projection without deleting registered workspaces or project data.
+
+## 0.3.18 — 2026-10-21
+- `host.whenReady(signal?)` waits for restored native/UI ownership before a
+  plugin starts I/O. UI/chat registrations stay synchronous during activation;
+  readers can wait without weakening the handoff admission barrier.
+- `ui.registerUpdateCloseHandler({ prepare, resume })` opts a plugin's center
+  tabs and selected side panel into automatic closure before a staged runtime
+  update. Floating views first drain through their existing return guard;
+  `prepare(signal)` freezes actions and durably saves drafts before the host
+  closes views. Cancellation/failure calls `resume`; unresolved edits remain
+  protected. The plugin and its chat bridge stay loaded until normal handoff.
+  Loaded handlers also prepare with closed views to settle background work.
+- This requires `ui:center-tab`, has one handler per plugin, and does not cover
+  overlay pages or grant another plugin permission to close a view. Plugins
+  without a handler retain their existing update blocker.
+
+## 0.3.17 — 2026-10-21
+- `registerCenterTab({ detached })` adds an optional native pop-out/return
+  surface under the separate `ui:detached-window` permission. A named renderer
+  export receives React, a JSON snapshot and a bounded action channel. The
+  original main document retains the controller and all host capabilities;
+  the floating document never calls `activate` or creates another chat bridge.
+- Return and native close flush queued UI actions before focusing the original
+  tab. Duplicate actions cannot resubmit work; stale owner/window identities
+  fail explicitly. Plugin reload/disable and application exit close the window.
+- Open plugin windows block runtime handoff until returned/closed, just as
+  plugin tabs without a checkpoint do; this API does not claim restart recovery.
+
 ## 0.3.16 — 2026-10-03
 - **Claude 原生生命周期的用量语义（契约澄清，API 形状不变）**：宿主不再在 Claude
   回复结束时立刻收尾——后台任务与自动续答期间进程保持存活，每次响应结束产生一个

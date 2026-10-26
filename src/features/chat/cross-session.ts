@@ -10,6 +10,11 @@ import type { PluginStorageBackend } from "@/features/plugins/runtime/context";
 import { cloneCheckpointValue, runtimeCheckpoint } from "@/lib/runtime-checkpoint";
 import { crossSessionCostReview, requiresCrossSessionCostApproval, type CrossSessionCostReview } from "./cross-session-cost";
 import { leaderWorkspacePathKey } from "@/features/leader/workspace-path";
+import { workspaceCatalogPathKey } from "@/lib/workspace-path";
+import { handlePluginManagementRequest, isPluginManagementMethod } from "@/features/plugins/runtime/management";
+import { handleWorkspaceOrganizationRequest, isWorkspaceOrganizationMethod } from "@/features/projects/management";
+import { sameParticipant, targetParticipant, type CorrespondenceEnvelope, type CorrespondenceReceipt, type InboxCaller,
+  type InboxMessageKind, type InboxReceiptState, type InboxSummary } from "@/features/plugins/runtime/chat-inbox";
 
 export interface CrossSessionRequest {
   requestId: string;
@@ -42,8 +47,13 @@ export interface CrossSessionCommunicationRecord {
   error?: string;
   acceptedAt: number;
   updatedAt: number;
+  /** Native branch timestamp; preview arrival times must not order snapshots. */
+  leaderUpdatedAt?: number;
+  /** Identifies the durable assignment timestamp domain after legacy checkpoint migration. */
+  leaderDelegationId?: string;
   reviewedBy?: string[];
   costReview?: CrossSessionCostReview;
+  mailbox?: InboxReceiptState;
 }
 
 export function isCrossSessionActiveStatus(status: CrossSessionCommunicationStatus): boolean {
@@ -55,6 +65,9 @@ export function isCrossSessionActiveStatus(status: CrossSessionCommunicationStat
     status === "awaiting_cost_approval" ||
     status === "awaiting_permission"
   );
+}
+export function isCrossSessionPendingRecord(record: CrossSessionCommunicationRecord): boolean {
+  return isCrossSessionActiveStatus(record.status) || (!!record.mailbox && record.mailbox.phase !== "handled" && record.status !== "failed");
 }
 
 export function crossSessionParticipantKey(participant: CrossSessionParticipant): string {
@@ -74,6 +87,8 @@ export function isCrossSessionRecordUnread(
   participant?: CrossSessionParticipant,
 ): boolean {
   if (isCrossSessionActiveStatus(record.status)) return false;
+  // Successful child work remains available in history without a completion prompt.
+  if (record.kind === "subtask" && record.status === "completed") return false;
   if (participant && !crossSessionRecordMatchesParticipant(record, participant)) return false;
   return (participant ? [participant] : [record.sender, record.target])
     .some((side) => !record.reviewedBy?.includes(crossSessionParticipantKey(side)));
@@ -107,14 +122,14 @@ function preserveReview(
 const MAX_CROSS_SESSION_RECORDS = 30;
 function retainedRecords(records: CrossSessionCommunicationRecord[]) {
   let finished = 0;
-  return records.filter((r) => isCrossSessionActiveStatus(r.status) || ++finished <= MAX_CROSS_SESSION_RECORDS);
+  return records.filter((r) => isCrossSessionPendingRecord(r) || ++finished <= MAX_CROSS_SESSION_RECORDS);
 }
 
 interface CrossSessionActivityState {
   records: CrossSessionCommunicationRecord[];
   upsertRecord: (record: CrossSessionCommunicationRecord) => void;
   removeRecords: (scopedIds: Iterable<string>) => void;
-  applyReceipt: (receipt: HostChatReceipt) => void;
+  applyReceipt: (receipt: CorrespondenceReceipt) => void;
   markFailed: (scopedId: string, error: string) => void;
   markReviewed: (observedRecords: CrossSessionCommunicationRecord[], participant?: CrossSessionParticipant) => void;
   clearFinished: () => void;
@@ -146,6 +161,15 @@ export const useCrossSessionActivityStore = create<CrossSessionActivityState>((s
       const idx = state.records.findIndex((r) => r.scopedId === receipt.requestId);
       if (idx < 0) return state;
       const current = state.records[idx];
+      // A local preparing record has no native run yet, so its wall-clock
+      // timestamp must not reject the first receipt. Once bound, a delayed
+      // submit/status response cannot overwrite newer events for that request.
+      if (current.runId !== undefined) {
+        if (receipt.runId !== current.runId || receipt.updatedAt < current.updatedAt) return state;
+        if (receipt.updatedAt === current.updatedAt &&
+          (current.status === "completed" || current.status === "failed") &&
+          isCrossSessionActiveStatus(receipt.status)) return state;
+      }
       const updated: CrossSessionCommunicationRecord = {
         ...current,
         status: receipt.status,
@@ -155,6 +179,7 @@ export const useCrossSessionActivityStore = create<CrossSessionActivityState>((s
         error: receipt.error ?? current.error,
         acceptedAt: receipt.acceptedAt || current.acceptedAt,
         updatedAt: receipt.updatedAt || Date.now(),
+        mailbox: receipt.mailbox ? { ...receipt.mailbox } : current.mailbox,
       };
       const next = [...state.records];
       next[idx] = preserveReview(current, updated);
@@ -193,7 +218,7 @@ export const useCrossSessionActivityStore = create<CrossSessionActivityState>((s
     }),
   clearFinished: () =>
     set((state) => ({
-      records: state.records.filter((r) => isCrossSessionActiveStatus(r.status)),
+      records: state.records.filter(isCrossSessionPendingRecord),
     })),
   reset: () => set({ records: [] }),
 }));
@@ -221,7 +246,8 @@ const unregisterActivityCheckpoint = runtimeCheckpoint.register({
 if (import.meta.hot) import.meta.hot.dispose(unregisterActivityCheckpoint);
 
 type Bridge = Pick<PluginContext["chat"], "identity" | "inspect" | "submit" | "receipt"> &
-  Pick<ReturnType<typeof createHostChatBridge>, "submitForCostApproval" | "submitWithCostGuard"> & Partial<Pick<PluginContext["chat"], "onEvent">>;
+  Pick<ReturnType<typeof createHostChatBridge>, "submitForCostApproval" | "submitWithCostGuard"> & Partial<Pick<PluginContext["chat"], "onEvent">> &
+  Partial<Pick<ReturnType<typeof createHostChatBridge>, "submitCorrespondence" | "findCorrespondence" | "inboxStatus" | "readMessages" | "acknowledgeMessage">>;
 interface Dependencies {
   store: { getState(): ChatStore };
   bridge: Bridge;
@@ -259,6 +285,7 @@ async function waitForReceipt(
   initial: HostChatReceipt | null,
   seconds: number,
   assertActive: () => void,
+  inboxCaller?: InboxCaller,
 ): Promise<HostChatReceipt | null> {
   const onEvent = bridge.onEvent;
   if (seconds <= 0 || isSettledReceipt(initial) || !onEvent) return initial;
@@ -279,6 +306,9 @@ async function waitForReceipt(
     const off = onEvent((receipt) => {
       if (receipt.requestId === scoped && isSettledReceipt(receipt)) {
         finish(receipt);
+      } else if (inboxCaller && (receipt as CorrespondenceReceipt).mailbox?.phase === "received" &&
+        receipt.status !== "awaiting_cost_approval" && sameParticipant(inboxCaller, targetParticipant(receipt.target))) {
+        finish();
       }
     });
     timer = setTimeout(() => finish(), seconds * 1000);
@@ -304,7 +334,7 @@ function publicReceipt(receipt: HostChatReceipt | null, id: string) {
   const review = receipt.status === "awaiting_cost_approval"
     ? useCrossSessionActivityStore.getState().records.find((r) => r.scopedId === receipt.requestId)?.costReview : undefined;
   return {
-    ...receipt, requestId: id,
+    ...receipt, requestId: id, message_id: receipt.requestId,
     ...(receipt.status === "awaiting_cost_approval" ? {
       submitted_to_model: false,
       cost_review: review,
@@ -389,6 +419,23 @@ export function createCrossSessionHandler(deps: Dependencies) {
     finally { if (preparing.get(id) === next) preparing.delete(id); }
   };
   const assertActive = () => { if (deps.isActive && !deps.isActive()) throw new Error("Host chat runtime has been disposed"); };
+  const callerOf = (request: CrossSessionRequest): InboxCaller => ({ runId: requiredString(request.sender?.runId, "sender run identity"),
+    engine: requiredString(request.sender?.engine, "sender engine"), sessionId: requiredString(request.sender?.sessionId, "sender session identity"),
+    workspacePath: requiredString(request.sender?.workspacePath, "sender workspace") });
+  const inboxNotice = async (caller: InboxCaller): Promise<{ inbox?: InboxSummary }> => {
+    const inbox = await deps.bridge.inboxStatus?.(caller);
+    assertActive();
+    return inbox && (inbox.pending || inbox.held || inbox.needsReconciliation || inbox.waitingOnCaller?.length) ? { inbox } : {};
+  };
+  const existingScopedId = async (caller: InboxCaller, id: string, fallback: string): Promise<string> => {
+    const known = await deps.bridge.findCorrespondence?.(caller, id);
+    if (known) return known.requestId;
+    // Preserve pre-inbox request hashes from the existing activity checkpoint.
+    const matches = useCrossSessionActivityStore.getState().records.filter(record => record.requestId === id && sameParticipant(record.sender, caller));
+    const receipts = (await Promise.all(matches.map(record => deps.bridge.receipt(record.scopedId)))).filter(receipt => receipt !== null);
+    if (receipts.length > 1) throw new Error("Correspondence identity is ambiguous; reconcile existing receipts before retrying");
+    return receipts[0]?.requestId ?? fallback;
+  };
   deps.bridge.onEvent?.((receipt) => {
     if (!deps.isActive || deps.isActive()) {
       useCrossSessionActivityStore.getState().applyReceipt(receipt);
@@ -399,11 +446,30 @@ export function createCrossSessionHandler(deps: Dependencies) {
     const archived = new Set(rows.archived.map((s) => sessionKey(s.engine, s.sessionId, s.workspacePath)));
     return rows.sessions.filter((s) => !s.remote && !archived.has(sessionKey(s.engine, s.sessionId, s.workspacePath)) &&
       !deps.store.getState().archivedSessionKeys[sessionKey(s.engine, s.sessionId, s.workspacePath)] &&
-      rows.workspaces.some((w) => w.path === s.workspacePath && !(w.meta && "wsl" in w.meta)));
+      rows.workspaces.some((w) => workspaceCatalogPathKey(w.path) === workspaceCatalogPathKey(s.workspacePath) && !(w.meta && "wsl" in w.meta)));
   }
   return async (request: CrossSessionRequest): Promise<unknown> => {
     assertActive();
     const args = request.arguments ?? {};
+    if (["get_inbox_status", "read_messages", "acknowledge_message"].includes(request.method)) {
+      const caller = callerOf(request);
+      if (request.method === "get_inbox_status") {
+        if (Object.keys(args).length) throw new Error("Inbox status does not accept identity overrides");
+        return await deps.bridge.inboxStatus?.(caller) ?? { pending: 0, held: 0, needsReconciliation: 0 };
+      }
+      if (request.method === "read_messages") {
+        if (!deps.bridge.readMessages || Object.keys(args).some(key => !["request_id", "limit", "message_ids"].includes(key))) throw new Error("Invalid inbox read arguments or unavailable inbox capability");
+        const result = await deps.bridge.readMessages(caller, { requestId: requestId(args.request_id),
+          ...(args.limit == null ? {} : { limit: args.limit as number }), ...(args.message_ids == null ? {} : { messageIds: args.message_ids as string[] }) });
+        assertActive(); return result;
+      }
+      if (!deps.bridge.acknowledgeMessage || Object.keys(args).some(key => !["message_id", "read_request_id", "outcome", "response", "impact_review"].includes(key))) throw new Error("Invalid inbox acknowledgement arguments or unavailable inbox capability");
+      const receipt = await deps.bridge.acknowledgeMessage(caller, requiredString(args.message_id, "message_id"), {
+        readRequestId: requestId(args.read_request_id), outcome: args.outcome as "handled" | "deferred",
+        ...(args.response == null ? {} : { response: args.response as string }), ...(args.impact_review == null ? {} : { impactReview: args.impact_review as string }) });
+      assertActive(); useCrossSessionActivityStore.getState().applyReceipt(receipt);
+      return { receipt, ...await inboxNotice(caller) };
+    }
     if (request.method === "list_chats") {
       if (args.query !== undefined && typeof args.query !== "string") throw new Error("Invalid query");
       const query = (args.query as string | undefined)?.toLocaleLowerCase() ?? "";
@@ -438,25 +504,35 @@ export function createCrossSessionHandler(deps: Dependencies) {
     if (request.method !== "send_message" && request.method !== "get_message_status") throw new Error("Unknown host chat method");
     const id = requestId(args.request_id);
     const wait = waitSeconds(args.wait_seconds);
-    const scoped = await scopedId(request.sender, id);
+    const rawScoped = await scopedId(request.sender, id);
+    const caller = callerOf(request);
     assertActive();
     if (request.method === "get_message_status") {
+      const scoped = await existingScopedId(caller, id, rawScoped);
       const initial = await deps.bridge.receipt(scoped);
       assertActive();
-      const settled = await waitForReceipt(deps.bridge, scoped, initial, wait, assertActive);
+      const notice = await inboxNotice(caller);
+      const settled = await waitForReceipt(deps.bridge, scoped, initial, notice.inbox?.pending || notice.inbox?.waitingOnCaller?.length ? 0 : wait, assertActive, caller);
       if (settled) useCrossSessionActivityStore.getState().applyReceipt(settled);
-      return { receipt: publicReceipt(settled, id) };
+      return { receipt: publicReceipt(settled, id), ...await inboxNotice(caller) };
     }
-    return serialRequest(scoped, async () => {
+    const serializationKey = await scopedId({ ...request.sender, workspacePath: workspaceCatalogPathKey(caller.workspacePath) }, id);
+    return serialRequest(serializationKey, async () => {
     assertActive();
+    const scoped = await existingScopedId(caller, id, rawScoped);
     const sessionId = requiredString(args.session_id, "session_id");
     const message = requiredString(args.message, "message");
     if (message.length > 130_000) throw new Error("message exceeds 130000 characters");
     const engine = args.engine === undefined ? undefined : requiredString(args.engine, "engine");
     const workspace = args.workspace_path === undefined ? undefined : requiredString(args.workspace_path, "workspace_path");
+    const updateOf = args.update_of == null ? undefined : requestId(args.update_of), replyTo = args.reply_to == null ? undefined : requestId(args.reply_to);
+    if (updateOf && replyTo) throw new Error("update_of and reply_to are mutually exclusive");
+    const relatedId = updateOf ?? replyTo;
+    if (args.message_kind != null && (!relatedId || !["information", "constraint", "correction"].includes(args.message_kind as string))) throw new Error("message_kind requires a valid associated message");
+    if (relatedId && !deps.bridge.submitCorrespondence) throw new Error("Associated inbox capability is unavailable");
     const rows = await catalog();
     assertActive();
-    const scopedRows = rows.filter((s) => (!engine || s.engine === engine) && (!workspace || s.workspacePath === workspace));
+    const scopedRows = rows.filter((s) => (!engine || s.engine === engine) && (!workspace || workspaceCatalogPathKey(s.workspacePath) === workspaceCatalogPathKey(workspace)));
     const exact = scopedRows.filter((s) => s.sessionId === sessionId);
     const matches = exact.length ? exact : sessionId.length >= 8 ? scopedRows.filter((s) => s.sessionId.startsWith(sessionId)) : [];
     if (matches.length !== 1) throw new Error(matches.length ? "Ambiguous session_id; specify exact engine and workspace" : "Unknown or unavailable local session_id");
@@ -467,16 +543,21 @@ export function createCrossSessionHandler(deps: Dependencies) {
     if (prompt.length > 131_072) throw new Error("Attributed message exceeds host prompt limit");
     const target: HostChatTarget = { client: "ccgui", engine: meta.engine, nativeSessionId: meta.sessionId, guiSessionId: meta.sessionId,
       workspacePath: meta.workspacePath, ...await deps.bridge.identity() };
+    const envelope: CorrespondenceEnvelope = { sender: { engine: caller.engine, sessionId: caller.sessionId, workspacePath: caller.workspacePath }, requestId: id,
+      ...(relatedId ? { relation: { type: updateOf ? "update" : "reply", requestId: relatedId,
+        scopedId: await scopedId(updateOf ? request.sender : { ...request.sender, engine: meta.engine, sessionId: meta.sessionId, workspacePath: meta.workspacePath }, relatedId) },
+        kind: (args.message_kind ?? "information") as InboxMessageKind } : {}) };
     const senderMeta = rows.find((s) => s.engine === request.sender.engine && s.sessionId === request.sender.sessionId);
     const existingReceipt = await deps.bridge.receipt(scoped);
     assertActive();
     if (existingReceipt) {
       // Validate the original target+prompt before touching the visible card.
       // Retrying never approves a held request or replaces the approved text.
-      const previous = await deps.bridge.submit({ requestId: scoped, target, prompt });
-      const settled = await waitForReceipt(deps.bridge, scoped, previous, wait, assertActive);
+      const previous = await (deps.bridge.submitCorrespondence?.({ requestId: scoped, target, prompt }, envelope) ?? deps.bridge.submit({ requestId: scoped, target, prompt }));
+      const notice = await inboxNotice(caller);
+      const settled = await waitForReceipt(deps.bridge, scoped, previous, notice.inbox?.pending || notice.inbox?.waitingOnCaller?.length ? 0 : wait, assertActive, caller);
       if (settled) useCrossSessionActivityStore.getState().applyReceipt(settled);
-      return publicReceipt(settled, id);
+      return { ...publicReceipt(settled, id), ...await inboxNotice(caller) };
     }
     const now = Date.now();
     useCrossSessionActivityStore.getState().upsertRecord({
@@ -498,6 +579,7 @@ export function createCrossSessionHandler(deps: Dependencies) {
       status: "preparing",
       acceptedAt: now,
       updatedAt: now,
+      ...(envelope.relation ? { mailbox: { phase: "received", relation: envelope.relation.type, parentRequestId: envelope.relation.requestId, kind: envelope.kind! } as InboxReceiptState } : {}),
     });
     try {
       if (!deps.store.getState().initialized) await deps.store.getState().init();
@@ -522,20 +604,24 @@ export function createCrossSessionHandler(deps: Dependencies) {
       const review = sampleReview(meta, inspected.status);
       assertActive();
       const submission = { requestId: scoped, target, prompt };
-      const submitted = await (requiresCrossSessionCostApproval(review) || !review.cache
+      const checkCost = async () => {
+        const freshRows = await catalog().catch(() => null);
+        const freshMeta = freshRows?.find((s) => s.engine === meta.engine && s.sessionId === meta.sessionId && s.workspacePath === meta.workspacePath) ?? meta;
+        const current = await deps.bridge.inspect(target);
+        const latest = sampleReview(freshMeta, current?.status ?? "idle");
+        return requiresCrossSessionCostApproval(latest);
+      };
+      const submitted = await (deps.bridge.submitCorrespondence
+        ? deps.bridge.submitCorrespondence(submission, envelope, { requiresCostApproval: requiresCrossSessionCostApproval(review), costGuard: true, reviewedModel: review.model ?? null, checkCost })
+        : requiresCrossSessionCostApproval(review)
         ? deps.bridge.submitForCostApproval(submission)
-        : deps.bridge.submitWithCostGuard(submission, review.model ?? null, async () => {
-          const freshRows = await catalog().catch(() => null);
-          const freshMeta = freshRows?.find((s) => s.engine === meta.engine && s.sessionId === meta.sessionId && s.workspacePath === meta.workspacePath) ?? meta;
-          const current = await deps.bridge.inspect(target);
-          const latest = sampleReview(freshMeta, current?.status ?? "idle");
-          return requiresCrossSessionCostApproval(latest) || !latest.cache;
-        }));
+        : deps.bridge.submitWithCostGuard(submission, review.model ?? null, checkCost));
       useCrossSessionActivityStore.getState().applyReceipt(submitted);
       assertActive();
-      const settled = await waitForReceipt(deps.bridge, scoped, submitted, wait, assertActive);
+      const notice = await inboxNotice(caller);
+      const settled = await waitForReceipt(deps.bridge, scoped, submitted, notice.inbox?.pending || notice.inbox?.waitingOnCaller?.length ? 0 : wait, assertActive, caller);
       if (settled) useCrossSessionActivityStore.getState().applyReceipt(settled);
-      return publicReceipt(settled, id);
+      return { ...publicReceipt(settled, id), ...await inboxNotice(caller) };
     } catch (error) {
       useCrossSessionActivityStore.getState().markFailed(scoped, error instanceof Error ? error.message : String(error));
       throw error;
@@ -623,7 +709,12 @@ export function startCrossSessionRuntime(): () => void {
   };
   void listen<CrossSessionRequest>("host-chat://request", ({ payload }) => {
     if (disposed) return;
-    void handler(payload).then((result) => invoke("host_chat_respond", { requestId: payload.requestId, result, error: null }),
+    const response = isWorkspaceOrganizationMethod(payload.method)
+      ? handleWorkspaceOrganizationRequest(payload, () => !disposed)
+      : isPluginManagementMethod(payload.method)
+      ? handlePluginManagementRequest(payload, () => !disposed)
+      : handler(payload);
+    void response.then((result) => invoke("host_chat_respond", { requestId: payload.requestId, result, error: null }),
       (error: unknown) => invoke("host_chat_respond", { requestId: payload.requestId, result: null, error: String(error) }))
       .catch(() => { console.error("[host-chat] response transport failed"); });
   }).then(async (unlisten) => {

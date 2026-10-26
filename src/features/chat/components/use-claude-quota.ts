@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ipc, type ClaudeQuotaSnapshot } from "@/lib/ipc";
 import { listenClaudeQuotaChanged } from "@/lib/events";
-import { CLAUDE_QUOTA_MAX_AGE, CLAUDE_QUOTA_STALE_AGE, isClaudeNativeProvider, validClaudeQuotaSnapshot } from "../claude-quota";
+import { CLAUDE_QUOTA_STALE_AGE, isClaudeNativeProvider, validClaudeQuotaSnapshot } from "../claude-quota";
+import { quotaReadFailed } from "../subscription-quota";
 
 const EMPTY: ClaudeQuotaSnapshot = { status: "unavailable", windows: {}, errorCode: "not_loaded" };
 
@@ -52,12 +53,9 @@ export function useClaudeQuota(engine: string, providerId: string | undefined, w
           setState(previous => ({ route, snapshot: keepUntilNextQuota(previous.snapshot, snapshot), loading: true }));
         }
       } catch {
-        // A transport failure cannot confirm that the account still matches.
-        // Native validated stale replies may retain values; an IPC rejection may not.
-        // 【对话额度】读取失败时留下上次窗口，等下一次成功的额度再替换。
         if (current()) setState(previous => ({
           route,
-          snapshot: hasQuotaWindows(previous.snapshot) ? previous.snapshot : { ...EMPTY, errorCode: "read_failed" },
+          snapshot: quotaReadFailed(previous.snapshot, EMPTY),
           loading: true,
         }));
       } finally {
@@ -93,9 +91,9 @@ export function useClaudeQuota(engine: string, providerId: string | undefined, w
   }, [route, engine, providerId, workspacePath, enabled]);
 
   const snapshot = enabled && state.route === route ? validClaudeQuotaSnapshot(state.snapshot, now) : undefined;
-  // Expire reset windows and freshness exactly between minute cache reads.
+  // Update freshness and reset labels exactly between minute cache reads.
   const deadlines = snapshot?.collectedAt && Number.isFinite(snapshot.collectedAt) && snapshot.collectedAt <= now
-    ? [snapshot.collectedAt + CLAUDE_QUOTA_STALE_AGE, snapshot.collectedAt + CLAUDE_QUOTA_MAX_AGE,
+    ? [snapshot.collectedAt + CLAUDE_QUOTA_STALE_AGE,
       ...Object.values(snapshot.windows).map(window => window?.resetsAt ?? 0)].filter(time => time > now)
     : [];
   const nextDeadline = deadlines.length ? Math.min(...deadlines) : undefined;

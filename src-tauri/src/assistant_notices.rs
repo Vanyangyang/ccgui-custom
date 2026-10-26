@@ -701,7 +701,13 @@ impl Service {
                     store.unread(at)?;
                     outbox.set_ready(ADMISSION_GENERATION, at.saturating_add(10_000))?;
                 }
-                candidates = Self::drain(&mut inner, store, outbox, at, &mut changed)?;
+                let app_state = self.app.try_state::<crate::AppState>();
+                candidates = Self::drain(&mut inner, store, outbox, at, &mut changed, |source| {
+                    let app_state = app_state.as_ref().ok_or("source_identity_unavailable")?;
+                    crate::leader::is_managed_child_session(
+                        &app_state.db, &source.engine, &source.session_id, &source.workspace_path,
+                    )
+                })?;
                 Ok(())
             })();
             if let Err(reason) = run {
@@ -731,14 +737,23 @@ impl Service {
         outbox: &Outbox,
         at: u64,
         changed: &mut bool,
+        is_managed_child: impl Fn(&NoticeSource) -> Result<bool, String>,
     ) -> Result<Vec<(NoticeSource, Pending, u64)>, String> {
         let mut candidates = Vec::new();
-        // Admission was already durable in the producer. Turning reminders off only stops
-        // new admission/presentation; it never prevents an owned terminal from reaching Store.
+        // For eligible main conversations, durable admission survives preference
+        // changes. Child identity is checked separately before domain publication.
         for item in outbox.pending(512)?.into_iter().take(8) {
             let source = Self::source(inner, &item);
             source.validate()?;
             let key = source.key();
+            // Older worker versions may already have queued a child's result.
+            // Consume it before inbox, overlay, observer or audio publication;
+            // this changes notification policy, not the task's real outcome.
+            if is_managed_child(&source)? {
+                inner.cancel_job(&key, at);
+                outbox.finish(&item.id)?;
+                continue;
+            }
             let turn = format!("{}-{}", key, item.started_at_ms);
             if item.started || item.cancel {
                 if inner.policy.begin(&key, &turn, item.started_at_ms, at) {
@@ -1107,6 +1122,9 @@ pub fn init(app: &tauri::AppHandle) -> Arc<Service> {
         .unwrap_or("zh-CN")
         .to_string();
     let audio = completion_audio::AudioService::new(now());
+    if fatal.is_none() {
+        audio.load(crate::paths::app_home().join("completion-audio.json"));
+    }
     audio.configure(
         config.enabled && config.voice_enabled && fatal.is_none(),
         &locale,
@@ -1250,6 +1268,46 @@ pub fn assistant_notices_displays(
 ) -> Result<Vec<overlay::DisplayInfo>, String> {
     gate(&window, true)?;
     overlay::monitors(&state.app)
+}
+#[tauri::command]
+pub fn assistant_notices_audio_settings(
+    window: tauri::Window,
+    state: tauri::State<'_, Arc<Service>>,
+) -> Result<completion_audio::AudioView, String> {
+    gate(&window, true)?;
+    state.usable(&state.inner.lock())?;
+    Ok(state.audio.view())
+}
+#[tauri::command]
+pub async fn assistant_notices_audio_configure(
+    window: tauri::Window,
+    state: tauri::State<'_, Arc<Service>>,
+    settings: completion_audio::AudioSettings,
+    expected_revision: u64,
+) -> Result<completion_audio::AudioView, String> {
+    gate(&window, true)?;
+    state.usable(&state.inner.lock())?;
+    state.audio.save(settings, expected_revision)
+}
+#[tauri::command]
+pub async fn assistant_notices_audio_voices(
+    window: tauri::Window,
+    state: tauri::State<'_, Arc<Service>>,
+) -> Result<Vec<completion_audio::VoiceInfo>, String> {
+    gate(&window, true)?;
+    state.usable(&state.inner.lock())?;
+    completion_audio::voices().await
+}
+#[tauri::command]
+pub async fn assistant_notices_audio_preview(
+    window: tauri::Window,
+    state: tauri::State<'_, Arc<Service>>,
+    engine: String,
+    settings: completion_audio::AudioSettings,
+) -> Result<(), String> {
+    gate(&window, true)?;
+    state.usable(&state.inner.lock())?;
+    state.audio.preview(&engine, settings)
 }
 #[tauri::command]
 pub fn assistant_notices_attach(

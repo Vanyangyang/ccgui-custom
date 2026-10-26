@@ -8,6 +8,8 @@ export interface AiChatThread {
   engine?: string;
   /** Exact workspace identity for session-scoped activity. */
   workspacePath?: string;
+  /** Display grouping only; never used to execute or select a session. */
+  sidebarWorkspacePath?: string | null;
   /** Relative-time chip (e.g. "34m"). */
   time: string;
   /** 【最后对话时间】毫秒时间戳。全部会话视图用它排序；相对时间文案不能比较先后。 */
@@ -58,6 +60,10 @@ export interface AiChatRepo {
   worktrees?: AiChatRepo[];
   /** Set on a repo that IS a worktree child row. */
   worktree?: AiChatWorktreeMeta;
+  /** A project member that has not been registered as a workspace yet. */
+  directoryOnly?: boolean;
+  /** Project identity check failed; never silently launch a different path. */
+  unavailable?: "missing" | "changed";
 }
 
 /** Worktree child metadata on a repo row (set when this repo IS a worktree
@@ -74,4 +80,6 @@ export interface AiChatRepoSection {
   id: string | null;
   name: string;
   repos: AiChatRepo[];
+  /** Project collections share the workspace list, without a global filter. */
+  project?: { launchId: string; canLaunch: boolean };
 }

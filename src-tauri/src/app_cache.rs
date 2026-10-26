@@ -11,6 +11,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+mod handoff_diagnostics;
+#[cfg(test)]
+mod stack_tests;
+
 const HANDOFF_MODEL: &str = "grok-4.7-low-fast";
 const HANDOFF_FALLBACK_MODEL: &str = "grok-4.7-low";
 // This covers CLI startup and shutdown as well as inference. On Windows a
@@ -117,8 +121,14 @@ async fn run_handoff_route(route: HandoffRoute<'_>, input: &str) -> Result<Strin
 }
 
 fn structured_handoff_summary(value: &serde_json::Value) -> Result<String, SideCallError> {
-    value.get("summary").and_then(serde_json::Value::as_str)
-        .and_then(sanitize_distilled_summary).ok_or(SideCallError::BadOutput)
+    let summary = value.get("summary").and_then(serde_json::Value::as_str).ok_or_else(|| {
+        side_call::diagnostics::record("summary_field");
+        SideCallError::BadOutput
+    })?;
+    sanitize_distilled_summary(summary).ok_or_else(|| {
+        side_call::diagnostics::record("summary_too_short");
+        SideCallError::BadOutput
+    })
 }
 
 #[derive(Debug)]
@@ -337,15 +347,14 @@ pub async fn summarize_session_handoff(
     )?;
 
     let selected_engine = compression_selection.as_ref().map(|s| s.engine.as_str()).unwrap_or("cursor");
-    let raw = run_handoff_route(route, &input).await
-    .map_err(|err| match err {
-        SideCallError::Unavailable => format!("{selected_engine} handoff provider/model unavailable"),
-        SideCallError::Timeout => format!("{selected_engine} handoff summary timed out"),
-        SideCallError::BadOutput => format!("{selected_engine} returned invalid summary"),
-        SideCallError::Failed => format!("{selected_engine} handoff summary failed"),
-    })?;
-
-    sanitize_distilled_summary(&raw).ok_or_else(|| "distilled summary too short".to_string())
+    let started = std::time::Instant::now();
+    side_call::diagnostics::capture(async {
+        let raw = run_handoff_route(route, &input).await?;
+        sanitize_distilled_summary(&raw).ok_or_else(|| {
+            side_call::diagnostics::record("summary_too_short");
+            SideCallError::BadOutput
+        })
+    }).await.map_err(|failure| handoff_diagnostics::format_failure(selected_engine, failure, started.elapsed()))
 }
 
 fn dir_bytes(path: &Path) -> u64 {
@@ -773,6 +782,44 @@ pub(crate) fn spawn_startup_cache_maintenance() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "explicitly enabled live Codex handoff smoke test"]
+    async fn live_codex_handoff_smoke() {
+        assert_eq!(std::env::var("CCGUI_CODEX_LIVE_HANDOFF_TEST").as_deref(), Ok("1"));
+        let selection = HandoffCompressionSelection {
+            engine: "codex".into(), model: "gpt-6-astra".into(),
+            provider_id: None, effort: Some("high".into()),
+        };
+        let main = (1..=20).map(|n| format!(
+            "验收项 {n}：脚本 tasks/case-{n}.ps1 的预检与构建异常必须在 finally 中清理临时目录 cache-{n}；仅允许删除本轮创建的目录，不能清理用户已有内容。编译失败应保留退出码，取消时停止自己启动的进程树并释放文件锁。"
+        )).collect::<Vec<_>>().join("\n");
+        let children = (1..=3).map(|n| format!(
+            "子任务 {n} 报告：检查 tasks/case-{}.ps1 到 tasks/case-{}.ps1；发现预检位于 try 之前，失败会跳过 finally。建议把预检移入保护区并保留错误传播。报告完成不等于已验收：只完成静态检查，未改代码，未跑桌面验证；仍需验证并发取消、只读目录及旧进程晚到事件。",
+            (n - 1) * 6 + 1, n * 6
+        )).collect::<Vec<_>>().join("\n");
+        let input = build_handoff_input(
+            "claude", "synthetic-handoff-smoke", Some("构建脚本异常清理"),
+            &main, Some(&children),
+        ).unwrap();
+        let summary = side_call::diagnostics::capture(run_handoff_route(HandoffRoute::Explicit(&selection), &input)).await.unwrap();
+        eprintln!("live handoff accepted: input_chars={} summary_chars={}", input.chars().count(), summary.chars().count());
+        assert!(sanitize_distilled_summary(&summary).is_some());
+    }
+
+    #[tokio::test]
+    async fn handoff_summary_validation_retains_its_failure_stage() {
+        for (value, stage) in [
+            (serde_json::json!({"text": "private model output"}), "summary_field"),
+            (serde_json::json!({"summary": 123}), "summary_field"),
+            (serde_json::json!({"summary": "短"}), "summary_too_short"),
+        ] {
+            let failure = side_call::diagnostics::capture(async { structured_handoff_summary(&value) }).await.unwrap_err();
+            assert_eq!(failure.kind, SideCallError::BadOutput);
+            assert_eq!(failure.stage, Some(stage));
+            assert!(!format!("{failure:?}").contains("private model output"));
+        }
+    }
 
     #[test]
     fn handoff_input_absent_or_blank_children_preserves_legacy_prompt() {

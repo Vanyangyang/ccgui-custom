@@ -14,6 +14,10 @@ use std::time::Duration;
 use tauri::Emitter;
 use tauri::Manager;
 
+#[cfg(all(test, windows))]
+#[path = "handoff_process_tests.rs"]
+mod process_tests;
+
 const CHECKPOINT_LIMIT: u64 = 256 * 1024 * 1024;
 static OPERATIONS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static CURRENT: LazyLock<Mutex<Current>> = LazyLock::new(|| Mutex::new(Current::default()));
@@ -251,7 +255,7 @@ fn launcher_supersedes_committed(
     current_mtime > state_mtime && current_mtime > committed_mtime
 }
 
-/// Full restart is the only supported v1 -> v2 transition. This runs after GUI
+/// Incompatible contract upgrades require a full restart. This runs after GUI
 /// ownership and worker discovery, before any application database is opened.
 pub(crate) fn reconcile_offline_upgrade(has_running_workers: bool) -> Result<(), String> {
     if has_resume() {
@@ -291,7 +295,7 @@ fn reconcile_offline_upgrade_in(update: &UpdateStore, current: &Path, state_path
     if !launcher_supersedes_committed(current, &executable, state_path, &releases) {
         return Err("Finish the previous version and install the new version before upgrading its database contract".into());
     }
-    update.retire_v1_after_offline_upgrade(&state)
+    update.retire_legacy_after_offline_upgrade(&state)
 }
 
 pub(crate) async fn restore_services(
@@ -336,13 +340,29 @@ pub(crate) async fn restore_sources() -> Result<(), String> {
     if let Some(saved) = saved {
         crate::worker_host::ensure_sources(&saved.required_sources).await?;
         crate::worker_host::ensure_sources(&saved.cursors).await?;
+        crate::worker_host::restore_observers(&saved.required_sources).await?;
     }
     Ok(())
 }
 
 async fn blockers(app: &tauri::AppHandle) -> Vec<String> {
+    blocker_snapshot(app).await.blockers
+}
+
+async fn blocker_snapshot(app: &tauri::AppHandle) -> crate::worker_host::BlockerSnapshot {
     let state = app.state::<crate::AppState>();
-    let mut blockers = crate::worker_host::blockers(&state.processes).await;
+    let mut snapshot = crate::worker_host::blocker_snapshot(&state.processes).await;
+    for plugin_id in crate::plugin_caps::tracked_child_owners() {
+        snapshot.add_plugin_process(Some(&plugin_id));
+    }
+    let activities: Vec<_> = ACTIVITIES.lock().unwrap_or_else(|p| p.into_inner())
+        .keys().copied().collect();
+    // A one-shot exec is not a service that an opted-in plugin can safely stop.
+    // Keep an unscoped detail even when tracked services have the same reason.
+    if activities.contains(&"plugin-processes") {
+        snapshot.add_plugin_process(None);
+    }
+    let blockers = &mut snapshot.blockers;
     if !state.terminals.lock().await.is_empty() {
         blockers.push("terminal-sessions".into());
     }
@@ -357,16 +377,8 @@ async fn blockers(app: &tauri::AppHandle) -> Vec<String> {
     if crate::auto_title::has_pending() {
         blockers.push("auto-title-pending".into());
     }
-    if crate::plugin_caps::has_tracked_children() {
-        blockers.push("plugin-processes".into());
-    }
-    blockers.extend(
-        ACTIVITIES
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .keys()
-            .map(|kind| (*kind).to_string()),
-    );
+    blockers.extend(crate::plugin_windows::blocking_reasons());
+    blockers.extend(activities.into_iter().map(str::to_owned));
     if !CURRENT
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -374,7 +386,9 @@ async fn blockers(app: &tauri::AppHandle) -> Vec<String> {
     {
         blockers.push("frontend-not-ready".into());
     }
-    blockers
+    blockers.sort();
+    blockers.dedup();
+    snapshot
 }
 
 static ACTIVE_AUTO_BUILDS: LazyLock<Mutex< std::collections::HashSet<String>>> =
@@ -412,7 +426,6 @@ fn ensure_auto_build() {
 }
 
 async fn run_auto_build_batch(batch: crate::live_update::channel::Batch) -> Result<(), String> {
-    use tokio::io::AsyncReadExt;
     let root = PathBuf::from(&batch.source_root);
     let script = root.join("scripts/self-update-build.mjs");
     if !script.is_file() {
@@ -446,27 +459,8 @@ async fn run_auto_build_batch(batch: crate::live_update::channel::Batch) -> Resu
             "--release-id",
             &release_id,
         ])
-        .current_dir(&root)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    #[cfg(windows)]
-    command.creation_flags(0x0800_0000);
-    let mut child = command.spawn().map_err(|e| format!("spawn self-update builder failed: {e}"))?;
-    let mut stdout = child.stdout.take().ok_or("builder stdout unavailable")?;
-    let mut stderr = child.stderr.take().ok_or("builder stderr unavailable")?;
-    let status = tokio::time::timeout(Duration::from_secs(1800), child.wait())
-        .await
-        .map_err(|_| {
-            let _ = child.start_kill();
-            "self-update build timed out".to_string()
-        })?
-        .map_err(|e| format!("wait for self-update builder failed: {e}"))?;
-    let mut out_bytes = Vec::new();
-    let _ = stdout.take(1024 * 1024).read_to_end(&mut out_bytes).await;
-    let mut err_bytes = Vec::new();
-    let _ = stderr.take(64 * 1024).read_to_end(&mut err_bytes).await;
+        .current_dir(&root);
+    let (status, out_bytes, err_bytes) = run_builder_command(&mut command, Duration::from_secs(1800)).await?;
     if !status.success() {
         let err_text = String::from_utf8_lossy(&err_bytes).trim().to_string();
         return Err(if err_text.is_empty() {
@@ -487,6 +481,80 @@ async fn run_auto_build_batch(batch: crate::live_update::channel::Batch) -> Resu
         .to_string();
     prepare_self_update(package_dir, manifest_sha256, batch.owner, Some(batch.id)).await?;
     Ok(())
+}
+
+/// A build owns its compiler tree, independently of the persistent task workers.
+/// Unlike a bare Child, this also cleans descendants if this future is cancelled.
+struct BuilderTree {
+    #[cfg(windows)]
+    _job: std::sync::Arc<crate::engine::job::KillOnCloseJob>,
+    #[cfg(unix)]
+    pid: u32,
+}
+
+#[cfg(unix)]
+impl Drop for BuilderTree {
+    fn drop(&mut self) { crate::engine::kill_process_group(self.pid); }
+}
+
+async fn run_builder_command(
+    command: &mut tokio::process::Command,
+    limit: Duration,
+) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>), String> {
+    use crate::cli_lifecycle::{capture_pipe, finish_output_readers, OutputReader, OUTPUT_DRAIN_TIMEOUT};
+    command.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    crate::engine::hide_console(command);
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command.spawn().map_err(|error| format!("spawn self-update builder failed: {error}"))?;
+    #[cfg(windows)]
+    let tree = match crate::engine::job::assign_kill_on_close(&child) {
+        Some(job) => BuilderTree { _job: job },
+        None => {
+            if let Some(pid) = child.id() { crate::engine::kill_process_group(pid); }
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(OUTPUT_DRAIN_TIMEOUT, child.wait()).await;
+            return Err("self-update builder process-tree cleanup is unavailable".into());
+        }
+    };
+    #[cfg(unix)]
+    let tree = BuilderTree { pid: child.id().ok_or("builder PID unavailable")? };
+    let mut tree = Some(tree);
+    let stdout = child.stdout.take().ok_or("builder stdout unavailable")?;
+    let stderr = child.stderr.take().ok_or("builder stderr unavailable")?;
+    let mut stdout = OutputReader::spawn(capture_pipe(stdout, 1024 * 1024));
+    let mut stderr = OutputReader::spawn(capture_pipe(stderr, 64 * 1024));
+    let result = tokio::time::timeout(limit, async {
+        let status = child.wait().await.map_err(|error| format!("wait for self-update builder failed: {error}"))?;
+        // A compiler orphan can retain stdout/stderr after node exits. Sweep it
+        // before awaiting EOF, while retaining everything already in the pipes.
+        drop(tree.take());
+        let (stdout, stderr) = finish_output_readers(&mut stdout, &mut stderr, OUTPUT_DRAIN_TIMEOUT).await?;
+        Ok((status, stdout, stderr))
+    }).await;
+    match result {
+        Ok(Ok(output)) => Ok(output),
+        failure => {
+            drop(tree.take());
+            let _ = child.start_kill();
+            let reaped = tokio::time::timeout(OUTPUT_DRAIN_TIMEOUT, child.wait()).await;
+            stdout.abort_and_wait().await;
+            stderr.abort_and_wait().await;
+            let reason = match failure {
+                Err(_) => "self-update build timed out".to_string(),
+                Ok(Err(error)) => error,
+                Ok(Ok(_)) => unreachable!(),
+            };
+            match reaped {
+                Ok(Ok(_)) => Err(reason),
+                _ => Err(format!("{reason}; builder exit could not be confirmed")),
+            }
+        }
+    }
 }
 
 #[tauri::command]
@@ -510,8 +578,9 @@ pub(crate) async fn live_update_status(
 ) -> Result<Value, String> {
     main_window(&window)?;
     ensure_auto_build();
+    let snapshot = blocker_snapshot(&app).await;
     Ok(
-        json!({"supported":true,"state":store()?.read_state()?,"channel":store()?.channel_status()?,"blockers":blockers(&app).await,
+        json!({"supported":true,"state":store()?.read_state()?,"channel":store()?.channel_status()?,"blockers":snapshot.blockers,"blockerDetails":snapshot.details,
         "pendingHandoff":preserving_workers() || has_resume()}),
     )
 }
@@ -526,6 +595,7 @@ pub(crate) async fn self_update_status(
     if let Some(hash) = manifest_sha256 { validate_update_hash(hash)?; }
     ensure_auto_build();
     let state = store()?.read_state()?;
+    let snapshot = blocker_snapshot(app).await;
     Ok(json!({
         "supported": true,
         "prepareSupported": true,
@@ -539,7 +609,8 @@ pub(crate) async fn self_update_status(
         "requestedManifestSha256": manifest_sha256,
         "state": state,
         "channel": store()?.channel_status()?,
-        "blockers": blockers(app).await,
+        "blockers": snapshot.blockers,
+        "blockerDetails": snapshot.details,
         "pendingHandoff": preserving_workers() || has_resume(),
     }))
 }
@@ -655,6 +726,7 @@ async fn probe_candidate(executable:&Path, candidate:&crate::live_update::Releas
         }
         let value:Value = serde_json::from_slice(&bytes).map_err(|_| "Candidate has no compatible runtime probe")?;
         validate_candidate_probe(&value, candidate, crate::launch_protection::update_protection_required())?;
+        validate_managed_handoff_probe(&value, crate::worker_host::requires_managed_handoff())?;
         Ok(value)
     }).await;
     let value = match checked {
@@ -678,6 +750,13 @@ fn validate_candidate_probe(value: &Value, candidate: &crate::live_update::Relea
             return Err("Candidate binary differs from its declared runtime compatibility".into());
         }
         Ok(())
+}
+
+fn validate_managed_handoff_probe(value: &Value, required: bool) -> Result<(), String> {
+    if required && value["capabilities"]["managedTaskHandoff"].as_u64() != Some(1) {
+        return Err("Candidate cannot restore running managed tasks; finish them before switching to this version".into());
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -706,7 +785,8 @@ pub(crate) async fn live_update_begin(
         return Err(format!("Update is waiting: {}", found.join(", ")));
     }
     let candidate_executable = store()?.release_path(&transaction.candidate)?.join(&transaction.candidate.executable);
-    tauri::async_runtime::spawn_blocking(move || crate::launch_protection::verify_update_candidate(&candidate_executable))
+    let protected_candidate = candidate_executable.clone();
+    tauri::async_runtime::spawn_blocking(move || crate::launch_protection::verify_update_candidate(&protected_candidate))
         .await.map_err(|_| "Candidate protection check failed".to_string())??;
     let ticket = crate::host_chat::prepare_update(Duration::from_secs(15)).await?;
     if let Err(error) = crate::worker_host::quiesce().await {
@@ -718,6 +798,15 @@ pub(crate) async fn live_update_begin(
         crate::worker_host::set_paused(false);
         let _ = crate::host_chat::abort_update(&ticket);
         return Err(format!("Update is waiting: {}", found.join(", ")));
+    }
+    // Tasks admitted after staging may require a newer continuation contract.
+    // Re-probe under the drained fence before serializing their capsules.
+    if crate::worker_host::requires_managed_handoff() {
+        if let Err(error) = probe_candidate(&candidate_executable, &transaction.candidate).await {
+            crate::worker_host::set_paused(false);
+            let _ = crate::host_chat::abort_update(&ticket);
+            return Err(error);
+        }
     }
     CURRENT.lock().unwrap_or_else(|p| p.into_inner()).fence = Some((transaction_id, ticket));
     Ok(())
@@ -1042,6 +1131,7 @@ pub(crate) async fn live_update_confirm(
         .await
         .map_err(|_| "Remote relay has not recovered")?;
     }
+    crate::worker_host::restore_observers(&checkpoint.required_sources).await?;
     let found = crate::worker_host::blockers(&app.state::<crate::AppState>().processes).await;
     if !found.is_empty() {
         return Err(format!(
@@ -1214,6 +1304,17 @@ pub(crate) mod tests {
         assert!(validate_candidate_probe(&probe, &candidate, true).is_err());
     }
 
+    #[test]
+    fn running_managed_tasks_require_an_explicit_candidate_recovery_contract() {
+        let mut probe = crate::task_worker::probe();
+        assert!(validate_managed_handoff_probe(&probe, true).is_ok());
+        probe["capabilities"].as_object_mut().unwrap().remove("managedTaskHandoff");
+        assert!(validate_managed_handoff_probe(&probe, false).is_ok());
+        assert!(validate_managed_handoff_probe(&probe, true).is_err());
+        probe["capabilities"]["managedTaskHandoff"] = json!(true);
+        assert!(validate_managed_handoff_probe(&probe, true).is_err());
+    }
+
     // A real verified release/store transaction, with a deliberately non-PE
     // executable: returning this receipt must not copy or run its probe again.
     pub(crate) fn prepared_update(profile: &Path) -> (UpdateStore, Transaction) {
@@ -1373,6 +1474,12 @@ pub(crate) mod tests {
 
     #[test]
     fn offline_upgrade_requires_newer_external_launcher_and_no_workers() {
+        for schema in [crate::task_worker::SCHEMA_CONTRACT_V1_HASH, crate::task_worker::SCHEMA_CONTRACT_V2_HASH] {
+            assert_offline_upgrade_requires_newer_external_launcher_and_no_workers(schema);
+        }
+    }
+
+    fn assert_offline_upgrade_requires_newer_external_launcher_and_no_workers(schema: &str) {
         let root = std::env::temp_dir().join(format!("ccgui-offline-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
         let source = root.join("package");
@@ -1380,7 +1487,7 @@ pub(crate) mod tests {
         std::fs::write(source.join("ccgui-next.exe"), b"v1").unwrap();
         let manifest = crate::live_update::ReleaseManifest {
             manifest_version: 1, channel: "protected-custom".into(), release_id: "v1".into(), version: "1.0.0".into(),
-            worker_protocol: 1, checkpoint_schema: 1, schema_hash: crate::task_worker::SCHEMA_CONTRACT_V1_HASH.into(),
+            worker_protocol: 1, checkpoint_schema: 1, schema_hash: schema.into(),
             executable: "ccgui-next.exe".into(), files: vec![crate::live_update::ReleaseFile {
                 path: "ccgui-next.exe".into(), bytes: 2, sha256: format!("{:x}", Sha256::digest(b"v1")),
             }],
@@ -1395,9 +1502,8 @@ pub(crate) mod tests {
         let old = update.stage(&source, &hash).unwrap();
         let state_path = root.join("runtime-updates/state.json");
         let launcher = canonical(&launcher).unwrap();
-        let v1 = Compatibility { worker_protocol: 1, checkpoint_schema: 1,
-            schema_hash: crate::task_worker::SCHEMA_CONTRACT_V1_HASH.into() };
-        let first = update.prepare(old.clone(), &v1).unwrap();
+        let previous = Compatibility { worker_protocol: 1, checkpoint_schema: 1, schema_hash: schema.into() };
+        let first = update.prepare(old.clone(), &previous).unwrap();
         let assert_first_update_blocked = || {
             let pending = update.read_state().unwrap();
             assert!(pending.active.is_none());
@@ -1415,14 +1521,14 @@ pub(crate) mod tests {
         assert_first_update_blocked();
         update.record_failure_reason(&first.id, crate::live_update::FailureReason::CandidateExited).unwrap();
         update.rollback(&first.id).unwrap();
-        let retry = update.prepare(old.clone(), &v1).unwrap();
+        let retry = update.prepare(old.clone(), &previous).unwrap();
         update.ready(&retry.id).unwrap();
         update.activating(&retry.id).unwrap();
         update.confirm_healthy(&retry.id).unwrap();
         let before = update.read_state().unwrap();
         assert!(reconcile_offline_upgrade_in(&update, &launcher, &state_path, false).is_err());
         std::thread::sleep(Duration::from_millis(25));
-        std::fs::write(&launcher, b"new standalone v2").unwrap();
+        std::fs::write(&launcher, b"new standalone v3").unwrap();
         assert!(reconcile_offline_upgrade_in(&update, &launcher, &state_path, true).is_err());
         let released = canonical(&update.release_path(&old).unwrap().join("ccgui-next.exe")).unwrap();
         assert!(reconcile_offline_upgrade_in(&update, &released, &state_path, false).is_err());

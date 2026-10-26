@@ -286,10 +286,11 @@ impl AppServer {
                     return Err(format!("{label}: the codex app-server closed stdout"))
                 }
                 Ok(Ok(LineRead::TooLong)) => {
-                    // Mirrors the host reader's own terminal message: a line
-                    // this large is a stuck CLI, not an event.
+                    // A valid history response can also exceed the frame cap.
+                    // Keep the memory bound and identify the RPC being read;
+                    // size alone is not evidence of a stuck or malformed CLI.
                     return Err(format!(
-                        "codex emitted a line over {} MiB without a newline; run terminated",
+                        "ENGINE_PROTOCOL_FRAME_TOO_LARGE: {label}: codex protocol line exceeded the {} MiB limit; run terminated",
                         MAX_LINE_BYTES / (1024 * 1024),
                     ));
                 }
@@ -2242,7 +2243,10 @@ async fn handshake_and_start(
             THREAD_TIMEOUT
         };
     let (method, mut params) = match req.session_id.as_deref() {
-        Some(thread_id) => ("thread/resume", json!({ "threadId": thread_id })),
+        // History is loaded independently by the GUI. Hydrating all prior
+        // turns in this one RPC reply can exceed MAX_LINE_BYTES even when
+        // each original event is small. Keep thread/model/live-state metadata.
+        Some(thread_id) => ("thread/resume", json!({ "threadId": thread_id, "excludeTurns": true })),
         None => ("thread/start", json!({})),
     };
     let (method, deadline) = match super::sidechat::codex_spec(&core.run_id) {
@@ -2283,13 +2287,18 @@ async fn handshake_and_start(
         params["model"] = json!(model);
     }
     if !codex_read_only::requested(req) {
-        if let Some(effort) = req.effort.as_deref() {
-            if let Some(obj) = params.as_object_mut() {
-                if !obj.contains_key("config") || obj["config"].is_null() {
-                    obj.insert("config".to_string(), json!({}));
-                }
-                if let Some(config) = obj.get_mut("config").and_then(Value::as_object_mut) {
-                    config.insert("model_reasoning_effort".to_string(), json!(effort));
+        for (key, value) in [
+            ("model_reasoning_effort", req.effort.as_deref()),
+            ("service_tier", req.service_tier.as_deref()),
+        ] {
+            if let Some(value) = value {
+                if let Some(obj) = params.as_object_mut() {
+                    if !obj.contains_key("config") || obj["config"].is_null() {
+                        obj.insert("config".to_string(), json!({}));
+                    }
+                    if let Some(config) = obj.get_mut("config").and_then(Value::as_object_mut) {
+                        config.insert(key.to_string(), json!(value));
+                    }
                 }
             }
         }
@@ -2795,6 +2804,7 @@ pub(crate) async fn run_plan_decision(
             req.permission.as_deref(),
         )?;
         super::mark_leader_child(&mut built.command, &run_id);
+        super::codex::apply_child_service_tier(&mut built.command, &mut req, &run_id);
         let local=crate::auto_title::origin::local_workspace(&state.db,&review.workspace_path);
         super::mark_native_completion(&mut built.command,&run_id,"codex",&req,local,&killed);
         Ok(())
@@ -3010,6 +3020,7 @@ mod tests {
     include!("codex_app_auto_review_tests.rs");
     include!("codex_app_timeout_tests.rs");
     include!("codex_app_isolation_tests.rs");
+    include!("codex_app_history_tests.rs");
 
     #[cfg(windows)]
     #[tokio::test]

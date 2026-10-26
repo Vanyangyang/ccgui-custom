@@ -3,6 +3,7 @@ import { useTranslation } from "react-i18next";
 import { Button, Dialog, DialogTrigger, Popover } from "react-aria-components";
 import { Switch } from "@/components/base/switch/switch";
 import { menuPopoverSurface } from "@/components/base/dropdown/menu-styles";
+import { CLAUDE_HAIKU_ASSIST_ENABLED } from "../claude-haiku-assist";
 
 /** Controlled by the owning conversation, including in a split pane. */
 export function ClaudeHaikuAssistControl({ enabled, mainModel, runningEnabled, onChange }: {
@@ -13,6 +14,7 @@ export function ClaudeHaikuAssistControl({ enabled, mainModel, runningEnabled, o
 }) {
   const { t } = useTranslation();
   const descriptionId = useId();
+  if (!CLAUDE_HAIKU_ASSIST_ENABLED) return null;
   const mode = t(enabled ? "chat.haikuAssistOn" : "chat.haikuAssistOff");
   const pending = runningEnabled !== undefined && runningEnabled !== enabled;
   const model = t("chat.haikuAssistMainModel", { model: mainModel || t("chat.haikuAssistDefaultModel") });

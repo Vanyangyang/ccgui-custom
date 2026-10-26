@@ -1,6 +1,141 @@
 use super::*;
+#[path = "message_routing_tests.rs"]
+mod message_routing_tests;
+#[path = "session_sidebar_tests.rs"]
+mod session_sidebar_tests;
+
+#[test]
+fn managed_plugin_ipc_rejects_unknown_relay_requests() {
+    assert!(require_live_plugin_request(None).is_ok());
+    assert!(require_live_plugin_request(Some("not-an-admitted-plugin-request")).unwrap_err().contains("no mutation was started"));
+}
 use serde_json::json;
 use tokio::sync::mpsc;
+
+fn organization_save_args() -> Value {
+    let path = std::env::temp_dir().to_string_lossy().into_owned();
+    json!({"requestId":"organize-1", "name":"Custom grouping", "defaultPath":path,
+        "members":[{"path":path,"label":"Free-form label"}]})
+}
+
+#[test]
+fn organization_tools_have_strict_role_free_inputs_and_no_privileged_operations() {
+    assert!(validate_arguments("get_workspace_organization", json!({})).is_ok());
+    assert!(validate_arguments("get_workspace_organization", json!({"settings":true})).is_err());
+    assert!(validate_arguments("save_workspace_project", organization_save_args()).is_ok());
+    for field in ["sourcePluginId", "sourceKey", "sender", "role", "permission"] {
+        let mut args = organization_save_args(); args[field] = json!("forged");
+        assert!(validate_arguments("save_workspace_project", args).is_err());
+    }
+    for field in ["role", "canonicalIdentity", "status", "sourcePluginId"] {
+        let mut args = organization_save_args(); args["members"][0][field] = json!("forged");
+        assert!(validate_arguments("save_workspace_project", args).is_err());
+    }
+    let mut missing_fingerprint = organization_save_args(); missing_fingerprint["id"] = json!("existing");
+    assert!(validate_arguments("save_workspace_project", missing_fingerprint).is_err());
+    let mut bad = organization_save_args(); bad["requestId"] = json!("bad id");
+    assert!(validate_arguments("save_workspace_project", bad).is_err());
+    assert!(validate_arguments("remove_workspace_project", json!({"id":"p"})).is_err());
+    assert!(!requires_saved_session("get_workspace_organization"));
+    assert!(requires_saved_session("save_workspace_project"));
+    let tools = mcp::HostChatServer::tool_router().list_all();
+    for name in ["get_workspace_organization", "save_workspace_project"] {
+        let tool = tools.iter().find(|t| t.name == name).unwrap();
+        assert_eq!(tool.input_schema["additionalProperties"], false);
+        assert!(tool.input_schema.get("properties").and_then(|properties| properties.get("sourcePluginId")).is_none());
+    }
+    assert!(with_workspace_request("plugin-window", "r", "save_workspace_project", |_, _| Ok(())).unwrap_err().contains("main window"));
+}
+
+#[test]
+fn organization_tools_require_the_host_capability_including_older_hosts() {
+    use rmcp::ServerHandler;
+    assert_eq!(mcp::startup_capabilities(Ok(json!({"taskTools":false}))).unwrap(), (false, false, false, false));
+    assert_eq!(mcp::startup_capabilities(Ok(json!({"taskTools":false,"workspaceOrganization":true}))).unwrap(), (false, false, false, true));
+    for workspace_organization in [false, true] {
+        let server = mcp::HostChatServer { session_sidebar_organization: false, self_update_only: false, workspace_organization, plugin_management:false, task_tools:false, self_update:false,
+            relay:RelayClient::new("http://127.0.0.1:12345/host-chat", uuid::Uuid::new_v4().to_string()).unwrap() };
+        for name in ["get_workspace_organization", "save_workspace_project"] {
+            assert_eq!(server.get_tool(name).is_some(), workspace_organization);
+        }
+    }
+}
+
+#[tokio::test]
+async fn organization_native_gate_binds_arguments_method_and_live_origin() {
+    let (relay, mut events, token) = fixture(REQUEST_TIMEOUT);
+    relay.set_ready(true).unwrap();
+    let args = organization_save_args();
+    let call = dispatch(&relay, &token, "save_workspace_project", args.clone());
+    let event = request(events.recv().await.unwrap());
+    let value = relay.with_workspace_request(&event.request_id, "save_workspace_project", |scope, admitted| {
+        assert!(scope.contains("source-session-id"));
+        assert_eq!(*admitted, validate_arguments("save_workspace_project", args).unwrap());
+        Ok(json!({"saved":true}))
+    }).unwrap();
+    assert!(relay.with_workspace_request(&event.request_id, "get_workspace_organization", |_, _| Ok(())).is_err());
+    assert!(relay.with_workspace_request("unknown", "save_workspace_project", |_, _| Ok(())).is_err());
+    relay.respond(&event.request_id, Some(value), None).unwrap();
+    assert!(call.await.unwrap().is_ok());
+    assert!(relay.with_workspace_request(&event.request_id, "save_workspace_project", |_, _| Ok(())).is_err());
+
+    let call = dispatch(&relay, &token, "save_workspace_project", organization_save_args());
+    let event = request(events.recv().await.unwrap());
+    relay.inner.lock().pending.get_mut(&event.request_id).unwrap().deadline = Instant::now() - Duration::from_secs(1);
+    let mut executed = false;
+    assert!(relay.with_workspace_request(&event.request_id, "save_workspace_project", |_, _| { executed = true; Ok(()) }).is_err());
+    assert!(!executed);
+    relay.finish("trusted-run");
+    let _ = call.await;
+}
+
+#[tokio::test]
+async fn organization_read_allows_unsaved_origin_but_save_does_not() {
+    let (relay, mut events, _) = fixture(REQUEST_TIMEOUT);
+    let token = relay.register("unsaved-organization", "codex", None, "workspace").unwrap();
+    relay.set_ready(true).unwrap();
+    let call = dispatch(&relay, &token, "get_workspace_organization", json!({}));
+    let event = request(events.recv().await.unwrap());
+    relay.with_workspace_request(&event.request_id, "get_workspace_organization", |_, _| Ok(())).unwrap();
+    relay.respond(&event.request_id, Some(json!({"projects":[]})), None).unwrap();
+    assert!(call.await.unwrap().is_ok());
+    assert_eq!(relay.dispatch(&token, "save_workspace_project".into(), organization_save_args()).await.unwrap_err().status, StatusCode::CONFLICT);
+    assert!(events.try_recv().is_err());
+}
+
+#[test]
+fn worker_context_managed_child_requires_exact_run_and_nonempty_branch() {
+    let mut context = WorkerHostContext {
+        profile: PathBuf::from("fixture-profile"), run_id: "worker-run".into(),
+        engine: "claude".into(), session_id: Some("worker-session".into()),
+        workspace_path: "fixture-workspace".into(), managed_task_parent: true,
+        managed_branch_id: None, server_config: Value::Null,
+    };
+    // Owning task tools does not make an ordinary root a child.
+    assert!(!context.is_managed_child("worker-run"));
+    for owns_tasks in [false, true] {
+        context.managed_task_parent = owns_tasks;
+        context.managed_branch_id = Some("child-branch".into());
+        assert!(context.is_managed_child("worker-run"));
+        assert!(!context.is_managed_child("other-run"));
+        assert!(!context.is_managed_child("worker-run-c1"));
+    }
+    for empty in ["", " \t\n"] {
+        context.managed_branch_id = Some(empty.into());
+        assert!(!context.is_managed_child("worker-run"));
+    }
+}
+
+#[test]
+fn worker_context_legacy_capsule_without_branch_is_not_managed_child() {
+    let context: WorkerHostContext = serde_json::from_value(json!({
+        "profile":"fixture-profile", "runId":"legacy-worker", "engine":"claude",
+        "sessionId":"legacy-session", "workspacePath":"fixture-workspace",
+        "managedTaskParent":true, "serverConfig":null
+    })).unwrap();
+    assert!(context.managed_branch_id.is_none());
+    assert!(!context.is_managed_child("legacy-worker"));
+}
 
 fn fixture(timeout: Duration) -> (Arc<Relay>, mpsc::UnboundedReceiver<RelayEvent>, String) {
     let (tx, rx) = mpsc::unbounded_channel();
@@ -89,9 +224,9 @@ async fn startup_capabilities_are_authenticated_internal_and_need_no_saved_sessi
         // Startup does not depend on the frontend being ready or session adoption.
         let server = HttpServer::start(relay.clone()).await;
         assert_eq!(server.client(&token).call("get_host_capabilities", json!({})).await.unwrap(),
-            json!({"taskTools":false, "selfUpdate":false}));
+            json!({"taskTools":false, "selfUpdate":false, "pluginManagement":true, "workspaceOrganization":true, "sessionSidebarOrganization":true}));
         assert_eq!(server.client(&ccgui_token).call("get_host_capabilities", json!({})).await.unwrap(),
-            json!({"taskTools":false, "selfUpdate":true}));
+            json!({"taskTools":false, "selfUpdate":true, "pluginManagement":true, "workspaceOrganization":true, "sessionSidebarOrganization":true}));
         assert!(events.try_recv().is_err());
         assert!(relay.inner.lock().transport.is_empty());
         assert_eq!(relay.dispatch("forged-token", "get_host_capabilities".into(), json!({})).await.unwrap_err().status,
@@ -112,7 +247,7 @@ fn tool_publication_and_guidance_follow_trusted_capabilities() {
     use rmcp::ServerHandler;
     for task_tools in [false, true] {
         for self_update in [false, true] {
-            let server = mcp::HostChatServer { task_tools, self_update,
+            let server = mcp::HostChatServer { session_sidebar_organization: false, self_update_only: false, workspace_organization: false, plugin_management: false, task_tools, self_update,
                 relay: RelayClient::new("http://127.0.0.1:12345/host-chat", uuid::Uuid::new_v4().to_string()).unwrap() };
             let tools = server.visible_tools().list_all();
             assert_eq!(tools.iter().filter(|tool| tool.name.starts_with("task_")).count(), if task_tools { 6 } else { 0 });
@@ -147,8 +282,73 @@ fn startup_capabilities_require_the_current_authenticated_contract() {
     assert!(mcp::startup_capabilities(Err("Host chat token is missing or expired".into())).is_err());
     assert!(mcp::startup_capabilities(Err("transport outcome is unknown".into())).is_err());
     assert!(mcp::startup_capabilities(Ok(json!({"leaderMode":true, "selfUpdate":true}))).is_err());
-    assert_eq!(mcp::startup_capabilities(Ok(json!({"taskTools":true, "selfUpdate":true}))).unwrap(), (true, true));
-    assert_eq!(mcp::startup_capabilities(Ok(json!({"taskTools":true, "selfUpdate":false}))).unwrap(), (true, false));
+    assert_eq!(mcp::startup_capabilities(Ok(json!({"taskTools":true, "selfUpdate":true}))).unwrap(), (true, true, false, false));
+    assert_eq!(mcp::startup_capabilities(Ok(json!({"taskTools":true, "selfUpdate":false}))).unwrap(), (true, false, false, false));
+}
+
+#[test]
+fn plugin_tools_are_strict_camel_case_and_capability_gated() {
+    let path = std::env::current_dir().unwrap().to_string_lossy().into_owned();
+    let install = json!({"path":path,"expectedId":"test-plugin","expectedVersion":"1.2.3"});
+    assert_eq!(validate_arguments("install_plugin", install.clone()).unwrap(), install);
+    assert!(validate_arguments("list_plugins", json!({})).is_ok());
+    assert!(validate_arguments("list_plugins", json!({"id":"test-plugin"})).is_err());
+    assert!(validate_arguments("get_plugin_status", json!({"id":"test-plugin","sourcePath":path})).is_ok());
+    for id in ["", "a", "-plugin", "Bad-plugin", "plugin_id", &"a".repeat(65)] {
+        assert!(validate_arguments("get_plugin_status", json!({"id":id})).is_err());
+    }
+    for version in ["", "1.2", "1.2.3-beta", "v1.2.3", "1.2.٣"] {
+        assert!(validate_arguments("reload_plugin", json!({"id":"test-plugin","expectedVersion":version})).is_err());
+    }
+    for bad_path in ["relative/plugin", "C:relative", "https://example.com/plugin", "file:///plugin", "", &"a".repeat(4097)] {
+        assert!(validate_arguments("install_plugin", json!({"path":bad_path,"expectedId":"test-plugin","expectedVersion":"1.2.3"})).is_err());
+        assert!(validate_arguments("get_plugin_status", json!({"id":"test-plugin","sourcePath":bad_path})).is_err());
+    }
+    assert!(validate_arguments("install_plugin", json!({"path":path,"expected_id":"test-plugin","expectedVersion":"1.2.3"})).is_err());
+    assert!(validate_arguments("reload_plugin", json!({"id":"test-plugin","expectedVersion":"1.2.3","enabled":true})).is_err());
+    for plugin_management in [false, true] {
+        let server = mcp::HostChatServer { session_sidebar_organization: false, self_update_only: false, workspace_organization: false, plugin_management, task_tools:false, self_update:false,
+            relay:RelayClient::new("http://127.0.0.1:12345/host-chat", uuid::Uuid::new_v4().to_string()).unwrap() };
+        assert_eq!(server.visible_tools().list_all().iter().filter(|tool| is_plugin_method(&tool.name)).count(), if plugin_management { 4 } else { 0 });
+    }
+    assert_eq!(mcp::startup_capabilities(Ok(json!({"taskTools":false,"pluginManagement":true}))).unwrap(), (false,false,true,false));
+    for tool in mcp::HostChatServer::tool_router().list_all().iter().filter(|tool| is_plugin_method(&tool.name)) {
+        assert_eq!(tool.input_schema["additionalProperties"], false);
+        if tool.name == "install_plugin" {
+            assert_eq!(tool.input_schema["properties"]["path"]["maxLength"], 4096);
+            assert_eq!(tool.input_schema["properties"]["expectedId"]["pattern"], "^[a-z0-9][a-z0-9-]{1,63}$");
+            assert!(tool.input_schema["properties"].get("expectedVersion").is_some());
+        }
+    }
+    assert!(!requires_saved_session("list_plugins"));
+    assert!(!requires_saved_session("get_plugin_status"));
+    assert!(requires_saved_session("install_plugin"));
+    assert!(requires_saved_session("reload_plugin"));
+}
+
+#[tokio::test]
+async fn plugin_relay_queries_work_without_saved_session_but_mutations_require_one() {
+    let (relay, mut events, _) = fixture(REQUEST_TIMEOUT);
+    let token = relay.register("unsaved-plugin-run", "claude", None, "G:\\ordinary-workspace").unwrap();
+    relay.set_ready(true).unwrap();
+    for (method, args) in [("list_plugins", json!({})), ("get_plugin_status", json!({"id":"test-plugin"}))] {
+        let call = dispatch(&relay, &token, method, args.clone());
+        let event = request(events.recv().await.unwrap());
+        assert_eq!(event.method, method);
+        assert_eq!(event.arguments, args);
+        assert!(relay.request_is_live(&event.request_id));
+        relay.respond(&event.request_id, Some(json!({"ok":true})), None).unwrap();
+        assert_eq!(call.await.unwrap().unwrap(), json!({"ok":true}));
+        assert!(!relay.request_is_live(&event.request_id));
+    }
+    for (method, args) in [
+        ("install_plugin", json!({"path":std::env::temp_dir(),"expectedId":"test-plugin","expectedVersion":"1.2.3"})),
+        ("reload_plugin", json!({"id":"test-plugin","expectedVersion":"1.2.3"})),
+    ] {
+        let error = relay.dispatch(&token, method.into(), args).await.unwrap_err();
+        assert_eq!(error.status, StatusCode::CONFLICT);
+    }
+    assert!(events.try_recv().is_err());
 }
 
 #[test]
@@ -177,7 +377,7 @@ fn self_update_tools_publish_camel_case_schema_and_reject_unsafe_arguments() {
     assert_eq!(prepare.input_schema["properties"]["manifestSha256"]["pattern"], "^[0-9a-f]{64}$");
     assert_eq!(prepare.input_schema["properties"]["packageDir"]["maxLength"], 4096);
     assert!(tools.iter().any(|tool| tool.name == "get_self_update_status"));
-    let server = mcp::HostChatServer { task_tools: false, self_update: true, relay: RelayClient::new("http://127.0.0.1:12345/host-chat", uuid::Uuid::new_v4().to_string()).unwrap() };
+    let server = mcp::HostChatServer { session_sidebar_organization: false, self_update_only: false, workspace_organization: false, plugin_management: false, task_tools: false, self_update: true, relay: RelayClient::new("http://127.0.0.1:12345/host-chat", uuid::Uuid::new_v4().to_string()).unwrap() };
     assert!(server.get_info().instructions.unwrap().contains("ccgui-self-update"));
 }
 
@@ -1070,7 +1270,7 @@ fn ledger_window_key_and_serialized_bounds_and_plugin_namespace_isolation() {
 #[test]
 fn rmcp_handler_and_tool_schema_compile() {
     use rmcp::ServerHandler;
-    let server = mcp::HostChatServer {
+    let server = mcp::HostChatServer { session_sidebar_organization: false, self_update_only: false, workspace_organization: false, plugin_management: false,
         task_tools: false,
         self_update: false,
         relay: RelayClient::new(
@@ -1106,10 +1306,15 @@ fn published_task_tools_preserve_delegation_without_model_deletion() {
     assert!(!tools.iter().any(|tool| tool.name.starts_with("leader_")));
     let spawn = tools.iter().find(|tool| tool.name == "task_spawn").unwrap();
     let description = spawn.description.as_deref().unwrap();
-    assert!(description.contains("same workspace files"));
+    assert!(description.contains("same workspace share files"));
+    assert!(description.contains("same registered project as the native parent"));
     assert!(!description.contains("enabled Leader mode"));
     assert!(description.contains("Completed children retain their conversation and results"));
     let properties = spawn.input_schema.get("properties").unwrap();
+    assert!(properties["workspace_path"]["description"].as_str().unwrap().contains("development members"));
+    assert!(!spawn.input_schema["required"].as_array().unwrap().contains(&json!("workspace_path")));
+    assert!(properties.get("parent_workspace_path").is_none());
+    assert!(properties.get("project_id").is_none());
     assert!(properties["task"]["description"]
         .as_str().unwrap().contains("cannot see this conversation"));
     let model_description = properties["model"]["description"].as_str().unwrap();
@@ -1135,6 +1340,6 @@ fn published_task_tools_preserve_delegation_without_model_deletion() {
     let wait = tools.iter().find(|tool| tool.name == "task_wait").unwrap();
     let description = wait.description.as_deref().unwrap();
     assert!(description.contains("during this call (listed in changedBranchIds)"));
-    assert!(description.contains("children already finished when the call starts do not end the wait"));
+    assert!(description.contains("assignments already finished when the call starts do not end a wait for other active assignments"));
     assert!(description.contains("call again while you still need results"));
 }

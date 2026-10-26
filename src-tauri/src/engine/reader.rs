@@ -34,9 +34,9 @@ pub(crate) const READER_SETTLE_GRACE: std::time::Duration = std::time::Duration:
 /// of parking on the grandchild forever (which leaked the run's registry
 /// entries — ps shows no process, yet the concurrency gate stays full).
 pub(crate) const POST_EXIT_DRAIN: std::time::Duration = std::time::Duration::from_millis(200);
-/// Hard cap on one NDJSON line from an engine. Real events are kilobytes;
-/// `BufReader::lines` has no limit, so a runaway engine writing without
-/// newlines would buffer the line whole and OOM the host.
+/// Hard cap on one NDJSON line from an engine. Callers should omit or paginate
+/// large histories. `BufReader::lines` has no limit, so oversized frames or a
+/// runaway engine writing without newlines could exhaust host memory.
 pub(crate) const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 /// How long a claude CLI may take to exit after its turn's Done before the
 /// reader treats it as still working (a background subagent) and shows a new
@@ -190,6 +190,8 @@ fn agy_stderr_warnings(stderr: &str) -> Vec<String> {
 }
 /// Mutable per-run streaming state shared by the reader loop's dispatch.
 pub(crate) struct TurnState {
+    /// Host timestamp captured before spawning the native request process.
+    request_started_at: Option<i64>,
     seq: u64,
     pub(crate) native_session_id: Option<String>,
     pub(crate) saw_done: bool,
@@ -232,6 +234,7 @@ pub(crate) struct TurnState {
 impl TurnState {
     pub(crate) fn new(preassigned: Option<String>) -> Self {
         Self {
+            request_started_at: None,
             seq: 0,
             native_session_id: preassigned,
             saw_done: false,
@@ -459,6 +462,7 @@ impl TurnCore {
                 super::sidechat::register_owned_session(&self.run_id, id, self.db.as_deref())
             });
             if let Err(error) = validation {
+                crate::host_chat::revoke_run(&self.run_id);
                 self.dispatch_event(state, EngineEvent::Error(error));
                 let registry = Arc::clone(&self.registry);
                 let run_id = self.run_id.clone();
@@ -466,6 +470,7 @@ impl TurnCore {
                 return false;
             }
             state.native_session_id = Some(id.to_string());
+            crate::host_chat::adopt_session(&self.run_id, id);
             if announce {
                 let run_id = self.current_run_id(state);
                 state.push(
@@ -1048,7 +1053,26 @@ impl TurnCore {
                     if !self.adopt_session_id(state, &id, false) { return; }
                 }
                 if let (Some(db), Some(sid)) = (&self.db, state.native_session_id.as_deref()) {
-                    crate::history::reader::refresh_session_prompt_cache(db, &self.engine_id, sid);
+                    if self.engine_id == "cursor" {
+                        let killed = self.registry.get(&self.run_id)
+                            .is_some_and(|entry| entry.killed.load(std::sync::atomic::Ordering::SeqCst));
+                        let observed_at = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
+                        if let Some(started_at) = state.request_started_at
+                            .filter(|start| !killed && *start > 0 && observed_at >= *start)
+                        {
+                            let window = crate::history::prompt_cache::CacheWindow {
+                                ttl_seconds: 300, started_at, observed_at,
+                                source: "cursor-policy".into(), reference: None,
+                            };
+                            match crate::history::prompt_cache::set(&db.0.lock(), "cursor", sid, Some(&window)) {
+                                Ok(()) => self.sink.emit_sessions_changed(),
+                                Err(error) => eprintln!("[prompt-cache] persist Cursor policy: {error}"),
+                            }
+                        }
+                    } else {
+                        crate::history::reader::refresh_session_prompt_cache(db, &self.engine_id, sid);
+                    }
                 }
                 self.settle_tasks(state, "unknown");
                 // Done is the native run's settle: only an Activity seen after
@@ -1096,6 +1120,7 @@ fn opens_turn(event: &EngineEvent) -> bool {
 }
 /// Everything the stdout reader task needs (moved in at spawn).
 pub(crate) struct RunContext {
+    pub(crate) request_started_at: Option<i64>,
     pub(crate) core: TurnCore,
     pub(crate) engine_impl: Box<dyn Engine>,
     pub(crate) pid: u32,
@@ -1242,7 +1267,7 @@ pub(crate) enum LineRead {
     Line(Vec<u8>),
     /// Clean EOF.
     Eof,
-    /// No newline within MAX_LINE_BYTES: the run must be torn down.
+    /// A line exceeds MAX_LINE_BYTES (even valid JSON): tear down the run.
     TooLong,
 }
 /// Cancellation-safe replacement for `BufReader::lines().next_line()` with a
@@ -1291,6 +1316,7 @@ pub(crate) async fn read_line_capped(
 /// registry cleanup, temp-file cleanup, and the terminal done/error event.
 pub(crate) async fn run_reader(stdout: ChildStdout, ctx: RunContext) {
     let mut state = TurnState::new(ctx.preassigned_session_id.clone());
+    state.request_started_at = ctx.request_started_at;
     if let Some(model) = ctx.initial_model.clone() {
         ctx.dispatch_event(&mut state, EngineEvent::Model(model));
     }
@@ -1394,13 +1420,13 @@ pub(crate) async fn run_reader(stdout: ChildStdout, ctx: RunContext) {
             Ok(LineRead::Line(bytes)) => bytes,
             Ok(LineRead::Eof) => break,
             Ok(LineRead::TooLong) => {
-                // A line this large is never a real event — the engine is
-                // stuck writing garbage. Settle the turn as a terminal
-                // error; dispatch also kills the process tree off-thread.
+                // Size alone does not prove malformed output. Settle as a
+                // bounded transport error; dispatch also kills the process
+                // tree off-thread instead of allocating an unbounded frame.
                 ctx.dispatch_event(
                     &mut state,
                     EngineEvent::Error(format!(
-                        "{} emitted a line over {} MiB without a newline; run terminated",
+                        "ENGINE_PROTOCOL_FRAME_TOO_LARGE: {} protocol line exceeded the {} MiB limit; run terminated",
                         ctx.core.engine_id,
                         MAX_LINE_BYTES / (1024 * 1024),
                     )),
@@ -1696,6 +1722,7 @@ mod staging_tests {
             let mut child = command.spawn().unwrap();
             child.wait().await.unwrap();
             let ctx = RunContext {
+                request_started_at: None,
                 core: TurnCore {
                     sink: event_sink::EventSink::new(Arc::new(Noop)),
                     registry: Arc::new(ProcessRegistry::default()),
@@ -1765,6 +1792,7 @@ mod staging_tests {
         registry.insert("run-abort".into(), entry.clone());
         registry.insert_alias("session-abort".into(), entry);
         let ctx = RunContext {
+            request_started_at: None,
             core: TurnCore {
                 sink: event_sink::EventSink::new(Arc::new(Noop)),
                 registry: Arc::clone(&registry),
@@ -1855,6 +1883,49 @@ mod staging_tests {
 #[cfg(test)]
 mod terminal_event_tests {
     use super::*;
+    use crate::engine::ChildEntry;
+    use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn cursor_prompt_cache_records_only_successful_native_completion() {
+        for outcome in ["success", "error", "killed", "missing-start"] {
+            let db = Arc::new(crate::db::Db::open_at(std::path::Path::new(":memory:")).unwrap());
+            let collector = Arc::new(Collector::default());
+            let registry = Arc::new(ProcessRegistry::default());
+            registry.insert("cursor-cache-run".into(), ChildEntry {
+                child: None, pid: 0, run_id: "cursor-cache-run".into(),
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(outcome == "killed")),
+                reader_abort: Arc::new(std::sync::OnceLock::new()), stdin: None,
+                questions: Arc::new(Mutex::new(HashMap::new())),
+                plans: Arc::new(Mutex::new(HashMap::new())),
+                native_tasks: Default::default(), codex_control: None,
+            });
+            let core = TurnCore {
+                sink: event_sink::EventSink::new(collector.clone()), registry,
+                engine_id: "cursor".into(), run_id: "cursor-cache-run".into(), db: Some(db.clone()),
+            };
+            let mut state = TurnState::new(Some("cursor-cache-session".into()));
+            let started_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64 - 60_000;
+            if outcome != "missing-start" { state.request_started_at = Some(started_at); }
+            if outcome == "error" { core.dispatch_event(&mut state, EngineEvent::Error("failed".into())); }
+            core.dispatch_event(&mut state, EngineEvent::Done { session_id: None, usage: None });
+            let before = crate::history::prompt_cache::load_all(&db.0.lock()).unwrap();
+            if outcome == "success" {
+                let window = &before["cursor:cursor-cache-session"];
+                assert_eq!(window.ttl_seconds, 300);
+                assert_eq!(window.started_at, started_at);
+                assert!(window.observed_at >= started_at + 60_000);
+                assert_eq!(window.source, "cursor-policy");
+                assert!(collector.1.lock().unwrap().iter().any(|name| name == event_sink::SESSIONS_CHANGED_EVENT));
+                assert_eq!(window.heat(started_at + 299_999), "hot");
+                assert_eq!(window.heat(window.observed_at + 300_000), "cold");
+            } else { assert!(before.is_empty(), "{outcome}"); }
+            state.request_started_at = Some(started_at + 1);
+            core.dispatch_event(&mut state, EngineEvent::Done { session_id: None, usage: None });
+            assert_eq!(crate::history::prompt_cache::load_all(&db.0.lock()).unwrap(), before);
+        }
+    }
 
     #[derive(Default)]
     struct Collector(Mutex<Vec<Value>>, Mutex<Vec<String>>);
@@ -1892,6 +1963,7 @@ mod terminal_event_tests {
             assert_eq!(child.wait().await.unwrap().code(), Some(exit_code));
             let collector = Arc::new(Collector::default());
             let ctx = RunContext {
+                request_started_at: None,
                 core: TurnCore {
                     sink: event_sink::EventSink::new(collector.clone()),
                     registry: Arc::new(ProcessRegistry::default()),
@@ -2248,6 +2320,7 @@ mod terminal_event_tests {
                 },
             );
             let context = RunContext {
+                request_started_at: None,
                 core: TurnCore {
                     sink: sink.clone(),
                     registry: registry.clone(),

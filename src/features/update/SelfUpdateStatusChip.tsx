@@ -22,11 +22,17 @@ export const LIVE_UPDATE_BLOCKER_KEYS: Record<string, string> = {
   "auto-title-pending": "autoTitle",
   "worker-unavailable": "workerUnavailable",
   "worker-journal-fault": "workerJournal",
+  "worker-coordinator-fault": "workerCoordinator",
+  "worker-stop-pending": "workerStopping",
+  "worker-task-starting": "workerTaskStarting",
   "schema-incompatible": "schema",
   "frontend-not-ready": "frontend",
   "unsaved-editor-drafts": "editorDrafts",
   "file-read-in-progress": "fileRead",
   "plugin-view-without-checkpoint": "pluginView",
+  "plugin-window-without-checkpoint": "pluginWindow",
+  "plugin-update-close-failed": "pluginUpdateClose",
+  "plugin-update-close-timeout": "pluginUpdateCloseTimeout",
   "layout-resize-in-progress": "layout",
   "participant-unavailable": "frontend",
   "checkpoint-not-restored": "frontend",
@@ -37,14 +43,22 @@ export const LIVE_UPDATE_BLOCKER_KEYS: Record<string, string> = {
   "open-dialog": "dialog",
   "plugin-install-in-progress": "pluginInstall",
   "plugin-loading": "pluginLoading",
+  "plugin-maintenance": "pluginMaintenance",
   chat: "chatOperation",
 };
 
 export function formatLiveUpdateBlocker(t: TFunction, blocker: LiveUpdateBlocker): string {
   const key = LIVE_UPDATE_BLOCKER_KEYS[blocker.reason.split(":", 1)[0]];
-  return key
+  const reason = key
     ? t(`settings.liveUpdateBlockers.${key}`)
     : t("settings.liveUpdateUnknownBlocker", { reason: blocker.reason });
+  const details = [reason];
+  if (blocker.engine) details.push(t("settings.liveUpdateBlockerEngine", { engine: blocker.engine }));
+  if (blocker.sessionId) details.push(t("settings.liveUpdateBlockerSession", { session: blocker.sessionId }));
+  if (blocker.runId) details.push(t("settings.liveUpdateBlockerRun", { run: blocker.runId }));
+  if (blocker.state) details.push(t(`settings.liveUpdateBlockerStates.${blocker.state}`));
+  if (blocker.detail) details.push(blocker.detail);
+  return details.join(" · ");
 }
 
 export type SelfUpdateVisualKind =

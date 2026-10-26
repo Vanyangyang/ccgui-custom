@@ -22,8 +22,10 @@ import { useSelfDevWorkspace } from "@/features/update/use-self-dev-workspace";
 import { IS_CUSTOM_DISTRIBUTION } from "@/version/distribution";
 import { ROW } from "./CliChannelRow";
 import { GrantedRootsCard } from "./GrantedRootsCard";
+import { ImagePreviewGrantsSettings } from "@/features/image-preview/ImagePreviewGrantsSettings";
 import { GroupNameEditor, GroupRow } from "./WorkspaceGroupRow";
 import { WorkspaceProjectsCard } from "./WorkspaceProjectsCard";
+import { ProjectViewsCard } from "@/features/projects/ProjectViewsCard";
 
 /**
  * 工作区二级分类 settings: group CRUD (create / rename / drag-reorder /
@@ -147,6 +149,7 @@ export function WorkspacesSection() {
 
   return (
     <div className="flex w-full flex-col gap-6">
+      <ProjectViewsCard workspaces={workspaces} />
       {error && (
         <p role="alert" className="text-body-regular text-text-error-primary">
           {t("common.error")}: {error}
@@ -320,6 +323,7 @@ export function WorkspacesSection() {
       )}
 
       <GrantedRootsCard onError={reportFailure} onClearError={clearError} />
+      <ImagePreviewGrantsSettings />
     </div>
   );
 }

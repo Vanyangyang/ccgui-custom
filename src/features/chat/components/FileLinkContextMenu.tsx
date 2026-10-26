@@ -5,7 +5,7 @@ import Link2 from "lucide-react/dist/esm/icons/link-2";
 import { ContextMenu, type ContextMenuEntry } from "@/components/context-menu";
 import { ipc } from "@/lib/ipc";
 import { useFilesStore } from "@/features/files/store";
-import { resolveChatFileLink } from "@/features/chat/file-link-resolution";
+import { resolveChatProjectFileLink } from "@/features/chat/project-file-links";
 import {
   OPEN_APP_ICONS,
   OPEN_APP_TARGETS,
@@ -68,7 +68,7 @@ export function FileLinkContextMenu({
   // whose file sits nested below the workspace root would otherwise open
   // nothing. Resolving can reject only by returning null, so `act` is total.
   const act = (run: (path: string) => void) => {
-    void resolveChatFileLink(menu.path, menu.workspacePath).then((path) => {
+    void resolveChatProjectFileLink(menu.path, menu.workspacePath).then((path) => {
       if (path) run(path);
     });
   };

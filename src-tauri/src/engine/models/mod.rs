@@ -48,12 +48,22 @@ mod pi;
 mod qoder;
 mod wsl;
 
+#[cfg(all(test, windows))]
+mod process_tests;
+
 /// Claude launch-time model resolution: picker alias → the custom id its
 /// ANTHROPIC_DEFAULT_<FAMILY>_MODEL override maps to (pass-through when
 /// unmapped), so the request carries the model the picker displayed even
 /// when the CLI build skips its own env remap.
 pub(crate) fn resolve_claude_launch_model(selector: &str) -> String {
     claude::resolve_launch_model(selector)
+}
+
+pub(crate) fn resolve_claude_discussion_model(selector: &str) -> String {
+    let settings = crate::settings::read_settings().unwrap_or_default();
+    let bin = super::engine_bin(&settings, "claude");
+    let bin_path = super::resolve::find_cli_binary("claude", Some(&bin));
+    claude::resolve_discussion_model(selector, bin_path.as_deref())
 }
 
 pub(crate) fn is_claude_alias(selector: &str) -> bool {
@@ -70,17 +80,33 @@ const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 /// lossy UTF-8 on success. `probe` names the subcommand in error messages
 /// ("models --json").
 pub(super) async fn run_probe(bin: &str, args: &[&str], probe: &str) -> Result<String, String> {
+    run_configured_probe(bin, args, probe, |_| {}).await
+}
+
+async fn run_configured_probe(
+    bin: &str,
+    args: &[&str],
+    probe: &str,
+    configure: impl FnOnce(&mut tokio::process::Command),
+) -> Result<String, String> {
     let mut cmd = super::command_for_binary(bin);
     crate::proxy::configure_cursor_command_proxy(&mut cmd);
+    configure(&mut cmd);
     for arg in args {
         cmd.arg(arg);
     }
-    // A timed-out probe must not outlive its budget: kill_on_drop kills the
-    // child with the handle instead of leaking a half-finished CLI.
-    cmd.kill_on_drop(true);
+    // Match output()'s stdio defaults while retaining the child for Job assignment.
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
     #[cfg(windows)]
     super::hide_console(&mut cmd);
-    let output = tokio::time::timeout(PROBE_TIMEOUT, cmd.output())
+    let child = cmd.spawn().map_err(|e| format!("failed to run {bin}: {e}"))?;
+    // Keep descendants owned even if a wrapper exits before its output closes.
+    #[cfg(windows)]
+    let _job = super::job::assign_kill_on_close(&child);
+    let output = tokio::time::timeout(PROBE_TIMEOUT, child.wait_with_output())
         .await
         .map_err(|_| format!("{bin} {probe} timed out"))?
         .map_err(|e| format!("failed to run {bin}: {e}"))?;
@@ -348,9 +374,7 @@ async fn agy_catalog() -> EngineCatalog {
 }
 
 async fn cursor_catalog() -> EngineCatalog {
-    let settings = crate::settings::read_settings().unwrap_or_default();
-    let bin = super::engine_bin(&settings, "cursor");
-    cursor::cursor_catalog(&bin).await
+    cursor::cursor_catalog().await
 }
 
 async fn opencode_catalog() -> EngineCatalog {

@@ -10,6 +10,7 @@ const LINE_LIMIT = 1024 * 1024;
 const BUFFER_LIMIT = 2 * LINE_LIMIT;
 const SAFE_ID = /^[A-Za-z0-9_-]{1,80}$/;
 const SHA256 = /^[a-f0-9]{64}$/;
+export const MANAGED_TASK = 'CCGUI_MANAGED_SMOKE_CHILD: emit only the isolated fake CLI stream';
 const fail = (code) => Object.assign(new Error(code), { code });
 const errorCode = (error) => /^FIXTURE_[A-Z_]+$/.test(error?.code ?? '') ? error.code : 'FIXTURE_INTERNAL_ERROR';
 
@@ -51,10 +52,25 @@ export async function validateServer(config, root) {
 
 export async function validateCommand(command, root) {
   if (!command || typeof command.id !== 'string' || !SAFE_ID.test(command.id)
-      || typeof command.manifestSha256 !== 'string' || !SHA256.test(command.manifestSha256)
-      || !['prepare', 'status'].includes(command.action ?? 'prepare')) throw fail('FIXTURE_COMMAND_INVALID');
+      || !['prepare', 'status', 'spawn', 'stop'].includes(command.action ?? 'prepare')) throw fail('FIXTURE_COMMAND_INVALID');
+  if (command.action === 'spawn') return command;
+  if (command.action === 'stop') {
+    if (typeof command.branchId !== 'string' || !SAFE_ID.test(command.branchId)) throw fail('FIXTURE_COMMAND_INVALID');
+    return command;
+  }
+  if (typeof command.manifestSha256 !== 'string' || !SHA256.test(command.manifestSha256)) throw fail('FIXTURE_COMMAND_INVALID');
   if ((command.action ?? 'prepare') === 'prepare') await containedDirectory(root, command.packageDir);
   return command;
+}
+
+export function toolCall(command) {
+  if (command.action === 'spawn') return { name: 'task_spawn', arguments: {
+    request_id: command.id, engine: 'claude', title: 'Managed smoke child', task: MANAGED_TASK,
+  } };
+  if (command.action === 'stop') return { name: 'task_stop', arguments: { branch_id: command.branchId } };
+  return command.action === 'status'
+    ? { name: 'get_self_update_status', arguments: { manifestSha256: command.manifestSha256 } }
+    : { name: 'prepare_self_update', arguments: { packageDir: command.packageDir, manifestSha256: command.manifestSha256 } };
 }
 
 export function jsonLines(stream, onMessage, onError, lineLimit = LINE_LIMIT, bufferLimit = BUFFER_LIMIT) {
@@ -251,10 +267,7 @@ export async function main(argv = process.argv.slice(2)) {
           let result;
           try {
             await validateCommand(command, root);
-            const status = command.action === 'status';
-            result = await rpc.call('tools/call', { name: status ? 'get_self_update_status' : 'prepare_self_update', arguments: status
-              ? { manifestSha256: command.manifestSha256 }
-              : { packageDir: command.packageDir, manifestSha256: command.manifestSha256 } });
+            result = await rpc.call('tools/call', toolCall(command));
           } catch (error) { result = { error: errorCode(error) }; }
           if (!stopping) await writeJson(workspace, `self-update-receipt-${command.id}.json`, result);
         })().catch(() => { void cleanup(fail('FIXTURE_RECEIPT_WRITE_FAILED')); });

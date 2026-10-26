@@ -104,8 +104,16 @@ async fn resolve_from_login_shell(keys: &[String]) -> Option<BTreeMap<String, St
     // tokio's output() does NOT kill on drop: a login shell whose rc files
     // block past the timeout would otherwise be abandoned alive — one orphan
     // `zsh -l -i` per codex send, same leak class as orphaned grandchildren.
-    command.kill_on_drop(true);
-    let output = timeout(RESOLUTION_TIMEOUT, command.output())
+    command.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    super::hide_console(&mut command);
+    let child = command.spawn().ok()?;
+    #[cfg(windows)]
+    let _job = super::job::assign_kill_on_close(&child);
+    let output = timeout(RESOLUTION_TIMEOUT, child.wait_with_output())
         .await
         .ok()?
         .ok()?;

@@ -1,5 +1,5 @@
 import { useTranslation } from "react-i18next";
-import { deriveSelfUpdateProgress, deriveSelfUpdateResult } from "./SelfUpdateStatusChip";
+import { deriveSelfUpdateProgress, deriveSelfUpdateResult, formatLiveUpdateBlocker } from "./SelfUpdateStatusChip";
 import type { LiveUpdateChannelChange, LiveUpdateState } from "./live-update";
 
 function Changes({ title, changes }: { title: string; changes: LiveUpdateChannelChange[] }) {
@@ -41,6 +41,12 @@ export function SelfUpdateDetails({ state }: { state: LiveUpdateState }) {
       </p>}
       {result?.kind === "unverified" && <p className="text-body-2-regular text-notification-warning">{t("settings.liveUpdateUnverifiedHint")}</p>}
     </div>
+    {progress?.kind === "waiting-switch" && state.blockers.length > 0 && <section className="space-y-2" data-testid="self-update-blockers">
+      <h4 className="text-body-2-medium text-text-primary">{t("settings.liveUpdateWaitingReasons")}</h4>
+      <ul className="list-disc space-y-1 break-words pl-5 text-body-2-regular text-text-secondary">
+        {state.blockers.map((blocker, index) => <li key={`${blocker.reason}:${blocker.runId ?? blocker.participant ?? "native"}:${index}`}>{formatLiveUpdateBlocker(t, blocker)}</li>)}
+      </ul>
+    </section>}
     {batch && <div className="space-y-2" data-testid="self-update-batch">
       <Changes title={t(result ? "settings.liveUpdateLatestChanges" : "settings.liveUpdateBatchChanges", { count: batch.changes.length })} changes={batch.changes} />
       {batch.changes.length === 0 && <p className="text-body-2-regular text-text-tertiary">{t("settings.liveUpdateNoChangeDetails")}</p>}

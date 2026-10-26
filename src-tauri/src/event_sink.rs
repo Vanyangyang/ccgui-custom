@@ -144,6 +144,7 @@ impl EventSink {
     pub fn push(self: &Arc<Self>, mut event: Value) {
         if self.name == ENGINE_EVENT_NAME {
             crate::leader::observe_event(&mut event);
+            crate::host_chat::annotate_worker_event(&mut event);
             crate::auto_title::observe_event(&event);
             if crate::assistant_notices::completion_outbox::observe_event(&event).is_err() { eprintln!("[assistant-notices] completion persistence failed"); }
         }

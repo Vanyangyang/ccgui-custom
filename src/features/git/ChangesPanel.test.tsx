@@ -130,6 +130,29 @@ describe("ChangesPanel virtual rows", () => {
     expect(getRuntimeCheckpointReadiness().some((item) => item.reason === "git-operation-pending")).toBe(false);
   });
 
+  it("clears old discard confirmation and ignores late errors on repository switches", async () => {
+    let reject!: (error: Error) => void;
+    vi.mocked(useGitStore.getState().stage).mockImplementationOnce(() => new Promise<void>((_, fail) => { reject = fail; }));
+    act(() => container.querySelector<HTMLButtonElement>('[aria-label="git.discard"]')!.click());
+    await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="git.stage"]')!.click());
+    expect(container.textContent).toContain("confirm");
+    act(() => root.render(<ChangesPanel workspacePath="/repo" repoPath="/other" />));
+    expect(container.textContent).not.toContain("confirm");
+    await act(async () => { reject(new Error("old repository failure")); });
+    expect(container.textContent).not.toContain("old repository failure");
+    expect(useGitStore.getState().discard).not.toHaveBeenCalled();
+    expect(useGitStore.getState().stage).toHaveBeenCalledWith("/repo", ["file-0.ts"]);
+  });
+
+  it("keeps commit drafts attached to their original repository", () => {
+    act(() => Array.from(container.querySelectorAll("button")).find((button) => button.textContent === "write draft")!.click());
+    act(() => root.render(<ChangesPanel workspacePath="/repo" repoPath="/other" />));
+    expect(container.querySelector("textarea")?.value).toBe("");
+    expect(getRuntimeCheckpointReadiness().some((item) => item.reason === "unsaved-git-commit-message")).toBe(true);
+    act(() => root.render(<ChangesPanel workspacePath="/repo" repoPath="/repo" />));
+    expect(container.querySelector("textarea")?.value).toBe("saved draft");
+  });
+
   it("preserves row diff, stage, unstage, discard confirmation and whole-group actions", async () => {
     const section = container.querySelectorAll("section")[1];
     const row = section.querySelector("li")!;

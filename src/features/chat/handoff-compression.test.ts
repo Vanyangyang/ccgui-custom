@@ -102,6 +102,24 @@ describe("optional handoff model compression", () => {
     expect(entry()).toMatchObject({ mode: "local", grokStatus: "idle", grokSummary: null });
   });
 
+  it("keeps native failure diagnostics and the editable local draft until an explicit retry succeeds", async () => {
+    const first = deferred(); const retry = deferred();
+    vi.spyOn(ipc, "summarizeSessionHandoff").mockReturnValueOnce(first.promise).mockReturnValueOnce(retry.promise);
+    useHandoffStore.getState().startHandoff({ ...args, initialMode: "grok" });
+    await Promise.resolve();
+    useChatStore.getState().setDraft(key, draft() + "保留下一步任务 😀");
+    const local = draft();
+    const diagnostic = "codex returned invalid summary [stage=final_json; http_status=200; diagnostic_id=fixture-call]";
+    first.reject(new Error(diagnostic)); await first.promise.catch(() => {});
+    expect(entry()).toMatchObject({ grokStatus: "error", grokError: diagnostic, grokSummary: null });
+    expect(draft()).toBe(local);
+    useHandoffStore.getState().retryGrok(workspacePath);
+    retry.resolve("有效的模型提炼摘要，保留所有待办。"); await retry.promise;
+    expect(entry()).toMatchObject({ grokStatus: "done", grokError: null });
+    expect(draft()).toContain("有效的模型提炼摘要，保留所有待办。");
+    expect(draft()).toContain("保留下一步任务 😀");
+  });
+
   it("binds each completion to its selected model and preserves text after the summary", async () => {
     const first = deferred(); const second = deferred();
     const summarize = vi.spyOn(ipc, "summarizeSessionHandoff").mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);

@@ -1,4 +1,5 @@
 use super::{parse_session_file_with_handoffs, Message, ParsedSession, SessionMeta};
+use crate::event_sink::Emit;
 use base64::Engine as _;
 use rusqlite::OptionalExtension;
 use serde::Serialize;
@@ -88,6 +89,7 @@ pub(crate) fn list_sessions_from(db: &crate::db::Db) -> Result<Vec<SessionMeta>,
                 auxiliary_kind: crate::db::session_auxiliary::decode(r.get(17)?)?,
                 session_id: r.get(1)?,
                 workspace_path: r.get(2)?,
+                sidebar_workspace_path: None,
                 file_path: r.get(3)?,
                 file_size: r.get(4)?,
                 file_mtime_ms: r.get(5)?,
@@ -108,11 +110,13 @@ pub(crate) fn list_sessions_from(db: &crate::db::Db) -> Result<Vec<SessionMeta>,
         },
     )?;
     let mut cache = super::prompt_cache::load_all(&db.0.lock()).map_err(|e| e.to_string())?;
+    let mut placements = crate::session_sidebar::storage::load_all(&db.0.lock())?;
     Ok(rows
         .into_iter()
         .filter(|s| !crate::engine::sidechat::is_hidden_session(&s.engine, &s.session_id))
         .map(|mut s| {
             s.prompt_cache = cache.remove(&format!("{}:{}", s.engine, s.session_id));
+            s.sidebar_workspace_path = placements.remove(&(s.engine.clone(), s.session_id.clone()));
             s
         })
         .collect())
@@ -120,6 +124,7 @@ pub(crate) fn list_sessions_from(db: &crate::db::Db) -> Result<Vec<SessionMeta>,
 
 fn list_archived_sessions_from(db: &crate::db::Db) -> Result<Vec<SessionMeta>, String> {
     let conn = db.0.lock();
+    let mut placements = crate::session_sidebar::storage::load_all(&conn)?;
     let mut stmt = conn
         .prepare("SELECT a.snapshot_json, c.ultracode FROM session_archives a
                   LEFT JOIN session_claude_options c ON a.engine='claude' AND c.session_id=a.session_id
@@ -133,6 +138,7 @@ fn list_archived_sessions_from(db: &crate::db::Db) -> Result<Vec<SessionMeta>, S
         match row {
             Ok((json, enabled)) => match serde_json::from_str::<SessionMeta>(&json) {
                 Ok(mut session) => {
+                    session.sidebar_workspace_path = placements.remove(&(session.engine.clone(), session.session_id.clone()));
                     session.claude_ultracode = if session.engine == "claude" {
                         enabled.or(session.claude_ultracode)
                     } else { None };
@@ -1093,6 +1099,7 @@ fn delete_session_blocking_owned(
             .map_err(|e| e.to_string())?;
     }
     crate::db::session_auxiliary::set(&tx, engine, session_id, None).map_err(|e| e.to_string())?;
+    crate::session_sidebar::storage::delete_session(&tx, engine, session_id)?;
     super::prompt_cache::set(&tx, engine, session_id, None).map_err(|e| e.to_string())?;
     crate::engine::plan_review::delete_reviews_for_session(&tx, engine, session_id)?;
     tx.commit().map_err(|e| e.to_string())
@@ -1363,6 +1370,7 @@ pub(crate) fn add_workspace_inner(
     }
     state.sink.emit_sessions_changed();
     super::scanner::spawn_scan(Arc::clone(&state.db), Arc::clone(&state.sink));
+    state.emitters.emit_json("workspace-roots://changed", "null");
     Ok(Workspace {
         id,
         path: trimmed.to_string(),
@@ -1435,6 +1443,9 @@ pub fn remove_workspace(
             |r| r.get(0),
         )
         .ok();
+    if path.is_some() {
+        crate::session_sidebar::storage::delete_workspace(&tx, &id)?;
+    }
     tx.execute("DELETE FROM workspaces WHERE id=?1", rusqlite::params![id])
         .map_err(|e| e.to_string())?;
     if let Some(path) = path {
@@ -1451,6 +1462,7 @@ pub fn remove_workspace(
     tx.commit().map_err(|e| e.to_string())?;
     drop(conn);
     state.sink.emit_sessions_changed();
+    state.emitters.emit_json("workspace-roots://changed", "null");
     Ok(())
 }
 
@@ -1634,6 +1646,7 @@ mod tests {
 
     fn archived_fixture() -> SessionMeta {
         SessionMeta {
+            sidebar_workspace_path: None,
             prompt_cache: None,
             auxiliary_kind: None,
             engine: "codex".into(),
@@ -1656,6 +1669,32 @@ mod tests {
             remote: None,
             remote_path: None,
         }
+    }
+
+    #[test]
+    fn session_sidebar_archive_restore_uses_current_mapping_and_preserves_execution() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = archived_fixture();
+        db.0.lock().execute_batch("INSERT INTO workspaces(id,path,name) VALUES('source','/ws/demo','Source'),('target','/ws/target','Target');
+            INSERT INTO sessions(engine,session_id,workspace_path,file_path,file_size,file_mtime_ms)
+            VALUES('codex','archived-1','/ws/demo','/tmp/archived-1.jsonl',12,34);").unwrap();
+        crate::session_sidebar::assign(&db, "archive-placement".into(), vec![crate::session_sidebar::Assignment {
+            engine: "codex".into(), session_id: session.session_id.clone(), expected_workspace_path: session.workspace_path.clone(),
+            expected_sidebar_workspace_path: None, sidebar_workspace_path: Some("/ws/target".into()),
+        }]).unwrap();
+        // The snapshot can be stale: the independent mapping remains authoritative.
+        archive_session_in(&db, &session).unwrap();
+        assert!(list_sessions_from(&db).unwrap().is_empty());
+        assert_eq!(list_archived_sessions_from(&db).unwrap()[0].sidebar_workspace_path.as_deref(), Some("/ws/target"));
+        restore_session_in(&db, "codex", &session.session_id).unwrap();
+        let restored = list_sessions_from(&db).unwrap().remove(0);
+        assert_eq!(restored.workspace_path, session.workspace_path);
+        assert_eq!(restored.sidebar_workspace_path.as_deref(), Some("/ws/target"));
+        archive_session_in(&db, &restored).unwrap();
+        db.0.lock().execute("DELETE FROM workspaces WHERE id='target'", []).unwrap();
+        assert!(list_archived_sessions_from(&db).unwrap()[0].sidebar_workspace_path.is_none());
+        restore_session_in(&db, "codex", &session.session_id).unwrap();
+        assert!(list_sessions_from(&db).unwrap()[0].sidebar_workspace_path.is_none());
     }
 
     #[test]

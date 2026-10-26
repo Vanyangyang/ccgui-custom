@@ -55,6 +55,44 @@ beforeEach(async () => {
 afterEach(async () => { await act(async () => root.unmount()); node.remove(); vi.useRealTimers(); });
 
 describe("cost approval", () => {
+  it.each(["consultation", "subtask"] as const)("keeps legacy unloaded Codex %s approval manual without cache expiry claims", async (kind) => {
+    const value = { ...record(), target: { ...target, engine: "codex" }, kind,
+      leaderCostApproval: kind === "subtask" ? { branchId: "branch-1", requestId: "held-1", model: "gpt-6-astra" } : undefined };
+    value.costReview = { ...value.costReview!, model: kind === "subtask" ? "old-model" : "gpt-6-astra", targetStatus: "busy",
+      cache: { startedAt: 1000, observedAt: 1000, ttlSeconds: 300, source: "anthropic-usage" } };
+    expect(value.costReview.cacheExpiryDisabled).toBeUndefined();
+    await act(async () => root.render(<CrossSessionCostApproval record={value} />));
+    expect(button("costApprove")).toBeDefined();
+    expect(button("costCancel")).toBeDefined();
+    for (const key of ["costCacheCold", "costCacheUnknown", "costCacheHot", "costQueueWarning"]) {
+      expect(node.textContent).not.toContain(i18n.t(`crossSession.${key}`));
+    }
+    if (kind === "consultation") expect(node.textContent).toContain(i18n.t("crossSession.costQueuePending"));
+    expect(actions.approve).not.toHaveBeenCalled();
+    expect(native.invoke).not.toHaveBeenCalled();
+  });
+
+  it.each(["send", "queue_drain"] as const)("retains Codex model-change confirmation in %s mode without expiry wording", async (mode) => {
+    const active = { ...target, engine: "codex" } as ActiveSession;
+    const key = sessionKey(active.engine, active.sessionId, active.workspacePath);
+    const onApproveSend = vi.fn();
+    const review = { ...record().costReview!, model: "gpt-6-astra",
+      cache: { startedAt: 1000, observedAt: 1000, ttlSeconds: 300, source: "anthropic-usage" as const },
+      context: { ...record().costReview!.context, modelMismatch: true, usageModel: "gpt-4.1" } };
+    useSessionSendCostGuardStore.getState().hold({ sessionKey: key, engine: active.engine,
+      sessionId: active.sessionId!, workspacePath: active.workspacePath, prompt: "Continue", images: [], mode, review, onApproveSend });
+    await act(async () => root.render(<SessionSendCostApproval active={active} />));
+    expect(node.querySelector('[data-testid="session-send-cost-approval"]')).not.toBeNull();
+    expect(node.textContent).toContain(i18n.t(mode === "send" ? "crossSession.selfCostModelApprovalPending" : "crossSession.selfCostModelQueuePending"));
+    expect(node.textContent).toContain(i18n.t("crossSession.costModelChanged", { model: "gpt-4.1" }));
+    for (const key of ["costCacheCold", "costCacheUnknown", "costCacheHot", "selfCostApprovalPending", "selfCostQueuePending"]) {
+      expect(node.textContent).not.toContain(i18n.t(`crossSession.${key}`));
+    }
+    expect(onApproveSend).not.toHaveBeenCalled();
+    await act(async () => node.querySelector<HTMLButtonElement>('[data-testid="session-cost-send-btn"]')!.click());
+    expect(onApproveSend).toHaveBeenCalledTimes(1);
+  });
+
   it.each([true, false])("resolves native held task approve=%s with its exact identity and model", async (approve) => {
     const value = { ...record(), kind: "subtask" as const,
       leaderCostApproval: { branchId: "branch-1", requestId: "held-1", model: "native-model" } };

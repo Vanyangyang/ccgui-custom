@@ -871,6 +871,60 @@ pub fn update_app_settings<R: tauri::Runtime>(
     result
 }
 
+/// Patch only Cursor's saved selection. Removal wins if an ID appears in both
+/// lists; existing order is retained and new selections are appended in order.
+fn merge_cursor_model_selection(
+    settings: &mut AppSettings,
+    add: Vec<String>,
+    remove: Vec<String>,
+) -> Result<Vec<String>, String> {
+    let normalize = |models: Vec<String>| -> Result<Vec<String>, String> {
+        let mut policy = normalize_leader_allowed_models(&HashMap::from([
+            ("cursor".to_owned(), Some(models)),
+        ]))?;
+        Ok(policy.remove("cursor").flatten().unwrap_or_default())
+    };
+    let add = normalize(add)?;
+    let remove = normalize(remove)?;
+    if add.iter().chain(&remove).any(|id| {
+        id.eq_ignore_ascii_case("auto") || id.eq_ignore_ascii_case("default")
+    }) {
+        return Err("Cursor model selections require concrete model IDs; auto/default are not allowed".into());
+    }
+    let mut selected = normalize(settings.leader_allowed_models.get("cursor")
+        .cloned().flatten().unwrap_or_default())?;
+    // Legacy settings could contain automatic aliases, which never authorize
+    // a concrete Cursor model and are also excluded by the settings UI.
+    selected.retain(|id| !id.eq_ignore_ascii_case("auto")
+        && !id.eq_ignore_ascii_case("default") && !remove.contains(id));
+    for id in add {
+        if !remove.contains(&id) && !selected.contains(&id) {
+            selected.push(id);
+        }
+    }
+    let selected = normalize(selected)?;
+    settings.leader_allowed_models.insert("cursor".into(), Some(selected.clone()));
+    Ok(selected)
+}
+
+#[tauri::command]
+pub fn update_cursor_model_selection<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    add: Vec<String>,
+    remove: Vec<String>,
+) -> Result<Vec<String>, String> {
+    let (selected, warning) = {
+        let _guard = settings_write_lock();
+        let mut settings = read_settings()?;
+        let selected = merge_cursor_model_selection(&mut settings, add, remove)?;
+        let warning = persist_settings_committed(&mut settings)?;
+        (selected, warning)
+    };
+    // Sanitized settings may have committed even when persistence reports a warning.
+    announce_settings(&app);
+    warning.map_or(Ok(selected), Err)
+}
+
 fn remove_retired_connection_settings(settings: &mut AppSettings) {
     // Flattened extension fields must not keep the retired service switch alive.
     settings.bin_overrides.remove("spellcastConnectionEnabled");
@@ -1080,6 +1134,79 @@ pub(crate) fn announce_settings<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursor_selection_patch_merges_in_order_and_removal_wins() {
+        let mut settings: AppSettings = serde_json::from_value(serde_json::json!({
+            "theme":"dark", "defaultModels":{"cursor":"other"},
+            "leaderAllowedModels":{"cursor":["first","second"],"claude":["sonnet"],"codex":null}
+        })).unwrap();
+        let selected = merge_cursor_model_selection(&mut settings,
+            vec![" second ".into(), "third".into(), "first".into(), "third".into()],
+            vec!["first".into()]).unwrap();
+        assert_eq!(selected, ["second", "third"]);
+        assert_eq!(settings.theme, "dark");
+        assert_eq!(settings.default_models["cursor"], "other");
+        assert_eq!(settings.leader_allowed_models["claude"], Some(vec!["sonnet".into()]));
+        assert_eq!(settings.leader_allowed_models["codex"], None);
+        assert!(crate::engine::cursor::ensure_model_selected(&settings, Some("third")).is_ok());
+        assert!(crate::engine::cursor::ensure_model_selected(&settings, Some("first")).is_err());
+    }
+
+    #[test]
+    fn cursor_selection_patch_rejects_invalid_inputs_without_mutation() {
+        let mut settings: AppSettings = serde_json::from_value(serde_json::json!({
+            "leaderAllowedModels":{"cursor":["saved"]}
+        })).unwrap();
+        let original = settings.leader_allowed_models.clone();
+        for invalid in [vec!["auto".into()], vec![" DEFAULT ".into()], vec![" ".into()],
+            vec!["bad\nmodel".into()], vec!["x".repeat(257)], vec!["model".into();129]] {
+            assert!(merge_cursor_model_selection(&mut settings, invalid.clone(), vec![]).is_err());
+            assert!(merge_cursor_model_selection(&mut settings, vec![], invalid).is_err());
+            assert_eq!(settings.leader_allowed_models, original);
+        }
+        settings.leader_allowed_models.insert("cursor".into(),
+            Some((0..128).map(|index| format!("model-{index}")).collect()));
+        let original = settings.leader_allowed_models.clone();
+        assert!(merge_cursor_model_selection(&mut settings, vec!["overflow".into()], vec![]).is_err());
+        assert_eq!(settings.leader_allowed_models, original);
+    }
+
+    #[test]
+    fn cursor_selection_patch_cleans_legacy_automatic_aliases() {
+        let mut settings: AppSettings = serde_json::from_value(serde_json::json!({
+            "leaderAllowedModels":{"cursor":[" AUTO ","first","default","second","Auto"],"claude":["auto"]}
+        })).unwrap();
+        let selected = merge_cursor_model_selection(&mut settings, vec!["third".into()], vec![]).unwrap();
+        assert_eq!(selected, ["first", "second", "third"]);
+        assert_eq!(settings.leader_allowed_models["claude"], Some(vec!["auto".into()]));
+        assert!(crate::engine::cursor::ensure_model_selected(&settings, Some("first")).is_ok());
+        assert!(crate::engine::cursor::ensure_model_selected(&settings, Some("auto")).is_err());
+    }
+
+    #[test]
+    fn cursor_selection_patch_persists_and_preserves_other_settings_on_next_patch() {
+        let scratch = Scratch::new();
+        let path = scratch.path("settings.json");
+        let mut settings: AppSettings = serde_json::from_value(serde_json::json!({
+            "theme":"dark", "leaderAllowedModels":{"claude":["sonnet"],"agy":[]},
+            "defaultModels":{"cursor":"unselected"}
+        })).unwrap();
+        merge_cursor_model_selection(&mut settings, vec!["first".into()], vec![]).unwrap();
+        persist_settings_to(&mut settings, &path).unwrap();
+        let mut latest: AppSettings = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        merge_cursor_model_selection(&mut latest, vec!["second".into()], vec!["first".into()]).unwrap();
+        persist_settings_to(&mut latest, &path).unwrap();
+        let saved: AppSettings = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved.leader_allowed_models["cursor"], Some(vec!["second".into()]));
+        assert_eq!(saved.leader_allowed_models["claude"], Some(vec!["sonnet".into()]));
+        assert_eq!(saved.leader_allowed_models["agy"], Some(vec![]));
+        assert_eq!(saved.theme, "dark");
+        assert_eq!(saved.default_models["cursor"], "unselected");
+        assert!(crate::engine::cursor::ensure_model_selected(&saved, Some("second\u{1e}{\"context\":\"500k\"}")).is_ok());
+        assert!(crate::engine::cursor::ensure_model_selected(&saved, Some("first")).is_err());
+        assert!(crate::engine::cursor::ensure_model_selected(&saved, Some("unselected")).is_err());
+    }
 
     #[test]
     fn claude_defaults_fill_missing_preferences_without_overwriting_saved_choices() {

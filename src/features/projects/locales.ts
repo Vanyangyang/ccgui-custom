@@ -1,0 +1,28 @@
+export const zh = {
+  title: "项目组织", description: "把相关工作区放在一起，自由设置项目和成员名称。也可以在对话中让 AI 帮你整理。",
+  create: "创建项目", edit: "编辑项目", name: "项目名称", defaultPath: "默认启动目录",
+  members: "成员目录", addDirectory: "选择目录", addWorkspace: "添加已登记工作区", label: "显示名称",
+  development: "开发", reference: "参照", available: "可用", missing: "目录离线", changed: "目录已变化",
+  removeMember: "移除成员", remove: "移除项目", removeConfirm: "移除“{{name}}”的项目关系？工作区、文件和会话都会保留。",
+  source: "来源：{{source}}", pluginManaged: "成员配置由来源插件维护。移除项目不会删除插件源数据。",
+  roleHint: "开发 / 参照仅表示用途，参照目录不会因此被强制设为只读。",
+  registrationFailed: "无法确认工作区登记成功，请重试。",
+  all: "全部工作区", newChat: "按默认目录新建", startMember: "从此目录新建", empty: "尚未创建项目。",
+  required: "请填写项目名称和成员显示名称，并选择一个成员作为默认启动目录。", unavailable: "目录暂不可用，请在设置中检查该成员。",
+  selectWorkspace: "选择已登记工作区", role: "用途", retry: "重新加载项目",
+  memberChanged: "该项目或成员已变化，请重新打开后编辑。",
+};
+export const en: Record<keyof typeof zh, string> = {
+  title: "Project organization", description: "Keep related workspaces together and choose your own project and member names. You can also ask AI to organize them in a conversation.",
+  create: "Create project", edit: "Edit project", name: "Project name", defaultPath: "Default launch directory",
+  members: "Member directories", addDirectory: "Choose directory", addWorkspace: "Add registered workspace", label: "Display name",
+  development: "Development", reference: "Reference", available: "Available", missing: "Directory offline", changed: "Directory changed",
+  removeMember: "Remove member", remove: "Remove project", removeConfirm: "Remove the project relationship for “{{name}}”? Workspaces, files and conversations will be kept.",
+  source: "Source: {{source}}", pluginManaged: "Member configuration is maintained by the source plugin. Removing this project keeps the plugin's source data.",
+  roleHint: "Development and reference describe purpose; reference directories are not forced to be read-only.",
+  registrationFailed: "Workspace registration could not be verified. Please retry.",
+  all: "All workspaces", newChat: "New chat in default directory", startMember: "New chat in this directory", empty: "No projects yet.",
+  required: "Enter a project name and member display names, and select a member as the default launch directory.", unavailable: "The directory is unavailable. Check this member in settings.",
+  selectWorkspace: "Select registered workspace", role: "Purpose", retry: "Reload projects",
+  memberChanged: "This project or member has changed. Reopen it before editing.",
+};

@@ -11,6 +11,7 @@ import { useTerminalStore } from "@/features/terminal/store";
 import { worktreeMetaOf, type SessionMeta, type Workspace } from "@/lib/ipc";
 import { RenameSessionDialog } from "./RenameSessionDialog";
 import { useChatStore } from "./store";
+import { ProjectMemberNameDialog } from "@/features/projects/ProjectMemberNameDialog";
 
 /** Modal dialogs owned by the chat page. */
 export type ChatPageDialog =
@@ -21,6 +22,7 @@ export type ChatPageDialog =
   | { kind: "delete"; session: SessionMeta; anchor?: { x: number; y: number } }
   | { kind: "removeWorkspace"; workspaceId: string }
   | { kind: "workspaceAlias"; workspaceId: string }
+  | { kind: "projectMemberName"; projectId: string; memberId: string }
   /** 新建 worktree（目标是该 id 对应的父仓库工作区）。 */
   | { kind: "createWorktree"; workspaceId: string }
   /** 删除 worktree 子工作区的分级确认。 */
@@ -95,6 +97,8 @@ export function ChatPageDialogs({
           onCancel={onClose}
         />
       )}
+      {dialog?.kind === "projectMemberName" && <ProjectMemberNameDialog
+        key={`${dialog.projectId}:${dialog.memberId}`} projectId={dialog.projectId} memberId={dialog.memberId} onClose={onClose} />}
       {dialog?.kind === "createWorktree" &&
         (() => {
           const parent = workspaces.find((w) => w.id === dialog.workspaceId);

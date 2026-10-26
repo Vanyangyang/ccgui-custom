@@ -21,6 +21,10 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufRead
 const OPENAI_BASE: &str = "https://api.openai.com/v1";
 const CHATGPT_BASE: &str = "https://chatgpt.com/backend-api/codex";
 const MAX_CONFIG: usize = 1024 * 1024;
+// Reasoning and token events repeat metadata/text on the wire. The transport
+// budget must not use the much smaller final structured-answer budget.
+const MAX_STREAM_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SSE_FRAME_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(PartialEq)]
 struct Route {
@@ -39,9 +43,15 @@ struct AuthSnapshot {
 
 fn traced<T>(stage: &'static str, result: Result<T, SideCallError>) -> Result<T, SideCallError> {
     if let Err(error) = &result {
+        super::diagnostics::record(stage);
         eprintln!("[side-call] codex stage={stage} error={error:?}");
     }
     result
+}
+
+fn bad_output(stage: &'static str) -> SideCallError {
+    super::diagnostics::record(stage);
+    SideCallError::BadOutput
 }
 
 pub(super) async fn structured(call: StructuredCall<'_>) -> Result<SideCallOutput, SideCallError> {
@@ -55,8 +65,8 @@ pub(super) async fn structured(call: StructuredCall<'_>) -> Result<SideCallOutpu
 
 async fn structured_inner(call: &StructuredCall<'_>) -> Result<SideCallOutput, SideCallError> {
     crate::config::ensure_engine_enabled("codex").map_err(|_| SideCallError::Unavailable)?;
-    let provider =
-        crate::config::resolve_provider("codex", call.provider_id).map_err(|_| SideCallError::Unavailable)?;
+    let provider = crate::config::resolve_provider("codex", call.provider_id)
+        .map_err(|_| SideCallError::Unavailable)?;
     let channel_env = provider
         .as_ref()
         .map(|provider| crate::provider_files::channel_env("codex", provider))
@@ -839,7 +849,9 @@ async fn complete_http(
             .await
             .map_err(|_| SideCallError::Failed),
     )?;
+    super::diagnostics::record_http_status(response.status().as_u16());
     if !response.status().is_success() {
+        super::diagnostics::record("http_status");
         eprintln!(
             "[side-call] codex stage=http_status error=Failed status={}",
             response.status().as_u16()
@@ -888,12 +900,12 @@ async fn complete_http(
     )? {
         total = total
             .checked_add(chunk.len())
-            .ok_or(SideCallError::BadOutput)?;
-        if total > MAX_OUTPUT {
+            .ok_or_else(|| bad_output("http_stream_limit"))?;
+        if total > MAX_STREAM_BYTES {
             eprintln!(
-                "[side-call] codex stage=http_output_limit error=BadOutput total_bytes={total}"
+                "[side-call] codex stage=http_stream_limit error=BadOutput total_bytes={total}"
             );
-            return Err(SideCallError::BadOutput);
+            return Err(bad_output("http_stream_limit"));
         }
         collected.extend_from_slice(&chunk);
         if !prefix_checked && collected.len() >= 3 {
@@ -910,27 +922,62 @@ async fn complete_http(
             eprintln!("[side-call] codex stage=http_response_sse_detected");
         }
         if sse {
-            while let Some((end, width)) = frame_boundary(&collected) {
-                let frame = traced(
-                    "sse_utf8",
-                    std::str::from_utf8(&collected[..end]).map_err(|_| SideCallError::BadOutput),
-                )?;
-                if let Some(output) = state.frame(frame)? {
-                    return Ok(output);
-                }
-                collected.drain(..end + width);
+            if let Some(output) = consume_sse_frames(&mut collected, &mut state)? {
+                return Ok(output);
             }
+        } else if collected.len() > MAX_OUTPUT {
+            return Err(bad_output("http_json_limit"));
         }
     }
     if sse {
         eprintln!("[side-call] codex stage=sse_missing_completion error=BadOutput total_bytes={total} pending_bytes={}", collected.len());
-        return Err(SideCallError::BadOutput);
+        return Err(bad_output("sse_missing_completion"));
     }
     let response: Value = serde_json::from_slice(&collected).map_err(|_| {
         eprintln!("[side-call] codex stage=http_response_json error=BadOutput encoding={encoding} body_kind={} total_bytes={total}", body_kind(&collected));
-        SideCallError::BadOutput
+        bad_output("http_response_json")
     })?;
-    parse_completed(&response, &[])
+    parse_nonstreamed(&response)
+}
+
+fn parse_nonstreamed(response: &Value) -> Result<SideCallOutput, SideCallError> {
+    // Unlike SSE, a JSON envelope has no response.completed event proving that
+    // generation finished. Missing or incorrectly typed status is not success.
+    if response.get("status").and_then(Value::as_str) != Some("completed")
+        && response.get("status").and_then(Value::as_str) != Some("failed")
+        && !response.get("error").is_some_and(|value| !value.is_null())
+    {
+        return Err(bad_output("final_response_status"));
+    }
+    parse_completed(response, &[])
+}
+
+fn consume_sse_frames(
+    collected: &mut Vec<u8>,
+    state: &mut SseState,
+) -> Result<Option<SideCallOutput>, SideCallError> {
+    let mut consumed = 0;
+    while let Some((end, width)) = frame_boundary(&collected[consumed..]) {
+        if end > MAX_SSE_FRAME_BYTES {
+            return Err(bad_output("sse_frame_limit"));
+        }
+        let frame = traced(
+            "sse_utf8",
+            std::str::from_utf8(&collected[consumed..consumed + end])
+                .map_err(|_| SideCallError::BadOutput),
+        )?;
+        if let Some(output) = state.frame(frame)? {
+            return Ok(Some(output));
+        }
+        consumed += end + width;
+    }
+    collected.drain(..consumed);
+    // A chunk can contain many valid frames. Limit only the remaining single
+    // incomplete frame, allowing a split CRLF delimiter at the limit.
+    if collected.len() > MAX_SSE_FRAME_BYTES + 3 {
+        return Err(bad_output("sse_frame_limit"));
+    }
+    Ok(None)
 }
 
 fn looks_like_sse(bytes: &[u8]) -> bool {
@@ -963,18 +1010,17 @@ fn body_kind(bytes: &[u8]) -> &'static str {
 }
 
 fn frame_boundary(bytes: &[u8]) -> Option<(usize, usize)> {
-    let lf = bytes
-        .windows(2)
-        .position(|window| window == b"\n\n")
-        .map(|position| (position, 2));
-    let crlf = bytes
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|position| (position, 4));
-    match (lf, crlf) {
-        (Some(a), Some(b)) => Some(if a.0 < b.0 { a } else { b }),
-        (a, b) => a.or(b),
+    // Stop at the first boundary of either kind. Scanning the entire remainder
+    // for CRLF for every LF frame makes a coalesced chunk quadratic to parse.
+    for (position, byte) in bytes.iter().enumerate() {
+        if *byte == b'\n' && bytes.get(position + 1) == Some(&b'\n') {
+            return Some((position, 2));
+        }
+        if *byte == b'\r' && bytes[position..].starts_with(b"\r\n\r\n") {
+            return Some((position, 4));
+        }
     }
+    None
 }
 
 #[derive(Default)]
@@ -997,7 +1043,7 @@ impl SseState {
         }
         if data == "[DONE]" {
             eprintln!("[side-call] codex stage=sse_done_before_completion error=BadOutput");
-            return Err(SideCallError::BadOutput);
+            return Err(bad_output("sse_done_before_completion"));
         }
         let event: Value = traced(
             "sse_json",
@@ -1018,21 +1064,31 @@ impl SseState {
                     | "response.failed"
                     | "response.incomplete"
                     | "response.output_text.refusal"
+                    | "response.refusal.delta"
+                    | "response.refusal.done"
             )
         {
             let stage = match kind {
                 "error" => "sse_error",
                 "response.failed" => "sse_response_failed",
                 "response.incomplete" => "sse_response_incomplete",
-                "response.output_text.refusal" => "sse_refusal",
+                "response.output_text.refusal"
+                | "response.refusal.delta"
+                | "response.refusal.done" => "sse_refusal",
                 _ => "sse_tool_call",
             };
-            eprintln!("[side-call] codex stage={stage} error=BadOutput");
-            return Err(SideCallError::BadOutput);
+            let error = if matches!(kind, "error" | "response.failed") {
+                SideCallError::Failed
+            } else {
+                SideCallError::BadOutput
+            };
+            return traced(stage, Err(error));
         }
         match kind {
             "response.output_item.added" | "response.output_item.done" => {
-                let item = event.get("item").ok_or(SideCallError::BadOutput)?;
+                let item = event
+                    .get("item")
+                    .ok_or_else(|| bad_output("sse_missing_item"))?;
                 traced("sse_output_item", check_item(item))?;
                 if kind.ends_with("done") {
                     self.items.push(item.clone());
@@ -1040,7 +1096,9 @@ impl SseState {
                 Ok(None)
             }
             "response.completed" => parse_completed(
-                event.get("response").ok_or(SideCallError::BadOutput)?,
+                event
+                    .get("response")
+                    .ok_or_else(|| bad_output("sse_missing_response"))?,
                 &self.items,
             )
             .map(Some),
@@ -1077,6 +1135,7 @@ fn check_item(item: &Value) -> Result<(), SideCallError> {
         _ => Err(SideCallError::BadOutput),
     };
     if result.is_err() {
+        super::diagnostics::record("item_shape");
         let item_type = match item.get("type").and_then(Value::as_str) {
             Some("message") => "message",
             Some("reasoning") => "reasoning",
@@ -1100,8 +1159,12 @@ fn parse_completed(
     response: &Value,
     completed_items: &[Value],
 ) -> Result<SideCallOutput, SideCallError> {
+    if response.get("error").is_some_and(|value| !value.is_null())
+        || response.get("status").and_then(Value::as_str) == Some("failed")
+    {
+        return traced("final_response_failed", Err(SideCallError::Failed));
+    }
     if !response.is_object()
-        || response.get("error").is_some_and(|value| !value.is_null())
         || response
             .get("status")
             .and_then(Value::as_str)
@@ -1112,7 +1175,7 @@ fn parse_completed(
         || response.get("end_turn").and_then(Value::as_bool) == Some(false)
     {
         eprintln!("[side-call] codex stage=final_response_status error=BadOutput");
-        return Err(SideCallError::BadOutput);
+        return Err(bad_output("final_response_status"));
     }
     let items = response
         .get("output")
@@ -1131,7 +1194,7 @@ fn parse_completed(
                 .is_some_and(|status| status != "completed")
             {
                 eprintln!("[side-call] codex stage=final_message_status error=BadOutput");
-                return Err(SideCallError::BadOutput);
+                return Err(bad_output("final_message_status"));
             }
             match message_phase(item) {
                 "commentary" => {
@@ -1140,7 +1203,7 @@ fn parse_completed(
                 }
                 "final_answer" => final_count += 1,
                 "legacy" => legacy_count += 1,
-                _ => return Err(SideCallError::BadOutput),
+                _ => return Err(bad_output("final_message_phase")),
             }
             candidates.push(item);
         }
@@ -1150,39 +1213,36 @@ fn parse_completed(
     // assistant message; multiple answers cannot form one schema JSON value.
     if candidates.len() != 1 {
         eprintln!("[side-call] codex stage=final_message_selection error=BadOutput commentary_count={commentary_count} final_count={final_count} legacy_count={legacy_count}");
-        return Err(SideCallError::BadOutput);
+        return Err(bad_output("final_message_selection"));
     }
     let message = candidates[0];
     let mut text = String::new();
     for part in message
         .get("content")
         .and_then(Value::as_array)
-        .ok_or(SideCallError::BadOutput)?
+        .ok_or_else(|| bad_output("final_message_content"))?
     {
-        text.push_str(traced(
+        let part = traced(
             "final_message_text",
             part.get("text")
                 .and_then(Value::as_str)
                 .ok_or(SideCallError::BadOutput),
-        )?);
-    }
-    if text.len() > MAX_OUTPUT {
-        eprintln!(
-            "[side-call] codex stage=final_text_limit error=BadOutput text_bytes={}",
-            text.len()
-        );
-        return Err(SideCallError::BadOutput);
+        )?;
+        if text.len().saturating_add(part.len()) > MAX_OUTPUT {
+            return Err(bad_output("final_text_limit"));
+        }
+        text.push_str(part);
     }
     let structured: Value = serde_json::from_str(&text).map_err(|_| {
         eprintln!("[side-call] codex stage=final_json error=BadOutput commentary_count={commentary_count} final_count={final_count} legacy_count={legacy_count} text_bytes={}", text.len());
-        SideCallError::BadOutput
+        bad_output("final_json")
     })?;
     if !structured.is_object() {
         eprintln!(
             "[side-call] codex stage=final_json_shape error=BadOutput text_bytes={}",
             text.len()
         );
-        return Err(SideCallError::BadOutput);
+        return Err(bad_output("final_json_shape"));
     }
     Ok(SideCallOutput {
         structured,
@@ -1222,6 +1282,15 @@ mod tests {
         content_type: &str,
         status: &str,
     ) -> (String, tokio::task::JoinHandle<(String, Value)>) {
+        fixture_chunked(body, content_type, status, 7).await
+    }
+
+    async fn fixture_chunked(
+        body: Vec<u8>,
+        content_type: &str,
+        status: &str,
+        chunk_size: usize,
+    ) -> (String, tokio::task::JoinHandle<(String, Value)>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let content_type = content_type.to_owned();
@@ -1255,7 +1324,7 @@ mod tests {
             let head_out = format!("HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
             stream.write_all(head_out.as_bytes()).await.unwrap();
             // Split through UTF-8 and SSE delimiters to exercise byte framing.
-            for chunk in body.chunks(7) {
+            for chunk in body.chunks(chunk_size) {
                 if stream.write_all(chunk).await.is_err() {
                     break;
                 }
@@ -1492,27 +1561,198 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reasoning_stream_budget_is_independent_of_final_summary_size() {
+        let schema = json!({"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"],"additionalProperties":false});
+        let answer =
+            json!({"summary":"- 已完成中文与 emoji 🧩 回归；待验证失败、取消和恢复路径。"});
+        let delta =
+            json!({"type":"response.reasoning_summary_text.delta","delta":"x".repeat(1024)});
+        let mut body = format!("data: {delta}\n\n").repeat(280);
+        let terminal =
+            json!({"type":"response.completed","response":completed(&answer.to_string())});
+        body.push_str(&format!("data: {terminal}\n\n"));
+        assert!(body.len() > MAX_OUTPUT);
+        let (base, server) = fixture(body.into_bytes(), "text/event-stream", "200 OK").await;
+        let result = complete_http(&call(&schema), &base, HeaderMap::new()).await;
+        server.await.unwrap();
+        assert_eq!(result.unwrap().structured, answer);
+    }
+
+    #[tokio::test]
+    async fn a_combined_chunk_is_not_mistaken_for_one_oversized_frame() {
+        let mut bytes = format!(": {}\n\n", "x".repeat(1024))
+            .repeat(2200)
+            .into_bytes();
+        assert!(bytes.len() > MAX_SSE_FRAME_BYTES);
+        bytes.extend_from_slice(format!("data: {}\n\n", json!({
+            "type":"response.completed", "response":completed(r#"{"summary":"有效的中文摘要，保留待处理任务。"}"#)
+        })).as_bytes());
+        let result = consume_sse_frames(&mut bytes, &mut SseState::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            result.structured["summary"],
+            "有效的中文摘要，保留待处理任务。"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_frame_and_final_text_limits_report_distinct_stages() {
+        for complete_frame in [false, true] {
+            let mut frame = vec![b' '; MAX_SSE_FRAME_BYTES + 4];
+            if complete_frame {
+                frame.extend_from_slice(b"\n\n");
+            }
+            let failure = super::super::diagnostics::capture(async {
+                consume_sse_frames(&mut frame, &mut SseState::default())
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(failure.stage, Some("sse_frame_limit"));
+        }
+        let large_answer = json!({"summary":"界".repeat(MAX_OUTPUT / 3 + 1)}).to_string();
+        let failure = super::super::diagnostics::capture(async {
+            parse_completed(&completed(&large_answer), &[])
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(failure.stage, Some("final_text_limit"));
+
+        // Valid individually bounded frames still have a finite total budget.
+        let body = format!(": {}\n\n", "x".repeat(4096))
+            .repeat(2050)
+            .into_bytes();
+        assert!(body.len() > MAX_STREAM_BYTES);
+        let (base, server) = fixture_chunked(body, "text/event-stream", "200 OK", 64 * 1024).await;
+        let schema = json!({"type":"object"});
+        let failure = super::super::diagnostics::capture(complete_http(
+            &call(&schema),
+            &base,
+            HeaderMap::new(),
+        ))
+        .await
+        .unwrap_err();
+        server.await.unwrap();
+        assert_eq!(failure.stage, Some("http_stream_limit"));
+        assert_eq!(failure.http_status, Some(200));
+    }
+
+    #[tokio::test]
+    async fn json_requires_completion_and_sse_refusals_cannot_be_overwritten() {
+        let valid = completed(r#"{"summary":"完整的中文摘要，不省略待验证事项。"}"#);
+        assert!(parse_nonstreamed(&valid).is_ok());
+        for status in [
+            None,
+            Some(Value::Null),
+            Some(json!(1)),
+            Some(json!("in_progress")),
+        ] {
+            let mut response = valid.clone();
+            response.as_object_mut().unwrap().remove("status");
+            if let Some(status) = status {
+                response["status"] = status;
+            }
+            let failure =
+                super::super::diagnostics::capture(async { parse_nonstreamed(&response) })
+                    .await
+                    .unwrap_err();
+            assert_eq!(failure.stage, Some("final_response_status"));
+        }
+        let terminal = json!({"type":"response.completed","response":valid});
+        for kind in [
+            "response.output_text.refusal",
+            "response.refusal.delta",
+            "response.refusal.done",
+        ] {
+            let event = json!({"type":kind,"delta":"private refusal text"});
+            let mut body = format!("data: {event}\n\ndata: {terminal}\n\n").into_bytes();
+            let failure = super::super::diagnostics::capture(async {
+                consume_sse_frames(&mut body, &mut SseState::default())
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(failure.kind, SideCallError::BadOutput);
+            assert_eq!(failure.stage, Some("sse_refusal"));
+        }
+    }
+
+    #[test]
+    fn frame_boundary_uses_the_first_complete_delimiter() {
+        assert_eq!(frame_boundary(b"a\n\nb\r\n\r\n"), Some((1, 2)));
+        assert_eq!(frame_boundary(b"a\r\n\r\nb\n\n"), Some((1, 4)));
+        assert_eq!(frame_boundary(b"a\r\n\r"), None);
+        assert_eq!(frame_boundary(b"a\n"), None);
+    }
+
+    #[tokio::test]
+    async fn failed_incomplete_and_malformed_responses_keep_content_free_diagnostics() {
+        for (event, kind, stage) in [
+            (
+                json!({"type":"error","message":"private upstream text"}),
+                SideCallError::Failed,
+                "sse_error",
+            ),
+            (
+                json!({"type":"response.failed","response":{"error":{"message":"private upstream text"}}}),
+                SideCallError::Failed,
+                "sse_response_failed",
+            ),
+            (
+                json!({"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}),
+                SideCallError::BadOutput,
+                "sse_response_incomplete",
+            ),
+            (
+                json!({"type":"response.completed","response":completed("private upstream text")}),
+                SideCallError::BadOutput,
+                "final_json",
+            ),
+        ] {
+            let failure = super::super::diagnostics::capture(async {
+                SseState::default().frame(&format!("data: {event}"))
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(failure.kind, kind);
+            assert_eq!(failure.stage, Some(stage));
+            assert!(!format!("{failure:?}").contains("private upstream text"));
+        }
+        assert_eq!(
+            parse_completed(
+                &json!({"status":"failed","error":{"message":"private upstream text"}}),
+                &[]
+            )
+            .unwrap_err(),
+            SideCallError::Failed
+        );
+    }
+
+    #[tokio::test]
     async fn rejects_server_errors_tools_refusals_incomplete_and_oversized_output() {
         let schema = json!({"type":"object"});
         let fixtures = [
             (
                 json!({"type":"response.failed","response":{"error":{"message":"private server body"}}}),
                 "text/event-stream",
+                SideCallError::Failed,
             ),
             (
                 json!({"type":"response.output_item.done","item":{"type":"function_call","name":"shell","arguments":"{}"}}),
                 "text/event-stream",
+                SideCallError::BadOutput,
             ),
             (
                 json!({"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}),
                 "text/event-stream",
+                SideCallError::BadOutput,
             ),
             (
                 json!({"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"refusal","refusal":"no"}]}]}),
                 "application/json",
+                SideCallError::BadOutput,
             ),
         ];
-        for (value, content_type) in fixtures {
+        for (value, content_type, expected) in fixtures {
             let body = if content_type == "text/event-stream" {
                 format!("data: {value}\n\n").into_bytes()
             } else {
@@ -1523,7 +1763,7 @@ mod tests {
                 complete_http(&call(&schema), &base, HeaderMap::new())
                     .await
                     .unwrap_err(),
-                SideCallError::BadOutput
+                expected
             );
             server.await.unwrap();
         }

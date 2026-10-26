@@ -2,6 +2,60 @@ import { describe, expect, it, vi } from "vitest";
 import { cloneCheckpointValue, createRuntimeCheckpointCoordinator } from "./runtime-checkpoint";
 
 describe("runtime checkpoint barrier", () => {
+  it("waits for restoration ownership without changing readiness revisions", async () => {
+    const coordinator = createRuntimeCheckpointCoordinator();
+    coordinator.initialize({ version: 1, participants: { chat: {} } }, { requiredParticipants: ["chat"] });
+    coordinator.register({ id: "chat", capture: () => ({}), restore: () => {} });
+    const readiness = coordinator.awaitReady();
+    const controller = new AbortController();
+    const remove = vi.spyOn(controller.signal, "removeEventListener");
+    const ready = vi.fn();
+    const waiting = coordinator.whenResumed(controller.signal).then(ready);
+    await readiness;
+    expect(ready).not.toHaveBeenCalled();
+    expect(coordinator.isPaused()).toBe(true);
+    await coordinator.resume(); await waiting;
+    expect(ready).toHaveBeenCalledOnce();
+    expect(remove).toHaveBeenCalledWith("abort", expect.any(Function));
+    expect(coordinator.isPaused()).toBe(false);
+  });
+
+  it("rejects cancelled readiness waits and removes their abort listeners", async () => {
+    const coordinator = createRuntimeCheckpointCoordinator();
+    coordinator.initialize({ version: 1, participants: {} }, { requiredParticipants: [] });
+    const controller = new AbortController();
+    const remove = vi.spyOn(controller.signal, "removeEventListener");
+    const pending = coordinator.whenResumed(controller.signal);
+    controller.abort(new Error("plugin unloaded"));
+    await expect(pending).rejects.toThrow("plugin unloaded");
+    expect(remove).toHaveBeenCalledOnce();
+    coordinator.abort();
+    expect(remove).toHaveBeenCalledOnce();
+    await expect(coordinator.whenResumed(controller.signal)).rejects.toThrow("plugin unloaded");
+  });
+
+  it.each(["abort", "resumeCommitted", "resume"] as const)("releases waiters on %s even when participant resume throws", async (method) => {
+    const coordinator = createRuntimeCheckpointCoordinator();
+    coordinator.initialize({ version: 1, participants: { chat: {} } }, { requiredParticipants: ["chat"] });
+    coordinator.register({ id: "chat", capture: () => ({}), restore: () => {}, resumed() { throw new Error("participant failed"); } });
+    const waiting = coordinator.whenResumed();
+    await expect(Promise.resolve().then(() => coordinator[method]())).rejects.toThrow("Runtime participant resume failed");
+    await expect(waiting).resolves.toBeUndefined();
+    expect(coordinator.isPaused()).toBe(false);
+  });
+
+  it("resolves unpaused waits without listeners or invalidating an in-flight preparation", async () => {
+    const coordinator = createRuntimeCheckpointCoordinator();
+    coordinator.initialize(undefined, { requiredParticipants: [] });
+    const controller = new AbortController();
+    const add = vi.spyOn(controller.signal, "addEventListener");
+    await expect(coordinator.whenResumed(controller.signal)).resolves.toBeUndefined();
+    expect(add).not.toHaveBeenCalled();
+    const preparing = coordinator.prepare();
+    const waiting = coordinator.whenResumed();
+    await expect(preparing).resolves.toEqual({ version: 1, participants: {} });
+    coordinator.abort(); await waiting;
+  });
   it("keeps capture-only blockers out of restore readiness while retaining real recovery blockers", async () => {
     const coordinator = createRuntimeCheckpointCoordinator();
     coordinator.initialize({ version: 1, participants: { chat: {}, "app-ui": {} } });

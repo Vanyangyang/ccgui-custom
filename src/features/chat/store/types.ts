@@ -1,3 +1,4 @@
+import type { HostLaunchChoices } from "./host-task-selection";
 import type { OmpServiceTier } from "@/lib/omp-service-tier";
 import type {
   EngineInfo,
@@ -21,7 +22,11 @@ export type PlanReviewRespondResult =
   | { kind: "error"; error: string };
 
 /** Per-send options carried from the composer to the spawn request. */
+export interface HostUserRowIdentity { runId: string; seq: number; ts: string | null; text: string; images?: string[] }
 export interface SendOptions {
+  /** Host-only exact committed-row correlation. No display text is written into
+   * native messages. Persistence completes before the native delivery call. */
+  hostUserRow?: (row: HostUserRowIdentity) => Promise<void>;
   /** Internal composer acceptance: user row is committed, before native launch. */
   onCommitted?: () => void;
   /** 电脑操控: mount the app's computer-use driver (screenshot/input MCP
@@ -32,12 +37,26 @@ export interface SendOptions {
    * Such sends reject busy targets and propagate spawn errors to the host
    * bridge after preserving the normal timeline's error handling. */
   requestedRunId?: string;
+  /** Host task launch: with requestedRunId, the target may be an open pending
+   * chat (first turn). Pre-spawn refusals throw HostChatBusyError. */
+  hostNewChat?: true;
+  /** Frozen model/effort/provider choices from task acceptance so queue waits cannot
+   * silently pick up later global default changes. */
+  hostLaunch?: HostLaunchChoices;
+  /** Re-resolve the accepted native selection after asynchronous preparation. */
+  hostBeforeSend?: () => Promise<void>;
   onRunStarted?: (result: { runId: string; sessionId: string | null }) => void;
+  /** Host-owned durable continuation queue. Never enters the ordinary composer
+   * queue or retries after a lost native ACK. Called immediately before IPC. */
+  hostContinuation?: {
+    beforeDelivery: (delivery: "turn" | "steer" | "live", runId: string) => Promise<void>;
+    onReceived: (delivery: "turn" | "steer" | "live", runId: string) => void;
+  };
 }
 
 /** Distinguishes a pre-spawn busy race from an ambiguous transport failure. */
 export class HostChatBusyError extends Error {
-  constructor() { super("Host chat target is busy"); }
+  constructor(message = "Host chat target is busy") { super(message); }
 }
 
 export interface ChatStore {
@@ -139,6 +158,14 @@ export interface ChatStore {
     toIndex: number,
   ) => void;
   startNewChat: (workspacePath: string) => void;
+  /** Host task launch: open a pending chat without activating it or touching
+   *  composer drafts. Returns false when the user already holds that pending
+   *  chat (focused, typed, launching or carrying different starting choices). */
+  openBackgroundDraft: (
+    engine: string,
+    workspacePath: string,
+    launch?: HostLaunchChoices,
+  ) => boolean;
   /** Move an unused draft tab and its composer state; refuses occupied targets. */
   moveDraftToWorkspace: (engine: string, workspacePath: string, targetWorkspacePath: string, draft: string) => boolean;
   setActiveEngine: (engine: string) => void;

@@ -13,6 +13,16 @@ import type {
   HostChatReceipt,
   HostChatSubmission,
   HostChatActivationEvent,
+  HostTasksApi,
+  HostTaskReceipt,
+  HostTaskSubmission,
+  HostTaskSelection,
+  PluginDetachedSurfaceDefinition,
+  HostTaskPlan,
+  HostTaskPlanRequest,
+  HostTaskCatalog,
+  HostTaskHistoryPage,
+  HostTaskExcerpt,
   PluginManifest,
   PluginTier,
   SessionMenuTarget,
@@ -62,6 +72,26 @@ type _ChatReceipt = Assert<Mutual<HostChatReceipt, Pub.HostChatReceipt>>;
 type _ChatSubmission = Assert<Mutual<HostChatSubmission, Pub.HostChatSubmission>>;
 type _ChatActivation = Assert<Mutual<HostChatActivationEvent, Pub.HostChatActivationEvent>>;
 type _ChatShape = Assert<Mutual<PluginContext["chat"], Pub.PluginContext["chat"]>>;
+type _ConversationsShape = Assert<Mutual<Omit<PluginContext["conversations"], "View">, Omit<Pub.PluginContext["conversations"], "View">>>;
+type _ConversationsKeys = Assert<KeyParity<PluginContext["conversations"], Pub.PluginContext["conversations"]>>;
+type _ImagesShape = Assert<Mutual<PluginContext["images"], Pub.PluginContext["images"]>>;
+type _ImagesKeys = Assert<KeyParity<PluginContext["images"], Pub.PluginContext["images"]>>;
+type _TasksShape = Assert<Mutual<HostTasksApi, Pub.HostTasksApi>>;
+type _TasksContext = Assert<Mutual<PluginContext["tasks"], Pub.PluginContext["tasks"]>>;
+type _MemoryExtraction = Assert<Mutual<PluginContext["memoryExtraction"], Pub.PluginContext["memoryExtraction"]>>;
+type _MemoryBatch = Assert<Mutual<import("./memory-extraction").MemoryExtractionBatch, Pub.MemoryExtractionBatch>>;
+type _TaskConversationSnapshot = Assert<Mutual<import("./task-conversations").HostTaskConversationSnapshot, Pub.HostTaskConversationSnapshot>>;
+type _TaskMessageReceipt = Assert<Mutual<import("./task-conversations").HostTaskMessageReceipt, Pub.HostTaskMessageReceipt>>;
+type _TaskConversationAction = Assert<Mutual<import("./task-conversations").HostTaskConversationAction, Pub.HostTaskConversationAction>>;
+type _TaskReceipt = Assert<Mutual<HostTaskReceipt, Pub.HostTaskReceipt>>;
+type _TaskSubmission = Assert<Mutual<HostTaskSubmission, Pub.HostTaskSubmission>>;
+type _TaskSelection = Assert<Mutual<HostTaskSelection, Pub.HostTaskSelection>>;
+type _DetachedDefinition = Assert<Mutual<PluginDetachedSurfaceDefinition, Pub.PluginDetachedSurfaceDefinition>>;
+type _TaskPlan = Assert<Mutual<HostTaskPlan, Pub.HostTaskPlan>>;
+type _TaskPlanRequest = Assert<Mutual<HostTaskPlanRequest, Pub.HostTaskPlanRequest>>;
+type _TaskCatalog = Assert<Mutual<HostTaskCatalog, Pub.HostTaskCatalog>>;
+type _TaskHistory = Assert<Mutual<HostTaskHistoryPage, Pub.HostTaskHistoryPage>>;
+type _TaskExcerpt = Assert<Mutual<HostTaskExcerpt, Pub.HostTaskExcerpt>>;
 
 // --- PluginContext：顶层与各能力组 key 完全对齐 ------------------------------
 

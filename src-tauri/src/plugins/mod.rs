@@ -7,10 +7,9 @@
 //! and records a tombstone; `plugin_list` purges rows whose tombstone is
 //! older than KV_TOMBSTONE_TTL_SECS.
 //!
-//! Install is a staging/backup rename transaction (fs::install_from); a
-//! crash mid-swap leaves at worst a stale `.staging-`/`.backup-` dir, and
-//! the next install of the same id self-heals by renaming a stranded backup
-//! back into place before proceeding.
+//! Installs serialize staging/backup swaps and roll back on state-write errors.
+//! Bundle and state writes are separate filesystem operations, not a crash-atomic
+//! transaction; a stranded backup is recovered on the next same-id install.
 //!
 //! Layout: manifest.rs = manifest parse + permission whitelist; state.rs =
 //! plugins.json records + STATE_LOCK; fs.rs = source-tree walk, the install
@@ -42,9 +41,15 @@ pub(crate) fn require_supported_plugin(id: &str) -> Result<(), String> {
 /// Invalidation only: frontends read the committed host snapshot. `reload`
 /// additionally replaces an active bundle after install or an explicit retry.
 pub(crate) fn emit_changed(emitter: &dyn crate::event_sink::Emit, id: Option<&str>, reload: bool) {
+    emit_changed_for_request(emitter, id, reload, None);
+}
+
+fn emit_changed_for_request(emitter: &dyn crate::event_sink::Emit, id: Option<&str>, reload: bool, request_id: Option<&str>) {
+    let mut payload = serde_json::json!({ "id": id, "reload": reload });
+    if let Some(request_id) = request_id { payload["requestId"] = request_id.into(); }
     emitter.emit_json(
         "plugins://changed",
-        &serde_json::json!({ "id": id, "reload": reload }).to_string(),
+        &payload.to_string(),
     );
 }
 
@@ -98,32 +103,76 @@ pub fn plugin_list(db: tauri::State<'_, Arc<crate::db::Db>>) -> Result<Vec<Plugi
     state::list_plugins(&db, &state::plugins_dir(), &state::state_path())
 }
 
+/// Inspect the same validated local bundle used by the installer, without copying
+/// files, changing grants or activating code.
+#[tauri::command]
+pub async fn plugin_inspect_path(path: String) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let source = Path::new(&path);
+        if !source.is_absolute() || !source.is_dir() {
+            return Err("Plugin source must be an absolute local directory".into());
+        }
+        let files = fs::collect_files(source)?;
+        let candidate = manifest::validate_manifest(source, &files)?;
+        Ok(serde_json::json!({
+            "id": candidate.id, "name": candidate.name, "version": candidate.version,
+            "tier": candidate.tier, "permissions": candidate.permissions,
+            "sdkVersion": candidate.sdk_version, "minAppVersion": candidate.min_app_version,
+        }))
+    }).await.map_err(|error| error.to_string())?
+}
+
+fn expected_package<'a>(id: &'a Option<String>, version: &'a Option<String>) -> Result<Option<(&'a str, &'a str)>, String> {
+    match (id.as_deref(), version.as_deref()) {
+        (None, None) => Ok(None),
+        (Some(id), Some(version)) => {
+            manifest::require_valid_id(id)?;
+            if manifest::semver_triple(version).is_none() { return Err("Invalid expected plugin version".into()); }
+            Ok(Some((id, version)))
+        }
+        _ => Err("expectedId and expectedVersion must be supplied together".into()),
+    }
+}
+
 #[tauri::command]
 pub async fn plugin_install_from_path(
+    app: tauri::AppHandle,
     state: tauri::State<'_, crate::AppState>,
     path: String,
     request_id: Option<String>,
+    expected_id: Option<String>,
+    expected_version: Option<String>,
+    host_request_id: Option<String>,
 ) -> Result<PluginInfo, String> {
     // spawn_blocking: sync commands execute on Tauri's main thread (see
     // cc_switch.rs), and the recursive copy below must not stall IPC there.
-    let sink = install_sink(state.emitters.clone(), request_id)?;
+    expected_package(&expected_id, &expected_version)?;
+    crate::host_chat::require_live_plugin_request(host_request_id.as_deref())?;
+    let sink = install_sink(state.emitters.clone(), request_id.clone())?;
     let result = tauri::async_runtime::spawn_blocking(move || {
-        fs::install_from(
+        crate::host_chat::require_live_plugin_request(host_request_id.as_deref())?;
+        fs::install_from_checked(
             &state::plugins_dir(),
             &state::state_path(),
             Path::new(path.trim()),
             "local",
+            expected_package(&expected_id, &expected_version)?,
             |p| sink.emit_install_progress(p),
         )
     })
     .await
     .map_err(|e| e.to_string())
     .and_then(|result| result);
+    if let Ok(info) = &result {
+        crate::plugin_caps::kill_tracked_children(&info.id);
+        crate::plugin_windows::dispose_plugin(&app, &info.id);
+    }
     // Copy/rename/state writes can fail after changing part of the host state.
-    emit_changed(
+    emit_changed_for_request(
         state.emitters.as_ref(),
         result.as_ref().ok().map(|info| info.id.as_str()),
         true,
+        request_id.as_deref(),
     );
     result
 }
@@ -136,6 +185,7 @@ fn uninstall_at(
     delete_data: bool,
 ) -> Result<(), String> {
     manifest::require_valid_id(id)?;
+    let _lifecycle_guard = fs::LIFECYCLE_LOCK.lock();
     let dir = plugins_dir.join(id);
     {
         // One locked read→mutate→write: the not-installed check, the record
@@ -166,6 +216,7 @@ fn uninstall_at(
 
 #[tauri::command]
 pub fn plugin_uninstall(
+    app: tauri::AppHandle,
     state: tauri::State<'_, crate::AppState>,
     db: tauri::State<'_, Arc<crate::db::Db>>,
     id: String,
@@ -178,6 +229,7 @@ pub fn plugin_uninstall(
         &id,
         delete_data,
     );
+    crate::plugin_windows::dispose_plugin(&app, &id);
     emit_changed(state.emitters.as_ref(), Some(&id), false);
     result
 }
@@ -188,6 +240,11 @@ fn set_enabled_at(
     id: &str,
     enabled: bool,
 ) -> Result<PluginInfo, String> {
+    let _lifecycle_guard = fs::LIFECYCLE_LOCK.lock();
+    set_enabled_locked(plugins_dir, state_path, id, enabled)
+}
+
+fn set_enabled_locked(plugins_dir: &Path, state_path: &Path, id: &str, enabled: bool) -> Result<PluginInfo, String> {
     manifest::require_valid_id(id)?;
     if enabled {
         require_supported_plugin(id)?;
@@ -211,44 +268,70 @@ fn set_enabled_at(
 
 #[tauri::command]
 pub fn plugin_set_enabled(
+    app: tauri::AppHandle,
     state: tauri::State<'_, crate::AppState>,
     id: String,
     enabled: bool,
 ) -> Result<PluginInfo, String> {
     let result = set_enabled_at(&state::plugins_dir(), &state::state_path(), &id, enabled);
+    if !enabled && result.is_ok() { crate::plugin_windows::dispose_plugin(&app, &id); }
     emit_changed(state.emitters.as_ref(), Some(&id), enabled);
     result
 }
 
 #[tauri::command]
 pub fn plugin_reload(
+    app: tauri::AppHandle,
     state: tauri::State<'_, crate::AppState>,
     id: String,
+    expected_version: Option<String>,
+    preserve_enabled: Option<bool>,
+    request_id: Option<String>,
+    host_request_id: Option<String>,
 ) -> Result<PluginInfo, String> {
-    let result = reload_at(&state::plugins_dir(), &state::state_path(), &id);
-    emit_changed(state.emitters.as_ref(), Some(&id), true);
+    crate::host_chat::require_live_plugin_request(host_request_id.as_deref())?;
+    let result = reload_checked_at(&state::plugins_dir(), &state::state_path(), &id, expected_version.as_deref(), preserve_enabled.unwrap_or(false));
+    if result.is_ok() { crate::plugin_windows::dispose_plugin(&app, &id); }
+    emit_changed_for_request(state.emitters.as_ref(), Some(&id), true, request_id.as_deref());
     result
 }
 
+#[cfg(test)]
 fn reload_at(plugins_dir: &Path, state_path: &Path, id: &str) -> Result<PluginInfo, String> {
+    reload_checked_at(plugins_dir, state_path, id, None, false)
+}
+
+fn reload_checked_at(plugins_dir: &Path, state_path: &Path, id: &str, expected_version: Option<&str>, preserve_enabled: bool) -> Result<PluginInfo, String> {
     manifest::require_valid_id(id)?;
     require_supported_plugin(id)?;
+    let _lifecycle_guard = fs::LIFECYCLE_LOCK.lock();
     // A reload must not create a state-only ghost record for an unknown id.
-    if !plugins_dir.join(id).exists() && !state::read_state(state_path)?.plugins.contains_key(id) {
+    let snapshot = state::read_state(state_path)?;
+    if !plugins_dir.join(id).exists() && !snapshot.plugins.contains_key(id) {
         return Err(format!("{id}: plugin not installed"));
     }
-    let info = set_enabled_at(plugins_dir, state_path, id, true)?;
+    if expected_version.is_some() || preserve_enabled {
+        let record = snapshot.plugins.get(id).ok_or_else(|| format!("{id}: plugin state is missing"))?;
+        let installed = fs::info_for(plugins_dir, id, record);
+        if expected_version.is_some_and(|expected| expected != installed.version) {
+            return Err(format!("{id}: installed version does not match expectedVersion"));
+        }
+        if preserve_enabled && !record.enabled { return Ok(installed); }
+    }
+    let info = set_enabled_locked(plugins_dir, state_path, id, true)?;
     crate::plugin_caps::kill_tracked_children(id);
     Ok(info)
 }
 
 #[tauri::command]
 pub fn plugin_quarantine(
+    app: tauri::AppHandle,
     state: tauri::State<'_, crate::AppState>,
     id: String,
     error: String,
 ) -> Result<PluginInfo, String> {
     manifest::require_valid_id(&id)?;
+    let _lifecycle_guard = fs::LIFECYCLE_LOCK.lock();
     let result = state::update_record(&state::state_path(), &id, |record| {
         record.quarantined = true;
         record.last_error = Some(error.clone());
@@ -256,6 +339,7 @@ pub fn plugin_quarantine(
     // Quarantine takes effect immediately for lifecycle="plugin" children
     // too — they belong to the quarantined plugin's runtime.
     crate::plugin_caps::kill_tracked_children(&id);
+    crate::plugin_windows::dispose_plugin(&app, &id);
     emit_changed(state.emitters.as_ref(), Some(&id), false);
     result.map(|record| fs::info_for(&state::plugins_dir(), &id, &record))
 }
@@ -470,6 +554,77 @@ mod tests {
         assert!(info.last_error.is_none());
     }
 
+    #[test]
+    fn managed_reload_checks_version_before_mutation_and_preserves_disabled_state() {
+        let scratch = Scratch::new();
+        let plugins_dir = scratch.path("plugins");
+        let state_path = scratch.path("plugins.json");
+        let source = scratch.path("source");
+        write_plugin(&source, &valid_manifest("managed-plugin"));
+        fs::install_from(&plugins_dir, &state_path, &source, "local", |_| {}).unwrap();
+        super::state::update_record(&state_path, "managed-plugin", |record| {
+            record.enabled = false;
+            record.quarantined = true;
+            record.last_error = Some("retained".into());
+        }).unwrap();
+        let before = std::fs::read(&state_path).unwrap();
+        assert!(super::reload_checked_at(&plugins_dir, &state_path, "managed-plugin", Some("9.9.9"), true).is_err());
+        let info = super::reload_checked_at(&plugins_dir, &state_path, "managed-plugin", Some("1.2.3"), true).unwrap();
+        assert!(!info.enabled && info.quarantined);
+        assert_eq!(info.last_error.as_deref(), Some("retained"));
+        assert_eq!(std::fs::read(&state_path).unwrap(), before);
+    }
+
+    #[test]
+    fn checked_package_requires_both_identity_fields() {
+        assert!(super::expected_package(&Some("valid-id".into()), &None).is_err());
+        assert!(super::expected_package(&None, &Some("1.0.0".into())).is_err());
+        assert!(super::expected_package(&Some("../bad".into()), &Some("1.0.0".into())).is_err());
+        assert!(super::expected_package(&Some("valid-id".into()), &Some("bad".into())).is_err());
+        assert!(super::expected_package(&None, &None).unwrap().is_none());
+    }
+
+    #[test]
+    fn managed_reload_waits_for_concurrent_lifecycle_commit_before_checking_enabled() {
+        let scratch = Scratch::new();
+        let plugins_dir = scratch.path("plugins");
+        let state_path = scratch.path("plugins.json");
+        let source = scratch.path("source");
+        write_plugin(&source, &valid_manifest("locked-plugin"));
+        fs::install_from(&plugins_dir, &state_path, &source, "local", |_| {}).unwrap();
+        let lifecycle = fs::LIFECYCLE_LOCK.lock();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let thread_plugins = plugins_dir.clone();
+        let thread_state = state_path.clone();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = super::reload_checked_at(&thread_plugins, &thread_state, "locked-plugin", Some("1.2.3"), true);
+            result_tx.send(result).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(result_rx.recv_timeout(std::time::Duration::from_millis(50)).is_err());
+        // Simulate the disable that owns the lifecycle section, before reload
+        // can inspect enabled/version. The old unlocked check raced this write.
+        super::set_enabled_locked(&plugins_dir, &state_path, "locked-plugin", false).unwrap();
+        drop(lifecycle);
+        assert!(!result_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap().unwrap().enabled);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn managed_change_event_correlates_reload_without_changing_legacy_events() {
+        struct Recorder(std::sync::Mutex<serde_json::Value>);
+        impl crate::event_sink::Emit for Recorder {
+            fn emit_json(&self, _: &str, raw_json: &str) {
+                *self.0.lock().unwrap() = serde_json::from_str(raw_json).unwrap();
+            }
+        }
+        let recorder = Recorder(std::sync::Mutex::new(serde_json::Value::Null));
+        super::emit_changed_for_request(&recorder, Some("managed-plugin"), true, Some("request-123"));
+        assert_eq!(recorder.0.lock().unwrap()["requestId"], "request-123");
+    }
+
     #[tokio::test]
     async fn disable_and_uninstall_kill_lifecycle_plugin_children() {
         let scratch = Scratch::new();
@@ -485,7 +640,7 @@ mod tests {
         crate::plugin_caps::register_tracked_child(
             "life-plugin",
             crate::plugin_caps::spawn_test_sleeper(),
-        );
+        ).unwrap();
         set_enabled_at(&plugins_dir, &state_path, "life-plugin", false).unwrap();
         // The disable hook already drained and killed the tracked child.
         assert_eq!(crate::plugin_caps::kill_tracked_children("life-plugin"), 0);
@@ -494,7 +649,7 @@ mod tests {
         crate::plugin_caps::register_tracked_child(
             "life-plugin",
             crate::plugin_caps::spawn_test_sleeper(),
-        );
+        ).unwrap();
         let db = crate::db::Db::open_at(&scratch.path("app.db")).unwrap();
         uninstall_at(&db, &plugins_dir, &state_path, "life-plugin", false).unwrap();
         // Same for uninstall: nothing left for a later kill to find.

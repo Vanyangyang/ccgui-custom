@@ -1,7 +1,7 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
-import type { AssistantNotice, AssistantNoticesStatus } from "./types";
+import type { AssistantNotice, AssistantNoticesStatus, CompletionAudioSettings, CompletionAudioView } from "./types";
 import { defaultNoticeConfig, noticeConfig } from "./config";
 const mock = vi.hoisted(() => ({ invoke: vi.fn(), listen: vi.fn(), models: vi.fn(), providers: vi.fn(), isWeb: false }));
 vi.mock("@/lib/transport", () => mock);
@@ -17,6 +17,10 @@ import { builtinSearchEntries } from "@/features/settings/builtin-search";
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 const status: AssistantNoticesStatus = { ...defaultNoticeConfig, available: true, observerAvailable: true, voiceAvailable: true, sourceEngines: ["codex", "cursor"], revision: 1, reason: "", model: "gemini-4-argon", effort: "medium", provider: "vertex" };
 const notice: AssistantNotice = { id: "notice-exact", kind: "completion", source: { engine: "codex", sessionId: "session", workspacePath: "workspace", label: "Custom title" }, turnId: "turn", createdAtMs: 1, startedAtMs: 0, tease: "A thought", body: "Full body 中文 😀 <script>safe</script>", pinned: false, expiresAtMs: null, read: false };
+const audioSettings: CompletionAudioSettings = { mode: "chimeAndVoice", chimeVolume: 40, voiceVolume: 80, quietHours: true, quietStart: 22, quietEnd: 8, engines: { codex: { chime: 1, voice: "", pitch: 100 }, cursor: { chime: 8, voice: "", pitch: 80 } } };
+const audioView: CompletionAudioView = { settings: audioSettings, revision: 1, defaults: audioSettings, autoVoices: { codex: { zh: "Kangkang", en: "David" }, cursor: { zh: "Kangkang", en: "Mark" } }, chimeCount: 13 };
+/** Completion audio IPC loads after status; answer it like native would. */
+const audioResponse = (command: string) => command === "assistant_notices_audio_settings" ? audioView : command === "assistant_notices_audio_voices" ? [] : undefined;
 function deferred<T>() { let resolve!: (value: T) => void; let reject!: (reason: unknown) => void; const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; }
 describe("built-in assistant notices", () => {
   let container: HTMLDivElement;
@@ -28,7 +32,7 @@ describe("built-in assistant notices", () => {
     mock.isWeb = false;
     mock.models.mockReset().mockResolvedValue([]); mock.providers.mockReset().mockResolvedValue({});
     notices = [notice]; history = []; callbacks = {};
-    mock.invoke.mockReset().mockImplementation(async (command: string) => command === "assistant_notices_list" ? notices : command === "assistant_notices_history" ? history : command === "assistant_notices_status" ? status : true);
+    mock.invoke.mockReset().mockImplementation(async (command: string) => audioResponse(command) ?? (command === "assistant_notices_list" ? notices : command === "assistant_notices_history" ? history : command === "assistant_notices_status" ? status : true));
     mock.listen.mockReset().mockImplementation(async (name: string, callback: (event: { payload: unknown }) => void) => { callbacks[name] = callback; return vi.fn(); });
     container = document.createElement("div"); document.body.appendChild(container); root = createRoot(container);
   });
@@ -356,7 +360,7 @@ describe("built-in assistant notices", () => {
     else mock.listen.mockRejectedValue(new Error("listener unavailable"));
     await act(async () => root.render(<AssistantNoticesControl />));
     expect(container.querySelector('[role="alert"]')?.textContent).toContain("assistantNotices.settingsError");
-    mock.invoke.mockResolvedValue({ ...status, paused: true });
+    mock.invoke.mockImplementation(async (command: string) => audioResponse(command) ?? { ...status, paused: true });
     const stop = vi.fn(); mock.listen.mockResolvedValue(stop);
     await act(async () => button("assistantNotices.reloadSettings").click());
     expect(container.querySelector('[role="alert"]')).toBeNull();

@@ -8,6 +8,17 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Instant;
 
+/// Managed background launches must not start AGY's detached auto-updater.
+/// AGY accepts the literal "true" here; "1" does not disable updates.
+/// This is child-local: explicit installation/update commands remain unaffected.
+pub(crate) fn configure_background_command(command: &mut tokio::process::Command) {
+    command.env("AGY_CLI_DISABLE_AUTO_UPDATE", "true");
+}
+
+#[cfg(all(test, windows))]
+#[path = "agy_background_tests.rs"]
+pub(crate) mod background_tests;
+
 /// Antigravity CLI (`agy`) home: `$ANTIGRAVITY_HOME` or `~/.gemini/antigravity-cli`.
 pub(crate) fn agy_home() -> PathBuf {
     crate::engine::engine_home(Some("ANTIGRAVITY_HOME"), ".gemini/antigravity-cli")
@@ -221,6 +232,7 @@ impl Engine for AgyEngine {
             .unwrap_or_else(|p| p.into_inner())
             .begin(session_id, Instant::now());
         let mut cmd = command_for_binary(bin);
+        configure_background_command(&mut cmd);
         let bridged = req
             .model
             .as_deref()
@@ -643,6 +655,26 @@ fn parse_result(result: &Value, usage: Option<Value>, succeeded: bool, out: &mut
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn agy_background_chat_and_helper_use_literal_true() {
+        let built = AgyEngine::new()
+            .build_command(&req(Some("auto")), "custom-cli")
+            .unwrap();
+        let value = |command: &tokio::process::Command| {
+            command
+                .as_std()
+                .get_envs()
+                .find(|(key, _)| *key == "AGY_CLI_DISABLE_AUTO_UPDATE")
+                .and_then(|(_, value)| value)
+                .map(|value| value.to_string_lossy().into_owned())
+        };
+        assert_eq!(value(&built.command).as_deref(), Some("true"));
+        let mut command = tokio::process::Command::new("custom-cli");
+        command.env("AGY_CLI_DISABLE_AUTO_UPDATE", "1");
+        configure_background_command(&mut command);
+        assert_eq!(value(&command).as_deref(), Some("true"));
+    }
 
     #[test]
     fn resume_keeps_billing_channel_and_rejects_colliding_ids() {

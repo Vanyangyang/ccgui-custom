@@ -37,7 +37,7 @@ import {
 import { usePromptCacheHeat } from "@/features/chat/use-prompt-cache";
 import { CrossSessionThreadIndicator, useCrossSessionThreadActivity } from "@/features/chat/components/CrossSessionCommsPanel";
 import Hourglass from "lucide-react/dist/esm/icons/hourglass";
-import { cacheWindowSummary, cacheWindowText, getPromptCacheHeatRatio, getSessionCacheHeat, isPromptCacheExpiringSoon, promptCacheForEngine, type CacheHeat } from "@/features/chat/prompt-cache";
+import { cacheWindowSummary, cacheWindowText, getPromptCacheHeatRatio, getSessionCacheHeat, isPromptCacheExpiringSoon, promptCacheForEngine, supportsPromptCacheExpiry, type CacheHeat } from "@/features/chat/prompt-cache";
 import type { PromptCacheWindow } from "@/lib/ipc";
 
 /** Streaming/unseen status dot on a thread row; renders nothing when the
@@ -165,18 +165,21 @@ export function CacheHeatHoverBadge({
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
   const [now, setNow] = useState(Date.now);
+  const supportsCacheExpiry = supportsPromptCacheExpiry(engine);
 
   useEffect(() => {
-    if (!open) return;
+    if (!open || !supportsCacheExpiry) return;
     setNow(Date.now());
     const timer = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(timer);
-  }, [open]);
+  }, [open, supportsCacheExpiry]);
 
-  if (engine === "cursor") {
+  if (!supportsCacheExpiry) {
     return (
       <span
-        style={cacheHeatChipStyle(0)}
+        style={cacheHeatChipStyle(engine === "codex" ? 1 : 0)}
+        title={engine === "codex" ? t("chat.cachePermanent") : undefined}
+        data-cache-heat-ratio={engine === "codex" ? 1 : undefined}
         className={cx(
           "inline-flex shrink-0 items-center justify-center rounded-sm bg-background-tertiary-default px-1 py-px text-caption-2-medium whitespace-nowrap text-text-tertiary transition-colors duration-300",
           hideOnGroupHover && "group-hover:hidden",
@@ -346,7 +349,7 @@ function ThreadItem({
   onSelect?: (id: string) => void;
   onAction?: (id: string, action: ThreadAction) => void;
   /** Right-click anywhere on the row: opens the thread context menu. */
-  onContextMenu?: (event: ReactMouseEvent<HTMLElement>, id: string) => void;
+  onContextMenu?: (event: ReactMouseEvent<HTMLElement>, id: string, workspacePath?: string) => void;
   disclosure?: ReactNode;
   /** 【全部会话】不缩进到工作区树下。 */
   flat?: boolean;
@@ -377,7 +380,11 @@ function ThreadItem({
       data-comm-active={comms.active || undefined}
       data-comm-related={comms.related || undefined}
       onContextMenu={
-        id && onContextMenu ? (event) => onContextMenu(event, id) : undefined
+        id && onContextMenu ? (event) => {
+          const source = workspacePath ?? leaderBranch?.workspacePath;
+          if (source) onContextMenu(event, id, source);
+          else onContextMenu(event, id);
+        } : undefined
       }
       className={cx(
         "group flex w-full cursor-pointer items-center gap-1.5 rounded-2lg py-[5px] pr-2 transition-colors duration-150 ease motion-reduce:transition-none",
@@ -636,9 +643,10 @@ function RepoHeaderRow({
             {repo.labelSuffix}
           </span>
         )}
+        {repo.unavailable && <span className="ml-1.5 shrink-0 text-caption-2-medium text-text-tertiary">{t(`projects.${repo.unavailable}`)}</span>}
       </button>
       {hasHoverActions && (
-        <span className="ml-auto hidden shrink-0 items-center gap-1.5 group-hover:inline-flex">
+        <span className="ml-auto hidden shrink-0 items-center gap-1.5 group-hover:inline-flex group-focus-within:inline-flex">
           {repo.id && onNewSession && (
             <button
               type="button"
@@ -672,7 +680,7 @@ function RepoHeaderRow({
       <span
         className={cx(
           "text-caption-2-medium text-text-tertiary",
-          hasHoverActions ? "group-hover:hidden" : "ml-auto",
+          hasHoverActions ? "group-hover:hidden group-focus-within:hidden" : "ml-auto",
         )}
       >
         {repo.threads.length}
@@ -796,7 +804,7 @@ function WorktreeGroup({
   onToggleRepo: (repo: AiChatRepo) => void;
   onThreadSelect?: (id: string) => void;
   onThreadAction?: (id: string, action: ThreadAction) => void;
-  onThreadContextMenu?: (event: ReactMouseEvent<HTMLElement>, id: string) => void;
+  onThreadContextMenu?: (event: ReactMouseEvent<HTMLElement>, id: string, workspacePath?: string) => void;
   onRepoContextMenu?: (event: ReactMouseEvent<HTMLElement>, workspaceId: string) => void;
   onNewWorktree?: (workspaceId: string) => void;
   /** Per-worktree + button: start a new chat in that worktree workspace. */
@@ -970,7 +978,7 @@ function ThreadTreeItem({ thread, activeThreadId, onSelect, onAction, onContextM
   activeThreadId?: string;
   onSelect?: (id: string) => void;
   onAction?: (id: string, action: ThreadAction) => void;
-  onContextMenu?: (event: ReactMouseEvent<HTMLElement>, id: string) => void;
+  onContextMenu?: (event: ReactMouseEvent<HTMLElement>, id: string, workspacePath?: string) => void;
   workspaceKey: string;
   flat?: boolean;
   nested?: boolean;
@@ -1017,7 +1025,7 @@ function RepoThreadList({
   activeThreadId?: string;
   onThreadSelect?: (id: string) => void;
   onThreadAction?: (id: string, action: ThreadAction) => void;
-  onThreadContextMenu?: (event: ReactMouseEvent<HTMLElement>, id: string) => void;
+  onThreadContextMenu?: (event: ReactMouseEvent<HTMLElement>, id: string, workspacePath?: string) => void;
   /** Rendered after the thread rows inside the same collapse animation (the
    *  parent repo's WORKTREES group), so it folds away with the threads. */
   trailing?: ReactNode;
@@ -1057,7 +1065,7 @@ function PagedThreadList({
   activeThreadId?: string;
   onThreadSelect?: (id: string) => void;
   onThreadAction?: (id: string, action: ThreadAction) => void;
-  onThreadContextMenu?: (event: ReactMouseEvent<HTMLElement>, id: string) => void;
+  onThreadContextMenu?: (event: ReactMouseEvent<HTMLElement>, id: string, workspacePath?: string) => void;
 }) {
 
   const { t } = useTranslation();
@@ -1144,7 +1152,7 @@ export function RepoItem({
   onThreadSelect?: (id: string) => void;
   onThreadAction?: (id: string, action: ThreadAction) => void;
   /** Right-click on a thread row: opens the thread context menu. */
-  onThreadContextMenu?: (event: ReactMouseEvent<HTMLElement>, id: string) => void;
+  onThreadContextMenu?: (event: ReactMouseEvent<HTMLElement>, id: string, workspacePath?: string) => void;
   onRemove?: (id: string) => void;
   /** Per-row + button: start a new chat in this workspace. */
   onNewSession?: (id: string) => void;
@@ -1226,7 +1234,7 @@ export function RecentThreadList({
   activeThreadId?: string;
   onThreadSelect?: (id: string) => void;
   onThreadAction?: (id: string, action: ThreadAction) => void;
-  onThreadContextMenu?: (event: ReactMouseEvent<HTMLElement>, id: string) => void;
+  onThreadContextMenu?: (event: ReactMouseEvent<HTMLElement>, id: string, workspacePath?: string) => void;
 }) {
   const { t } = useTranslation();
   const [page, setPage] = useState(0);

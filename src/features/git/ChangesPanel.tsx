@@ -18,6 +18,7 @@ import { registerRuntimeCheckpointBlocker } from "@/lib/runtime-checkpoint";
 import { cx } from "@/utils/cx";
 import { useFilesStore } from "@/features/files/store";
 import { resolveWorkspaceRepository } from "@/features/files/repositorySelection";
+import { useProjectContext } from "@/features/projects/store";
 import { useGitStore } from "./store";
 import { ChangesPanelHeader } from "./ChangesPanelHeader";
 import { CommitFooter } from "./CommitFooter";
@@ -58,6 +59,7 @@ export function ChangesPanel({
   const { t } = useTranslation();
   const selectedPath = useFilesStore((s) => s.selectedPath);
   const repositories = useFilesStore((s) => s.repositories);
+  const { roots } = useProjectContext(workspacePath);
   const gitWorkspacePath = useMemo(
     () =>
       repoPath ??
@@ -65,8 +67,9 @@ export function ChangesPanel({
         selectedPath,
         repositoryRoots: Object.keys(repositories),
         workspacePath,
+        projectRoots: roots.filter((root) => root.status === "available").map((root) => root.path),
       }),
-    [repositories, selectedPath, workspacePath, repoPath],
+    [repositories, selectedPath, workspacePath, repoPath, roots],
   );
   const status = useVisibleGitValue(visible, (s) => s.statusByWorkspace[gitWorkspacePath]);
   const notRepo = useVisibleGitValue(visible, (s) => s.notRepoByWorkspace[gitWorkspacePath]);
@@ -86,16 +89,27 @@ export function ChangesPanel({
   const checkpointState = useRef({ pending, commitMsg });
   checkpointState.current = { pending, commitMsg };
   const pendingOperations = useRef(0);
+  const targetRef = useRef({ path: gitWorkspacePath });
+  if (targetRef.current.path !== gitWorkspacePath) targetRef.current = { path: gitWorkspacePath };
+  const commitDrafts = useRef(new Map<string, string>());
   const setCommitMsg = useCallback((value: string) => {
+    if (value) commitDrafts.current.set(targetRef.current.path, value);
+    else commitDrafts.current.delete(targetRef.current.path);
     checkpointState.current.commitMsg = value;
     setCommitMsgState(value);
   }, []);
   useEffect(() => registerRuntimeCheckpointBlocker(`git-changes:${checkpointId}`, () => [
-    ...(checkpointState.current.commitMsg.length ? ["unsaved-git-commit-message"] : []),
+    ...(checkpointState.current.commitMsg.length || commitDrafts.current.size ? ["unsaved-git-commit-message"] : []),
     ...(pendingOperations.current || Object.keys(checkpointState.current.pending).length ? ["git-operation-pending"] : []),
   ]), [checkpointId]);
   /** Paths awaiting discard confirmation (one row or a whole group). */
   const [discardTarget, setDiscardTarget] = useState<string[] | null>(null);
+  useLayoutEffect(() => {
+    setDiscardTarget(null);
+    setCommitMsg(commitDrafts.current.get(gitWorkspacePath) ?? "");
+    setActionError(null);
+    setPending({});
+  }, [gitWorkspacePath, setCommitMsg]);
 
   useEffect(() => {
     if (!visible) return;
@@ -105,13 +119,15 @@ export function ChangesPanel({
 
   /** Runs a mutating action: tracks busy state, surfaces errors inline. */
   const run = useCallback((key: string, action: () => Promise<unknown>) => {
+    const target = targetRef.current;
     pendingOperations.current++;
     setPending((p) => ({ ...p, [key]: true }));
     setActionError(null);
     void action()
-      .catch((err: unknown) => setActionError(errorText(err)))
+      .catch((err: unknown) => { if (targetRef.current === target) setActionError(errorText(err)); })
       .finally(() => {
         pendingOperations.current--;
+        if (targetRef.current !== target) return;
         setPending((p) => {
           const next = { ...p };
           delete next[key];

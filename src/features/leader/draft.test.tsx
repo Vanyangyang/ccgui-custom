@@ -12,6 +12,7 @@ import { ipc, type ResolvedBuiltInAgent, type SendResult, type Workspace } from 
 import { invoke } from "@/lib/transport";
 import { getSelectedAgent } from "@/features/agents/selected-agent";
 import { useLeaderStore } from "./store";
+import { useProjectsStore } from "@/features/projects/store";
 
 const runtime = vi.hoisted(() => ({ web: false }));
 vi.mock("@/lib/transport", () => ({ get isWeb() { return runtime.web; }, invoke: vi.fn(), listen: vi.fn(async () => () => {}), webToken: null }));
@@ -40,8 +41,10 @@ beforeEach(() => {
   vi.mocked(getSelectedAgent).mockReturnValue(null);
   vi.mocked(invoke).mockImplementation(async (command, args) => command === "send_message"
     ? { runId: args!.runId, sessionId: null } : command === "task_snapshot" ? { leaders: [], branches: [] }
+    : command === "list_workspace_projects" ? []
     : command === "load_session_page" ? { messages: [], subagentHistory: [], nextBefore: null } : undefined);
   useLeaderStore.setState({ snapshot: { leaders: [], branches: [] }, error: null, busy: false, managing: null });
+  useProjectsStore.setState({ projects: [], loaded: false, error: null });
   useChatStore.setState({ initialized: true, workspaces: [workspace], sessions: [], active: tab, openTabs: [tab], activeEngine: "claude",
     bySession: {}, streamingByKey: {}, retryingByKey: {}, drafts: {}, unseen: {}, archivedSessionKeys: {}, workspaceGroups: [], workspaceAliases: {}, archivedWorkspaces: [],
     engines: [{ id: "claude", available: true, enabled: true, supportsImages: true, supportsComputerUse: true, permissions: ["manual", "bypass"] }],

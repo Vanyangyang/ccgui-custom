@@ -26,13 +26,13 @@ function checkpoint() {
 function request(method = "send_message", args: Record<string, unknown> = {}, from = sender): CrossSessionRequest {
   return { requestId: "transport-request", sender: from, method, arguments: { request_id: "retry-1", session_id: target.sessionId, message: "Please inspect this", ...args } };
 }
-function fixture(status: "idle" | "busy" | "awaiting_permission" = "idle") {
+function fixture(status: "idle" | "busy" | "awaiting_permission" = "idle", engine = target.engine) {
   const data = new Map<string, unknown>(); const observers = new Set<() => void>();
   let onEngineEvents: ((events: Array<{ runId: string; engine: string; sessionId: string; seq: number; kind: string; data?: unknown }>) => void) | undefined;
-  const meta = { ...target, title: "Target", preview: "private preview", model: "saved-model", effort: "high", provider: "saved-provider",
+  const meta = { ...target, engine, title: "Target", preview: "private preview", model: "saved-model", effort: "high", provider: "saved-provider",
     promptCache: { startedAt: Date.now() - 1000, observedAt: Date.now(), ttlSeconds: 3600, source: "anthropic-usage" } } as SessionMeta;
   const rows = { sessions: [meta], archived: [] as SessionMeta[], workspaces: [{ path: target.workspacePath }] as Workspace[] };
-  const key = sessionKey(target.engine, target.sessionId, target.workspacePath);
+  const key = sessionKey(engine, target.sessionId, target.workspacePath);
   const state = { initialized: true, bySession: {}, archivedSessionKeys: {}, openTabs: [], active: sender, drafts: { draft: "do not alter" }, activeEngine: "codex", permission: "manual" } as unknown as ChatStore;
   state.selectSession = vi.fn(async (engine, sessionId, workspacePath) => {
     state.openTabs.push({ engine, sessionId, workspacePath });
@@ -55,6 +55,81 @@ beforeEach(() => {
 });
 afterEach(() => { bridges.splice(0).forEach((bridge) => bridge.dispose()); vi.unstubAllGlobals(); });
 describe("host cross-session messaging", () => {
+  it("lists and addresses Windows workspaces across separator, drive-case and trailing-slash aliases", async () => {
+    const f = fixture("idle", "codex");
+    f.rows.sessions[0].model = "gpt-6-astra";
+    f.rows.workspaces[0].path = "g:\\target\\";
+    const listed = await f.handler(request("list_chats", { query: target.sessionId })) as { chats: Array<{ session_id: string }> };
+    expect(listed.chats.map((chat) => chat.session_id)).toEqual([target.sessionId]);
+    await f.handler(request("send_message", { workspace_path: "g:\\target\\" }));
+    await vi.waitFor(() => expect(f.host.send).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(f.host.send).mock.calls[0][0].workspacePath).toBe(target.workspacePath);
+  });
+
+  it("keeps distinct POSIX workspace casing unavailable", async () => {
+    const f = fixture();
+    f.rows.sessions[0].workspacePath = "/project/Target";
+    f.rows.workspaces[0].path = "/project/target";
+    expect(await f.handler(request("list_chats"))).toEqual({ chats: [] });
+  });
+
+  it.each([43920, 49999].flatMap((used) => ["cold", "unknown", "within-10-seconds"].map((heat) => ({ used, heat }))))(
+    "sends a small current context without approval: $used / $heat", async ({ used, heat }) => {
+      const f = fixture();
+      f.rows.sessions[0].promptCache = heat === "unknown" ? null : {
+        startedAt: Date.now() - (heat === "cold" ? 7200 : 3595) * 1000,
+        observedAt: Date.now() - (heat === "cold" ? 7100 : 3594) * 1000,
+        ttlSeconds: 3600, source: "anthropic-usage",
+      };
+      await f.state.selectSession(target.engine, target.sessionId, target.workspacePath);
+      f.state.bySession[sessionKey(target.engine, target.sessionId, target.workspacePath)].usage = { input_tokens: used };
+      vi.mocked(f.state.selectSession).mockResolvedValue(undefined);
+      const receipt = await f.handler(request()) as { status: string };
+      expect(receipt.status).not.toBe("awaiting_cost_approval");
+      await vi.waitFor(() => expect(f.host.send).toHaveBeenCalledTimes(1));
+    });
+  it("rechecks a small queued context that grows to 50k before dispatch", async () => {
+    const f = fixture("busy");
+    f.rows.sessions[0].promptCache = null;
+    await f.state.selectSession(target.engine, target.sessionId, target.workspacePath);
+    const session = f.state.bySession[sessionKey(target.engine, target.sessionId, target.workspacePath)];
+    session.usage = { input_tokens: 43920 };
+    vi.mocked(f.state.selectSession).mockResolvedValue(undefined);
+    expect(await f.handler(request())).toMatchObject({ status: "queued" });
+    session.usage = { input_tokens: 50000 };
+    f.idle();
+    await vi.waitFor(() => expect(useCrossSessionActivityStore.getState().records[0].status).toBe("awaiting_cost_approval"));
+    expect(f.host.send).not.toHaveBeenCalled();
+    session.usage = { input_tokens: 43920 };
+    expect(await f.handler(request())).toMatchObject({ status: "awaiting_cost_approval" });
+    expect(f.host.send).not.toHaveBeenCalled();
+  });
+  it.each(["idle", "busy", "awaiting_permission"] as const)("sends or queues a %s Codex GPT target without a cache expiry gate", async (status) => {
+    const f = fixture(status, "codex");
+    const meta = f.rows.sessions[0];
+    meta.model = "gpt-6-astra";
+    meta.updatedAt = Date.now() - 30 * 24 * 60 * 60_000;
+    meta.promptCache = { startedAt: Date.now() - 7200_000, observedAt: Date.now() - 7100_000, ttlSeconds: 1800, source: "openai-policy" };
+    const receipt = await f.handler(request()) as { status: string };
+    expect(receipt.status).not.toBe("awaiting_cost_approval");
+    if (status !== "idle") {
+      expect(receipt.status).toBe("queued");
+      expect(f.host.send).not.toHaveBeenCalled();
+      meta.promptCache = null;
+      f.idle();
+    }
+    await vi.waitFor(() => expect(f.host.send).toHaveBeenCalledTimes(1));
+    expect(useCrossSessionActivityStore.getState().records[0].costReview?.cache).toBeUndefined();
+  });
+  it("does not report a finite Codex retention window from legacy metadata", async () => {
+    const f = fixture("idle", "codex");
+    f.rows.sessions[0].model = "gpt-6-astra";
+    f.rows.sessions[0].promptCache = { startedAt: Date.now() - 7200_000, observedAt: Date.now() - 7100_000, ttlSeconds: 1800, source: "openai-policy" };
+    const result = await f.handler(request("list_chats")) as { chats: Array<Record<string, unknown>> };
+    expect(result.chats[0].cache_warmth).toBe("unknown");
+    expect(result.chats[0]).not.toHaveProperty("cache_retention_seconds");
+    expect(result.chats[0]).not.toHaveProperty("cache_evidence");
+  });
   it("loads an unopened idle exact target before sending an attributed prompt and preserves active/draft state", async () => {
     const f = fixture(); const active = f.state.active; const drafts = f.state.drafts;
     const receipt = await f.handler(request()) as { requestId: string; target: HostChatTarget };
@@ -138,9 +213,13 @@ describe("host cross-session messaging", () => {
     const reference = await f.handler(request("list_chats", { query: "Target", limit: 1 })) as { chats: Array<Record<string, unknown>> };
     expect(reference.chats[0]).toMatchObject({ cache_warmth: "hot", cache_reference: true, cache_retention_max_seconds: 1200, last_cache_read_tokens: 900 });
     f.rows.sessions[0].engine = "cursor";
-    const disabled = await f.handler(request("list_chats", { query: "Target", limit: 1 })) as { chats: Array<Record<string, unknown>> };
-    expect(disabled.chats[0].cache_warmth).toBe("unknown");
-    expect(disabled.chats[0]).not.toHaveProperty("cache_retention_seconds");
+    f.rows.sessions[0].promptCache = { startedAt: Date.now() - 60_000, observedAt: Date.now() - 30_000, ttlSeconds: 300, source: "cursor-policy" };
+    const cursor = await f.handler(request("list_chats", { query: "Target", limit: 1 })) as { chats: Array<Record<string, unknown>> };
+    expect(cursor.chats[0]).toMatchObject({ cache_warmth: "hot", cache_retention_seconds: 300, cache_evidence: "cursor-policy" });
+    f.rows.sessions[0].promptCache = null;
+    const unknown = await f.handler(request("list_chats", { query: "Target", limit: 1 })) as { chats: Array<Record<string, unknown>> };
+    expect(unknown.chats[0].cache_warmth).toBe("unknown");
+    expect(unknown.chats[0]).not.toHaveProperty("cache_retention_seconds");
   });
   it.each(["unknown", "short", "ambiguous", "archived", "remote", "remote-workspace", "unregistered", "self", "self-path-variant", "no-sender"])("rejects %s without preparing or sending", async (kind) => {
     const f = fixture(); let args: Record<string, unknown> = {}; let from = sender;
@@ -296,12 +375,12 @@ describe("host cross-session messaging", () => {
       f.state.openTabs.push(target);
       f.state.bySession[sessionKey(target.engine, target.sessionId, target.workspacePath)] = {
         ...EMPTY_SESSION, activeModel: "saved-model",
-        usage: { input_tokens: 100, cache_read_input_tokens: 800, output_tokens: 100, context_window: 2000 },
+        usage: { input_tokens: 49100, cache_read_input_tokens: 800, output_tokens: 100, context_window: 200000 },
       };
     });
     const result = await f.handler(request("send_message", { wait_seconds: 20, approve: true })) as Record<string, unknown>;
     expect(result).toMatchObject({ status: "awaiting_cost_approval", submitted_to_model: false,
-      cost_review: { context: { used: 1000, max: 2000, kind: "current_context" } } });
+      cost_review: { context: { used: 50000, max: 200000, kind: "current_context" } } });
     const record = useCrossSessionActivityStore.getState().records[0];
     expect(f.host.send).not.toHaveBeenCalled();
     expect(await f.handler(request("get_message_status"))).toMatchObject({ receipt: { status: "awaiting_cost_approval" } });
@@ -338,6 +417,59 @@ describe("cross-session activity review", () => {
     runId: "run-1", status: "completed", text: "Done", acceptedAt: 1, updatedAt: 3, ...overrides,
   });
   beforeEach(() => store.getState().reset());
+
+  it("accepts the first native receipt despite a newer local preparation timestamp", () => {
+    store.getState().upsertRecord(record({ status: "preparing", updatedAt: 1000 }));
+    store.getState().applyReceipt(receipt({ status: "received", updatedAt: 10 }));
+    expect(store.getState().records[0]).toMatchObject({ status: "received", runId: "run-1", updatedAt: 10 });
+  });
+
+  it("keeps an event completion when the delayed submitted receipt returns afterwards", () => {
+    store.getState().upsertRecord(record({ status: "preparing", updatedAt: 1000 }));
+    // createCrossSessionHandler applies bridge events before its awaited submit result.
+    store.getState().applyReceipt(receipt({ status: "completed", text: "Final answer", updatedAt: 20 }));
+    store.getState().markReviewed(store.getState().records);
+    const completed = store.getState();
+    store.getState().applyReceipt(receipt({ status: "received", text: "", updatedAt: 10 }));
+    expect(store.getState()).toBe(completed);
+  });
+
+  it("ignores an older same-run update while awaiting permission", () => {
+    store.getState().upsertRecord(record());
+    store.getState().applyReceipt(receipt({ status: "awaiting_permission", text: "Needs approval", updatedAt: 20 }));
+    const waiting = store.getState();
+    store.getState().applyReceipt(receipt({ status: "executing", text: "Earlier output", updatedAt: 10 }));
+    expect(store.getState()).toBe(waiting);
+    store.getState().applyReceipt(receipt({ status: "executing", text: "Resumed", updatedAt: 21 }));
+    expect(store.getState().records[0]).toMatchObject({ status: "executing", replyText: "Resumed" });
+  });
+
+  it("ignores a different run after accepting a request's run identity", () => {
+    store.getState().upsertRecord(record());
+    store.getState().applyReceipt(receipt({ status: "executing", updatedAt: 20 }));
+    const current = store.getState();
+    store.getState().applyReceipt(receipt({ runId: "old-run", status: "failed", error: "Unrelated failure", updatedAt: 30 }));
+    expect(store.getState()).toBe(current);
+  });
+
+  it.each(["completed", "failed"] as const)("keeps %s over an active receipt with the same timestamp but allows newer activity", (status) => {
+    store.getState().upsertRecord(record());
+    store.getState().applyReceipt(receipt({ status, updatedAt: 20 }));
+    const terminal = store.getState();
+    for (const active of ["received", "queued", "executing", "awaiting_permission", "awaiting_cost_approval"] as const) {
+      store.getState().applyReceipt(receipt({ status: active, updatedAt: 20 }));
+      expect(store.getState()).toBe(terminal);
+    }
+    store.getState().applyReceipt(receipt({ status: "executing", updatedAt: 21 }));
+    expect(store.getState().records[0].status).toBe("executing");
+  });
+
+  it("accepts a newer authoritative receipt after an unknown state", () => {
+    store.getState().upsertRecord(record());
+    store.getState().applyReceipt(receipt({ status: "unknown", updatedAt: 20 }));
+    store.getState().applyReceipt(receipt({ status: "executing", updatedAt: 21 }));
+    expect(store.getState().records[0].status).toBe("executing");
+  });
 
   it("keeps pending approvals visible beyond the terminal history limit and clear-finished", () => {
     for (let i = 0; i < 40; i++) store.getState().upsertRecord(record({ scopedId: `held-${i}`, status: "awaiting_cost_approval" }));
@@ -392,6 +524,18 @@ describe("cross-session activity review", () => {
     store.getState().markReviewed([current]);
     expect(isCrossSessionRecordUnread(store.getState().records.find((r) => r.scopedId === "activity-1")!)).toBe(false);
     expect(isCrossSessionRecordUnread(store.getState().records[0])).toBe(true);
+  });
+
+  it.each(["completed", "failed", "unknown"] as const)("keeps subtask %s history with the appropriate notification policy", (status) => {
+    const completed = record({ kind: "subtask", status, replyText: "Actual child result" });
+    store.getState().upsertRecord(completed);
+    const saved = store.getState().records[0];
+    expect(saved).toMatchObject({ kind: "subtask", status, replyText: "Actual child result" });
+    for (const participant of [undefined, sender, target]) {
+      expect(isCrossSessionRecordUnread(saved, participant)).toBe(status !== "completed");
+      expect(isCrossSessionRecordUnread({ ...saved, kind: "consultation" }, participant)).toBe(true);
+    }
+    expect(saved.reviewedBy).toBeUndefined();
   });
 
   it("preserves review across duplicate receipts and timestamp-only upserts", () => {
@@ -469,7 +613,7 @@ describe("cross-session activity review", () => {
     store.getState().markReviewed(store.getState().records);
     expect(store.getState()).toBe(before);
     const activeSnapshot = store.getState().records;
-    store.getState().applyReceipt(receipt());
+    store.getState().applyReceipt(receipt({ updatedAt: 4 }));
     store.getState().markReviewed(activeSnapshot);
     expect(isCrossSessionRecordUnread(store.getState().records[0])).toBe(true);
   });

@@ -63,6 +63,7 @@ export function CursorQuotaStatus({ snapshot, loading, refresh, now = Date.now()
           <p>{t("chat.cursorQuotaScope")}</p>
           {resetDate && <p>{t("chat.quotaResetAt", { time: resetDate.toLocaleString(i18n.language) })}</p>}
           {stale && <p>{t("chat.quotaStale")}</p>}
+          {ready?.collectedAt !== undefined && Number.isFinite(ready.collectedAt) && ready.collectedAt > 0 && ready.collectedAt <= now && Number.isFinite(new Date(ready.collectedAt * 1000).getTime()) && <p>{t("chat.quotaUpdated", { time: new Date(ready.collectedAt * 1000).toLocaleString(i18n.language) })}</p>}
           {errorKey && <p>{t(errorKey)}</p>}
         </div>
         <div className="flex items-center justify-between gap-2 border-t border-border-button-default pt-2">

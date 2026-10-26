@@ -1,9 +1,24 @@
-import { beforeEach, expect, it } from "vitest";
-import { usePluginTabsStore } from "./center-tabs";
+import { beforeEach, expect, it, vi } from "vitest";
+import { registerPluginTabLifecycle, usePluginTabsStore } from "./center-tabs";
 
 /** 与 browser store 相同的契约：打开即激活、关闭取邻居、越界移动钳制。 */
 beforeEach(() => {
   usePluginTabsStore.setState({ tabs: [], activeId: null });
+});
+
+it("silent restoration preserves selection and lifecycle replacement rejects stale teardown", () => {
+  const old = vi.fn(), current = vi.fn();
+  const removeOld = registerPluginTabLifecycle("plugin:a", old);
+  const removeCurrent = registerPluginTabLifecycle("plugin:a", current);
+  removeOld();
+  const s = usePluginTabsStore.getState();
+  s.openTab("plugin:b");
+  s.openTab("plugin:a", { activate: false, reason: "maintenance" });
+  expect(usePluginTabsStore.getState().activeId).toBe("plugin:b");
+  s.closeTab("plugin:a", "maintenance");
+  expect(old).not.toHaveBeenCalled();
+  expect(current.mock.calls).toEqual([[{ type: "open", reason: "maintenance" }], [{ type: "close", reason: "maintenance" }]]);
+  removeCurrent();
 });
 
 it("openTab 打开即激活；重复打开只聚焦", () => {

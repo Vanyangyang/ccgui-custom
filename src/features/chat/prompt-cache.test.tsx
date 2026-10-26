@@ -83,10 +83,29 @@ describe("provider prompt-cache retention", () => {
     expect(cacheWindowText(i18n.t, cache, "hot")).toContain("参考");
     expect(cacheWindowText(i18n.t, missed, "unknown")).toContain("上次请求未命中");
   });
-  it("disables Cursor policy metadata and never renews heat from streaming or activity", () => {
-    expect(promptCacheForEngine("cursor", windowFor(3600))).toBeUndefined();
+  it("uses Cursor's five-minute policy without renewing heat from streaming or activity", () => {
+    const cache = { ...windowFor(300), source: "cursor-policy" as const };
+    expect(promptCacheForEngine("cursor", cache)).toBe(cache);
+    expect(getSessionCacheHeat(cache, start + 299_999)).toBe("hot");
+    expect(getSessionCacheHeat(cache, start + 300_000)).toBe("unknown");
+    expect(getSessionCacheHeat(cache, start + 360_000)).toBe("cold");
+    expect(getPromptCacheHeatRatio(cache, start + 276_000, true, start + 276_000, "cursor")).toBe(0.08);
     expect(getPromptCacheHeatRatio(undefined, start + 60_000, true, start + 60_000)).toBe(0);
     expect(getPromptCacheHeatRatio(windowFor(300), start + 10 * 60_000, true, start + 10 * 60_000)).toBe(0);
+  });
+  it("ignores legacy Codex finite windows without inventing a hot cache or scheduling an expiry", () => {
+    const cache = promptCacheForEngine("codex", { ...windowFor(1800), source: "openai-policy" });
+    expect(cache).toBeUndefined();
+    expect(getSessionCacheHeat(cache, start + 30 * 24 * 60 * 60_000)).toBe("unknown");
+    expect(getPromptCacheHeatRatio(cache, start, false, start + 60_000)).toBe(0);
+    expect(nextCacheBoundary(cache, start + 60_000)).toBeUndefined();
+  });
+  it("keeps Codex at the red end of the scale regardless of age or evidence", () => {
+    for (const now of [start, start + 1800_000, start + 365 * 24 * 60 * 60_000]) {
+      expect(getPromptCacheHeatRatio(undefined, start, false, now, "codex")).toBe(1);
+      expect(getPromptCacheHeatRatio(windowFor(1800), start, false, now, "codex")).toBe(1);
+      expect(getPromptCacheHeatRatio(undefined, start, false, now, "cursor")).toBe(0);
+    }
   });
   it.each([300, 1800, 3600])("uses the recorded %i-second window and preserves uncertain request timing", (ttl) => {
     const w = windowFor(ttl);

@@ -25,13 +25,13 @@ export function retireLeaderBranch(id: string, key?: string) {
   if (key) { reclaimedSessions.add(key); hydrationNeeded.delete(key); }
 }
 
-type LeaderStreamObserver = (branchId: string, delta: string) => void;
+type LeaderStreamObserver = (branchId: string, runId: string, delta: string) => void;
 const streamObservers = new Set<LeaderStreamObserver>();
 export function subscribeLeaderStream(cb: LeaderStreamObserver): () => void {
   streamObservers.add(cb);
   return () => { streamObservers.delete(cb); };
 }
-export function emitLeaderStreamDelta(branchId: string, delta: string) {
+export function emitLeaderStreamDelta(branchId: string, runId: string, delta: string) {
   if (reclaimedBranches.has(branchId) || !delta) return;
-  for (const cb of streamObservers) cb(branchId, delta);
+  for (const cb of streamObservers) cb(branchId, runId, delta);
 }

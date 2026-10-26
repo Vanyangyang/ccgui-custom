@@ -1,4 +1,5 @@
 import { ipc, type FileIndexEntry } from "@/lib/ipc";
+import { distinctProjectRoots, type FileProjectRoot } from "@/features/files/project-roots";
 import {
   createRootCacheStore,
   type RootCache,
@@ -20,6 +21,8 @@ import {
 
 /** A file/dir in the picker, with match keys precomputed at index time. */
 export interface MentionEntry {
+  root?: string;
+  rootLabel?: string;
   /** Workspace-relative path, "/" separators. */
   rel: string;
   /** Basename (dirs included). */
@@ -66,6 +69,30 @@ const { useStore: useMentionIndexStore, prune: pruneMentionIndex } =
 /** Drop one workspace root's cached index when its workspace is removed;
  * the per-root cache would otherwise accumulate every root ever opened. */
 export { useMentionIndexStore, pruneMentionIndex };
+
+/** Bounded root cache; active roots always survive eviction. */
+export function ensureMentionRoots(roots: readonly FileProjectRoot[]) {
+  const available = distinctProjectRoots(roots).filter((root) => root.status === "available");
+  const active = new Set(available.map((root) => root.path));
+  const cached = Object.entries(useMentionIndexStore.getState().byRoot)
+    .filter(([path]) => !active.has(path)).sort((a, b) => b[1].fetchedAt - a[1].fetchedAt);
+  for (const [path] of cached.slice(Math.max(0, 16 - active.size))) pruneMentionIndex(path);
+  for (const root of available) useMentionIndexStore.getState().ensure(root.path);
+}
+
+export function matchProjectMentionEntries(
+  roots: readonly FileProjectRoot[], byRoot: Record<string, RootIndex>, query: string,
+): MentionEntry[] {
+  const matches = distinctProjectRoots(roots).filter((root) => root.status === "available").flatMap((root) =>
+    matchMentionEntries(byRoot[root.path]?.entries ?? [], root.path, query)
+      .map((entry) => ({ ...entry, root: root.path, rootLabel: root.label })),
+  );
+  const q = query.replace(/\\/g, "/").toLowerCase();
+  if (!q.startsWith("/") && !/^[a-z]:\//.test(q)) {
+    matches.sort((a, b) => (scoreEntry(b, q) ?? 0) - (scoreEntry(a, q) ?? 0) || a.depth - b.depth || a.key.localeCompare(b.key));
+  }
+  return matches.slice(0, MENTION_MENU_LIMIT);
+}
 
 /** Max rows the picker renders — caps DOM work regardless of match count. */
 export const MENTION_MENU_LIMIT = 50;

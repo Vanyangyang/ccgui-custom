@@ -19,6 +19,18 @@ beforeEach(() => {
 });
 
 describe("resolveChatFileLink", () => {
+  it("uses only a unique cross-root fallback and keeps cwd priority", async () => {
+    mocks.listFileIndex.mockImplementation(async (path) => path === "/plan" ? [{ rel: "notes.md", isDir: false }] : []);
+    expect(await resolveChatFileLink("notes.md", "/game", ["/game", "/plan"])).toBe("/plan/notes.md");
+    mocks.listDir.mockResolvedValueOnce([{ name: "notes.md" }]);
+    expect(await resolveChatFileLink("notes.md", "/game", ["/game", "/plan"])).toBe("/game/notes.md");
+  });
+  it("rejects ambiguity across roots, including multiple matches inside one root", async () => {
+    mocks.listFileIndex.mockImplementation(async (path) => path === "/game" ? [] : [{ rel: "a/notes.md", isDir: false }]);
+    expect(await resolveChatFileLink("notes.md", "/game", ["/plan", "/research"])).toBe("/game/notes.md");
+    mocks.listFileIndex.mockImplementation(async (path) => path === "/game" ? [] : [{ rel: "a/notes.md", isDir: false }, { rel: "b/notes.md", isDir: false }]);
+    expect(await resolveChatFileLink("notes.md", "/game", ["/plan"])).toBe("/game/notes.md");
+  });
   it("keeps the workspace-anchored candidate when its file shows up in the parent listing", async () => {
     mocks.listDir.mockResolvedValueOnce([{ name: "app.exe" }]);
     const got = await resolveChatFileLink("release/app.exe", WS);

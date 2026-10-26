@@ -80,7 +80,7 @@ pub async fn save_image_as(
         (Some(path), _) => {
             let db = std::sync::Arc::clone(db.inner());
             let bytes = tauri::async_runtime::spawn_blocking(move || {
-                crate::files::read_image_bytes_blocking(&db, &path)
+                crate::image_preview::read_blocking(&db, &path)
             })
             .await
             .map_err(|e| e.to_string())??;

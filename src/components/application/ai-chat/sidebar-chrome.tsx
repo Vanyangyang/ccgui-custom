@@ -28,6 +28,8 @@ import { WindowControls } from "@/components/application/window-controls";
 import { useRemoteControl } from "@/hooks/use-remote-control";
 import { compareByOrder, sidebarNavRegistry, useRegistry } from "@ccgui/plugin-sdk";
 import { OnboardingEntryButton } from "@/features/onboarding/OnboardingTour";
+import type { SessionMeta } from "@/lib/ipc";
+import { SessionSidebarWorkspaceDialog } from "./session-sidebar-workspace-dialog";
 
 type IconComponent = ComponentType<{
   className?: string;
@@ -297,8 +299,10 @@ export function SidebarContextMenus({
   auxiliary?: boolean;
   onSetAuxiliary?: (id: string, auxiliary: boolean) => void;
 }) {
+  const [sidebarSession, setSidebarSession] = useState<SessionMeta | null>(null);
   return (
     <>
+      {sidebarSession && <SessionSidebarWorkspaceDialog key={`${sidebarSession.engine}/${sidebarSession.sessionId}/${sidebarSession.workspacePath}`} session={sidebarSession} onClose={() => setSidebarSession((current) => current === sidebarSession ? null : current)} />}
       {workspaceMenu && (onWorkspaceAlias || onSetWorkspaceArchived) && (
         <WorkspaceContextMenu
           menu={workspaceMenu}
@@ -324,6 +328,7 @@ export function SidebarContextMenus({
           onCopyId={onCopyThreadId}
           auxiliary={auxiliary}
           onSetAuxiliary={onSetAuxiliary}
+          onSidebarWorkspace={setSidebarSession}
         />
       )}
     </>

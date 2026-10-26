@@ -6,7 +6,7 @@ import { ActionFeedbackIcon } from "@/components/base/action-feedback";
 import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw";
 import type { ClaudeQuotaSnapshot, CodexQuotaSnapshot } from "@/lib/ipc";
 import { useDismissOnOutsidePress, useTriggerToggle } from "@/utils/use-dismiss-on-outside-press";
-import { compactQuotaReset, quotaResetCountdown, validSubscriptionQuotaSnapshot } from "../subscription-quota";
+import { QUOTA_CREDITS_MAX_AGE, compactQuotaReset, quotaResetCountdown, validSubscriptionQuotaSnapshot } from "../subscription-quota";
 import { QuotaFact, QuotaMeter } from "./quota-meter";
 
 export function SubscriptionQuotaStatus({ engine = "claude", snapshot, loading, refresh, now = Date.now() / 1000 }: {
@@ -24,7 +24,7 @@ export function SubscriptionQuotaStatus({ engine = "claude", snapshot, loading, 
   const allowOpenChange = useTriggerToggle(open, triggerRef);
   const conversationQuota = engine === "claude";
   const quota = snapshot
-    ? validSubscriptionQuotaSnapshot(snapshot, now, conversationQuota ? { retainUntilNext: true } : undefined)
+    ? validSubscriptionQuotaSnapshot(snapshot, now)
     : undefined;
   const fiveHourUsed = quota?.windows.fiveHour?.usedPercentage;
   const fiveHourRemaining = fiveHourUsed === undefined ? undefined : 100 - fiveHourUsed;
@@ -32,7 +32,7 @@ export function SubscriptionQuotaStatus({ engine = "claude", snapshot, loading, 
   const sevenDayRemaining = sevenDayUsed === undefined ? undefined : 100 - sevenDayUsed;
   // Credits and reset chances are informational and only trusted while the
   // snapshot itself is valid; they are never redeemed from here.
-  const codexData = engine === "codex" && quota && quota.status !== "unavailable" ? quota as CodexQuotaSnapshot : undefined;
+  const codexData = engine === "codex" && quota && quota.status !== "unavailable" && quota.collectedAt !== undefined && now - quota.collectedAt < QUOTA_CREDITS_MAX_AGE ? quota as CodexQuotaSnapshot : undefined;
   const codexCredits = codexData?.credits;
   const codexResets = codexData?.resetCredits;
   const plan = t(engine === "codex" ? "chat.codexQuotaPlan" : "chat.quotaPlan");

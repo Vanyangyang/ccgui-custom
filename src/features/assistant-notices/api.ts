@@ -1,6 +1,6 @@
 import { invoke, isWeb, listen } from "@/lib/transport";
 import { useEffect, useRef, useState } from "react";
-import type { AssistantNotice, AssistantNoticeDisplay, AssistantNoticesConfig, AssistantNoticesStatus } from "./types";
+import type { AssistantNotice, AssistantNoticeDisplay, AssistantNoticesConfig, AssistantNoticesStatus, CompletionAudioSettings, CompletionAudioView, CompletionAudioVoice } from "./types";
 
 export { isWeb };
 function native<T>(command: string, args?: Record<string, unknown>): Promise<T> {
@@ -12,6 +12,10 @@ export const assistantNotices = {
   status: () => native<AssistantNoticesStatus>("assistant_notices_status"),
   configure: (config: AssistantNoticesConfig, expectedRevision: number) => native<AssistantNoticesStatus>("assistant_notices_configure", { config, expectedRevision }),
   displays: () => native<AssistantNoticeDisplay[]>("assistant_notices_displays"),
+  audioSettings: () => native<CompletionAudioView>("assistant_notices_audio_settings"),
+  configureAudio: (settings: CompletionAudioSettings, expectedRevision: number) => native<CompletionAudioView>("assistant_notices_audio_configure", { settings, expectedRevision }),
+  audioVoices: () => native<CompletionAudioVoice[]>("assistant_notices_audio_voices"),
+  previewAudio: (engine: string, settings: CompletionAudioSettings) => native<void>("assistant_notices_audio_preview", { engine, settings }),
   list: () => native<AssistantNotice[]>("assistant_notices_list"),
   history: () => native<AssistantNotice[]>("assistant_notices_history", { limit: 10 }),
   read: (id: string) => native<boolean>("assistant_notices_read", { id }),

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { MOBILE_MEDIA } from "@/hooks/use-media-query";
 import { readStoredBool, readStoredNumber, writeStored } from "@/lib/storage";
 
@@ -15,13 +15,27 @@ const PANEL_WIDTH_KEY = "ccgui-next.panelWidth";
 const SIDEBAR_WIDTH_KEY = "ccgui-next.sidebarWidth";
 let checkpointPanelTab = "files";
 let checkpointDragging = false;
+const panelListeners = new Set<() => void>();
+const panelGuards = new Set<(value: string) => void>();
+const subscribePanel = (listener: () => void) => { panelListeners.add(listener); return () => { panelListeners.delete(listener); }; };
+export function registerLayoutPanelSelectionGuard(guard: (value: string) => void) {
+  panelGuards.add(guard);
+  return () => { panelGuards.delete(guard); };
+}
+export function setLayoutPanelRuntime(value: string | ((previous: string) => string)): void {
+  const next = typeof value === "function" ? value(checkpointPanelTab) : value;
+  for (const guard of panelGuards) guard(next);
+  if (next === checkpointPanelTab) return;
+  checkpointPanelTab = next;
+  for (const listener of panelListeners) listener();
+}
 
 export function captureLayoutPanelRuntime() { return { panelTab: checkpointPanelTab }; }
 export function layoutPanelCheckpointBlockers(): string[] { return checkpointDragging ? ["layout-resize-in-progress"] : []; }
 export function restoreLayoutPanelRuntime(value: unknown): void {
   const state = value as { panelTab?: unknown } | null;
   if (!state || typeof state.panelTab !== "string") throw new Error("Invalid layout panel checkpoint");
-  checkpointPanelTab = state.panelTab;
+  setLayoutPanelRuntime(state.panelTab);
 }
 
 /** Stored width, validated against the live min/max before use. */
@@ -66,11 +80,8 @@ export function useLayoutPanels() {
   }, []);
   const [dragging, setDragging] = useState<"sidebar" | "panel" | null>(null);
   const [sidebarWidth, setSidebarWidth] = useState(() => readStoredWidth(SIDEBAR_WIDTH_KEY, SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_DEFAULT_WIDTH));
-  const [panelTab, setPanelTabState] = useState(() => checkpointPanelTab);
-  const setPanelTab = useCallback((value: string | ((previous: string) => string)) => {
-    checkpointPanelTab = typeof value === "function" ? value(checkpointPanelTab) : value;
-    setPanelTabState(checkpointPanelTab);
-  }, []);
+  const panelTab = useSyncExternalStore(subscribePanel, () => checkpointPanelTab);
+  const setPanelTab = setLayoutPanelRuntime;
   useEffect(() => () => { checkpointDragging = false; }, []);
   const widthAtDragStart = useRef(PANEL_DEFAULT_WIDTH);
   const dragStartX = useRef(0);

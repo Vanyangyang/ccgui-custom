@@ -356,13 +356,32 @@ async fn run_git(
     cancel: Option<&Arc<CreationCancel>>,
 ) -> Result<(GitOutput, bool), String> {
     let mut command = Command::new("git");
+    command.arg("-C").arg(repo).args(args);
+    run_git_command(command, cancel, std::time::Duration::from_secs(2)).await
+}
+
+async fn cancellation_requested(cancel: Option<&Arc<CreationCancel>>) {
+    let Some(cancel) = cancel else {
+        return std::future::pending().await;
+    };
+    let notified = cancel.notify.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    if !cancel.is_cancelled() {
+        notified.await;
+    }
+}
+
+async fn run_git_command(
+    mut command: Command,
+    cancel: Option<&Arc<CreationCancel>>,
+    drain_limit: std::time::Duration,
+) -> Result<(GitOutput, bool), String> {
     command
-        .arg("-C")
-        .arg(repo)
-        .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
     // Same spawn contract as cli_lifecycle: own process group on unix so a
     // cancel sweeps fetch's helper children (ssh) too; job object on
     // Windows so app exit never orphans the tree.
@@ -373,38 +392,58 @@ async fn run_git(
     let mut child = command.spawn().map_err(|e| format!("spawn git: {e}"))?;
     let pid = child.id();
     #[cfg(windows)]
-    let _tree_guard = crate::engine::job::assign_kill_on_close(&child);
+    let tree_guard = crate::engine::job::assign_kill_on_close(&child);
 
-    async fn drain(pipe: Option<impl tokio::io::AsyncRead + Unpin>) -> Vec<u8> {
-        let mut buf = Vec::new();
+    async fn drain(pipe: Option<impl tokio::io::AsyncRead + Unpin>, buf: &mut Vec<u8>) {
         if let Some(mut s) = pipe {
-            let _ = s.read_to_end(&mut buf).await;
+            let _ = s.read_to_end(buf).await;
         }
-        buf
     }
-    let out_task = tokio::spawn(drain(child.stdout.take()));
-    let err_task = tokio::spawn(drain(child.stderr.take()));
-
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let mut out = Vec::new();
+    let mut err = Vec::new();
     let mut cancelled = false;
-    let status = if let Some(cancel) = cancel {
-        tokio::select! {
-            s = child.wait() => s,
-            _ = cancel.notify.notified() => {
-                cancelled = true;
-                if let Some(pid) = pid.filter(|p| *p != 0) {
-                    crate::engine::kill_process_group(pid);
+    let status;
+    {
+        // Inline readers are dropped with this future: cancellation cannot
+        // detach background pipe tasks. Keep their partial output on Stop.
+        let readers = async {
+            tokio::join!(drain(stdout, &mut out), drain(stderr, &mut err));
+        };
+        tokio::pin!(readers);
+        let mut drained = false;
+        status = loop {
+            tokio::select! {
+                s = child.wait() => break s,
+                _ = cancellation_requested(cancel) => {
+                    cancelled = true;
+                    if let Some(pid) = pid.filter(|p| *p != 0) {
+                        crate::engine::kill_process_group(pid);
+                    }
+                    let _ = child.start_kill();
+                    break tokio::time::timeout(std::time::Duration::from_secs(2), child.wait())
+                        .await.map_err(|_| "wait git after cancellation timed out".to_string())?;
                 }
-                let _ = child.start_kill();
-                child.wait().await
+                _ = &mut readers, if !drained => { drained = true; }
             }
         }
-    } else {
-        child.wait().await
+        .map_err(|e| format!("wait git: {e}"))?;
+        // A descendant can keep pipes open after git exits. Sweep it before
+        // waiting for EOF, not when this function eventually returns.
+        #[cfg(windows)]
+        drop(tree_guard);
+        if !drained {
+            tokio::select! {
+                result = tokio::time::timeout(drain_limit, &mut readers) => {
+                    if result.is_err() && !cancelled { return Err("git output drain timed out".into()); }
+                }
+                _ = cancellation_requested(cancel), if !cancelled => { cancelled = true; }
+            }
+        }
     }
-    .map_err(|e| format!("wait git: {e}"))?;
-
-    let stdout = String::from_utf8_lossy(&out_task.await.map_err(|e| e.to_string())?).into_owned();
-    let stderr = String::from_utf8_lossy(&err_task.await.map_err(|e| e.to_string())?).into_owned();
+    let stdout = String::from_utf8_lossy(&out).into_owned();
+    let stderr = String::from_utf8_lossy(&err).into_owned();
     Ok((GitOutput { stdout, stderr, status }, cancelled))
 }
 
@@ -912,31 +951,43 @@ struct GhPrAuthor {
 /// `gh pr view` with a hard deadline: the CLI may be absent, logged out, or
 /// slow — every failure degrades the preview instead of blocking creation.
 async fn gh_pr_view(number: u64, repo_slug: &str) -> Option<GhPrView> {
-    let output = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        Command::new("gh")
-            .args([
-                "pr",
-                "view",
-                &number.to_string(),
-                "--repo",
-                repo_slug,
-                "--json",
-                "title,author,additions,deletions,state",
-            ])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .await
-    })
-    .await
-    .ok()?
-    .ok()?;
+    let mut command = Command::new("gh");
+    command.args([
+        "pr",
+        "view",
+        &number.to_string(),
+        "--repo",
+        repo_slug,
+        "--json",
+        "title,author,additions,deletions,state",
+    ]);
+    gh_pr_view_command(command, std::time::Duration::from_secs(3)).await
+}
+
+async fn gh_pr_view_command(mut command: Command, limit: std::time::Duration) -> Option<GhPrView> {
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    crate::engine::hide_console(&mut command);
+    let child = command.spawn().ok()?;
+    #[cfg(windows)]
+    let _tree_guard = crate::engine::job::assign_kill_on_close(&child);
+    let output = tokio::time::timeout(limit, child.wait_with_output())
+        .await
+        .ok()?
+        .ok()?;
     if !output.status.success() {
         return None;
     }
     serde_json::from_slice(&output.stdout).ok()
 }
+
+#[cfg(all(test, windows))]
+#[path = "git_worktree_process_tests.rs"]
+mod process_tests;
 
 /// PR preview for the create dialog: parse the input, confirm the repo is a
 /// GitHub remote, enrich via gh when available, flag branch/dir conflicts.

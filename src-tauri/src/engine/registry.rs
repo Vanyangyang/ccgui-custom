@@ -610,19 +610,57 @@ pub(crate) fn kill_process_group(pid: u32) {
     };
     // Bounded: app teardown sweeps every child, and a wedged taskkill must
     // not hang the exit path. Normal completion is tens of milliseconds.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    wait_cleanup_helper(
+        &mut killer,
+        std::time::Duration::from_secs(3),
+        std::time::Duration::from_secs(1),
+    );
+}
+
+#[cfg(not(unix))]
+fn wait_cleanup_helper(
+    child: &mut std::process::Child,
+    limit: std::time::Duration,
+    reap_limit: std::time::Duration,
+) {
+    let deadline = std::time::Instant::now() + limit;
     loop {
-        match killer.try_wait() {
-            Ok(Some(_)) | Err(_) => return,
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    return;
-                }
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Err(_) => {
+                eprintln!("[engine] cleanup helper wait failed");
+                break;
+            }
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                eprintln!("[engine] cleanup helper timed out");
+                break;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+        }
+    }
+    // std Child does not kill on drop. Own the helper's failure path too,
+    // without replacing a bounded teardown with an unbounded wait().
+    if child.kill().is_err() {
+        eprintln!("[engine] cleanup helper termination failed");
+    }
+    let deadline = std::time::Instant::now() + reap_limit;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            _ => {
+                eprintln!("[engine] cleanup helper reap incomplete");
+                return;
             }
         }
     }
 }
+
+#[cfg(all(test, windows))]
+#[path = "registry_cleanup_process_tests.rs"]
+mod cleanup_process_tests;
 
 /// Synthetic registry identity for virtual (host-stream) runs: they own no
 /// process, but the registry's dedup/remove paths are pid-keyed, so each run

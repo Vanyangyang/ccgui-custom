@@ -2,7 +2,8 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import i18n from "@/lib/i18n";
-import { SelfUpdateStatusChip } from "./SelfUpdateStatusChip";
+import { SelfUpdateStatusChip, formatLiveUpdateBlocker } from "./SelfUpdateStatusChip";
+import { SelfUpdateDetails } from "./SelfUpdateDetails";
 import { useLiveUpdateStore } from "./live-update";
 import { OnboardingTourHost } from "@/features/onboarding/OnboardingTour";
 import { useOnboardingStore } from "@/features/onboarding/store";
@@ -30,6 +31,42 @@ describe("self-update status action", () => {
     vi.restoreAllMocks();
   });
   const button = () => container.querySelector<HTMLButtonElement>("button")!;
+
+  it.each(["zh", "en"])("explains plugin close failures without hiding their saving error (%s)", language => {
+    const t = i18n.getFixedT(language);
+    expect(formatLiveUpdateBlocker(t, { reason: "plugin-update-close-failed", detail: "Draft write failed" }))
+      .toBe(`${t("settings.liveUpdateBlockers.pluginUpdateClose")} · Draft write failed`);
+    expect(formatLiveUpdateBlocker(t, { reason: "plugin-update-close-timeout" }))
+      .toBe(t("settings.liveUpdateBlockers.pluginUpdateCloseTimeout"));
+  });
+
+  it.each(["zh", "en"])("shows individual blockers and observed states in tooltip and details (%s)", async language => {
+    const t = i18n.getFixedT(language);
+    const blockers = [
+      { reason: "legacy-runs", runId: "run-a", engine: "codex", sessionId: "session-a", state: "registered" as const },
+      { reason: "legacy-runs", runId: "run-b", state: "reader-finished" as const },
+      { reason: "legacy-runs", state: "registry-unavailable" as const },
+    ];
+    for (const blocker of blockers) {
+      const label = formatLiveUpdateBlocker(t, blocker);
+      expect(label).toContain(t(`settings.liveUpdateBlockerStates.${blocker.state}`));
+      if (blocker.runId) expect(label).toContain(blocker.runId);
+      if (blocker.sessionId) expect(label).toContain(blocker.sessionId);
+      expect(label).not.toContain("settings.liveUpdate");
+    }
+    await act(async () => { useLiveUpdateStore.setState({
+      transaction: { ...transaction, phase: "Preparing" }, stage: "waiting", blockers,
+    }); });
+    expect(button().title).toContain("run-a");
+    expect(button().title).toContain("run-b");
+    expect(button().title).toContain("session-a");
+    await act(async () => { root.render(<SelfUpdateDetails state={useLiveUpdateStore.getState()} />); });
+    const list = container.querySelector('[data-testid="self-update-blockers"]');
+    expect(list?.querySelectorAll("li")).toHaveLength(3);
+    expect(list?.textContent).toContain("run-a");
+    expect(list?.textContent).toContain("run-b");
+    expect(list?.textContent).toContain(i18n.t("settings.liveUpdateBlockerStates.reader-finished"));
+  });
 
   async function guide(step: number) {
     vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {

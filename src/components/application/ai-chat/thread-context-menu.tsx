@@ -17,14 +17,18 @@ import type { ThreadAction } from "@/components/application/ai-chat/sidebar-type
 import { openSessionBeside, sessionFromThreadId } from "@/features/chat/split/store";
 import { useChatStore } from "@/features/chat/store";
 import { useLeaderStore, manageLeader, branchDeletionState } from "@/features/leader/store";
-import { isLeaderGroupMember } from "@/features/leader/types";
+import { isLeaderGroupMember, parentWorkspacePath } from "@/features/leader/types";
 import { isManagedLeaderSession } from "@/features/leader/event-state";
 import { parentOfBranch } from "@/features/leader/tree";
+import type { SessionMeta } from "@/lib/ipc";
+import { isLocalSidebarWorkspace } from "./session-sidebar-workspace-dialog";
+import { workspaceCatalogPathKey } from "@/lib/workspace-path";
 
 export interface ThreadMenuState {
   x: number;
   y: number;
   threadId: string;
+  workspacePath?: string;
 }
 
 type MenuEntry = ContextMenuEntry | "separator";
@@ -156,6 +160,7 @@ export function ThreadContextMenu({
   onCopyId,
   auxiliary,
   onSetAuxiliary,
+  onSidebarWorkspace,
 }: {
   menu: ThreadMenuState;
   onClose: () => void;
@@ -163,6 +168,7 @@ export function ThreadContextMenu({
   onCopyId?: (id: string) => void;
   auxiliary?: boolean;
   onSetAuxiliary?: (id: string, auxiliary: boolean) => void;
+  onSidebarWorkspace?: (session: SessionMeta) => void;
 }) {
   const { t } = useTranslation();
   const pluginDefs = useRegistry(sessionMenuRegistry);
@@ -170,10 +176,12 @@ export function ThreadContextMenu({
   const snapshot = useLeaderStore((s) => s.snapshot);
   const busy = useLeaderStore((s) => s.busy);
   const chat = useChatStore();
-  const meta = useChatStore((s) => s.sessions.find((m) => `${m.engine}/${m.sessionId}` === menu.threadId));
+  const candidates = chat.sessions.filter((m) => `${m.engine}/${m.sessionId}` === menu.threadId);
+  const meta = menu.workspacePath ? candidates.find((m) => m.workspacePath === menu.workspacePath) : candidates.length === 1 ? candidates[0] : undefined;
   const branch = snapshot.branches.find((b) => b.state !== "reclaimed" && (b.sessionId ? `${b.engine}/${b.sessionId}` : `leader-branch:${b.id}`) === menu.threadId);
   const target = parseThreadTarget(menu.threadId);
-  const workspacePath = meta?.workspacePath ?? branch?.workspacePath ?? snapshot.branches.find((b) => `${b.parentEngine}/${b.parentSessionId}` === menu.threadId)?.workspacePath;
+  const parentBranch = snapshot.branches.find((b) => `${b.parentEngine}/${b.parentSessionId}` === menu.threadId);
+  const workspacePath = menu.workspacePath ?? meta?.workspacePath ?? branch?.workspacePath ?? (parentBranch ? parentWorkspacePath(parentBranch) : undefined);
   const identity = target && workspacePath != null ? { ...target, workspacePath } : null;
   const managed = !!identity && isLeaderGroupMember(snapshot, identity);
   const leaderEntries: MenuEntry[] = [];
@@ -208,10 +216,16 @@ export function ThreadContextMenu({
   });
   const pluginSection =
     pluginDefs.length > 0 && !isDraft
-      ? buildPluginEntries(pluginDefs, parseThreadTarget(menu.threadId))
+      ? buildPluginEntries(pluginDefs, target && workspacePath ? { ...target, workspacePath } : target)
       : [];
   const entries = joinSections([
     buildSplitEntries(menu.threadId, t),
+    meta && !isDraft && !snapshot.branches.some((b) => b.engine === meta.engine && b.sessionId === meta.sessionId) && !meta.remote && !meta.auxiliaryKind
+      && chat.workspaces.some((w) => workspaceCatalogPathKey(w.path) === workspaceCatalogPathKey(meta.workspacePath) && isLocalSidebarWorkspace(w))
+      && onSidebarWorkspace ? [{
+      id: "sidebar-workspace", icon: null, label: t("chat.sidebarWorkspace"),
+      onSelect: () => onSidebarWorkspace(meta),
+    }] : [],
     auxiliary !== undefined && onSetAuxiliary ? [{
       id: "auxiliary-classification", icon: null,
       label: t(auxiliary ? "chat.moveToOrdinarySessions" : "chat.moveToAuxiliaryTasks"),

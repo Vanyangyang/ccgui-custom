@@ -246,7 +246,15 @@ fn recovered_old_completions_stay_durable_but_do_not_start_or_publish_asides() {
     let mut state = inner();
     state.config.observer_enabled = true; // This may have been restored by the one-time import.
     state.reconfigure(at);
-    let candidates = Service::drain(&mut state, &store, &outbox, at, &mut false).unwrap();
+    let candidates = Service::drain(
+        &mut state,
+        &store,
+        &outbox,
+        at,
+        &mut false,
+        |_: &NoticeSource| Ok(false),
+    )
+    .unwrap();
     assert!(outbox.pending(512).unwrap().is_empty());
     assert_eq!(candidates.len(), 1);
     assert!(!store.get(&pending.id).unwrap().unwrap().read);
@@ -468,6 +476,124 @@ fn admitted_completion(
 }
 
 #[test]
+fn managed_child_completions_are_acked_without_notices_or_candidates_while_root_survives() {
+    let outbox = Outbox::open(":memory:").unwrap();
+    outbox.set_ready(7, MAX_GENERATION).unwrap();
+    let recorder = completion_outbox::Recorder::new(outbox.clone());
+    for (run, session) in [
+        ("child-before", "managed-child"),
+        ("root", "managed-child-root"),
+        ("child-after", "managed-child"),
+    ] {
+        admitted_completion(&outbox, &recorder, run, session);
+    }
+    let captured = outbox.pending(512).unwrap();
+    assert_eq!(captured.len(), 3);
+    assert!(captured
+        .iter()
+        .all(|pending| !pending.cancel && !pending.started));
+    let store = inbox();
+    let mut state = inner();
+    state.config.observer_enabled = true;
+    let candidates = Service::drain(
+        &mut state,
+        &store,
+        &outbox,
+        now() + 1,
+        &mut false,
+        |source: &NoticeSource| Ok(source.session_id == "managed-child"),
+    )
+    .unwrap();
+    assert!(outbox.pending(512).unwrap().is_empty());
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].0.session_id, "managed-child-root");
+    for pending in captured {
+        let notice = store.get(&pending.id).unwrap();
+        if pending.session_id == "managed-child" {
+            assert!(notice.is_none());
+        } else {
+            assert_eq!(notice.unwrap().body, "A durable result");
+        }
+    }
+    // The only stored item and observer/audio candidate belong to the root.
+    assert_eq!(store.history(512).unwrap().len(), 1);
+}
+
+#[test]
+fn recovered_managed_child_completion_is_acked_without_notices_or_candidates() {
+    let root = std::env::temp_dir().join(format!("notice-child-recovery-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&root).unwrap();
+    let path = root.join("outbox.sqlite");
+    let captured = {
+        let outbox = Outbox::open(&path).unwrap();
+        outbox.set_ready(7, MAX_GENERATION).unwrap();
+        let recorder = completion_outbox::Recorder::new(outbox.clone());
+        admitted_completion(&outbox, &recorder, "old-child", "managed-child");
+        outbox.pending(512).unwrap().pop().unwrap()
+    };
+    assert!(!captured.cancel && !captured.started);
+    let outbox = Outbox::open(&path).unwrap();
+    assert_eq!(outbox.pending(512).unwrap(), vec![captured.clone()]);
+    let store = inbox();
+    let mut state = inner();
+    state.config.observer_enabled = true;
+    let candidates = Service::drain(
+        &mut state,
+        &store,
+        &outbox,
+        now() + 1,
+        &mut false,
+        |source: &NoticeSource| Ok(source.session_id == "managed-child"),
+    )
+    .unwrap();
+    assert!(candidates.is_empty());
+    assert!(outbox.pending(512).unwrap().is_empty());
+    assert!(store.get(&captured.id).unwrap().is_none());
+    assert!(store.history(512).unwrap().is_empty());
+    drop(outbox);
+    std::fs::remove_file(path).unwrap();
+    std::fs::remove_dir(root).unwrap();
+}
+
+#[test]
+fn failed_managed_child_lookup_preserves_pending_until_successful_retry() {
+    for session in ["managed-child", "managed-child-root"] {
+        let outbox = Outbox::open(":memory:").unwrap();
+        outbox.set_ready(7, MAX_GENERATION).unwrap();
+        let recorder = completion_outbox::Recorder::new(outbox.clone());
+        admitted_completion(&outbox, &recorder, "run", session);
+        let captured = outbox.pending(512).unwrap();
+        let store = inbox();
+        let mut state = inner();
+        let result = Service::drain(
+            &mut state,
+            &store,
+            &outbox,
+            now() + 1,
+            &mut false,
+            |_: &NoticeSource| Err("ownership lookup unavailable".into()),
+        );
+        assert_eq!(result.unwrap_err(), "ownership lookup unavailable");
+        assert_eq!(outbox.pending(512).unwrap(), captured);
+        assert!(store.history(512).unwrap().is_empty());
+        let candidates = Service::drain(
+            &mut state,
+            &store,
+            &outbox,
+            now() + 2,
+            &mut false,
+            |source: &NoticeSource| Ok(source.session_id == "managed-child"),
+        )
+        .unwrap();
+        assert!(outbox.pending(512).unwrap().is_empty());
+        let expected = usize::from(session == "managed-child-root");
+        assert_eq!(candidates.len(), expected);
+        assert_eq!(store.history(512).unwrap().len(), expected);
+        assert_eq!(store.get(&captured[0].id).unwrap().is_some(), expected == 1);
+    }
+}
+
+#[test]
 fn all_admitted_completions_commit_across_policy_and_total_switch_changes() {
     for config in [
         Config {
@@ -506,8 +632,15 @@ fn all_admitted_completions_commit_across_policy_and_total_switch_changes() {
             outbox.pause().unwrap();
         }
         let mut changed = false;
-        let candidates =
-            Service::drain(&mut state, &store, &outbox, now() + 1, &mut changed).unwrap();
+        let candidates = Service::drain(
+            &mut state,
+            &store,
+            &outbox,
+            now() + 1,
+            &mut changed,
+            |_: &NoticeSource| Ok(false),
+        )
+        .unwrap();
         assert!(changed);
         assert!(
             outbox.pending(512).unwrap().is_empty(),
@@ -547,7 +680,15 @@ fn bounded_drain_does_not_starve_old_generations_and_duplicate_commit_does_not_r
     store.record_completion(&first, &source).unwrap();
     store.mark_read(&first.id).unwrap();
     let mut changed = false;
-    let first_batch = Service::drain(&mut state, &store, &outbox, now() + 1, &mut changed).unwrap();
+    let first_batch = Service::drain(
+        &mut state,
+        &store,
+        &outbox,
+        now() + 1,
+        &mut changed,
+        |_: &NoticeSource| Ok(false),
+    )
+    .unwrap();
     assert_eq!(
         first_batch.len(),
         7,
@@ -555,7 +696,15 @@ fn bounded_drain_does_not_starve_old_generations_and_duplicate_commit_does_not_r
     );
     assert_eq!(outbox.pending(512).unwrap().len(), 1);
     assert!(store.get(&first.id).unwrap().unwrap().read);
-    let last = Service::drain(&mut state, &store, &outbox, now() + 2, &mut changed).unwrap();
+    let last = Service::drain(
+        &mut state,
+        &store,
+        &outbox,
+        now() + 2,
+        &mut changed,
+        |_: &NoticeSource| Ok(false),
+    )
+    .unwrap();
     assert_eq!(last.len(), 1);
     assert!(outbox.pending(512).unwrap().is_empty());
     assert_eq!(store.history(512).unwrap().len(), 9);
@@ -574,7 +723,15 @@ fn unsuccessful_domain_commit_never_acknowledges_the_owned_completion() {
     store.record_completion(&conflicting, &source()).unwrap();
     let mut state = inner();
     state.generation = 99;
-    assert!(Service::drain(&mut state, &store, &outbox, now() + 1, &mut false).is_err());
+    assert!(Service::drain(
+        &mut state,
+        &store,
+        &outbox,
+        now() + 1,
+        &mut false,
+        |_: &NoticeSource| Ok(false)
+    )
+    .is_err());
     assert_eq!(outbox.pending(512).unwrap(), vec![captured]);
 }
 
@@ -759,7 +916,15 @@ fn a_terminal_that_replaced_its_start_fences_the_previous_observation() {
         .unwrap()
         .unwrap();
     assert!(state.policy.current(&ticket, captured.started_at_ms));
-    Service::drain(&mut state, &store, &outbox, now() + 1, &mut false).unwrap();
+    Service::drain(
+        &mut state,
+        &store,
+        &outbox,
+        now() + 1,
+        &mut false,
+        |_: &NoticeSource| Ok(false),
+    )
+    .unwrap();
     assert!(!state.policy.current(&ticket, now() + 1));
     assert!(outbox.pending(512).unwrap().is_empty());
 }
@@ -944,9 +1109,13 @@ fn emit_progress(recorder: &completion_outbox::Recorder, run: &str, session: &st
 }
 
 fn take_progress(state: &mut Inner, store: &Store, outbox: &Outbox, at: u64) -> Observation {
-    assert!(Service::drain(state, store, outbox, at, &mut false)
+    assert!(
+        Service::drain(state, store, outbox, at, &mut false, |_: &NoticeSource| Ok(
+            false
+        ))
         .unwrap()
-        .is_empty());
+        .is_empty()
+    );
     let mut candidates = Service::drain_progress(state, outbox, at).unwrap();
     assert_eq!(candidates.len(), 1);
     candidates.pop().unwrap()
@@ -1248,9 +1417,16 @@ fn optional_progress_storage_failure_preserves_completion_delivery_and_recovers(
             admitted_completion(&outbox, &recorder, "terminal-run", "native-session");
             let at = now() + 1;
             assert_eq!(
-                Service::drain(&mut state, &store, &outbox, at, &mut false)
-                    .unwrap()
-                    .len(),
+                Service::drain(
+                    &mut state,
+                    &store,
+                    &outbox,
+                    at,
+                    &mut false,
+                    |_: &NoticeSource| Ok(false)
+                )
+                .unwrap()
+                .len(),
                 1
             );
             assert!(Service::progress_cycle(&mut state, &outbox, at).is_empty());
@@ -1270,9 +1446,16 @@ fn optional_progress_storage_failure_preserves_completion_delivery_and_recovers(
             // Optional observer failure leaves completion admission live for the next task too.
             admitted_completion(&outbox, &recorder, "next-terminal", "next-session");
             assert_eq!(
-                Service::drain(&mut state, &store, &outbox, now() + 1, &mut false)
-                    .unwrap()
-                    .len(),
+                Service::drain(
+                    &mut state,
+                    &store,
+                    &outbox,
+                    now() + 1,
+                    &mut false,
+                    |_: &NoticeSource| Ok(false)
+                )
+                .unwrap()
+                .len(),
                 1
             );
             assert_eq!(store.unread(now() + 1).unwrap().len(), 2);

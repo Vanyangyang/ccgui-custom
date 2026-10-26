@@ -1151,13 +1151,20 @@ mod tests {
     }
 
     #[test]
-    fn offline_upgrade_preserves_terminal_channel_before_retiring_v1_journal() {
-        for (phase, expected) in [(TransactionPhase::Committed, Phase::Committed),
-            (TransactionPhase::Failed, Phase::Failed), (TransactionPhase::RolledBack, Phase::RolledBack)] {
+    fn offline_upgrade_preserves_terminal_channel_before_retiring_legacy_journal() {
+        for schema in [crate::task_worker::SCHEMA_CONTRACT_V1_HASH, crate::task_worker::SCHEMA_CONTRACT_V2_HASH] {
+            for (phase, expected) in [(TransactionPhase::Committed, Phase::Committed),
+                (TransactionPhase::Failed, Phase::Failed), (TransactionPhase::RolledBack, Phase::RolledBack)] {
+                assert_offline_upgrade_preserves_terminal_channel(schema, phase, expected);
+            }
+        }
+    }
+
+    fn assert_offline_upgrade_preserves_terminal_channel(schema: &str, phase: TransactionPhase, expected: Phase) {
             let f = Fixture::new(); let a = owner("codex"); f.ready(&a, "ui", "r1");
             let batch = f.begin(&a, "build").channel.batch.unwrap();
             let package = f.package(&batch);
-            let hash = f.hash_with_schema(&package, crate::task_worker::SCHEMA_CONTRACT_V1_HASH);
+            let hash = f.hash_with_schema(&package, schema);
             let store = f.store();
             store.bind_update_package(&a, Some(&batch.id), &hash, &package).unwrap();
             let candidate = store.stage(&package, &hash).unwrap();
@@ -1168,11 +1175,10 @@ mod tests {
             f.ready(&a, "late", "r2"); // Persist Preparing; only the journal knows its later terminal state.
             state.transaction.as_mut().unwrap().phase = phase;
             store.persist(&state).unwrap();
-            store.retire_v1_after_offline_upgrade(&state).unwrap();
+            store.retire_legacy_after_offline_upgrade(&state).unwrap();
             assert_eq!(store.read_state().unwrap(), UpdateState::default());
             assert_eq!(store.channel_status().unwrap().batch.unwrap().phase, expected);
             assert!(f.begin(&a, "next").start_build);
-        }
     }
 
     #[test]

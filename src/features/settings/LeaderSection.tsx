@@ -10,6 +10,8 @@ import { EngineIcon } from "@/components/foundations/icons/engine-icon";
 import { CLI_DISPLAY_NAMES } from "@/components/foundations/icons/engine-brands";
 import { errorText } from "@/lib/errors";
 import { ipc, type AppSettings, type EngineModel } from "@/lib/ipc";
+import { listenSettingsChanged } from "@/lib/events";
+import { useTauriEvent } from "@/hooks/use-tauri-event";
 
 const ENGINES = ["claude", "codex", "agy", "cursor"] as const;
 type LeaderEngine = (typeof ENGINES)[number];
@@ -154,6 +156,10 @@ export function LeaderSection() {
   const mounted = useRef(false);
   const request = useRef(0);
   const savePending = useRef(false);
+  const settingsRef = useRef(settings);
+  const draftRef = useRef(draft);
+  settingsRef.current = settings;
+  draftRef.current = draft;
 
   useEffect(() => {
     mounted.current = true;
@@ -172,6 +178,31 @@ export function LeaderSection() {
     } finally { if (active()) setLoading(false); }
   }, []);
   useEffect(() => { void loadSettings().catch(() => {}); }, [loadSettings]);
+  useTauriEvent(() => listenSettingsChanged(() => {
+    if (savePending.current) return;
+    const token = ++request.current;
+    void ipc.refreshAppSettings().then((result) => {
+      if (!mounted.current || token !== request.current) return;
+      const previous = policies(settingsRef.current);
+      const next = policies(result);
+      // Other entry points can save while this page is open. Adopt their
+      // confirmed selections, but never erase this page's unsaved edits.
+      for (const engine of ENGINES) {
+        if (!policyChanged(draftRef.current[engine], previous[engine])) continue;
+        if (engine === "cursor") {
+          const removed = previous.cursor.models.filter(id => !draftRef.current.cursor.models.includes(id));
+          const added = draftRef.current.cursor.models.filter(id => !previous.cursor.models.includes(id));
+          next.cursor.models = [...new Set([...next.cursor.models, ...added])].filter(id => !removed.includes(id));
+        } else next[engine] = draftRef.current[engine];
+      }
+      settingsRef.current = result;
+      draftRef.current = next;
+      setSettings(result);
+      setDraft(next);
+      setLoading(false);
+      setSaved(false);
+    }).catch((reason) => { if (mounted.current && token === request.current) setError(errorText(reason)); });
+  }));
 
   const changed = ENGINES.filter((engine) => policyChanged(draft[engine], policies(settings)[engine]));
   const invalidDraft = ENGINES.some((engine) => engine !== "cursor" && draft[engine].mode === "restricted" && !draft[engine].models.length);
@@ -182,17 +213,29 @@ export function LeaderSection() {
     setError(null);
     setSaved(false);
     try {
-      const latest = await ipc.refreshAppSettings();
-      if (!mounted.current) return;
-      const leaderAllowedModels = { ...latest.leaderAllowedModels };
-      for (const engine of changed) {
-        if (draft[engine].mode === "unrestricted") leaderAllowedModels[engine] = null;
-        else leaderAllowedModels[engine] = draft[engine].mode === "disabled" ? [] : [...draft[engine].models];
+      const expected = { ...draft };
+      if (changed.includes("cursor")) {
+        const baseline = policies(settings).cursor.models;
+        const selected = await ipc.updateCursorModelSelection(
+          draft.cursor.models.filter(id => !baseline.includes(id)),
+          baseline.filter(id => !draft.cursor.models.includes(id)),
+        );
+        expected.cursor = { mode: "restricted", models: selected };
       }
-      await ipc.updateAppSettings({ ...latest, leaderAllowedModels });
+      const others = changed.filter(engine => engine !== "cursor");
+      if (others.length) {
+        const latest = await ipc.refreshAppSettings();
+        if (!mounted.current) return;
+        const leaderAllowedModels = { ...latest.leaderAllowedModels };
+        for (const engine of others) {
+          if (draft[engine].mode === "unrestricted") leaderAllowedModels[engine] = null;
+          else leaderAllowedModels[engine] = draft[engine].mode === "disabled" ? [] : [...draft[engine].models];
+        }
+        await ipc.updateAppSettings({ ...latest, leaderAllowedModels });
+      }
       const confirmed = await ipc.refreshAppSettings();
       if (!mounted.current) return;
-      if (changed.some((engine) => policyChanged(draft[engine], policies(confirmed)[engine]))) {
+      if (changed.some((engine) => policyChanged(expected[engine], policies(confirmed)[engine]))) {
         throw new Error(t("settings.leaderSaveMismatch"));
       }
       setSettings(confirmed);

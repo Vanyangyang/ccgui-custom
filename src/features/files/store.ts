@@ -15,6 +15,7 @@ import {
 import { errorText } from "@/lib/errors";
 import { writeStored } from "@/lib/storage";
 import { installFilesBridge, readRemoteAware } from "./remote-files";
+import { distinctProjectRoots, type FileProjectRoot } from "./project-roots";
 
 export const FILES_ROOT_KEY = "ccgui-next.filesRoot";
 let treeGeneration = 0;
@@ -54,6 +55,8 @@ export interface OpenFileState {
 interface FilesStore {
   /** Folder the tree is rooted at; "" = unset. Persisted to localStorage. */
   root: string;
+  roots: FileProjectRoot[];
+  setProjectRoots: (workspacePath: string, roots: readonly FileProjectRoot[]) => void;
   /** dirPath -> loaded children (dirs first; backend sorts). Missing = not fetched. */
   children: Record<string, DirEntry[]>;
   loadingDirs: Record<string, true>;
@@ -134,6 +137,7 @@ function dismissNonFileSurfaces() {
 
 export const useFilesStore = create<FilesStore>((set, get) => ({
   root: localStorage.getItem(FILES_ROOT_KEY) ?? "",
+  roots: [],
   children: {},
   loadingDirs: {},
   dirErrors: {},
@@ -151,8 +155,12 @@ export const useFilesStore = create<FilesStore>((set, get) => ({
   searchRoot: null,
 
   setRoot: (path) => {
+    get().setProjectRoots(path, path.trim() ? [{ path: path.trim(), label: fileName(path.trim()), role: "development", status: "available" }] : []);
+  },
+  setProjectRoots: (path, projectRoots) => {
     const root = path.trim();
-    if (root === get().root) return;
+    const roots = distinctProjectRoots(projectRoots);
+    if (root === get().root && JSON.stringify(roots) === JSON.stringify(get().roots)) return;
     treeGeneration += 1;
     if (root) {
       writeStored(FILES_ROOT_KEY, root);
@@ -163,6 +171,7 @@ export const useFilesStore = create<FilesStore>((set, get) => ({
     // paths and stay editable regardless of which tree is shown.
     set({
       root,
+      roots,
       refreshing: false,
       children: {},
       loadingDirs: {},
@@ -176,7 +185,7 @@ export const useFilesStore = create<FilesStore>((set, get) => ({
       // previous tree).
       searchRoot: null,
     });
-    if (root) void get().ensureDir(root);
+    for (const member of roots) if (member.status === "available") void get().ensureDir(member.path);
   },
 
   ensureDir: async (path) => {
@@ -269,7 +278,7 @@ export const useFilesStore = create<FilesStore>((set, get) => ({
     const generation = treeGeneration;
     set({ refreshing: true });
     try {
-      const dirs = new Set([s.root, ...Object.keys(s.children), ...Object.keys(s.expanded)]);
+      const dirs = new Set([...s.roots.filter((root) => root.status === "available").map((root) => root.path), ...Object.keys(s.children), ...Object.keys(s.expanded)]);
       const levels: Record<string, DirEntry[]> = {};
       await Promise.all(
         [...dirs].map(async (dir) => {

@@ -108,7 +108,7 @@ export function classifySessionForCleanup({
   const key = sessionKey(session.engine, session.sessionId, session.workspacePath);
   const isRunning = Boolean(streaming || state?.streaming || state?.loading || state?.queue.length);
   const heat = getSessionCacheHeat(promptCacheForEngine(session.engine, session.promptCache), now);
-  const heatRatio = getPromptCacheHeatRatio(promptCacheForEngine(session.engine, session.promptCache), session.updatedAt, isRunning, now);
+  const heatRatio = getPromptCacheHeatRatio(promptCacheForEngine(session.engine, session.promptCache), session.updatedAt, isRunning, now, session.engine);
   const idleMs =
     typeof session.updatedAt === "number" && Number.isFinite(session.updatedAt) && session.updatedAt > 0
       ? Math.max(0, now - session.updatedAt)

@@ -11,8 +11,9 @@ import { TerminalContextMenu, type TerminalMenuState } from "./TerminalContextMe
 import {
   ensureTerminalOutputListener,
   hasTerminalSession,
+  isTerminalTabAlive,
   markTerminalClosed,
-  markTerminalOpened,
+  openTerminalSession,
   setTerminalWriter,
   terminalBacklog,
 } from "./sessions";
@@ -97,18 +98,14 @@ export const TerminalView = memo(function TerminalView({ id, cwd }: { id: string
       setTerminalWriter(id, (data) => term.write(data));
 
       const openSession = () =>
-        ipc
-          .terminalOpen({ id, cwd, cols: term.cols, rows: term.rows })
-          .then(() => {
-            // Unmounted before the open resolved: leave the PTY alone (it
-            // outlives the view by design — a remount reopens/reuses it),
-            // but don't mark or touch state for a dead view.
-            if (disposed) return;
-            markTerminalOpened(id);
-            setError(null);
+        openTerminalSession({ id, cwd, cols: term.cols, rows: term.rows })
+          .then((opened) => {
+            if (opened && !disposed) setError(null);
+            return opened;
           })
           .catch((e: unknown) => {
             if (!disposed) setError(String(e));
+            return false;
           });
 
       const safeFit = () => {
@@ -134,18 +131,21 @@ export const TerminalView = memo(function TerminalView({ id, cwd }: { id: string
       );
 
       inputDisposable = term.onData((data) => {
-        const write = () =>
-          ipc.terminalWrite(id, data).catch((e: unknown) => {
+        const canWrite = () => !disposed && isTerminalTabAlive(id);
+        const write = () => {
+          if (!canWrite()) return;
+          return ipc.terminalWrite(id, data).catch((e: unknown) => {
             // Shell exited (exit/Ctrl-D): respawn, then deliver the input.
-            if (String(e).includes("Terminal session not found")) {
+            if (canWrite() && String(e).includes("Terminal session not found")) {
               markTerminalClosed(id);
-              void openSession().then(() =>
-                ipc.terminalWrite(id, data).catch(() => {}),
-              );
+              void openSession().then((opened) => {
+                if (opened && canWrite()) return ipc.terminalWrite(id, data).catch(() => {});
+              });
             }
           });
+        };
         if (hasTerminalSession(id)) void write();
-        else void openSession().then(write);
+        else if (canWrite()) void openSession().then((opened) => { if (opened) return write(); });
       });
 
       resizeObserver = new ResizeObserver(() => {

@@ -15,6 +15,7 @@ import { useChatSidebar } from "./use-chat-sidebar";
 import { useLeaderStore } from "@/features/leader/store";
 import { pickDirectory } from "@/lib/platform";
 import { WorkspaceSection } from "@/components/application/ai-chat/workspace-sections";
+import { useProjectsStore } from "@/features/projects/store";
 
 vi.mock("@/lib/ipc", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/ipc")>()),
@@ -72,7 +73,7 @@ function Harness() {
   const streaming = useChatStore((s) => s.streamingByKey["codex/s-1"] === true);
   const retrying = useChatStore((s) => s.retryingByKey["codex/s-1"] === true);
   sidebar = useChatSidebar({
-    sessionById: new Map(),
+    sessionById: new Map(useChatStore.getState().sessions.map((s) => [`${s.engine}/${s.sessionId}`, s])),
     threadStreaming: [streaming],
     threadRetrying: [retrying],
     collapseSidebarOnMobile: () => {},
@@ -91,6 +92,7 @@ describe("useChatSidebar repo mapping", () => {
     expect(captured[0].threads[0].auxiliaryKind).toBeUndefined();
   });
   beforeEach(async () => {
+    useProjectsStore.setState({ projects: [], loaded: true, error: null });
     useChatStore.setState({
       workspaces: [WS],
       sessions: [SESSION],
@@ -124,6 +126,44 @@ describe("useChatSidebar repo mapping", () => {
     expect(captured[0]?.threads.map((t) => t.id)).toEqual(["codex/s-1"]);
   });
 
+  it("groups by sidebar assignment but selects the real execution directory, and restores on clear", async () => {
+    const originalSelect = useChatStore.getState().selectSession;
+    const select = vi.fn(async () => {});
+    try {
+      await act(async () => useChatStore.setState({
+        workspaces: [WS, { ...WS, id: "sorted", name: "Sorted", path: "G:/sorted" }],
+        sessions: [{ ...SESSION, sidebarWorkspacePath: "g:\\sorted\\" }], selectSession: select,
+      }));
+      expect(captured[0].threads).toEqual([]);
+      expect(captured[1].threads[0]).toMatchObject({ id: "codex/s-1", workspacePath: "/ws/a" });
+      await act(async () => sidebar.handleThreadSelect("codex/s-1"));
+      expect(select).toHaveBeenCalledWith("codex", "s-1", "/ws/a");
+      await act(async () => useChatStore.setState({ sessions: [{ ...SESSION, sidebarWorkspacePath: null }] }));
+      expect(captured[0].threads[0].id).toBe("codex/s-1");
+      expect(captured[1].threads).toEqual([]);
+    } finally { await act(async () => useChatStore.setState({ selectSession: originalSelect })); }
+  });
+
+  it("project organization retains other workspaces and new chat follows the active workspace", async () => {
+    const originalStart = useChatStore.getState().startNewChat;
+    const start = vi.fn();
+    const other = { ...WS, id: "w2", path: "/ws/b", name: "b" };
+    try {
+      await act(async () => {
+        useProjectsStore.setState({ projects: [{ id: "p", name: "My project", defaultPath: WS.path,
+          members: [{ id: "m", path: WS.path, label: "Custom name", role: "reference", status: "available" }] }] });
+        useChatStore.setState({ workspaces: [WS, other], startNewChat: start,
+          active: { engine: "codex", sessionId: "other-chat", workspacePath: other.path } });
+      });
+      expect(sidebar.repos.map((r) => r.id)).toEqual(["w1", "w2"]);
+      expect(sidebar.sections?.[0]).toMatchObject({ name: "My project", repos: [{ label: "Custom name" }] });
+      expect(sidebar.sections?.[1].repos[0].id).toBe("w2");
+      await act(async () => sidebar.handleNewSession());
+      expect(start).toHaveBeenCalledExactlyOnceWith(other.path);
+      expect(useChatStore.getState().active?.sessionId).toBe("other-chat");
+    } finally { await act(async () => useChatStore.setState({ startNewChat: originalStart })); }
+  });
+
   it("includes saved sessions and drafts when a Windows workspace has repeated separators", async () => {
     const workspacePath = String.raw`C:\\Users\\demo\\Documents\\Projects\\example-app`;
     const sessionPath = String.raw`C:\Users\demo\Documents\Projects\example-app`;
@@ -140,6 +180,16 @@ describe("useChatSidebar repo mapping", () => {
       "codex/s-1",
     ]);
     expect(captured[0]?.path).toBe(workspacePath);
+  });
+
+  it("shows sessions and drafts without an override across drive-case and trailing-slash aliases", async () => {
+    await act(async () => useChatStore.setState({
+      workspaces: [{ ...WS, path: "G:/project/" }],
+      sessions: [{ ...SESSION, workspacePath: "g:\\project" }],
+      openTabs: [{ engine: "codex", sessionId: null, workspacePath: "g:/project" }],
+    }));
+    expect(captured[0].threads.map((thread) => thread.id)).toEqual(["new:codex:g:/project", "codex/s-1"]);
+    expect(captured[0].threads[1].workspacePath).toBe("g:\\project");
   });
 
   it("offers the remote add button and registers the chosen host path, preserving cancellation", async () => {

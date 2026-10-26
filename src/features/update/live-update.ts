@@ -7,6 +7,7 @@ import {
   prepareRuntimeCheckpoint,
 } from "@/lib/runtime-checkpoint";
 import { IS_CUSTOM_DISTRIBUTION } from "@/version/distribution";
+import { canClosePluginViewsForUpdate, preparePluginViewsForUpdate, resumePluginViewsAfterUpdate } from "@/features/plugins/runtime/update-close";
 
 export type LiveUpdatePhase = "Preparing" | "Ready" | "Activating" | "Committed" | "RolledBack" | "Failed";
 export interface LiveUpdateIdentity {
@@ -62,9 +63,19 @@ export interface LiveUpdateStatus {
   state: { stateVersion: number; active: LiveUpdateIdentity | null; transaction: LiveUpdateTransaction | null };
   channel?: LiveUpdateChannel;
   blockers: string[];
+  blockerDetails?: LiveUpdateBlockerDetail[];
   pendingHandoff: boolean;
 }
-export interface LiveUpdateBlocker { reason: string; participant?: string }
+export type LiveUpdateBlockerState = "starting" | "stopping" | "reader-finished" | "registered" | "registry-unavailable";
+export interface LiveUpdateBlockerDetail {
+  reason: string;
+  runId?: string;
+  engine?: string;
+  sessionId?: string;
+  pluginId?: string;
+  state?: LiveUpdateBlockerState;
+}
+export interface LiveUpdateBlocker extends LiveUpdateBlockerDetail { participant?: string; detail?: string }
 export type LiveUpdateErrorCode = "invalidInput" | "statusFailed" | "stageFailed" | "switchFailed" | "recoveryFailed" | "previousFailed";
 export interface LiveUpdateState {
   support: "checking" | "supported" | "unsupported" | "web" | "not-custom";
@@ -99,10 +110,17 @@ export interface LiveUpdateDependencies {
   prepareCheckpoint: typeof prepareRuntimeCheckpoint;
   abortCheckpoint: typeof abortRuntimeCheckpoint;
   resumeEvents: typeof resumeWorkerEvents;
+  canClosePluginViews?: (blockers: readonly LiveUpdateBlocker[]) => boolean;
+  preparePluginViews?: (signal: AbortSignal) => Promise<void>;
+  resumePluginViews?: () => void;
 }
 
 const POLL_MS = 3_000;
 const ERROR_POLL_MS = 10_000;
+const VIEW_PREPARE_TIMEOUT_MS = 45_000;
+class PluginViewPreparationError extends Error {
+  constructor(readonly reason: string, readonly detail?: string) { super(reason); }
+}
 const eligible = (transaction: LiveUpdateTransaction | null) => transaction?.phase === "Preparing" || transaction?.phase === "Ready";
 const busyBatchPhases = ["Building", "Staging", "Preparing", "Ready", "Activating"];
 
@@ -128,6 +146,42 @@ function validTransaction(value: unknown): value is LiveUpdateTransaction {
     && transaction.candidate?.channel === "protected-custom" && typeof transaction.candidate.version === "string";
 }
 
+/** Details enrich the authoritative reason list; they can never clear a blocker. */
+function nativeBlockers(reasons: string[], details: unknown): LiveUpdateBlocker[] {
+  const byReason = new Map<string, LiveUpdateBlockerDetail[]>();
+  if (Array.isArray(details)) {
+    const seen = new Set<string>();
+    for (const value of details) {
+      if (!value || typeof value !== "object" || !reasons.includes(value.reason)) continue;
+      const invalid = [value.runId, value.engine, value.sessionId].some(field => field !== undefined
+        && (typeof field !== "string" || !field.trim() || field.length > 256 || /[\u0000-\u001f\u007f]/.test(field)))
+        || (value.pluginId !== undefined && (typeof value.pluginId !== "string" || !/^[a-z0-9][a-z0-9-]{1,63}$/.test(value.pluginId)))
+        || (value.state !== undefined && !["starting", "stopping", "reader-finished", "registered", "registry-unavailable"].includes(value.state));
+      if (invalid) {
+        // Malformed service metadata must never be hidden by another valid owner.
+        if (value.reason === "plugin-processes") {
+          const matches = byReason.get(value.reason) ?? [];
+          matches.push({ reason: value.reason }); byReason.set(value.reason, matches);
+        }
+        continue;
+      }
+      const detail: LiveUpdateBlockerDetail = { reason: value.reason };
+      if (value.runId !== undefined) detail.runId = value.runId;
+      if (value.engine !== undefined) detail.engine = value.engine;
+      if (value.sessionId !== undefined) detail.sessionId = value.sessionId;
+      if (value.pluginId !== undefined) detail.pluginId = value.pluginId;
+      if (value.state !== undefined) detail.state = value.state;
+      const key = JSON.stringify(detail);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const matches = byReason.get(detail.reason) ?? [];
+      matches.push(detail);
+      byReason.set(detail.reason, matches);
+    }
+  }
+  return reasons.flatMap(reason => byReason.get(reason) ?? [{ reason }]);
+}
+
 /** One coordinator per UI runtime. Status polling is read-only until a staged
  * transaction and both readiness checks allow its already-authorized handoff. */
 export function createLiveUpdateStore(deps: LiveUpdateDependencies) {
@@ -143,6 +197,7 @@ export function createLiveUpdateStore(deps: LiveUpdateDependencies) {
   let failedTransactionId: string | undefined;
   // Keep the same id after an uncertain reply so native retries are idempotent.
   let requestId: string | undefined;
+  let viewPreparation: AbortController | undefined;
 
   const store = create<LiveUpdateState>(() => ({
     support: !deps.custom ? "not-custom" : deps.web ? "web" : "checking",
@@ -235,6 +290,7 @@ export function createLiveUpdateStore(deps: LiveUpdateDependencies) {
     async cancel() {
       if (disposed || deps.web || !deps.custom || activationSent || !store.getState().canCancel) return;
       cancelRequested = true;
+      viewPreparation?.abort();
       autoApply = false;
       revision++;
       clearTimer();
@@ -249,6 +305,7 @@ export function createLiveUpdateStore(deps: LiveUpdateDependencies) {
       disposed = true;
       revision++;
       cancelRequested = true;
+      viewPreparation?.abort();
       clearTimer();
     },
   }));
@@ -263,6 +320,9 @@ export function createLiveUpdateStore(deps: LiveUpdateDependencies) {
   }
 
   function transientWaitBlockers(cause: unknown): LiveUpdateBlocker[] | null {
+    if (cause instanceof PluginViewPreparationError) {
+      return [{ participant: "plugin-update-close", reason: cause.reason, detail: cause.detail }];
+    }
     const text = message(cause);
     const runtimeMatch = /^Runtime checkpoint is blocked:\s*(.+)$/.exec(text);
     if (runtimeMatch) {
@@ -287,6 +347,7 @@ export function createLiveUpdateStore(deps: LiveUpdateDependencies) {
       aborted = true;
     } catch (error) { recoveryErrors.push(message(error)); }
     try { deps.abortCheckpoint(); } catch (error) { recoveryErrors.push(message(error)); }
+    try { deps.resumePluginViews?.(); } catch (error) { recoveryErrors.push(message(error)); }
     try { await deps.resumeEvents(); } catch (error) { recoveryErrors.push(message(error)); }
     activationSent = false;
     cancelRequested = false;
@@ -309,10 +370,38 @@ export function createLiveUpdateStore(deps: LiveUpdateDependencies) {
     }
   }
 
-  function switchCandidate(transaction: LiveUpdateTransaction) {
+  async function prepareViews() {
+    const controller = new AbortController();
+    viewPreparation = controller;
+    let timedOut = false;
+    const timeout = setTimeout(() => { timedOut = true; controller.abort(); }, VIEW_PREPARE_TIMEOUT_MS);
+    let onAbort: (() => void) | undefined;
+    try {
+      // Bound even a non-cooperative callback. The view registry also fences
+      // each continuation so a late callback cannot close a newly edited tab.
+      await new Promise<void>((resolve, reject) => {
+        onAbort = () => reject(controller.signal.reason);
+        controller.signal.addEventListener("abort", onAbort, { once: true });
+        Promise.resolve().then(() => {
+          controller.signal.throwIfAborted();
+          return deps.preparePluginViews!(controller.signal);
+        }).then(resolve, reject);
+      });
+    } catch (error) {
+      if (cancelRequested || disposed) throw error;
+      throw new PluginViewPreparationError(timedOut ? "plugin-update-close-timeout" : "plugin-update-close-failed", timedOut ? undefined : message(error));
+    } finally {
+      clearTimeout(timeout);
+      if (onAbort) controller.signal.removeEventListener("abort", onAbort);
+      if (viewPreparation === controller) viewPreparation = undefined;
+    }
+  }
+
+  function switchCandidate(transaction: LiveUpdateTransaction, nativeReasons: LiveUpdateBlocker[]) {
     if (operation || disposed || !autoApply) return;
-    const initialBlockers = deps.readiness().map(({ participant, reason }) => ({ participant, reason }));
-    if (initialBlockers.length > 0) {
+    const initialBlockers = [...nativeReasons, ...deps.readiness().map(({ participant, reason }) => ({ participant, reason }))];
+    const closeViews = initialBlockers.length > 0 && !!deps.preparePluginViews && deps.canClosePluginViews?.(initialBlockers) === true;
+    if (initialBlockers.length > 0 && !closeViews) {
       store.setState({ stage: "waiting", canCancel: true, blockers: initialBlockers, error: undefined, errorCode: undefined });
       schedule();
       return;
@@ -324,6 +413,12 @@ export function createLiveUpdateStore(deps: LiveUpdateDependencies) {
     store.setState({ stage: "applying", canCancel: true, blockers: [], error: undefined, errorCode: undefined });
     operation = (async () => {
       try {
+        // Loaded opt-in controllers can keep background work even after their
+        // views close, including after a deferred admission attempt.
+        if (deps.preparePluginViews) await prepareViews();
+        if (cancelRequested || disposed) { await recover(transaction, undefined); return; }
+        const remaining = deps.readiness();
+        if (remaining.length) throw new Error(`Runtime checkpoint is blocked: ${remaining.map(b => `${b.participant}:${b.reason}`).join(", ")}`);
         await deps.native("live_update_begin", { transactionId: transaction.id });
         if (cancelRequested || disposed) { await recover(transaction, undefined); return; }
         const cursors = await deps.pauseEvents();
@@ -335,7 +430,7 @@ export function createLiveUpdateStore(deps: LiveUpdateDependencies) {
         await deps.native("live_update_activate", { transactionId: transaction.id, checkpoint, cursors });
         store.setState({ stage: "handoff", transaction: { ...transaction, phase: "Activating" }, canCancel: false });
       } catch (error) {
-        await recover(transaction, message(error));
+        await recover(transaction, cancelRequested || disposed ? undefined : error);
       }
     })().finally(() => { operation = null; schedule(); });
   }
@@ -346,6 +441,7 @@ export function createLiveUpdateStore(deps: LiveUpdateDependencies) {
     clearTimer();
     const ticket = revision;
     let ready: LiveUpdateTransaction | null = null;
+    let nativeReasons: LiveUpdateBlocker[] = [];
     store.setState({ checking: true });
     reading = (async () => {
       try {
@@ -365,8 +461,9 @@ export function createLiveUpdateStore(deps: LiveUpdateDependencies) {
           requestId = undefined;
           store.setState({ requestError: undefined });
         }
+        nativeReasons = nativeBlockers(status.blockers, status.blockerDetails);
         const blockers: LiveUpdateBlocker[] = [
-          ...status.blockers.map(reason => ({ reason })),
+          ...nativeReasons,
           ...deps.readiness().map(({ participant, reason }) => ({ participant, reason })),
         ];
         if (store.getState().errorCode === "statusFailed") {
@@ -384,7 +481,8 @@ export function createLiveUpdateStore(deps: LiveUpdateDependencies) {
           store.setState({ stage: "handoff", canCancel: false });
         } else if (eligible(transaction)) {
           if (store.getState().errorCode === undefined) store.setState({ stage: "waiting", canCancel: true });
-          if (autoApply && store.getState().errorCode === undefined && blockers.length === 0) ready = transaction;
+          if (autoApply && store.getState().errorCode === undefined && (blockers.length === 0 ||
+            (!!deps.preparePluginViews && deps.canClosePluginViews?.(blockers) === true))) ready = transaction;
         } else if (transaction?.phase === "Failed" || transaction?.phase === "RolledBack") {
           autoApply = false;
           failedTransactionId = transaction.id;
@@ -405,7 +503,7 @@ export function createLiveUpdateStore(deps: LiveUpdateDependencies) {
       }
     })().finally(() => {
       reading = null;
-      if (ready && ticket === revision) switchCandidate(ready);
+      if (ready && ticket === revision) switchCandidate(ready, nativeReasons);
       else schedule();
     });
     return reading;
@@ -419,6 +517,9 @@ export const useLiveUpdateStore = createLiveUpdateStore({
   readiness: () => getRuntimeCheckpointReadiness(), pauseEvents: () => pauseWorkerEvents(),
   prepareCheckpoint: () => prepareRuntimeCheckpoint(), abortCheckpoint: () => abortRuntimeCheckpoint(),
   resumeEvents: () => resumeWorkerEvents(),
+  canClosePluginViews: canClosePluginViewsForUpdate,
+  preparePluginViews: preparePluginViewsForUpdate,
+  resumePluginViews: resumePluginViewsAfterUpdate,
 });
 
 /** Register once after bootstrap recovery has released native/UI ownership.

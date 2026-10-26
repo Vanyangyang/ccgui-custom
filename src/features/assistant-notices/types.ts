@@ -54,3 +54,32 @@ export interface AssistantNoticesStatus extends AssistantNoticesConfig {
   sourceEngines: string[];
   revision: number;
 }
+
+export type CompletionAudioMode = "chimeAndVoice" | "chimeOnly" | "voiceOnly";
+
+export interface CompletionAudioEngine {
+  chime: number;
+  /** Installed voice display name; empty follows the engine default for the UI language. */
+  voice: string;
+  pitch: number;
+}
+
+export interface CompletionAudioSettings {
+  mode: CompletionAudioMode;
+  chimeVolume: number;
+  voiceVolume: number;
+  quietHours: boolean;
+  quietStart: number;
+  quietEnd: number;
+  engines: Record<string, CompletionAudioEngine>;
+}
+
+export interface CompletionAudioView {
+  settings: CompletionAudioSettings;
+  revision: number;
+  defaults: CompletionAudioSettings;
+  autoVoices: Record<string, { zh: string; en: string }>;
+  chimeCount: number;
+}
+
+export interface CompletionAudioVoice { name: string; language: string; gender: "male" | "female" | "unknown" }

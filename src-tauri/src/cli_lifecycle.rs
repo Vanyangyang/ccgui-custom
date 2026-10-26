@@ -24,6 +24,10 @@ use crate::engine::{command_for_binary, resolve};
 use crate::event_sink::{BroadcastEmit, EventSink, CLI_UPDATE_PROGRESS_EVENT};
 use crate::AppState;
 
+#[cfg(all(test, windows))]
+#[path = "cli_lifecycle_process_tests.rs"]
+pub(crate) mod process_tests;
+
 const CLI_VERSION_TIMEOUT: Duration = Duration::from_secs(10);
 const NPM_VIEW_TIMEOUT: Duration = Duration::from_secs(15);
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(420);
@@ -38,6 +42,7 @@ const UPDATE_LOG_CAP: usize = 200;
 /// and normal npm output stays well under this. Without a cap a chatty or
 /// stuck installer buffered unboundedly for up to INSTALL_TIMEOUT.
 const CAPTURE_CAP_BYTES: usize = 1024 * 1024;
+pub(crate) const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// npm-distributed engines → registry package. Grok / agy ship via their own
 /// installer scripts (no npm distribution), so they get a local-version probe
@@ -287,6 +292,9 @@ pub(crate) struct CliProbe {
 /// as installed (we just have nothing to display).
 pub(crate) async fn probe_local_version(bin: &str) -> CliProbe {
     let mut command = command_for_binary(bin);
+    // A custom AGY binary need not be named agy. Other CLIs ignore this AGY-only
+    // variable; apply it only to the read-only probe, never the update command.
+    crate::engine::agy::configure_background_command(&mut command);
     command.arg("--version");
     let output = match run_capture(&mut command, CLI_VERSION_TIMEOUT).await {
         Ok(output) => output,
@@ -775,6 +783,67 @@ struct ProcOutput {
     timed_out: bool,
 }
 
+/// Dropping a JoinHandle detaches it. Output readers instead belong to their
+/// command, including when the command future is cancelled during a pipe read.
+pub(crate) struct OutputReader<T>(Option<JoinHandle<Result<T, String>>>);
+
+impl<T: Send + 'static> OutputReader<T> {
+    pub(crate) fn spawn(future: impl std::future::Future<Output = Result<T, String>> + Send + 'static) -> Self {
+        Self(Some(tokio::spawn(future)))
+    }
+
+    async fn join(&mut self) -> Result<T, String> {
+        let result = self.0.as_mut().expect("reader is joined once").await;
+        self.0.take();
+        result.map_err(|error| format!("process output reader failed: {error}"))?
+    }
+
+    pub(crate) async fn abort_and_wait(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
+
+impl<T> Drop for OutputReader<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.0 { handle.abort(); }
+    }
+}
+
+/// Capture a bounded prefix while draining the rest, so output beyond the
+/// reporting limit cannot block the child on a full stdout/stderr pipe.
+pub(crate) async fn capture_pipe<R: AsyncRead + Unpin>(pipe: R, cap: usize) -> Result<Vec<u8>, String> {
+    let mut taken = pipe.take(cap as u64);
+    let mut bytes = Vec::new();
+    taken.read_to_end(&mut bytes).await.map_err(|error| format!("read process output: {error}"))?;
+    tokio::io::copy(&mut taken.into_inner(), &mut tokio::io::sink()).await
+        .map_err(|error| format!("drain process output: {error}"))?;
+    Ok(bytes)
+}
+
+pub(crate) async fn finish_output_readers<T: Send + 'static>(
+    stdout: &mut OutputReader<T>,
+    stderr: &mut OutputReader<T>,
+    limit: Duration,
+) -> Result<(T, T), String> {
+    let result = timeout(limit, async { tokio::try_join!(stdout.join(), stderr.join()) }).await;
+    match result {
+        Ok(Ok(output)) => Ok(output),
+        failure => {
+            // Do not leave detached reads after a timeout or one broken pipe.
+            stdout.abort_and_wait().await;
+            stderr.abort_and_wait().await;
+            match failure {
+                Ok(Err(error)) => Err(error),
+                Err(_) => Err("process output did not close after exit".into()),
+                Ok(Ok(_)) => unreachable!(),
+            }
+        }
+    }
+}
+
 async fn run_capture(command: &mut Command, limit: Duration) -> Result<ProcOutput, String> {
     command
         .stdin(Stdio::null())
@@ -791,9 +860,9 @@ async fn run_capture(command: &mut Command, limit: Duration) -> Result<ProcOutpu
     // live tree, so a grandchild orphaned before it ran would escape; the
     // job sweeps members whenever this guard drops — timeout or completion.
     #[cfg(windows)]
-    let _tree_guard = crate::engine::job::assign_kill_on_close(&child);
-    let stdout = child.stdout.take().map(spawn_read_all);
-    let stderr = child.stderr.take().map(spawn_read_all);
+    let tree_guard = crate::engine::job::assign_kill_on_close(&child);
+    let mut stdout = spawn_read_all(child.stdout.take().ok_or("process stdout unavailable")?);
+    let mut stderr = spawn_read_all(child.stderr.take().ok_or("process stderr unavailable")?);
     let (status, timed_out) = match timeout(limit, child.wait()).await {
         Ok(Ok(status)) => (Some(status), false),
         Ok(Err(e)) => return Err(e.to_string()),
@@ -802,7 +871,9 @@ async fn run_capture(command: &mut Command, limit: Duration) -> Result<ProcOutpu
                 crate::engine::kill_process_group(pid);
             }
             let _ = child.start_kill();
-            let _ = child.wait().await;
+            timeout(OUTPUT_DRAIN_TIMEOUT, child.wait()).await
+                .map_err(|_| "process did not exit after timeout")?
+                .map_err(|error| error.to_string())?;
             (None, true)
         }
     };
@@ -812,14 +883,11 @@ async fn run_capture(command: &mut Command, limit: Duration) -> Result<ProcOutpu
     if let Some(pid) = pid.filter(|p| *p != 0) {
         crate::engine::kill_process_group(pid);
     }
-    let stdout = match stdout {
-        Some(handle) => handle.await.unwrap_or_default(),
-        None => String::new(),
-    };
-    let stderr = match stderr {
-        Some(handle) => handle.await.unwrap_or_default(),
-        None => String::new(),
-    };
+    // A surviving descendant may own a pipe writer. Close the job before
+    // waiting for EOF, otherwise the readers and the guard wait on each other.
+    #[cfg(windows)]
+    drop(tree_guard);
+    let (stdout, stderr) = finish_output_readers(&mut stdout, &mut stderr, OUTPUT_DRAIN_TIMEOUT).await?;
     Ok(ProcOutput {
         status,
         stdout,
@@ -828,16 +896,13 @@ async fn run_capture(command: &mut Command, limit: Duration) -> Result<ProcOutpu
     })
 }
 
-fn spawn_read_all<R: AsyncRead + Unpin + Send + 'static>(pipe: R) -> JoinHandle<String> {
-    tokio::spawn(async move {
+fn spawn_read_all<R: AsyncRead + Unpin + Send + 'static>(pipe: R) -> OutputReader<String> {
+    OutputReader::spawn(async move {
         // Keep the first CAPTURE_CAP_BYTES + 1 bytes, then drain the rest
         // to a sink so the child never blocks on a full pipe (same
         // pattern as plugin_caps::read_stream_capped).
-        let mut taken = pipe.take((CAPTURE_CAP_BYTES + 1) as u64);
-        let mut bytes = Vec::new();
-        let _ = taken.read_to_end(&mut bytes).await;
-        let _ = tokio::io::copy(&mut taken.into_inner(), &mut tokio::io::sink()).await;
-        String::from_utf8_lossy(&bytes).into_owned()
+        let bytes = capture_pipe(pipe, CAPTURE_CAP_BYTES + 1).await?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
     })
 }
 /// Like `run_capture`, but each output line is also pushed to the progress
@@ -861,16 +926,10 @@ async fn run_streaming(
     let pid = child.id();
     // Same kill-on-close job rationale as run_capture above.
     #[cfg(windows)]
-    let _tree_guard = crate::engine::job::assign_kill_on_close(&child);
+    let tree_guard = crate::engine::job::assign_kill_on_close(&child);
     reporter.emit("started", None, None);
-    let stdout = child
-        .stdout
-        .take()
-        .map(|pipe| spawn_read_lines(pipe, reporter.clone(), "stdout"));
-    let stderr = child
-        .stderr
-        .take()
-        .map(|pipe| spawn_read_lines(pipe, reporter.clone(), "stderr"));
+    let mut stdout = spawn_read_lines(child.stdout.take().ok_or("process stdout unavailable")?, reporter.clone(), "stdout");
+    let mut stderr = spawn_read_lines(child.stderr.take().ok_or("process stderr unavailable")?, reporter.clone(), "stderr");
     let (status, timed_out) = match timeout(limit, child.wait()).await {
         Ok(Ok(status)) => (Some(status), false),
         Ok(Err(e)) => return Err(e.to_string()),
@@ -879,7 +938,9 @@ async fn run_streaming(
                 crate::engine::kill_process_group(pid);
             }
             let _ = child.start_kill();
-            let _ = child.wait().await;
+            timeout(OUTPUT_DRAIN_TIMEOUT, child.wait()).await
+                .map_err(|_| "process did not exit after timeout")?
+                .map_err(|error| error.to_string())?;
             (None, true)
         }
     };
@@ -888,14 +949,9 @@ async fn run_streaming(
     if let Some(pid) = pid.filter(|p| *p != 0) {
         crate::engine::kill_process_group(pid);
     }
-    let stdout = match stdout {
-        Some(handle) => handle.await.unwrap_or_default(),
-        None => String::new(),
-    };
-    let stderr = match stderr {
-        Some(handle) => handle.await.unwrap_or_default(),
-        None => String::new(),
-    };
+    #[cfg(windows)]
+    drop(tree_guard);
+    let (stdout, stderr) = finish_output_readers(&mut stdout, &mut stderr, OUTPUT_DRAIN_TIMEOUT).await?;
     reporter.emit("finished", None, status.map(|s| s.success()));
     reporter.flush();
     Ok(ProcOutput {
@@ -907,14 +963,14 @@ async fn run_streaming(
 }
 
 /// Read a stream line by line, reporting each line (clipped to
-/// PROGRESS_LINE_CAP chars) while capturing the full text. Invalid UTF-8
-/// ends the read early — captured-so-far is still returned.
+/// PROGRESS_LINE_CAP chars) while capturing bounded text. Read failures are
+/// reported instead of converting incomplete output into a successful update.
 fn spawn_read_lines<R: AsyncRead + Unpin + Send + 'static>(
     pipe: R,
     reporter: ProgressReporter,
     stream: &'static str,
-) -> JoinHandle<String> {
-    tokio::spawn(async move {
+) -> OutputReader<String> {
+    OutputReader::spawn(async move {
         let mut lines = tokio::io::BufReader::new(pipe).lines();
         let mut captured = String::new();
         loop {
@@ -933,10 +989,11 @@ fn spawn_read_lines<R: AsyncRead + Unpin + Send + 'static>(
                     };
                     reporter.emit(stream, Some(clipped), None);
                 }
-                Ok(None) | Err(_) => break,
+                Ok(None) => break,
+                Err(error) => return Err(format!("read process {stream}: {error}")),
             }
         }
-        captured
+        Ok(captured)
     })
 }
 

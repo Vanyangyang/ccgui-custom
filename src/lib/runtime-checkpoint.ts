@@ -49,6 +49,21 @@ export function createRuntimeCheckpointCoordinator() {
   let paused = false;
   let preparing = false;
   let revision = 0;
+  const resumeWaiters = new Set<() => void>();
+  const whenResumed = (signal?: AbortSignal): Promise<void> => {
+    if (signal?.aborted) return Promise.reject(signal.reason);
+    if (!paused) return Promise.resolve();
+    return new Promise<void>((resolve, reject) => {
+      const cleanup = () => {
+        resumeWaiters.delete(onResume);
+        signal?.removeEventListener("abort", onAbort);
+      };
+      const onResume = () => { cleanup(); resolve(); };
+      const onAbort = () => { cleanup(); reject(signal?.reason); };
+      resumeWaiters.add(onResume);
+      signal?.addEventListener("abort", onAbort, { once: true });
+    });
+  };
   const readiness = (capturing = true): RuntimeCheckpointBlocker[] => {
     const result: RuntimeCheckpointBlocker[] = [];
     for (const id of required) if (!participants.has(id)) result.push({ participant: id, reason: "participant-unavailable" });
@@ -67,6 +82,8 @@ export function createRuntimeCheckpointCoordinator() {
   const resume = () => {
     if (!paused) return;
     paused = false;
+    // Ownership is available even if a participant's resumed callback fails.
+    for (const waiter of resumeWaiters) waiter();
     const failures: unknown[] = [];
     for (const participant of participants.values()) {
       try { participant.resumed?.(); } catch (error) { failures.push(error); }
@@ -116,6 +133,7 @@ export function createRuntimeCheckpointCoordinator() {
       return cloneCheckpointValue(participant.capture());
     },
     isPaused: () => paused,
+    whenResumed,
     assertAllowed,
     beginOperation(reason: string): () => void {
       assertAllowed();
@@ -163,6 +181,7 @@ export const awaitRuntimeCheckpointReady = runtimeCheckpoint.awaitReady;
 export const resumeRuntimeCheckpoint = runtimeCheckpoint.resume;
 export const resumeCommittedRuntimeCheckpoint = runtimeCheckpoint.resumeCommitted;
 export const isRuntimeSubmissionPaused = runtimeCheckpoint.isPaused;
+export const whenRuntimeSubmissionResumed = runtimeCheckpoint.whenResumed;
 export const assertRuntimeSubmissionAllowed = runtimeCheckpoint.assertAllowed;
 export const beginRuntimeOperation = runtimeCheckpoint.beginOperation;
 

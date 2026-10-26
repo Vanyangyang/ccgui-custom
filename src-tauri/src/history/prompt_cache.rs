@@ -1,12 +1,24 @@
 //! Prompt-cache evidence, independent of file/activity timestamps and process state.
-//! Anthropic's usage buckets report the requested TTL; OpenAI's GPT-5.6/6
-//! policy specifies a 30-minute minimum. Neither guarantees the next prefix hit.
+//! Anthropic's usage buckets report the requested TTL, without guaranteeing the
+//! next prefix hit. Codex GPT cache time limits are disabled by application policy.
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
 const NAMESPACE: &str = "$ccgui-prompt-cache";
+
+/// Application policy, independent of provider and observed cache evidence.
+pub fn cache_time_limit_disabled(engine: &str, model: Option<&str>) -> bool {
+    engine == "codex"
+        && model.is_some_and(|model| {
+            let model = model.trim();
+            model.len() > 4
+                && model
+                    .get(..4)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("gpt-"))
+        })
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -98,9 +110,20 @@ pub fn load_all(conn: &Connection) -> rusqlite::Result<HashMap<String, CacheWind
     let mut result = HashMap::new();
     for row in rows {
         let (key, value, provider) = row?;
-        // Cursor policy is intentionally disabled until explicitly enabled.
-        if key.starts_with("cursor:") { continue; }
         if let Ok(window) = serde_json::from_str::<CacheWindow>(&value) {
+            // Only restore the explicitly enabled Cursor policy, never legacy
+            // metadata that happened to be stored while Cursor was disabled.
+            if key.starts_with("cursor:")
+                && (window.source != "cursor-policy" || window.ttl_seconds != 300
+                    || window.reference.is_some() || window.started_at <= 0
+                    || window.observed_at < window.started_at)
+            {
+                continue;
+            }
+            // Ignore legacy finite Codex windows, including local/custom providers.
+            if key.starts_with("codex:") && window.source == "openai-policy" {
+                continue;
+            }
             if window.source != "openai-policy"
                 || provider
                     .as_deref()
@@ -120,10 +143,7 @@ pub fn delete_for_workspace(conn: &Connection, workspace: &str) -> rusqlite::Res
 
 pub(super) struct Tracker {
     engine: String,
-    model: Option<String>,
-    provider: Option<String>,
     input_at: Option<i64>,
-    last_codex_total: Option<Value>,
     window: Option<CacheWindow>,
 }
 
@@ -131,10 +151,7 @@ impl Tracker {
     pub fn new(engine: &str) -> Self {
         Self {
             engine: engine.into(),
-            model: None,
-            provider: None,
             input_at: None,
-            last_codex_total: None,
             window: None,
         }
     }
@@ -207,74 +224,8 @@ impl Tracker {
             } else {
                 self.window = None;
             }
-        } else if self.engine == "codex" {
-            let payload = &row["payload"];
-            if kind == "session_meta" {
-                self.provider = payload["model_provider"].as_str().map(str::to_owned);
-            }
-            if kind == "turn_context" {
-                let model = payload["model"].as_str().map(str::to_owned);
-                if model != self.model {
-                    self.window = None;
-                }
-                self.model = model;
-                self.input_at = ts;
-            }
-            if (kind == "event_msg"
-                && matches!(
-                    payload["type"].as_str(),
-                    Some("task_started" | "user_message")
-                ))
-                || (kind == "response_item"
-                    && matches!(
-                        payload["type"].as_str(),
-                        Some("function_call_output" | "custom_tool_call_output")
-                    ))
-            {
-                self.input_at = ts;
-            }
-            if kind == "event_msg" && payload["type"] == "context_compacted" {
-                self.window = None;
-                self.input_at = None;
-            }
-            if kind != "event_msg" || payload["type"] != "token_count" {
-                return;
-            }
-            let Some(info) = payload.get("info").filter(|v| v.is_object()) else {
-                return;
-            };
-            let total = info.get("total_token_usage");
-            if total.is_some() && total == self.last_codex_total.as_ref() {
-                return;
-            }
-            self.last_codex_total = total.cloned();
-            let eligible = info
-                .pointer("/last_token_usage/input_tokens")
-                .and_then(Value::as_u64)
-                .is_some_and(|n| n >= 1024);
-            if self.provider.as_deref() == Some("openai")
-                && self
-                    .model
-                    .as_deref()
-                    .is_some_and(openai_thirty_minute_model)
-                && eligible
-            {
-                self.record(1800, ts, "openai-policy");
-            } else {
-                self.window = None;
-            }
         }
     }
-}
-
-fn openai_thirty_minute_model(model: &str) -> bool {
-    // Explicit verified families, not a blanket promise about future models.
-    ["gpt-5.6", "gpt-6"].iter().any(|prefix| {
-        model == *prefix
-            || model
-                .strip_prefix(prefix)
-                .is_some_and(|s| s.starts_with('-') || s.starts_with('.'))
-    })
 }
 
 #[cfg(test)]
@@ -321,13 +272,13 @@ mod tests {
     }
 
     #[test]
-    fn prompt_cache_codex_policy_is_provider_and_model_scoped() {
-        for (provider, model, expected) in [
-            ("openai", "gpt-6", true),
-            ("openai", "gpt-5.6-codex", true),
-            ("openai", "gpt-5.4", false),
-            ("custom", "gpt-6", false),
-            ("openai", "gpt-60", false),
+    fn prompt_cache_codex_does_not_generate_finite_windows() {
+        for (provider, model) in [
+            ("openai", "gpt-6"),
+            ("openai", "gpt-5.6-codex"),
+            ("openai", "gpt-5.4"),
+            ("custom", "gpt-6"),
+            ("openai", "gpt-60"),
         ] {
             let mut t = Tracker::new("codex");
             t.observe(&json!({"type":"session_meta","payload":{"model_provider":provider}}));
@@ -337,12 +288,25 @@ mod tests {
             // A duplicate report cannot renew a window after a later tool.
             t.observe(&json!({"type":"response_item","timestamp":"2026-10-17T10:10:00Z","payload":{"type":"function_call_output"}}));
             t.observe(&report);
-            let w = t.finish();
-            assert_eq!(w.is_some(), expected, "{provider}/{model}");
-            if let Some(w) = w {
-                assert_eq!(w.ttl_seconds, 1800);
-                assert_eq!(w.started_at, super::super::parse_ts_ms_str(START).unwrap());
-            }
+            assert!(t.finish().is_none(), "{provider}/{model}");
+        }
+    }
+
+    #[test]
+    fn prompt_cache_time_limit_policy_is_scoped_to_codex_gpt() {
+        for model in ["gpt-6-astra", "gpt-5.4", " GPT-6-ASTRA "] {
+            assert!(cache_time_limit_disabled("codex", Some(model)));
+            assert!(!cache_time_limit_disabled("claude", Some(model)));
+        }
+        for model in [
+            None,
+            Some(""),
+            Some("gpt-"),
+            Some("gpt-  "),
+            Some("o3"),
+            Some("中文模型"),
+        ] {
+            assert!(!cache_time_limit_disabled("codex", model));
         }
     }
 
@@ -352,12 +316,20 @@ mod tests {
         conn.execute_batch("CREATE TABLE plugin_kv(plugin_id TEXT,key TEXT,value TEXT,PRIMARY KEY(plugin_id,key)); CREATE TABLE session_providers(engine TEXT,session_id TEXT,provider_id TEXT);").unwrap();
         let w = claude(0, 100);
         set(&conn, "claude", "a", Some(&w)).unwrap();
-        set(&conn, "cursor", "disabled", Some(&w)).unwrap();
-        assert!(!load_all(&conn).unwrap().contains_key("cursor:disabled"));
+        set(&conn, "cursor", "legacy", Some(&w)).unwrap();
+        assert!(!load_all(&conn).unwrap().contains_key("cursor:legacy"));
+        let cursor = CacheWindow { ttl_seconds: 300, source: "cursor-policy".into(), ..w.clone() };
+        set(&conn, "cursor", "enabled", Some(&cursor)).unwrap();
+        assert_eq!(load_all(&conn).unwrap()["cursor:enabled"], cursor);
+        let stale_cursor = CacheWindow { ttl_seconds: 3600, ..cursor.clone() };
+        set(&conn, "cursor", "stale", Some(&stale_cursor)).unwrap();
+        assert!(!load_all(&conn).unwrap().contains_key("cursor:stale"));
         assert_eq!(load_all(&conn).unwrap()["claude:a"], w);
         let mut openai = w.clone();
         openai.source = "openai-policy".into();
         set(&conn, "codex", "b", Some(&openai)).unwrap();
+        set(&conn, "codex", "local-legacy", Some(&openai)).unwrap();
+        assert!(!load_all(&conn).unwrap().contains_key("codex:local-legacy"));
         conn.execute(
             "INSERT INTO session_providers VALUES('codex','b','custom-channel')",
             [],
@@ -365,6 +337,7 @@ mod tests {
         .unwrap();
         assert!(!load_all(&conn).unwrap().contains_key("codex:b"));
         set(&conn, "claude", "a", None).unwrap();
+        set(&conn, "cursor", "enabled", None).unwrap();
         assert!(load_all(&conn).unwrap().is_empty());
     }
 }

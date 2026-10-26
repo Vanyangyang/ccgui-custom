@@ -17,6 +17,15 @@ import { create } from "zustand";
 /** Tab strip key prefix; use-chat-tabs routes select/close/reorder by it. */
 export const PLUGIN_TAB_PREFIX = "plugin-tab:";
 
+export type PluginTabCloseReason = "user" | "maintenance" | "presentation";
+type TabLifecycle = (event: { type: "open" | "close"; reason: PluginTabCloseReason }) => void;
+const lifecycle = new Map<string, TabLifecycle>();
+/** One live owner per registered definition; stale disposers cannot remove its replacement. */
+export function registerPluginTabLifecycle(id: string, listener: TabLifecycle): () => void {
+  lifecycle.set(id, listener);
+  return () => { if (lifecycle.get(id) === listener) lifecycle.delete(id); };
+}
+
 interface PluginTabsStore {
   /** Open plugin tabs (registry ids), in tab order. */
   tabs: string[];
@@ -24,8 +33,8 @@ interface PluginTabsStore {
   activeId: string | null;
 
   /** Open (or focus) a tab and activate it. */
-  openTab: (id: string) => void;
-  closeTab: (id: string) => void;
+  openTab: (id: string, options?: { activate?: boolean; reason?: PluginTabCloseReason }) => void;
+  closeTab: (id: string, reason?: PluginTabCloseReason) => void;
   /** Activate a plugin tab (selecting one deactivates file/chat surfaces —
  *  the caller in use-chat-tabs handles that mutual exclusion). */
   activate: (id: string) => void;
@@ -38,16 +47,17 @@ export const usePluginTabsStore = create<PluginTabsStore>()((set, get) => ({
   tabs: [],
   activeId: null,
 
-  openTab: (id) => {
+  openTab: (id, options) => {
     const s = get();
+    lifecycle.get(id)?.({ type: "open", reason: options?.reason ?? "user" });
     if (s.tabs.includes(id)) {
-      if (s.activeId !== id) set({ activeId: id });
+      if (options?.activate !== false && s.activeId !== id) set({ activeId: id });
       return;
     }
-    set({ tabs: [...s.tabs, id], activeId: id });
+    set({ tabs: [...s.tabs, id], activeId: options?.activate === false ? s.activeId : id });
   },
 
-  closeTab: (id) => {
+  closeTab: (id, reason = "user") => {
     const s = get();
     const idx = s.tabs.indexOf(id);
     if (idx < 0) return;
@@ -56,6 +66,7 @@ export const usePluginTabsStore = create<PluginTabsStore>()((set, get) => ({
     const activeId =
       s.activeId === id ? (tabs[Math.min(idx, tabs.length - 1)] ?? null) : s.activeId;
     set({ tabs, activeId });
+    lifecycle.get(id)?.({ type: "close", reason });
   },
 
   activate: (id) => {

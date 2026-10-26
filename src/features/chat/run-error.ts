@@ -1,4 +1,5 @@
 import type { TFunction } from "i18next";
+import { errorText } from "@/lib/errors";
 
 /** `[codex-desktop:<code>] <English text>`, then Desktop's own words on the
  *  following lines (the backend's `codex_desktop::banner`). */
@@ -16,13 +17,24 @@ export function desktopTaskMayContinue(message: unknown): boolean {
  *  UI language and keep Desktop's detail. Any other error, or a code this
  *  build does not know, is shown exactly as the engine wrote it. */
 export function localizeRunError(message: string | null, t: TFunction): string | null {
+  if (message !== null) message = errorText(message);
   // Error objects stringified by the send path retain this prefix. Strip it
   // only for recognized banners; ordinary errors keep their original text.
   if (message?.startsWith("Error: ")) {
     const candidate = message.slice("Error: ".length);
-    if (/^(CLAUDE_HAIKU_ASSIST_UNAVAILABLE|CODEX_APPROVAL_UNSUPPORTED|CODEX_AUTO_REVIEW_UNAVAILABLE):/.test(candidate)) {
+    if (/^(CLAUDE_HAIKU_ASSIST_UNAVAILABLE|CODEX_APPROVAL_UNSUPPORTED|CODEX_AUTO_REVIEW_UNAVAILABLE|DELEGATION_LEGACY_UNKNOWN|DELEGATION_RESTART_UNKNOWN|ENGINE_PROTOCOL_FRAME_TOO_LARGE):/.test(candidate)) {
       message = candidate;
     }
+  }
+  if (message?.startsWith("ENGINE_PROTOCOL_FRAME_TOO_LARGE:")) {
+    const detail = message.slice("ENGINE_PROTOCOL_FRAME_TOO_LARGE:".length).trim();
+    return `${t("chat.protocolFrameTooLarge")}${detail ? `\n${detail}` : ""}`;
+  }
+  if (message?.startsWith("DELEGATION_LEGACY_UNKNOWN:")) {
+    return t("leader.delegationLegacyUnknown");
+  }
+  if (message?.startsWith("DELEGATION_RESTART_UNKNOWN:")) {
+    return t("leader.delegationRestartUnknown");
   }
   if (message?.startsWith("CLAUDE_HAIKU_ASSIST_UNAVAILABLE:")) {
     const detail = message.slice("CLAUDE_HAIKU_ASSIST_UNAVAILABLE:".length).trim();

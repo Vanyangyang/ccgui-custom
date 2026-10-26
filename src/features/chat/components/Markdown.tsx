@@ -24,7 +24,7 @@ import { useFilesStore } from "@/features/files/store";
 import { markdownRegistry, useRegistry } from "@ccgui/plugin-sdk";
 import { useCopied } from "@/hooks/use-copied";
 import { FileLinkContextMenu } from "./FileLinkContextMenu";
-import { resolveChatFileLink } from "@/features/chat/file-link-resolution";
+import { resolveChatProjectFileLink } from "@/features/chat/project-file-links";
 import { INTERACTIVE_LANGUAGE, isClosedInteractiveFence } from "@/features/interactive-answer/protocol";
 import {
   decodeFileLink,
@@ -37,6 +37,7 @@ import {
 const REMARK_PLUGINS = [remarkGfm, remarkMath, remarkDisplayMath, remarkGithubAlerts];
 const InteractiveAnswer = lazy(() => import("@/features/interactive-answer/InteractiveAnswer"));
 const InteractiveContext = createContext<{ enabled: boolean; source: string; streaming: boolean; identity?: string }>({ enabled: false, source: "", streaming: false });
+const FileOpenContext = createContext<((path: string) => void) | undefined>(undefined);
 /** ReactMarkdown's plugin-list prop type, derived here instead of importing
  * `PluggableList` from unified (a transitive dep we don't declare). */
 type PluginListProp = NonNullable<
@@ -47,7 +48,7 @@ function openFileFromChat(rawPath: string, workspacePath: string) {
   // Async on purpose: a path that only exists nested below the workspace
   // root (outer folder opened as workspace) is found through the index
   // fallback instead of dead-ending in a not-found tab.
-  void resolveChatFileLink(rawPath, workspacePath).then((path) => {
+  void resolveChatProjectFileLink(rawPath, workspacePath).then((path) => {
     if (!path) return;
     // Opens as a center-area tab; visible at every window width.
     void useFilesStore.getState().openFile(path);
@@ -75,6 +76,7 @@ function FileLink({
   children: ReactNode;
 }) {
   const resolved = resolveFilePath(path, workspacePath);
+  const onOpenFile = useContext(FileOpenContext);
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
   return (
     <>
@@ -85,9 +87,10 @@ function FileLink({
         onClick={(event) => {
           event.preventDefault();
           event.stopPropagation();
-          openFileFromChat(path, workspacePath);
+          if (onOpenFile) onOpenFile(path); else openFileFromChat(path, workspacePath);
         }}
         onContextMenu={(event) => {
+          if (onOpenFile) return;
           event.preventDefault();
           event.stopPropagation();
           setMenu({ x: event.clientX, y: event.clientY });
@@ -172,12 +175,14 @@ export default memo(function Markdown({
   streaming = false,
   interactive = false,
   interactiveIdentity,
+  onOpenFile,
 }: {
   text: string;
   workspacePath: string;
   streaming?: boolean;
   interactive?: boolean;
   interactiveIdentity?: string;
+  onOpenFile?: (path: string) => void;
 }) {
   const contributions = useRegistry(markdownRegistry);
   // External rehype plugins may mutate highlighted nodes in place. Avoid
@@ -321,7 +326,7 @@ export default memo(function Markdown({
   }, [hostComponents, contributions]);
 
   return (
-    <InteractiveContext.Provider value={interactiveContext}>
+    <FileOpenContext.Provider value={onOpenFile}><InteractiveContext.Provider value={interactiveContext}>
     <div className="prose-chat text-body-regular text-text-primary">
       <ReactMarkdown
         remarkPlugins={remarkPlugins}
@@ -346,6 +351,6 @@ export default memo(function Markdown({
         {mathText}
       </ReactMarkdown>
     </div>
-    </InteractiveContext.Provider>
+    </InteractiveContext.Provider></FileOpenContext.Provider>
   );
 });

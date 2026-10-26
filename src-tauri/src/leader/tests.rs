@@ -1,4 +1,12 @@
 use super::*;
+#[path = "delegation_tests.rs"]
+mod delegation_tests;
+#[path = "delegation_storage_tests.rs"]
+mod delegation_storage_tests;
+#[path = "cross_workspace_tests.rs"]
+mod cross_workspace_tests;
+#[path = "parent_message_tests.rs"]
+mod parent_message_tests;
 use crate::engine::ChildEntry;
 use std::sync::atomic::{AtomicI64, Ordering};
 
@@ -383,7 +391,7 @@ fn legacy_request_methods_migrate_durably_without_restarting_spawn_or_send() {
         assert_eq!(encoded(&actual).unwrap(), encoded(request).unwrap(), "migration must only rename the persisted method");
         let stored: String = f.manager.db.0.lock().query_row(
             "SELECT record_json FROM leader_requests WHERE request_id=?1", [&request.request_id], |row| row.get(0)).unwrap();
-        assert_eq!(serde_json::from_str::<Value>(&stored).unwrap(), encoded(request).unwrap());
+        assert_eq!(encoded(&delegation_storage::decode_request(&stored).unwrap()).unwrap(), encoded(request).unwrap());
     }
     recovered.processes.insert(f.caller.run_id.clone(), reservation(&f.caller.run_id));
     recovered.prepare(&f.caller.run_id, &f.caller.engine, Some(&f.caller.session_id),
@@ -893,6 +901,7 @@ fn pending_first_root_keeps_foreign_claims_after_retired_run_pruning() {
 
 fn args(request_id: &str) -> SpawnArgs {
     SpawnArgs {
+        workspace_path: None,
         request_id: request_id.into(),
         engine: "codex".into(),
         title: "Inspect parsing".into(),
@@ -996,8 +1005,12 @@ fn branch(f: &Fixture, id: &str) -> LeaderBranch {
 }
 
 fn settle(f: &Fixture, id: &str, run: &str, session: &str) {
-    observe(f, run, session, "session", json!(session), 1);
-    observe(f, run, session, "done", json!({}), 2);
+    let engine = branch(f, id).engine;
+    for (kind, data, seq) in [("session", json!(session), 1), ("done", json!({}), 2)] {
+        let mut event = event(run, Some(session), kind, data, seq);
+        event["engine"] = json!(engine);
+        f.manager.observe(&mut event);
+    }
     f.manager.finish(run);
     assert_eq!(branch(f, id).state, "completed");
 }
@@ -1023,6 +1036,469 @@ fn held_send(f: &Fixture, id: &str, request_id: &str) -> SendArgs {
     assert_eq!(receipt["submitted_to_model"], false);
     assert_eq!(receipt["mayHaveStarted"], false);
     args
+}
+
+#[test]
+fn completion_notice_child_identity_is_durable_and_does_not_suppress_the_parent() {
+    let f = basic();
+    let (id, run) = spawn(&f, "notice-child");
+    settle(&f, &id, &run, "notice-child-session");
+    let child = branch(&f, &id);
+    let db = &f.manager.db;
+    assert!(is_managed_child_session(db, &child.engine, "notice-child-session", &child.workspace_path).unwrap());
+    // Owning a child does not make the main conversation a child itself.
+    assert!(!is_managed_child_session(db, &f.parent.engine, &f.parent.session_id, &f.parent.workspace_path).unwrap());
+    assert!(!is_managed_child_session(db, "different-engine", "notice-child-session", &child.workspace_path).unwrap());
+    assert!(!is_managed_child_session(db, &child.engine, "notice-child-session", "different-workspace").unwrap());
+    assert!(!is_managed_child_session(db, &child.engine, "unrelated-session", &child.workspace_path).unwrap());
+    let restored = reload(&f).unwrap();
+    assert!(is_managed_child_session(&restored.db, &child.engine, "notice-child-session", &child.workspace_path).unwrap());
+    // Retained old completion events must stay silent even after reclamation.
+    db.0.lock().execute("UPDATE leader_branches SET state='reclaimed' WHERE id=?1", [&id]).unwrap();
+    assert!(is_managed_child_session(db, &child.engine, "notice-child-session", &child.workspace_path).unwrap());
+}
+
+struct CostContextScratch(std::path::PathBuf);
+
+impl CostContextScratch {
+    fn new() -> Self {
+        let path = std::env::temp_dir().join(format!("leader-cost-context-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for CostContextScratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn cost_context_branch(f: &Fixture, engine: &str, path: &std::path::Path) -> String {
+    let mut spawn_args = args("context-spawn");
+    spawn_args.engine = engine.into();
+    spawn_args.model = Some("context-model".into());
+    let Reservation::Start((id, run)) = f.manager.reserve_spawn(
+        &f.caller, &f.parent, "manual", &spawn_args, encoded(&spawn_args).unwrap(),
+        Some("context-model".into()), None,
+    ).unwrap() else { panic!("unexpected replay"); };
+    f.manager.acknowledge(&f.parent, &spawn_args.request_id, &run,
+        Ok(crate::engine::SendResult {
+            run_id: run.clone(), session_id: Some("context-session".into()),
+        }),
+    ).unwrap();
+    settle(f, &id, &run, "context-session");
+    let conn = f.manager.db.0.lock();
+    if engine == "codex" {
+        conn.execute_batch("CREATE TABLE codex_desktop_prompts(
+            thread_id TEXT NOT NULL,prompt_sha256 TEXT NOT NULL,handed_at INTEGER NOT NULL,
+            PRIMARY KEY(thread_id,prompt_sha256));").unwrap();
+    }
+    conn.execute(
+        "INSERT INTO sessions(engine,session_id,workspace_path,file_path) VALUES(?1,'context-session',?2,?3)",
+        params![engine, f.parent.workspace_path, path.to_string_lossy()],
+    ).unwrap();
+    conn.execute("INSERT INTO session_models VALUES(?1,'context-session','context-model')", [engine]).unwrap();
+    id
+}
+
+fn write_cost_agy_context(path: &std::path::Path, estimate: Option<u64>, max: Option<u64>) {
+    fn varint(mut value: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        while value >= 128 {
+            out.push((value as u8 & 0x7f) | 0x80);
+            value >>= 7;
+        }
+        out.push(value as u8);
+        out
+    }
+    fn number(field: u64, value: u64) -> Vec<u8> {
+        [varint(field << 3), varint(value)].concat()
+    }
+    fn bytes(field: u64, value: &[u8]) -> Vec<u8> {
+        [varint((field << 3) | 2), varint(value.len() as u64), value.to_vec()].concat()
+    }
+    // Same native protobuf layout as history::agy: metadata(1), request(4),
+    // context start(9) / window(10), estimate(1) and maximum(4).
+    let request = [number(2, 100), number(3, 20), number(5, 30)].concat();
+    let mut window = Vec::new();
+    if let Some(value) = estimate { window.extend(number(1, value)); }
+    if let Some(value) = max { window.extend(number(4, value)); }
+    let metadata = [bytes(4, &request), bytes(9, &bytes(10, &window))].concat();
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS gen_metadata(idx INTEGER PRIMARY KEY,data BLOB);
+        CREATE TABLE IF NOT EXISTS steps(idx INTEGER PRIMARY KEY,step_type INTEGER,step_payload BLOB);").unwrap();
+    conn.execute("INSERT OR REPLACE INTO gen_metadata VALUES(0,?1)", [bytes(1, &metadata)]).unwrap();
+}
+
+fn assert_cost_context_send(f: &Fixture, id: &str, bypass: bool) {
+    let send = SendArgs { branch_id: id.into(), request_id: "context-send".into(), message: "Continue".into() };
+    let result = f.manager.reserve_send(&f.caller, &f.parent, "manual", &send, encoded(&send).unwrap()).unwrap();
+    assert_eq!(matches!(result, Reservation::Start(_)), bypass);
+    assert_eq!(branch(f, id).cost_approval.is_none(), bypass);
+    if let Reservation::Replay(receipt) = result {
+        assert_eq!(receipt["status"], "awaiting_cost_approval");
+        assert_eq!(receipt["submitted_to_model"], false);
+    }
+}
+
+#[test]
+fn task_cost_approval_agy_small_current_context_bypasses_cold_unknown_and_near_expiry() {
+    for used in [43_920, 49_999, 50_000] {
+        for remaining in [None, Some(-1), Some(0), Some(10)] {
+            let scratch = CostContextScratch::new();
+            let path = scratch.0.join("session.db");
+            write_cost_agy_context(&path, Some(used), Some(200_000));
+            let native = crate::history::agy::read_native_context(&path).unwrap();
+            assert_eq!(native.estimated_tokens, Some(used));
+            assert_eq!(native.max_tokens, Some(200_000));
+            let f = basic();
+            let id = cost_context_branch(&f, "agy", &path);
+            if let Some(remaining) = remaining {
+                let now = f.clock.load(Ordering::SeqCst);
+                crate::history::prompt_cache::set(&f.manager.db.0.lock(), "agy", "context-session",
+                    Some(&crate::history::prompt_cache::CacheWindow {
+                        ttl_seconds: 300, started_at: now - (300 - remaining) * 1000,
+                        observed_at: now, source: "test-observed".into(), reference: None,
+                    })).unwrap();
+            }
+            assert_cost_context_send(&f, &id, used < 50_000);
+        }
+    }
+}
+
+#[test]
+fn task_cost_approval_agy_untrusted_or_last_prompt_context_stays_held() {
+    for case in ["last-prompt", "missing-max", "model-mismatch", "model-unknown", "wrong-workspace", "missing-file"] {
+        let scratch = CostContextScratch::new();
+        let path = scratch.0.join("session.db");
+        write_cost_agy_context(&path,
+            (case != "last-prompt").then_some(43_920),
+            (case != "missing-max").then_some(200_000));
+        let f = basic();
+        let id = cost_context_branch(&f, "agy", &path);
+        match case {
+            "model-mismatch" => { f.manager.db.0.lock().execute("UPDATE session_models SET model='other-model'", []).unwrap(); }
+            "model-unknown" => {
+                let mut inner = f.manager.inner.lock();
+                let record = inner.branches.get_mut(&id).unwrap();
+                record.branch.model = None;
+                write_branch(&f.manager.db.0.lock(), record).unwrap();
+                // Missing picker metadata cannot establish an unknown branch model.
+                f.manager.db.0.lock().execute("DELETE FROM session_models", []).unwrap();
+            }
+            "wrong-workspace" => { f.manager.db.0.lock().execute("UPDATE sessions SET workspace_path='other-workspace'", []).unwrap(); }
+            "missing-file" => { std::fs::remove_file(&path).unwrap(); }
+            _ => {}
+        }
+        assert_cost_context_send(&f, &id, false);
+    }
+}
+
+#[test]
+fn task_cost_approval_agy_acknowledged_model_without_picker_metadata_bypasses() {
+    let scratch = CostContextScratch::new();
+    let path = scratch.0.join("session.db");
+    write_cost_agy_context(&path, Some(43_920), Some(200_000));
+    let f = basic();
+    let id = cost_context_branch(&f, "agy", &path);
+    f.manager.db.0.lock().execute("DELETE FROM session_models", []).unwrap();
+    assert_cost_context_send(&f, &id, true);
+}
+
+#[test]
+fn task_cost_approval_claude_counts_cached_tokens_at_small_context_boundary() {
+    for total in [49_999, 50_000] {
+        let scratch = CostContextScratch::new();
+        let path = scratch.0.join("session.jsonl");
+        let record = json!({"type":"assistant", "uuid":"cost-context-message", "message": {
+            "role":"assistant", "model":"context-model", "content":[{"type":"text","text":"Done"}],
+            "usage":{"input_tokens":100,"output_tokens":100,"cache_read_input_tokens":40_000,
+                "cache_creation_input_tokens":total - 40_200}
+        }});
+        std::fs::write(&path, format!("{record}\n")).unwrap();
+        let f = basic();
+        let id = cost_context_branch(&f, "claude", &path);
+        let page = crate::history::reader::load_session_page_blocking(
+            &f.manager.db, "claude", "context-session", Some(500), None,
+        ).unwrap();
+        assert_eq!(page.messages.last().unwrap().usage.as_ref().unwrap()["cache_read_input_tokens"], 40_000);
+        assert_cost_context_send(&f, &id, total < 50_000);
+    }
+}
+
+#[test]
+fn task_cost_approval_claude_latest_incomplete_usage_stays_held() {
+    for latest_usage in [json!({"output_tokens":100}), json!({"model_context_window":200_000})] {
+        let scratch = CostContextScratch::new();
+        let path = scratch.0.join("session.jsonl");
+        let record = |id, usage| json!({"type":"assistant", "uuid":id, "message": {
+            "role":"assistant", "model":"context-model", "content":[{"type":"text","text":"Reply"}],
+            "usage":usage
+        }});
+        let lines = [
+            record("earlier", json!({"input_tokens":100,"output_tokens":100})),
+            record("latest", latest_usage.clone()),
+        ];
+        std::fs::write(&path, lines.iter().map(Value::to_string).collect::<Vec<_>>().join("\n")).unwrap();
+        let f = basic();
+        let id = cost_context_branch(&f, "claude", &path);
+        let page = crate::history::reader::load_session_page_blocking(
+            &f.manager.db, "claude", "context-session", Some(500), None,
+        ).unwrap();
+        let parsed_latest = page.messages.last().unwrap().usage.as_ref().unwrap();
+        for (field, expected) in latest_usage.as_object().unwrap() {
+            assert_eq!(&parsed_latest[field], expected);
+        }
+        assert_eq!(parsed_latest["usage_scope"], "last_request");
+        assert!(parsed_latest.get("input_tokens").is_none());
+        assert!(page.messages.first().unwrap().usage.as_ref().unwrap().get("input_tokens").is_some());
+        assert_cost_context_send(&f, &id, false);
+    }
+}
+
+#[test]
+fn task_cost_approval_codex_non_gpt_uses_latest_request_not_cumulative_or_older_usage() {
+    for case in ["small", "boundary", "latest-unknown", "latest-cumulative"] {
+        let scratch = CostContextScratch::new();
+        let path = scratch.0.join("session.jsonl");
+        let assistant = |text| json!({"type":"response_item", "payload": {
+            "type":"message", "role":"assistant", "content":[{"type":"output_text","text":text}]
+        }});
+        let usage = |info| json!({"type":"event_msg", "payload":{"type":"token_count","info":info}});
+        let mut lines = vec![assistant("Earlier reply"), usage(json!({
+            "last_token_usage":{"input_tokens":43_800,"output_tokens":120,"cached_input_tokens":40_000},
+            "total_token_usage":{"input_tokens":9_000_000,"output_tokens":100_000},
+            "model_context_window":200_000
+        }))];
+        if case != "small" {
+            lines.push(assistant("Latest reply"));
+            lines.push(usage(match case {
+                "boundary" => json!({"last_token_usage":{"input_tokens":49_900,"output_tokens":100}}),
+                "latest-cumulative" => json!({"total_token_usage":{"input_tokens":100,"output_tokens":20}}),
+                _ => json!({"model_context_window":200_000}),
+            }));
+        }
+        std::fs::write(&path, lines.iter().map(Value::to_string).collect::<Vec<_>>().join("\n")).unwrap();
+        let f = basic();
+        // context-model is deliberately non-GPT, so the GPT policy cannot bypass this test.
+        let id = cost_context_branch(&f, "codex", &path);
+        let page = crate::history::reader::load_session_page_blocking(
+            &f.manager.db, "codex", "context-session", Some(500), None,
+        ).unwrap();
+        let latest = page.messages.iter().rev().find_map(|message| message.usage.as_ref()).unwrap();
+        if case == "small" || case == "boundary" {
+            assert_eq!(latest["usage_scope"], "last_request");
+        } else {
+            assert!(latest.get("input_tokens").is_none());
+            assert!(page.messages.first().unwrap().usage.as_ref().unwrap().get("input_tokens").is_some());
+        }
+        assert_cost_context_send(&f, &id, case == "small");
+    }
+}
+
+#[test]
+fn task_cost_approval_small_context_concurrent_duplicate_send_starts_once() {
+    let scratch = CostContextScratch::new();
+    let path = scratch.0.join("session.db");
+    write_cost_agy_context(&path, Some(43_920), Some(200_000));
+    let f = basic();
+    let id = cost_context_branch(&f, "agy", &path);
+    let send = SendArgs {
+        branch_id: id.clone(), request_id: "concurrent-context-send".into(),
+        message: "Continue once 中文 😀".into(),
+    };
+    let (runs_before, requests_before) = {
+        let inner = f.manager.inner.lock();
+        (inner.runs.len(), inner.requests.len())
+    };
+    let barrier = std::sync::Barrier::new(2);
+    let results = std::thread::scope(|scope| {
+        let attempts: Vec<_> = (0..2).map(|_| {
+            let f = &f;
+            let send = &send;
+            let barrier = &barrier;
+            scope.spawn(move || {
+                barrier.wait();
+                f.manager.reserve_send(&f.caller, &f.parent, "manual", send, encoded(send).unwrap()).unwrap()
+            })
+        }).collect();
+        attempts.into_iter().map(|attempt| attempt.join().unwrap()).collect::<Vec<_>>()
+    });
+    let launches: Vec<_> = results.iter().filter_map(|result| match result {
+        Reservation::Start(start) => Some(start),
+        Reservation::Replay(_) => None,
+    }).collect();
+    assert_eq!(launches.len(), 1);
+    assert_eq!(results.iter().filter(|result| matches!(result, Reservation::Replay(_))).count(), 1);
+    let (started, run_id) = launches[0];
+    assert_eq!(started.task, send.message);
+    assert_eq!(started.state, "starting");
+    assert!(started.cost_approval.is_none());
+    {
+        let inner = f.manager.inner.lock();
+        assert_eq!(inner.runs.len(), runs_before + 1);
+        assert_eq!(inner.requests.len(), requests_before + 1);
+        assert!(inner.runs[run_id].launch_pending);
+        assert_eq!(inner.runs.values().filter(|run| run.branch_id.as_deref() == Some(id.as_str()) && run.launch_pending).count(), 1);
+    }
+    assert!(matches!(f.manager.reserve_send(
+        &f.caller, &f.parent, "manual", &send, encoded(&send).unwrap(),
+    ).unwrap(), Reservation::Replay(_)));
+    let final_branch = branch(&f, &id);
+    assert_eq!(final_branch.run_id.as_deref(), Some(run_id.as_str()));
+    assert_eq!(final_branch.task, send.message);
+    assert!(final_branch.cost_approval.is_none());
+    let inner = f.manager.inner.lock();
+    assert_eq!(inner.runs.len(), runs_before + 1);
+    assert_eq!(inner.requests.len(), requests_before + 1);
+}
+
+#[test]
+fn task_cost_approval_existing_hold_survives_smaller_native_context() {
+    let scratch = CostContextScratch::new();
+    let path = scratch.0.join("session.db");
+    write_cost_agy_context(&path, Some(50_000), Some(200_000));
+    let f = basic();
+    let id = cost_context_branch(&f, "agy", &path);
+    let send = held_send(&f, &id, "held-context-send");
+    write_cost_agy_context(&path, Some(43_920), Some(200_000));
+    let Reservation::Replay(receipt) = f.manager.reserve_send(
+        &f.caller, &f.parent, "manual", &send, encoded(&send).unwrap(),
+    ).unwrap() else { panic!("smaller context automatically released existing approval"); };
+    assert_eq!(receipt["status"], "awaiting_cost_approval");
+    let mut retry = send;
+    retry.request_id = "held-context-new-request".into();
+    assert!(f.manager.reserve_send(&f.caller, &f.parent, "manual", &retry, encoded(&retry).unwrap()).is_err());
+    assert_eq!(branch(&f, &id).state, "awaiting_cost_approval");
+}
+
+#[test]
+fn task_cost_approval_codex_gpt_has_no_cache_time_gate() {
+    for (engine, model, bypass) in [
+        ("codex", Some("gpt-6-astra"), true),
+        ("codex", Some("gpt-5.4"), true),
+        ("codex", Some("  GPT-6-ASTRA  "), true),
+        ("codex", Some("o3"), false),
+        ("codex", Some("gpt-"), false),
+        ("codex", None, false),
+        ("claude", Some("gpt-6-astra"), false),
+    ] {
+        for legacy_cache in [false, true] {
+            let f = basic();
+            let mut spawn_args = args("policy-spawn");
+            spawn_args.engine = engine.into();
+            spawn_args.model = model.map(str::to_owned);
+            let Reservation::Start((id, run)) = f
+                .manager
+                .reserve_spawn(
+                    &f.caller,
+                    &f.parent,
+                    "manual",
+                    &spawn_args,
+                    encoded(&spawn_args).unwrap(),
+                    model.map(str::to_owned),
+                    None,
+                )
+                .unwrap()
+            else {
+                panic!("unexpected replay");
+            };
+            settle(&f, &id, &run, "policy-session");
+            if legacy_cache {
+                crate::history::prompt_cache::set(
+                    &f.manager.db.0.lock(),
+                    engine,
+                    "policy-session",
+                    Some(&crate::history::prompt_cache::CacheWindow {
+                        ttl_seconds: 1,
+                        started_at: 1,
+                        observed_at: 1,
+                        source: "openai-policy".into(),
+                        reference: None,
+                    }),
+                )
+                .unwrap();
+                f.manager.db.0.lock().execute("INSERT INTO session_providers VALUES(?1,'policy-session','custom-channel')", [engine]).unwrap();
+            }
+            let send = SendArgs {
+                branch_id: id.clone(),
+                request_id: "policy-send".into(),
+                message: "Next".into(),
+            };
+            let result = f
+                .manager
+                .reserve_send(
+                    &f.caller,
+                    &f.parent,
+                    "manual",
+                    &send,
+                    encoded(&send).unwrap(),
+                )
+                .unwrap();
+            assert_eq!(
+                matches!(result, Reservation::Start(_)),
+                bypass,
+                "{engine}/{model:?}, legacy={legacy_cache}"
+            );
+            assert_eq!(branch(&f, &id).cost_approval.is_none(), bypass);
+        }
+    }
+}
+
+#[test]
+fn task_cost_approval_existing_hold_survives_codex_gpt_policy() {
+    let f = basic();
+    let (id, run) = spawn(&f, "held-policy-spawn");
+    settle(&f, &id, &run, "held-policy-session");
+    let send = held_send(&f, &id, "held-policy-send");
+    {
+        let mut inner = f.manager.inner.lock();
+        let record = inner.branches.get_mut(&id).unwrap();
+        record.branch.model = Some("gpt-6-astra".into());
+        write_branch(&f.manager.db.0.lock(), record).unwrap();
+    }
+    let restored = reload(&f).unwrap();
+    restored
+        .processes
+        .insert(f.caller.run_id.clone(), reservation(&f.caller.run_id));
+    restored
+        .prepare(
+            &f.caller.run_id,
+            &f.caller.engine,
+            Some(&f.caller.session_id),
+            &f.caller.workspace_path,
+            Some("manual"),
+        )
+        .unwrap();
+    let Reservation::Replay(receipt) = restored
+        .reserve_send(
+            &f.caller,
+            &f.parent,
+            "manual",
+            &send,
+            encoded(&send).unwrap(),
+        )
+        .unwrap()
+    else {
+        panic!("existing approval started automatically");
+    };
+    assert_eq!(receipt["status"], "awaiting_cost_approval");
+    let mut new_send = send.clone();
+    new_send.request_id = "held-policy-new".into();
+    assert!(restored
+        .reserve_send(
+            &f.caller,
+            &f.parent,
+            "manual",
+            &new_send,
+            encoded(&new_send).unwrap()
+        )
+        .is_err());
+    assert_eq!(
+        restored.inner.lock().branches[&id].branch.state,
+        "awaiting_cost_approval"
+    );
 }
 
 #[test]
@@ -1229,7 +1705,23 @@ fn task_cost_approval_busy_and_failed_persistence_keep_request_held() {
 #[test]
 fn task_cost_approval_old_card_cannot_approve_a_new_held_request() {
     let f = basic();
-    let (id, run) = spawn(&f, "old-card-spawn");
+    let spawn_args = args("old-card-spawn");
+    // Keep this approval lifecycle test independent of the user's default model.
+    let Reservation::Start((id, run)) = f
+        .manager
+        .reserve_spawn(
+            &f.caller,
+            &f.parent,
+            "manual",
+            &spawn_args,
+            encoded(&spawn_args).unwrap(),
+            Some("test-model".into()),
+            None,
+        )
+        .unwrap()
+    else {
+        panic!("unexpected replay");
+    };
     settle(&f, &id, &run, "old-card-session");
     let first = held_send(&f, &id, "old-card-send");
     let old_model = branch(&f, &id).model;
@@ -1293,6 +1785,7 @@ fn assert_erased(record: &BranchRecord) {
     assert!(record.branch.result.is_empty());
     assert!(!record.branch.result_truncated);
     assert!(record.branch.error.is_none());
+    assert!(record.branch.delegation.is_none());
     assert!(record.output.stream_start.is_none());
     assert!(!record.output.stream_prefix_truncated);
     assert!(record.questions.is_empty());
@@ -2012,6 +2505,84 @@ async fn reclaimed_and_retired_continuation_events_keep_envelope_without_revival
             Some("manual")
         )
         .is_err());
+}
+
+#[test]
+fn settled_turn_late_events_cannot_revive_or_finish_a_new_continuation() {
+    let f = basic();
+    let (id, run) = spawn(&f, "turn-isolation");
+    observe(&f, &run, "turn-session", "delta", json!("Base."), 1);
+    observe(&f, &run, "turn-session", "done", json!({}), 2);
+    let base_done = encoded(&branch(&f, &id)).unwrap();
+    f.clock.fetch_add(100, Ordering::SeqCst);
+    for (offset, kind, data) in [
+        (3, "delta", json!("Late base")),
+        (4, "thinking", json!("Late thought")),
+        (5, "session", json!("turn-session")),
+        (6, "error", json!("Late base error")),
+    ] {
+        let late = observe(&f, &run, "turn-session", kind, data, offset);
+        assert_eq!(late["leader"]["branchId"], id);
+        assert_eq!(encoded(&branch(&f, &id)).unwrap(), base_done, "late base {kind}");
+    }
+    let c1 = format!("{run}-c1");
+    observe(&f, &c1, "turn-session", "delta", json!("First."), 1);
+    assert_eq!(branch(&f, &id).state, "running");
+    observe(&f, &c1, "turn-session", "done", json!({}), 2);
+    let first_done = encoded(&branch(&f, &id)).unwrap();
+    f.clock.fetch_add(100, Ordering::SeqCst);
+    for (seq, kind, data) in [
+        (3, "delta", json!("Late first")),
+        (4, "thinking", json!("Late first thought")),
+        (5, "session", json!("turn-session")),
+        (6, "message", json!({"role":"assistant", "text":"Late first message"})),
+    ] {
+        let late = observe(&f, &c1, "turn-session", kind, data, seq);
+        assert_eq!(late["leader"]["branchId"], id);
+        assert_eq!(encoded(&branch(&f, &id)).unwrap(), first_done, "late c1 {kind}");
+    }
+    let c2 = format!("{run}-c2");
+    observe(&f, &c2, "turn-session", "delta", json!("Second."), 1);
+    let second_running = encoded(&branch(&f, &id)).unwrap();
+    assert_eq!(branch(&f, &id).state, "running");
+    f.clock.fetch_add(100, Ordering::SeqCst);
+    for (seq, kind, data) in [(7, "done", json!({})), (8, "error", json!("Old failure"))] {
+        observe(&f, &c1, "turn-session", kind, data, seq);
+        assert_eq!(encoded(&branch(&f, &id)).unwrap(), second_running, "old c1 {kind}");
+    }
+    observe(&f, &c2, "turn-session", "done", json!({}), 2);
+    assert_eq!(branch(&f, &id).state, "completed");
+    assert_eq!(branch(&f, &id).result, "Base.First.Second.");
+}
+
+#[test]
+fn settled_turn_keeps_first_late_session_binding_without_reopening() {
+    let f = basic();
+    let (id, run) = spawn(&f, "late-first-session");
+    let mut done = event(&run, None, "done", json!({}), 1);
+    f.manager.observe(&mut done);
+    assert_eq!(branch(&f, &id).state, "completed");
+    assert!(branch(&f, &id).session_id.is_none());
+    observe(&f, &run, "late-first-session", "session", json!("late-first-session"), 2);
+    let bound = branch(&f, &id);
+    assert_eq!(bound.session_id.as_deref(), Some("late-first-session"));
+    assert_eq!(bound.state, "completed");
+    assert!(bound.result.is_empty());
+}
+
+#[test]
+fn settled_turn_waiting_approval_can_resume_in_the_same_turn() {
+    let f = basic();
+    let (id, run) = spawn(&f, "waiting-turn");
+    observe(&f, &run, "waiting-session", "question", json!({"requestId":"question"}), 1);
+    observe(&f, &run, "waiting-session", "done", json!({}), 2);
+    assert_eq!(branch(&f, &id).state, "waiting");
+    observe(&f, &run, "waiting-session", "question_settled", json!({"requestId":"question"}), 3);
+    assert_eq!(branch(&f, &id).state, "running");
+    observe(&f, &run, "waiting-session", "delta", json!("Approved."), 4);
+    observe(&f, &run, "waiting-session", "done", json!({}), 5);
+    assert_eq!(branch(&f, &id).state, "completed");
+    assert_eq!(branch(&f, &id).result, "Approved.");
 }
 
 #[tokio::test]
@@ -3680,6 +4251,8 @@ async fn request_scrub_failure_preserves_recoverable_content_and_reclaim_retry()
     let request_key = (key(&f.parent), "failed-scrub".into());
     let request_before =
         encoded(f.manager.inner.lock().requests.get(&request_key).unwrap()).unwrap();
+    let persisted_before: String = f.manager.db.0.lock().query_row(
+        "SELECT record_json FROM leader_requests WHERE request_id='failed-scrub'", [], |row| row.get(0)).unwrap();
     f.manager.db.0.lock().execute_batch(
         "CREATE TRIGGER reject_request_scrub BEFORE UPDATE ON leader_requests WHEN json_extract(NEW.record_json,'$.state')='reclaimed' BEGIN SELECT RAISE(ABORT,'request scrub unavailable'); END;",
     ).unwrap();
@@ -3722,9 +4295,10 @@ async fn request_scrub_failure_preserves_recoverable_content_and_reclaim_retry()
         )
         .unwrap();
     assert_eq!(
-        serde_json::from_str::<Value>(&persisted_request).unwrap(),
+        encoded(&delegation_storage::decode_request(&persisted_request).unwrap()).unwrap(),
         request_before
     );
+    assert_eq!(persisted_request, persisted_before, "failed reclamation must preserve the complete durable receipt byte for byte");
     assert!(ensure_unmanaged(&f.manager.db, "codex", "child-session").is_err());
     f.manager
         .db

@@ -119,6 +119,42 @@ mod tests {
     use super::*;
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
+    /// Exit the owner without Rust destructors: the kernel, not Drop or a
+    /// frontend close hook, must reclaim its plugin service scope.
+    #[tokio::test]
+    async fn owner_crash_releases_job_and_reaps_service() {
+        const DRIVER: &str = "CCGUI_JOB_CRASH_FIXTURE";
+        if let Some(marker) = std::env::var_os(DRIVER) {
+            let mut command = tokio::process::Command::new("powershell.exe");
+            command.args(["-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 30"])
+                .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()).kill_on_drop(true);
+            crate::engine::hide_console(&mut command);
+            let child = command.spawn().expect("spawn isolated service");
+            let _job = assign_kill_on_close(&child).expect("assign service job");
+            std::fs::write(marker, child.id().unwrap().to_string()).unwrap();
+            // Intentionally skips both the child's kill_on_drop and job Drop.
+            std::process::exit(29);
+        }
+        let marker = std::env::temp_dir().join(format!("ccgui-job-crash-{}.txt", uuid::Uuid::new_v4()));
+        let mut driver = std::process::Command::new(std::env::current_exe().unwrap());
+        driver.args(["engine::job::tests::owner_crash_releases_job_and_reaps_service", "--exact", "--nocapture"])
+            .env(DRIVER, &marker).stdin(std::process::Stdio::null());
+        use std::os::windows::process::CommandExt;
+        driver.creation_flags(0x08000000);
+        let output = driver.output().unwrap();
+        assert_eq!(output.status.code(), Some(29), "isolated driver did not exit at the crash fence");
+        let pid: u32 = std::fs::read_to_string(&marker).unwrap().parse().unwrap();
+        std::fs::remove_file(marker).unwrap();
+        let mut sys = System::new();
+        for _ in 0..30 {
+            sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[Pid::from_u32(pid)]), true, ProcessRefreshKind::nothing());
+            if sys.process(Pid::from_u32(pid)).is_none() { return; }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        panic!("service survived its owner's abrupt process exit");
+    }
+
     /// The field scenario: the direct child (cmd) exits while a detached
     /// grandchild (ping) keeps running, so `taskkill /T` has no tree left
     /// to walk. Dropping the guard must still sweep the orphan via job

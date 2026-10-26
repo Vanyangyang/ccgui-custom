@@ -207,6 +207,8 @@ fn ssh_target(transport: &WslTransport) -> String {
 /// destination 永远不被当成选项(user/host 另有白名单,这里是纵深防御)。
 fn base_ssh_command(transport: &WslTransport) -> Command {
     let mut command = Command::new("ssh");
+    #[cfg(windows)]
+    super::hide_console(&mut command);
     for opt in ssh_options(transport) {
         command.arg(opt);
     }
@@ -305,38 +307,46 @@ async fn upload_script(
 ) -> Result<(), String> {
     let mut command = base_ssh_command(transport);
     command.arg(wsl_command_string(transport, &["tee", remote_path]));
+    upload_command(command, script_body.as_bytes(), REMOTE_CALL_TIMEOUT).await
+}
+
+async fn upload_command(
+    mut command: Command,
+    script_body: &[u8],
+    limit: std::time::Duration,
+) -> Result<(), String> {
+    #[cfg(windows)]
+    super::hide_console(&mut command);
     // stderr 直接丢弃:从不读取却 piped 会在远端写满管缓冲时与 wait 互等
     // 死锁;错误细节本就不进报错文案(下面是固定提示)。
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
     let mut child = command
         .spawn()
         .map_err(|e| format!("ssh 脚本上传失败: {e}"))?;
-    let wrote = if let Some(mut stdin) = child.stdin.take() {
+    #[cfg(windows)]
+    let tree_guard = super::job::assign_kill_on_close(&child);
+    let result = tokio::time::timeout(limit, async {
         use tokio::io::AsyncWriteExt;
-        let result = stdin.write_all(script_body.as_bytes()).await;
-        stdin.shutdown().await.ok();
+        let mut stdin = child.stdin.take().ok_or("ssh 脚本上传缺少 stdin")?;
+        stdin.write_all(script_body).await.map_err(|e| format!("ssh 脚本写入失败: {e}"))?;
+        stdin.shutdown().await.map_err(|e| format!("ssh 脚本关闭输入失败: {e}"))?;
         drop(stdin);
-        result
-    } else {
-        Ok(())
-    };
-    wrote.map_err(|e| format!("ssh 脚本写入失败: {e}"))?;
-    // 全局 deadline:远端挂起时管道写满会让 wait 与 write 互等,没有超时
-    // 这个 future 永不 resolve(调用链上UI 无取消路径)。超时即 kill,
-    // 不留半写的远端脚本与孤儿 ssh。
-    let status = match tokio::time::timeout(REMOTE_CALL_TIMEOUT, child.wait()).await {
-        Ok(result) => result.map_err(|e| format!("ssh 脚本上传等待失败: {e}"))?,
-        Err(_) => {
-            let _ = child.start_kill();
-            return Err(format!(
-                "wsl 脚本上传超时({}s,检查远程主机 wsl.exe 是否无响应)",
-                REMOTE_CALL_TIMEOUT.as_secs()
-            ));
-        }
-    };
+        child.wait().await.map_err(|e| format!("ssh 脚本上传等待失败: {e}"))
+    }).await.unwrap_or_else(|_| Err(format!(
+        "wsl 脚本上传超时({}s,检查远程主机 wsl.exe 是否无响应)", limit.as_secs()
+    )));
+    // The local tree is ours; stopping SSH does not prove remote cleanup.
+    #[cfg(windows)]
+    drop(tree_guard);
+    if result.is_err() {
+        let _ = child.start_kill();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await;
+    }
+    let status = result?;
     if !status.success() {
         return Err("wsl 脚本上传失败(检查远程主机连接/认证;ControlMaster 可能已过期,请在 WSL 主机设置重新连接)".to_string());
     }
@@ -417,9 +427,12 @@ pub async fn run_script_output(
         .stderr(Stdio::piped());
     // 全局 deadline(理由见 REMOTE_CALL_TIMEOUT):模型目录/历史回放都走
     // 这里,远端挂起不得拖死前端。kill_on_drop:超时后 output future 被
-    // 丢弃即 SIGKILL 本地 ssh(远端脚本落盘即删,无残留面)。
+    // 丢弃即终止本地 ssh；不能据此保证远端命令已退出或临时脚本已删除。
     command.kill_on_drop(true);
-    let output = match tokio::time::timeout(REMOTE_CALL_TIMEOUT, command.output()).await {
+    let child = command.spawn().map_err(|e| format!("远程命令执行失败: {e}"))?;
+    #[cfg(windows)]
+    let _tree_guard = super::job::assign_kill_on_close(&child);
+    let output = match tokio::time::timeout(REMOTE_CALL_TIMEOUT, child.wait_with_output()).await {
         Ok(result) => result.map_err(|e| format!("远程命令执行失败: {e}"))?,
         Err(_) => {
             return Err(format!(
@@ -458,6 +471,10 @@ fn strip_transport_noise(raw: &[u8]) -> Vec<u8> {
 pub fn transport_for_workspace(db: &crate::db::Db, workspace_path: &str) -> Option<WslTransport> {
     transport_from_meta_json(workspace_meta_json(db, workspace_path).as_deref())
 }
+
+#[cfg(all(test, windows))]
+#[path = "wsl_transport_process_tests.rs"]
+mod process_tests;
 
 #[cfg(test)]
 mod tests {

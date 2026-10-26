@@ -11,6 +11,9 @@ export interface LeaderBranch {
   id: string;
   parentEngine: string;
   parentSessionId: string;
+  /** Exact parent source; absent in legacy same-workspace records. */
+  parentWorkspacePath?: string;
+  /** Child execution cwd. */
   workspacePath: string;
   engine: string;
   sessionId: string | null;
@@ -29,6 +32,21 @@ export interface LeaderBranch {
   result: string;
   resultTruncated: boolean;
   error: string | null;
+  /** Latest parent assignment; later manual child turns do not reopen its terminal state. */
+  delegation?: TaskDelegation;
+}
+
+export interface TaskDelegation {
+  requestId: string;
+  runId: string | null;
+  task: string;
+  state: LeaderBranch["state"];
+  createdAt: number;
+  updatedAt: number;
+  result: string;
+  resultTruncated: boolean;
+  error: string | null;
+  costApproval?: LeaderBranch["costApproval"];
 }
 
 export interface LeaderArchivedGroup {
@@ -48,7 +66,11 @@ export interface LeaderSnapshot {
 
 export function isDirectChild(branch: LeaderBranch, parent: LeaderIdentity) {
   return branch.parentEngine === parent.engine && branch.parentSessionId === parent.sessionId
-    && sameLeaderWorkspace(branch.workspacePath, parent.workspacePath);
+    && sameLeaderWorkspace(parentWorkspacePath(branch), parent.workspacePath);
+}
+
+export function parentWorkspacePath(branch: LeaderBranch): string {
+  return branch.parentWorkspacePath ?? branch.workspacePath;
 }
 
 export function sameIdentity(a: LeaderIdentity, b: LeaderIdentity) {
@@ -74,7 +96,7 @@ export function leaderGroupRoot(snapshot: LeaderSnapshot, identity: LeaderIdenti
     seen.add(key);
     const branch = snapshot.branches.find((b) => b.state !== "reclaimed" && b.sessionId === root.sessionId && b.engine === root.engine && sameLeaderWorkspace(b.workspacePath, root.workspacePath));
     if (!branch) return root;
-    root = { engine: branch.parentEngine, sessionId: branch.parentSessionId, workspacePath: branch.workspacePath };
+    root = { engine: branch.parentEngine, sessionId: branch.parentSessionId, workspacePath: parentWorkspacePath(branch) };
   }
 }
 

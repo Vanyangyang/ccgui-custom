@@ -94,15 +94,19 @@ describe("AGY quota lifecycle", () => {
     await act(async () => vi.advanceTimersByTimeAsync(250));
     expect(ipc.agyQuotaRead).toHaveBeenCalledTimes(3);
   });
-  it("drops values on transport failure and expires reset windows between polls", async () => {
+  it("retains stale values on transport failure and reset, but honors identity invalidation", async () => {
     vi.mocked(ipc.agyQuotaRead).mockResolvedValueOnce({ ...quota(), groups: [{ id: "gemini", windows: { fiveHour: { usedPercentage: 20, resetsAt: NOW + 5 } } }] });
     await render(); await act(async () => vi.advanceTimersByTimeAsync(5_000));
-    expect(controls.snapshot?.groups).toEqual([]);
+    expect(controls.snapshot?.groups[0]?.windows.fiveHour?.usedPercentage).toBe(20);
     vi.mocked(ipc.agyQuotaRead).mockRejectedValueOnce(new Error("transport"));
     await act(async () => controls.refresh());
-    expect(controls.snapshot).toMatchObject({ status: "unavailable", groups: [], errorCode: "read_failed" });
+    expect(controls.snapshot).toMatchObject({ status: "stale", collectedAt: NOW, errorCode: "read_failed" });
+    expect(controls.snapshot?.groups[0]?.windows.fiveHour?.usedPercentage).toBe(20);
+    vi.mocked(ipc.agyQuotaRead).mockResolvedValueOnce({ status: "unavailable", groups: [], errorCode: "auth_changed" });
+    await act(async () => changed());
+    expect(controls.snapshot?.groups).toEqual([]);
   });
-  it("expires idle data while hidden and cleans StrictMode subscriptions and timers", async () => {
+  it("retains idle data while hidden and cleans StrictMode subscriptions and timers", async () => {
     await render(undefined, undefined, undefined, true);
     expect(ipc.agyQuotaRead).toHaveBeenCalledOnce();
     expect(stop).toHaveBeenCalledOnce();
@@ -110,7 +114,7 @@ describe("AGY quota lifecycle", () => {
     await act(async () => vi.advanceTimersByTimeAsync(120_000));
     expect(controls.snapshot?.status).toBe("stale");
     await act(async () => vi.advanceTimersByTimeAsync(3_480_000));
-    expect(controls.snapshot).toMatchObject({ status: "unavailable", groups: [], errorCode: "quota_expired" });
+    expect(controls.snapshot).toMatchObject({ status: "stale", collectedAt: NOW, groups: quota().groups });
     await render("custom", undefined, undefined, true);
     expect(stop).toHaveBeenCalledTimes(2);
     expect(vi.getTimerCount()).toBe(0);

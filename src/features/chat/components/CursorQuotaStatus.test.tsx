@@ -30,6 +30,7 @@ describe("Cursor quota status", () => {
       cursorQuotaOnDemand: "On-Demand", cursorQuotaOnDemandOff: "Off", cursorQuotaScope: "Account period",
       cursorQuotaOpen: "Open", quotaRefresh: "Refresh", quotaRefreshing: "Refreshing",
       quotaIdentityUnknown: "Unknown", quotaResetAt: "Resets {{time}}", quotaStale: "Stale", quotaStaleShort: "stale",
+      quotaUpdated: "Last usage received {{time}}",
       cursorQuotaAuth: "Sign in", cursorQuotaUnsupported: "Unsupported", cursorQuotaQueryFailed: "Failed",
     } }, true, true);
     openExternal.mockClear();
@@ -52,5 +53,15 @@ describe("Cursor quota status", () => {
     await act(async () => open.click());
     expect(openExternal).toHaveBeenCalledExactlyOnceWith(CURSOR_USAGE_URL);
     expect([...new URL(CURSOR_USAGE_URL).searchParams.keys()]).toEqual(["tab"]);
+  });
+  it("shows the original collection time for stale usage and hides it on logout", async () => {
+    await act(async () => root.render(<CursorQuotaStatus snapshot={{ ...snapshot(), status: "stale", errorCode: "read_failed" }} loading={false} refresh={refresh} now={1_900_007_200} />));
+    expect(container.textContent).toContain("Auto 12% · Other models 2% · stale");
+    await act(async () => container.querySelector("button")!.click());
+    const dialog = document.querySelector('[role="dialog"]')!;
+    expect(dialog.textContent).toContain(`Last usage received ${new Date(1_900_000_000 * 1000).toLocaleString("en")}`);
+    await act(async () => root.render(<CursorQuotaStatus snapshot={{ status: "unavailable", errorCode: "not_logged_in" }} loading={false} refresh={refresh} now={1_900_007_200} />));
+    expect(dialog.textContent).not.toContain("Ultra");
+    expect(dialog.textContent).not.toContain("Last usage received");
   });
 });

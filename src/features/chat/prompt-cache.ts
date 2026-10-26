@@ -3,9 +3,19 @@ import type { TFunction } from "i18next";
 
 export type CacheHeat = "hot" | "cold" | "unknown";
 
-/** Cursor rules remain disabled, including metadata injected by plugins. */
+/** Codex has no finite retention estimate; Cursor uses a five-minute policy. */
+export function supportsPromptCacheExpiry(engine: string | undefined): boolean {
+  return engine !== "codex";
+}
+
+/** Client policy for Codex GPT routes, independent of missing/legacy TTL samples.
+ * This disables time-based warnings; it does not assert a measured cache hit. */
+export function usesUnlimitedPromptCache(engine: string | undefined, model: string | null | undefined): boolean {
+  return engine === "codex" && /^gpt-.+/i.test(model?.trim() ?? "");
+}
+
 export function promptCacheForEngine(engine: string | undefined, cache: PromptCacheWindow | null | undefined) {
-  return engine === "cursor" ? undefined : cache;
+  return supportsPromptCacheExpiry(engine) ? cache : undefined;
 }
 
 function validWindow(cache: PromptCacheWindow | null | undefined): cache is PromptCacheWindow {
@@ -38,7 +48,10 @@ export function getPromptCacheHeatRatio(
   _updatedAt?: number | null,
   _streaming = false,
   now = Date.now(),
+  engine?: string,
 ): number {
+  // Codex's permanent red is a display policy, not evidence of a cache hit.
+  if (engine === "codex") return 1;
   if (!validWindow(cache) || !Number.isFinite(now) || now < cache.observedAt || cache.reference?.cacheReadTokens === 0) return 0;
   const ttlMs = (cache.reference?.maxTtlSeconds ?? cache.ttlSeconds) * 1000;
   const remaining = (cache.startedAt + ttlMs - now) / ttlMs;

@@ -104,7 +104,21 @@ fn auth_stamp() -> Option<AuthStamp> {
 
 /// 自动刷新在 20 秒内复用缓存。手动刷新，或凭据文件变了（登录/登出），必须重查。
 fn reuse_cache(force: bool, elapsed: Duration, cached: Option<AuthStamp>, current: Option<AuthStamp>) -> bool {
-    !force && elapsed < CACHE_FLOOR && cached == current
+    !force && elapsed < CACHE_FLOOR && current.is_some() && cached == current
+}
+
+fn same_account(before: Option<AuthStamp>, after: Option<AuthStamp>) -> bool {
+    before.is_some() && before == after
+}
+
+fn stale_cached(cache: &Cache, stamp: Option<AuthStamp>) -> Option<CursorQuotaSnapshot> {
+    if same_account(cache.stamp, stamp) && cache.snapshot.status == "ready" {
+        let mut stale = cache.snapshot.clone();
+        stale.status = "stale";
+        Some(stale)
+    } else {
+        None
+    }
 }
 
 fn now_secs() -> u64 {
@@ -353,11 +367,15 @@ pub async fn cursor_quota_read(force: Option<bool>) -> CursorQuotaSnapshot {
         }
     }
     let snapshot = fetch_snapshot(now).await;
+    // Never publish an in-flight response after the local account changes.
     if matches!(snapshot.error_code, Some("auth" | "not_logged_in")) {
         if let Ok(mut guard) = CACHE.lock() {
             *guard = None;
         }
         return snapshot;
+    }
+    if !same_account(stamp, auth_stamp()) {
+        return unavailable("auth_changed");
     }
     if snapshot.status == "ready" {
         if let Ok(mut guard) = CACHE.lock() {
@@ -369,12 +387,11 @@ pub async fn cursor_quota_read(force: Option<bool>) -> CursorQuotaSnapshot {
         }
         return snapshot;
     }
-    // 查询失败时，两分钟内仍显示上一次成功结果，并标成过期。登录失效则直接清空。
+    // 临时查询失败保留同一账号最后成功结果及采样时间。登录失效仍直接清空。
     if let Ok(guard) = CACHE.lock() {
         if let Some(cache) = guard.as_ref() {
-            if cache.stamp == stamp && cache.at.elapsed() < Duration::from_secs(120) && cache.snapshot.status == "ready" {
-                let mut stale = cache.snapshot.clone();
-                stale.status = "stale";
+            if let Some(mut stale) = stale_cached(cache, stamp) {
+                stale.error_code = snapshot.error_code;
                 return stale;
             }
         }
@@ -386,6 +403,23 @@ pub async fn cursor_quota_read(force: Option<bool>) -> CursorQuotaSnapshot {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn transient_failure_keeps_old_sample_only_for_verified_same_account() {
+        let stamp = AuthStamp { len: 1, modified_ms: 1 };
+        let mut snapshot = unavailable("fixture");
+        snapshot.status = "ready";
+        snapshot.collected_at = Some(1);
+        snapshot.included_percent = Some(42.0);
+        let cache = Cache { at: Instant::now() - Duration::from_secs(7200), stamp: Some(stamp), snapshot };
+        let stale = stale_cached(&cache, Some(stamp)).unwrap();
+        assert_eq!(stale.status, "stale");
+        assert_eq!(stale.collected_at, Some(1));
+        assert_eq!(stale.included_percent, Some(42.0));
+        assert!(stale_cached(&cache, None).is_none());
+        assert!(!same_account(None, None));
+        assert!(!same_account(Some(stamp), Some(AuthStamp { len: 2, modified_ms: 2 })));
+    }
 
     #[test]
     fn included_uses_spend_over_limit_and_keeps_auto_api() {

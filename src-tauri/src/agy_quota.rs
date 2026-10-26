@@ -51,32 +51,21 @@ impl AgyQuotaSnapshot {
         }
     }
     fn expire(&mut self, now: u64) {
-        if self
-            .collected_at
-            .is_some_and(|at| at > now || now - at >= MAX_AGE)
-        {
+        if self.collected_at.is_none_or(|at| at > now) {
             self.groups.clear();
-            self.credits = None;
-            self.error_code.get_or_insert("quota_expired");
         }
-        for group in &mut self.groups {
-            for window in [&mut group.windows.five_hour, &mut group.windows.seven_day] {
-                if window
-                    .as_ref()
-                    .and_then(|w| w.resets_at)
-                    .is_some_and(|at| at <= now)
-                {
-                    *window = None;
-                }
-            }
+        if self.collected_at.is_none_or(|at| at > now || now - at >= MAX_AGE) {
+            self.credits = None;
         }
         self.groups.retain(|g| g.windows != QuotaWindows::default());
         if self.groups.is_empty() {
             self.status = "unavailable";
             self.error_code.get_or_insert("quota_not_available");
-        } else if self
+        } else if self.groups.iter().flat_map(|g| [&g.windows.five_hour, &g.windows.seven_day])
+            .flatten().any(|w| w.resets_at.is_some_and(|at| at <= now))
+            || self
             .collected_at
-            .is_some_and(|at| now.saturating_sub(at) >= 120)
+            .is_some_and(|at| at > now || now.saturating_sub(at) >= 120)
         {
             self.status = "stale";
         }
@@ -197,6 +186,7 @@ fn parse_usage(value: &Value, now: u64) -> Result<Vec<AgyQuotaGroup>, &'static s
         },
     ];
     let mut seen = HashSet::new();
+    let mut disabled_count = 0;
     for group in groups {
         let buckets = group
             .get("buckets")
@@ -227,6 +217,7 @@ fn parse_usage(value: &Value, now: u64) -> Result<Vec<AgyQuotaGroup>, &'static s
             // A weekly limit can disable the 5h bucket. Its remaining fraction
             // is then historical and its reset time may be absent.
             if bucket.get("disabled").and_then(Value::as_bool) == Some(true) {
+                disabled_count += 1;
                 continue;
             }
             let remaining = bucket
@@ -254,6 +245,11 @@ fn parse_usage(value: &Value, now: u64) -> Result<Vec<AgyQuotaGroup>, &'static s
         }
     }
     result.retain(|g| g.windows != QuotaWindows::default());
+    // An empty/expired response is not an explicit revocation. Only a
+    // validated response disabling every supported bucket clears old usage.
+    if result.is_empty() && (seen.is_empty() || disabled_count != seen.len()) {
+        return Err("quota_not_available");
+    }
     Ok(result)
 }
 
@@ -394,6 +390,7 @@ async fn read_bounded(reader: impl AsyncRead + Unpin) -> Result<Vec<u8>, &'stati
 }
 async fn run_slash(binding: &Binding, slash: &str, timeout: &str) -> Result<Value, &'static str> {
     let mut cmd = crate::engine::command_for_binary(&binding.bin);
+    crate::engine::agy::configure_background_command(&mut cmd);
     cmd.args([
         "--output-format",
         "json",
@@ -410,6 +407,8 @@ async fn run_slash(binding: &Binding, slash: &str, timeout: &str) -> Result<Valu
     #[cfg(windows)]
     cmd.creation_flags(0x08000000);
     let mut child = cmd.spawn().map_err(|_| "cli_unavailable")?;
+    #[cfg(windows)]
+    let _job = crate::engine::job::assign_kill_on_close(&child);
     let stdout = child.stdout.take().ok_or("query_failed")?;
     let stderr = child.stderr.take().ok_or("query_failed")?;
     let (output, _, status) =
@@ -449,14 +448,14 @@ fn remember_credits(stamp: &str, credits: Option<f64>) {
     match credits {
         Some(n) => {
             if map.len() >= MAX_BINDINGS && !map.contains_key(stamp) {
-                map.clear();
+                if let Some(oldest) = map.iter().min_by_key(|(_, (at, _))| *at).map(|(key, _)| key.clone()) {
+                    map.remove(&oldest);
+                }
             }
             map.insert(stamp.to_owned(), (now_seconds(), n));
         }
         // A failed or malformed read is unknown, not the previous balance.
-        None => {
-            map.remove(stamp);
-        }
+        None => { map.remove(stamp); }
     }
 }
 
@@ -643,6 +642,31 @@ pub async fn agy_quota_read(
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn agy_background_usage_and_credits_receive_true() {
+        let fixture = crate::engine::agy::background_tests::Fixture::new(
+            "echo {\"disabled\":\"%AGY_CLI_DISABLE_AUTO_UPDATE%\"}",
+        );
+        let binding = Binding {
+            stamp: "fixture".into(),
+            bin: fixture.bin(),
+            workspace: fixture.0.clone(),
+            provider: None,
+        };
+        for slash in ["/usage", "/credits"] {
+            let result = run_slash(&binding, slash, "1s").await.unwrap();
+            assert_eq!(result["disabled"], "true");
+        }
+        assert_eq!(
+            fixture.calls(),
+            [
+                "--output-format json --print-timeout 1s --print /usage",
+                "--output-format json --print-timeout 1s --print /credits",
+            ]
+        );
+    }
+
     #[tokio::test]
     #[ignore = "requires a signed-in native AGY CLI; queries /usage without a model request"]
     async fn agy_live_smoke_reads_native_quota() {
@@ -700,7 +724,7 @@ mod tests {
         }
         let mut v = response(json!(1));
         v["command"]["data"]["groups"][0]["buckets"][0]["id"] = json!("future-5h");
-        assert!(parse_usage(&v, 0).unwrap().is_empty());
+        assert_eq!(parse_usage(&v, 0), Err("quota_not_available"));
     }
     #[test]
     fn rejects_invalid_and_duplicate_buckets() {
@@ -788,14 +812,13 @@ mod tests {
         s.expire(1120);
         assert_eq!(s.status, "stale");
         s.expire(4600);
-        assert_eq!(s.status, "unavailable");
-        assert!(s.groups.is_empty());
-        assert!(parse_usage(
-            &response(json!(0.5)),
-            reset_time("2099-01-01T00:00:00Z").unwrap()
-        )
-        .unwrap()
-        .is_empty());
+        assert_eq!(s.status, "stale");
+        assert!(!s.groups.is_empty());
+        assert_eq!(s.collected_at, Some(1000));
+        assert_eq!(
+            parse_usage(&response(json!(0.5)), reset_time("2099-01-01T00:00:00Z").unwrap()),
+            Err("quota_not_available")
+        );
     }
     #[tokio::test]
     async fn concurrent_refresh_cooldown_cache_only_and_binding_changes() {
@@ -958,9 +981,9 @@ mod tests {
             .unwrap()
             .resets_at = Some(1100);
         snapshot.expire(1100);
-        assert_eq!(snapshot.groups.len(), 1);
-        assert_eq!(snapshot.groups[0].id, "third_party");
-        assert_eq!(snapshot.status, "ready");
+        assert_eq!(snapshot.groups.len(), 2);
+        assert_eq!(snapshot.groups[0].id, "gemini");
+        assert_eq!(snapshot.status, "stale");
         let mut v = response(json!(0.5));
         v["command"]["name"] = json!("other");
         assert!(parse_usage(&v, 0).is_err());
@@ -969,6 +992,39 @@ mod tests {
     fn remote_paths_fail_closed() {
         assert!(!local_path(Path::new("wsl:Ubuntu/home")));
         assert!(!local_path(Path::new("ssh:host/path")));
+    }
+    #[test]
+    fn quota_rejects_missing_and_future_sample_times() {
+        for collected_at in [None, Some(2000)] {
+            let mut snapshot = AgyQuotaSnapshot {
+                status: "ready", groups: groups(), collected_at,
+                ..Default::default()
+            };
+            snapshot.expire(1000);
+            assert_eq!(snapshot.status, "unavailable");
+            assert!(snapshot.groups.is_empty());
+        }
+    }
+    #[tokio::test]
+    async fn old_sample_survives_sparse_and_failed_reads_but_disabled_clears() {
+        let state = AgyQuotaState::default();
+        let first = state.read_bound("a", false, async { Ok(groups()) }, || true).await;
+        {
+            let mut cache = state.cache.lock().unwrap();
+            let entry = cache.get_mut("a").unwrap();
+            entry.last_attempt = None;
+            entry.snapshot.as_mut().unwrap().collected_at = Some(1);
+        }
+        let empty = json!({"status":"SUCCESS","command":{"name":"usage","data":{"groups":[]}}});
+        let stale = state.read_bound("a", false, async { parse_usage(&empty, now_seconds()) }, || true).await;
+        assert_eq!(stale.groups, first.groups);
+        assert_eq!(stale.collected_at, Some(1));
+        assert_eq!(stale.status, "stale");
+        state.cache.lock().unwrap().get_mut("a").unwrap().last_attempt = None;
+        let disabled = json!({"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{"buckets":[{"id":"gemini-5h","window":"5h","disabled":true}]}]}}});
+        let cleared = state.read_bound("a", false, async { parse_usage(&disabled, now_seconds()) }, || true).await;
+        assert!(cleared.groups.is_empty());
+        assert_eq!(cleared.status, "unavailable");
     }
     #[test]
     fn unrelated_settings_and_dotenv_are_metadata_only() {

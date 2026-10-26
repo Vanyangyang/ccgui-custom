@@ -1,11 +1,16 @@
 import type { CSSProperties } from "react";
-import type { AssistantNoticesConfig } from "./types";
+import type { AssistantNoticesConfig, CompletionAudioSettings } from "./types";
 
 export const defaultNoticeConfig: AssistantNoticesConfig = {
   enabled: true, observerEnabled: false, paused: false, focusMode: false,
   voiceEnabled: true, displayTarget: { mode: "active" },
   bodyTextPercent: 100, titleTextPercent: 100, interfaceTextPercent: 100,
   observerEngine: "agy_vertex", observerModel: "gemini-4-argon", observerEffort: "medium",
+};
+
+/** Placeholder shown disabled until native settings load; native owns the real defaults. */
+export const defaultCompletionAudio: CompletionAudioSettings = {
+  mode: "chimeAndVoice", chimeVolume: 40, voiceVolume: 80, quietHours: true, quietStart: 22, quietEnd: 8, engines: {},
 };
 
 /** Explicitly exclude status metadata from writes. */

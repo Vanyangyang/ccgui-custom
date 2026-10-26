@@ -30,7 +30,29 @@ describe("file tree Git refresh", () => {
     mocks.gitTreeStatus.mockResolvedValue(emptyStatus());
     mocks.gitRepositorySummaries.mockResolvedValue([]);
     mocks.gitFileColors.mockResolvedValue({});
-    useFilesStore.setState({ root: "/repo", children: { "/repo": [], "/repo/sub": [] }, expanded: {}, loadingDirs: {}, dirErrors: {}, repositories: {}, fileColors: {}, refreshing: false });
+    useFilesStore.setState({ root: "/repo", roots: [], children: { "/repo": [], "/repo/sub": [] }, expanded: {}, loadingDirs: {}, dirErrors: {}, repositories: {}, fileColors: {}, refreshing: false });
+  });
+
+  it("loads distinct available project roots and ignores replies after switching", async () => {
+    let finish!: (entries: DirEntry[]) => void;
+    mocks.listDir.mockImplementation((path) => path === "/old" ? new Promise((resolve) => { finish = resolve; }) : Promise.resolve([entry("current.txt")]));
+    const member = (path: string, status: "available" | "missing" = "available") => ({ path, label: path, role: "development" as const, status });
+    useFilesStore.getState().setProjectRoots("/old", [member("/old"), member("/old/nested"), member("/gone", "missing")]);
+    expect(mocks.listDir).toHaveBeenCalledTimes(1);
+    useFilesStore.getState().setProjectRoots("/new", [member("/new"), member("/plan")]);
+    await vi.waitFor(() => expect(useFilesStore.getState().children["/plan"]).toBeDefined());
+    finish([entry("stale.txt")]);
+    await Promise.resolve();
+    expect(useFilesStore.getState().children["/old"]).toBeUndefined();
+    expect(useFilesStore.getState().children["/new"]).toEqual([entry("current.txt")]);
+    expect(mocks.listDir).not.toHaveBeenCalledWith("/gone");
+  });
+
+  it("keeps an available root usable when another root fails", async () => {
+    mocks.listDir.mockImplementation((path) => path === "/broken" ? Promise.reject(new Error("missing directory")) : Promise.resolve([entry("usable.txt")]));
+    useFilesStore.getState().setProjectRoots("/good", ["/broken", "/good"].map((path) => ({ path, label: path, role: "development", status: "available" })));
+    await vi.waitFor(() => expect(useFilesStore.getState().dirErrors["/broken"]).toContain("missing directory"));
+    expect(useFilesStore.getState().children["/good"]).toEqual([entry("usable.txt")]);
   });
 
   it("batches all loaded levels instead of requesting a scan per directory", async () => {

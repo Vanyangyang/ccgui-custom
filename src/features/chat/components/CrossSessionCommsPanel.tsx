@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { create } from "zustand";
 import { useTranslation } from "react-i18next";
 import { Dialog, DialogTrigger, Popover, Pressable } from "react-aria-components";
@@ -21,13 +21,13 @@ import { CrossSessionCostApproval } from "./CrossSessionCostApproval";
 import {
   crossSessionParticipantKey,
   crossSessionRecordMatchesParticipant,
-  isCrossSessionActiveStatus,
-  isCrossSessionRecordUnread,
+  isCrossSessionPendingRecord,
   useCrossSessionActivityStore,
   type CrossSessionCommunicationRecord,
   type CrossSessionParticipant,
 } from "../cross-session";
 import { sameLeaderWorkspace } from "@/features/leader/workspace-path";
+import { localizeRunError } from "../run-error";
 
 function resolveParticipantLabel(
   participant: CrossSessionParticipant,
@@ -38,10 +38,6 @@ function resolveParticipantLabel(
   const title = match?.customTitle || match?.title || participant.title;
   if (title?.trim()) return title.trim();
   return `${CLI_DISPLAY_NAMES[participant.engine] ?? participant.engine} · ${participant.sessionId.slice(0, 8)}`;
-}
-
-function needsAttention(record: CrossSessionCommunicationRecord, participant?: CrossSessionParticipant) {
-  return isCrossSessionActiveStatus(record.status) || isCrossSessionRecordUnread(record, participant);
 }
 
 function threadParticipant(threadId?: string, workspacePath?: string, leaderBranch?: { id: string; engine: string; sessionId: string | null; workspacePath: string; title?: string }): CrossSessionParticipant | undefined {
@@ -72,22 +68,25 @@ export function useCrossSessionThreadActivity(
     ? state.records.filter((record) => crossSessionRecordMatchesParticipant(record, participant)) : []));
   const emphasized = useCommsEmphasis((state) => state.participant);
   const active = records.find((record) => record.status === "awaiting_cost_approval") ??
-    records.find((record) => isCrossSessionActiveStatus(record.status));
+    records.find((record) => isCrossSessionPendingRecord(record));
   const outgoing = !!active && !!participant && crossSessionParticipantKey(active.sender) === crossSessionParticipantKey(participant);
   const other = active ? outgoing ? active.target : active.sender : undefined;
   const title = useChatStore((state) => other ? resolveParticipantLabel(other, state.sessions) : "");
   const isSubtask = active?.kind === "subtask";
-  const summary = active ? t(active.status === "awaiting_cost_approval" ? "crossSession.rowAwaitingCostApproval" :
+  const summary = active?.mailbox ? `${t("crossSession.inboxWith", { title })} · ${t(`crossSession.mailboxPhase.${active.mailbox.phase}`)}${active.mailbox.waitReason ? ` · ${t(`crossSession.mailboxWait.${active.mailbox.waitReason}`)}` : ""}` : active ? t(active.status === "awaiting_cost_approval" ? "crossSession.rowAwaitingCostApproval" :
     active.status === "awaiting_permission" ? "crossSession.rowAwaitingPermission" :
     outgoing ? (isSubtask ? "crossSession.rowDelegating" : "crossSession.rowAsking") :
     active.status === "executing" ? (isSubtask ? "crossSession.rowSubtaskRunning" : "crossSession.rowReplying") :
     (isSubtask ? "crossSession.rowSubtaskStarting" : "crossSession.rowReceiving"), { title }) : undefined;
   const related = !!participant && !!emphasized && crossSessionParticipantKey(participant) !== crossSessionParticipantKey(emphasized) &&
-    records.some((record) => crossSessionRecordMatchesParticipant(record, emphasized) && needsAttention(record, emphasized));
+    records.some((record) => crossSessionRecordMatchesParticipant(record, emphasized) && isCrossSessionPendingRecord(record));
   return { active: !!active, summary, related };
 }
 
-function StatusIcon({ status }: { status: CrossSessionCommunicationRecord["status"] }) {
+function StatusIcon({ status, mailbox }: Pick<CrossSessionCommunicationRecord, "status" | "mailbox">) {
+  if (mailbox) return mailbox.phase === "uncertain" || mailbox.phase === "deferred"
+    ? <CircleAlert className="size-3 shrink-0 text-text-warning-primary" aria-hidden />
+    : <Clock className="size-3 shrink-0 text-text-tertiary" aria-hidden />;
   if (status === "failed" || status === "unknown" || status === "awaiting_permission" || status === "awaiting_cost_approval") {
     return <CircleAlert className={cx("size-3 shrink-0", status === "failed" ? "text-notification-error" : "text-text-warning-primary")} aria-hidden />;
   }
@@ -131,39 +130,40 @@ function CommsPopover({ participant }: { participant?: CrossSessionParticipant }
   };
   const rowBodyRef = useRef<HTMLButtonElement | null>(null);
   const wasOpen = useRef(false);
-  const attention = records.filter((record) => needsAttention(record, participant));
+  // Badges describe current communication, not unreviewed history. Keep terminal
+  // records available in the overview without leaving marks on either row.
+  const activeRecords = records.filter((record) => isCrossSessionPendingRecord(record));
+  const activeCount = activeRecords.length;
   const participantKey = participant ? crossSessionParticipantKey(participant) : undefined;
   useEffect(() => {
-    if (!attention.length) clearEmphasis();
-  }, [attention.length, emphasisOwner]);
+    if (!activeCount) clearEmphasis();
+  }, [activeCount, emphasisOwner]);
   useEffect(() => clearEmphasis, [participantKey, emphasisOwner]);
-  const activeCount = attention.filter((record) => isCrossSessionActiveStatus(record.status)).length;
-  const unreadCount = attention.length - activeCount;
-  // Prioritize something requiring intervention, then active work, then replies.
-  const primary = attention.find((r) => r.status === "awaiting_cost_approval") ??
-    attention.find((r) => ["failed", "awaiting_permission", "unknown"].includes(r.status)) ??
-    attention.find((r) => isCrossSessionActiveStatus(r.status)) ?? attention[0];
-  let summary = activeCount ? t("crossSession.activeBadge", { count: activeCount }) :
-    unreadCount ? t("crossSession.unreadBadge", { count: unreadCount }) : t("crossSession.title");
+  // Requests waiting for the user take priority over other active work.
+  const primary = activeRecords.find((r) => r.status === "awaiting_cost_approval") ??
+    activeRecords.find((r) => r.status === "awaiting_permission") ?? activeRecords[0];
+  let summary = activeCount ? t("crossSession.activeBadge", { count: activeCount }) : t("crossSession.title");
   if (participant && primary) {
     const outgoing = crossSessionParticipantKey(primary.sender) === crossSessionParticipantKey(participant);
     const other = resolveParticipantLabel(outgoing ? primary.target : primary.sender, useChatStore.getState().sessions);
     const isSubtask = primary.kind === "subtask";
-    summary = `${t(outgoing ? (isSubtask ? "crossSession.subtaskOutgoing" : "crossSession.outgoing") : (isSubtask ? "crossSession.subtaskIncoming" : "crossSession.incoming"), { title: other })} · ${t(`crossSession.status.${primary.status}`)}`;
-    if (attention.length > 1) summary += ` · ${t("crossSession.recordCount", { count: attention.length })}`;
+    summary = primary.mailbox
+      ? `${t("crossSession.inboxWith", { title: other })} · ${t(`crossSession.mailboxPhase.${primary.mailbox.phase}`)}${primary.mailbox.waitReason ? ` · ${t(`crossSession.mailboxWait.${primary.mailbox.waitReason}`)}` : ""}`
+      : `${t(outgoing ? (isSubtask ? "crossSession.subtaskOutgoing" : "crossSession.outgoing") : (isSubtask ? "crossSession.subtaskIncoming" : "crossSession.incoming"), { title: other })} · ${t(`crossSession.status.${primary.status}`)}`;
+    if (activeCount > 1) summary += ` · ${t("crossSession.recordCount", { count: activeCount })}`;
   }
   const label = participant ? t("crossSession.showDetails", { summary }) :
-    `${t("crossSession.togglePanel")}${attention.length ? ` · ${summary}` : ""}`;
+    `${t("crossSession.togglePanel")}${activeCount ? ` · ${summary}` : ""}`;
 
   useEffect(() => {
-    // A reviewed terminal indicator disappears when its popover closes. Return
+    // A finished communication's anchor disappears when its popover closes. Return
     // keyboard focus to the row only if dismissal did not focus another control.
-    if (wasOpen.current && !popover.isOpen && participant && !attention.length &&
+    if (wasOpen.current && !popover.isOpen && participant && !activeCount &&
       document.activeElement === document.body) rowBodyRef.current?.focus();
     wasOpen.current = popover.isOpen;
-  }, [popover.isOpen, participant, attention.length]);
+  }, [popover.isOpen, participant, activeCount]);
 
-  if (participant && !attention.length && !popover.isOpen) return null;
+  if (participant && !activeCount && !popover.isOpen) return null;
   return <DialogTrigger isOpen={popover.isOpen} onOpenChange={(open) => {
     if (open && participant) rowBodyRef.current = popover.triggerRef.current?.parentElement?.querySelector("button[data-thread-select]") ?? null;
     popover.setOpen(open);
@@ -172,7 +172,7 @@ function CommsPopover({ participant }: { participant?: CrossSessionParticipant }
         base IconButton's 32px minimum would increase the row height. */}
     <Pressable><button type="button" ref={popover.triggerRef}
       data-testid={participant ? "thread-cross-session-btn" : "sidebar-cross-session-btn"}
-      data-comm-status={primary?.status}
+      data-comm-status={primary?.mailbox?.phase ?? primary?.status}
       aria-label={label} title={label}
       onMouseEnter={() => { hovered.current = true; emphasize(); }}
       onMouseLeave={() => { hovered.current = false; if (document.activeElement !== popover.triggerRef.current) clearEmphasis(); }}
@@ -184,9 +184,9 @@ function CommsPopover({ participant }: { participant?: CrossSessionParticipant }
     >
       <span className="relative inline-flex">
         <MessagesSquare className={participant ? "size-3.5" : "size-4"} aria-hidden />
-        {primary && <span className="absolute -right-1 -bottom-1 inline-flex rounded-full bg-background-secondary-default [&_svg]:size-2.5"><StatusIcon status={primary.status} /></span>}
+        {primary && <span className="absolute -right-1 -bottom-1 inline-flex rounded-full bg-background-secondary-default [&_svg]:size-2.5"><StatusIcon status={primary.status} mailbox={primary.mailbox} /></span>}
       </span>
-      {attention.length > (participant ? 1 : 0) && <span data-testid="cross-session-count" className="text-caption-2-medium">{attention.length}</span>}
+      {activeCount > (participant ? 1 : 0) && <span data-testid="cross-session-count" className="text-caption-2-medium">{activeCount}</span>}
     </button></Pressable>
     <Popover ref={popover.popoverRef} isNonModal placement="right top" offset={8}
       className="max-h-[min(32rem,calc(100dvh-2rem))] w-80 max-w-[calc(100vw-2rem)] overflow-y-auto rounded-xl border border-border-button-default bg-background-primary-default p-3 shadow-dropdown outline-none transition duration-150 ease-out data-[entering]:scale-95 data-[entering]:opacity-0 data-[exiting]:scale-95 data-[exiting]:opacity-0 motion-reduce:transition-none">
@@ -214,14 +214,14 @@ function CommsDetails({ records, participant, onClose }: {
   const markReviewed = useCrossSessionActivityStore((s) => s.markReviewed);
   const clearFinished = useCrossSessionActivityStore((s) => s.clearFinished);
   const [now, setNow] = useState(Date.now);
-  const [category, setCategory] = useState<CommsCategory>("all");
+  // Open on the records behind the indicator instead of an empty active list.
+  // This is an initial choice only: live updates must not change the user's filter.
+  const [category, setCategory] = useState<CommsCategory>(() => records.length &&
+    !records.some((record) => isCrossSessionPendingRecord(record)) ? "finished" : "active");
   const [detailed, setDetailed] = useState(false);
   const [expandedIds, setExpandedIds] = useState<Record<string, boolean>>({});
-  const active = records.some((record) => isCrossSessionActiveStatus(record.status));
+  const active = records.some((record) => isCrossSessionPendingRecord(record));
   const [navigationError, setNavigationError] = useState<string>();
-  useEffect(() => {
-    markReviewed(records, participant);
-  }, [records, participant, markReviewed]);
   useEffect(() => {
     if (!active) return;
     setNow(Date.now());
@@ -239,7 +239,7 @@ function CommsDetails({ records, participant, onClose }: {
       setNavigationError(t("crossSession.openFailed"));
     }
   };
-  const activeCount = records.filter((r) => isCrossSessionActiveStatus(r.status)).length;
+  const activeCount = records.filter((r) => isCrossSessionPendingRecord(r)).length;
   const finishedCount = records.length - activeCount;
   const subtaskCount = records.filter((r) => r.kind === "subtask").length;
   const consultationCount = records.length - subtaskCount;
@@ -250,13 +250,16 @@ function CommsDetails({ records, participant, onClose }: {
     { id: "subtask", label: t("crossSession.filterSubtask"), count: subtaskCount },
     { id: "consultation", label: t("crossSession.filterConsultation"), count: consultationCount },
   ];
-  const filteredRecords = records.filter((record) => {
-    if (category === "active") return isCrossSessionActiveStatus(record.status);
-    if (category === "finished") return !isCrossSessionActiveStatus(record.status);
+  const filteredRecords = useMemo(() => records.filter((record) => {
+    if (category === "active") return isCrossSessionPendingRecord(record);
+    if (category === "finished") return !isCrossSessionPendingRecord(record);
     if (category === "subtask") return record.kind === "subtask";
     if (category === "consultation") return record.kind !== "subtask";
     return true;
-  });
+  }), [records, category]);
+  useEffect(() => {
+    markReviewed(filteredRecords, participant);
+  }, [filteredRecords, participant, markReviewed]);
   const toggleDensity = () => {
     setDetailed((prev) => !prev);
     setExpandedIds({});
@@ -299,8 +302,8 @@ function CommsDetails({ records, participant, onClose }: {
     {records.length > 0 && !filteredRecords.length && <p data-testid="cross-session-filter-empty" className="text-caption-1-regular text-text-tertiary">{t("crossSession.filterEmpty")}</p>}
     {filteredRecords.map((record) => {
       const cardExpanded = expandedIds[record.scopedId] ?? detailed;
-      const canToggleCard = isCollapsibleRecord(record) || expandedIds[record.scopedId] !== undefined;
-      return <section key={record.scopedId} data-testid="cross-session-comm-card" data-comm-status={record.status} data-expanded={cardExpanded}
+      const canToggleCard = !!record.mailbox || isCollapsibleRecord(record) || expandedIds[record.scopedId] !== undefined;
+      return <section key={record.scopedId} data-testid="cross-session-comm-card" data-comm-status={record.mailbox?.phase ?? record.status} data-expanded={cardExpanded}
         className="flex flex-col gap-2 rounded-lg border border-border-secondary bg-background-secondary/60 p-2">
         <div className="flex items-center gap-1 text-caption-2-medium">
           {[record.sender, record.target].map((target, index) => {
@@ -319,9 +322,9 @@ function CommsDetails({ records, participant, onClose }: {
           })}
         </div>
         <div className="flex items-center justify-between gap-2 text-caption-2-medium text-text-secondary">
-          <span className="inline-flex items-center gap-1.5"><StatusIcon status={record.status} />{t(`crossSession.status.${record.status}`)}</span>
+          <span className="inline-flex items-center gap-1.5"><StatusIcon status={record.status} mailbox={record.mailbox} />{record.mailbox ? t(`crossSession.mailboxPhase.${record.mailbox.phase}`) : t(`crossSession.status.${record.status}`)}</span>
           <div className="flex items-center gap-1.5">
-            <span className="text-text-tertiary">{t("crossSession.elapsedSeconds", { seconds: Math.max(0, Math.floor(((isCrossSessionActiveStatus(record.status) ? now : record.updatedAt) - record.acceptedAt) / 1000)) })}</span>
+            <span className="text-text-tertiary">{t("crossSession.elapsedSeconds", { seconds: Math.max(0, Math.floor(((isCrossSessionPendingRecord(record) ? now : record.updatedAt) - record.acceptedAt) / 1000)) })}</span>
             {canToggleCard && <button type="button" data-testid="cross-session-card-toggle"
               aria-expanded={cardExpanded}
               aria-label={t(cardExpanded ? "crossSession.collapseCard" : "crossSession.expandCard")}
@@ -333,19 +336,21 @@ function CommsDetails({ records, participant, onClose }: {
             </button>}
           </div>
         </div>
-        <p data-testid="cross-session-card-prompt" className={cx("whitespace-pre-wrap text-caption-1-regular text-text-secondary [overflow-wrap:anywhere]", !cardExpanded && "line-clamp-3")}>
-          <span className="font-medium">{t(record.kind === "subtask" ? "crossSession.subtaskPromptLabel" : "crossSession.promptLabel")}： </span>{record.message}
+        {record.mailbox && <p className="text-caption-1-regular text-text-secondary">{t(`crossSession.mailboxKind.${record.mailbox.kind}`)}{record.mailbox.waitReason && ` · ${t(`crossSession.mailboxWait.${record.mailbox.waitReason}`)}`}</p>}
+        <p hidden={!!record.mailbox && !cardExpanded} data-testid="cross-session-card-prompt" className={cx("whitespace-pre-wrap text-caption-1-regular text-text-secondary [overflow-wrap:anywhere]", !record.mailbox && !cardExpanded && "line-clamp-3")}>
+          <span className="font-medium">{t(record.mailbox ? "crossSession.inboxOriginal" : record.kind === "subtask" ? "crossSession.subtaskPromptLabel" : "crossSession.promptLabel")}： </span>{record.message}
         </p>
         {record.status === "awaiting_cost_approval" && <CrossSessionCostApproval record={record} />}
-        {record.replyText && <div data-testid="cross-session-card-reply" className={cx("rounded-md bg-background-primary-default p-2 text-caption-1-regular text-text-secondary", !cardExpanded && "line-clamp-3")}>
-          <span className="font-medium">{t(record.status === "executing" ? "crossSession.replyStreamingLabel" : "crossSession.replyDoneLabel")}： </span>
+        {record.replyText && <div hidden={!!record.mailbox && !cardExpanded} data-testid="cross-session-card-reply" className={cx("rounded-md bg-background-primary-default p-2 text-caption-1-regular text-text-secondary", !record.mailbox && !cardExpanded && "line-clamp-3")}>
+          <span className="font-medium">{t(record.mailbox ? "crossSession.inboxReceipt" : record.status === "executing" ? "crossSession.replyStreamingLabel" : "crossSession.replyDoneLabel")}： </span>
           <span className="whitespace-pre-wrap [overflow-wrap:anywhere]">{record.replyText}</span>
           {record.truncated && <span className="text-text-tertiary">{t("crossSession.truncated")}</span>}
         </div>}
-        {record.error && <p role="alert" className="text-caption-1-regular text-notification-error [overflow-wrap:anywhere]">{record.error}</p>}
+        {record.mailbox?.impactReview && <p hidden={!cardExpanded} data-testid="cross-session-impact-review" className="whitespace-pre-wrap text-caption-1-regular text-text-secondary [overflow-wrap:anywhere]">{t("crossSession.inboxImpactReview")}： {record.mailbox.impactReview}</p>}
+        {record.error && <p role="alert" className="text-caption-1-regular text-notification-error [overflow-wrap:anywhere]">{localizeRunError(record.error, t)}</p>}
       </section>;
     })}
-    {!participant && records.some((r) => !isCrossSessionActiveStatus(r.status)) &&
+    {!participant && records.some((r) => !isCrossSessionPendingRecord(r)) &&
       <Button size="xs" data-testid="cross-session-clear-btn" onClick={clearFinished}>{t("crossSession.clearFinished")}</Button>}
   </div>;
 }

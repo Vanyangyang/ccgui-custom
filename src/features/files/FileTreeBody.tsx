@@ -4,6 +4,7 @@ import type { Virtualizer } from "@tanstack/react-virtual";
 import { useFilesStore } from "./store";
 import { TreeRow, type VisibleNode } from "./FileTreeRow";
 import { useChatStore } from "@/features/chat/store";
+import { useProjectsStore } from "@/features/projects/store";
 
 interface FileTreeBodyProps {
   virtualizer: Virtualizer<HTMLDivElement, Element>;
@@ -32,11 +33,20 @@ export function FileTreeBody({ virtualizer, visible, onContextMenu }: FileTreeBo
     (path: string) => useChatStore.getState().requestMention(path),
     [],
   );
+  const toggleAvailableDir = useCallback((path: string) => {
+    const member = useFilesStore.getState().roots.find((root) => root.path === path);
+    if (member && member.status !== "available") return;
+    void toggleDir(path);
+  }, [toggleDir]);
+  const openAvailableContextMenu = useCallback((event: MouseEvent<HTMLElement>, node: VisibleNode) => {
+    if (node.projectRoot && node.projectRoot.status !== "available") { event.preventDefault(); return; }
+    onContextMenu(event, node);
+  }, [onContextMenu]);
 
   const rootError = root ? dirErrors[root] : undefined;
   const rootLoading = root ? !!loadingDirs[root] : false;
 
-  if (rootError) {
+  if (rootError && !visible.length) {
     return (
       <div className="flex flex-col items-start gap-2 px-3 py-2">
         <p className="text-caption-1-regular text-text-error-primary break-all">{rootError}</p>
@@ -81,14 +91,23 @@ export function FileTreeBody({ virtualizer, visible, onContextMenu }: FileTreeBo
             <TreeRow
               node={node}
               selected={selectedPath === node.path}
-              isRoot={node.path === root}
-              onToggleDir={toggleDir}
+              isRoot={!!node.projectRoot || node.path === root}
+              onToggleDir={toggleAvailableDir}
               onOpenFile={openFile}
               onSelectDir={selectPath}
-              onContextMenu={onContextMenu}
+              onContextMenu={openAvailableContextMenu}
               onMention={handleMention}
               mentionLabel={t("files.addToChat")}
             />
+            {(dirErrors[node.path] || (node.projectRoot && node.projectRoot.status !== "available" && !useFilesStore.getState().children[node.path])) && (
+              <div className="px-3 pb-1 text-caption-1-regular text-text-error-primary" role="alert">
+                {dirErrors[node.path] ?? t(`projectsFiles.${node.projectRoot?.status}`)}{" "}
+                <button type="button" disabled={!!loadingDirs[node.path]} className="underline" onClick={() => {
+                  if (node.projectRoot && node.projectRoot.status !== "available") void useProjectsStore.getState().load();
+                  else void ensureDir(node.path);
+                }}>{t("common.refresh")}</button>
+              </div>
+            )}
           </div>
         );
       })}

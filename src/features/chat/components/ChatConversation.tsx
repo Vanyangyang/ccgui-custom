@@ -33,6 +33,8 @@ import { localizeRunError } from "../run-error";
 import { useBranchSwitcher } from "./use-branch-switcher";
 import { useComposerImages } from "./use-composer-images";
 import { useEngineModels } from "./use-engine-models";
+import { useLeaderStore } from "@/features/leader/store";
+import { isManagedCodexChild } from "./child-service-tier";
 import { useTabModelDisplay } from "./use-tab-model-display";
 import { resolveClaudeUltracode, resolveSessionModel } from "../store/stream";
 import type { EngineInfo, Workspace } from "@/lib/ipc";
@@ -138,6 +140,7 @@ function useConversationMenus({
   displayProviders,
   ompServiceTier,
   codexServiceTier,
+  allowCodexFast,
   permission,
   setActiveEngine,
   setPermission,
@@ -166,6 +169,7 @@ function useConversationMenus({
   displayProviders: Record<string, string>;
   ompServiceTier: OmpServiceTier;
   codexServiceTier: OmpServiceTier;
+  allowCodexFast: boolean;
   permission: ComposerPermission;
   setActiveEngine: (engine: string) => void;
   setPermission: (permission: ComposerPermission) => void;
@@ -249,6 +253,7 @@ function useConversationMenus({
           onChannelChange={handleChannelChange}
           ompServiceTier={ompServiceTier}
           onOmpServiceTierChange={setOmpServiceTier}
+          allowCodexFast={allowCodexFast}
           codexServiceTier={codexServiceTier}
           onCodexServiceTierChange={setCodexServiceTier}
           onRefreshModels={refreshModels}
@@ -276,6 +281,7 @@ function useConversationMenus({
       ompServiceTier,
       setOmpServiceTier,
       codexServiceTier,
+      allowCodexFast,
       setCodexServiceTier,
       refreshModels,
       loadingEngines,
@@ -425,6 +431,8 @@ export const ChatConversation = memo(function ChatConversation({
     dismissImageError,
   } = useComposerImages(key || undefined);
 
+  const allowCodexFast = useLeaderStore((state) => !isManagedCodexChild(state.snapshot.branches, active));
+
   const { displayModels, displayEfforts, displayProviders } = useTabModelDisplay({
     active,
     activeEngine,
@@ -544,6 +552,7 @@ export const ChatConversation = memo(function ChatConversation({
       displayProviders,
       ompServiceTier,
       codexServiceTier,
+      allowCodexFast,
       permission,
       setActiveEngine,
       setPermission,

@@ -1,16 +1,55 @@
-use super::{run_probe, EngineCatalog, EngineModel};
+use super::{run_configured_probe, EngineCatalog, EngineModel};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Mutex, OnceLock,
+        Arc, Mutex, OnceLock, Weak,
     },
 };
 
 const SNAPSHOT: &str = include_str!("../../../resources/engine-models/agy.json");
 const CACHE_LIMIT: usize = 8;
 type CacheKey = (String, PathBuf);
+type Flight = tokio::sync::Mutex<Option<EngineCatalog>>;
+
+#[derive(Default)]
+struct CatalogFlights(Mutex<HashMap<CacheKey, Weak<Flight>>>);
+
+impl CatalogFlights {
+    async fn resolve(
+        &self,
+        key: CacheKey,
+        query: impl std::future::Future<Output = EngineCatalog>,
+    ) -> EngineCatalog {
+        let flight = {
+            let mut flights = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            // Only callers own a batch. A later independent refresh must probe again.
+            flights.retain(|_, flight| flight.strong_count() > 0);
+            match flights.get(&key).and_then(Weak::upgrade) {
+                Some(flight) => flight,
+                None => {
+                    let flight = Arc::new(Flight::new(None));
+                    flights.insert(key, Arc::downgrade(&flight));
+                    flight
+                }
+            }
+        };
+        let mut result = flight.lock().await;
+        if let Some(catalog) = result.as_ref() {
+            return catalog.clone();
+        }
+        // Cancellation drops this lock and query; a waiting caller can take over.
+        let catalog = query.await;
+        *result = Some(catalog.clone());
+        catalog
+    }
+}
+
+#[cfg(test)]
+#[path = "agy_flight_tests.rs"]
+mod flight_tests;
+
 #[derive(Default)]
 struct CatalogCache(Vec<(CacheKey, u64, Vec<EngineModel>)>);
 impl CatalogCache {
@@ -53,27 +92,44 @@ impl CatalogCache {
 pub(super) async fn agy_catalog(bin: &str) -> EngineCatalog {
     static CACHE: OnceLock<Mutex<CatalogCache>> = OnceLock::new();
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    static FLIGHTS: OnceLock<CatalogFlights> = OnceLock::new();
     let key = (bin.to_owned(), crate::engine::agy::agy_home());
-    let mut live = None;
-    if let Ok(stdout) = run_probe(bin, &["--output-format", "json", "models"], "models JSON").await
-    {
-        live = parse_agy_models_json(&stdout);
-    }
-    if live.is_none() {
-        if let Ok(stdout) = run_probe(bin, &["models"], "models").await {
-            let models = parse_agy_models_tsv(&stdout);
-            if !models.is_empty() {
-                live = Some(models);
-            }
-        }
-    }
-    // Never hold the cache lock across a child-process await.
-    CACHE
+    FLIGHTS
         .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .resolve(key, sequence, live)
+        .resolve(key.clone(), async {
+            let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let mut live = None;
+            if let Ok(stdout) =
+                run_agy_probe(bin, &["--output-format", "json", "models"], "models JSON").await
+            {
+                live = parse_agy_models_json(&stdout);
+            }
+            if live.is_none() {
+                if let Ok(stdout) = run_agy_probe(bin, &["models"], "models").await {
+                    let models = parse_agy_models_tsv(&stdout);
+                    if !models.is_empty() {
+                        live = Some(models);
+                    }
+                }
+            }
+            // Never hold the cache lock across a child-process await.
+            CACHE
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .resolve(key, sequence, live)
+        })
+        .await
+}
+
+async fn run_agy_probe(bin: &str, args: &[&str], probe: &str) -> Result<String, String> {
+    run_configured_probe(
+        bin,
+        args,
+        probe,
+        crate::engine::agy::configure_background_command,
+    )
+    .await
 }
 
 fn parse_agy_models_json(stdout: &str) -> Option<Vec<EngineModel>> {

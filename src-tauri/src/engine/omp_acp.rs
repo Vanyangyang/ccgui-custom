@@ -1,7 +1,7 @@
 //! OMP 18.0.11 的 ACP 计划会话驱动（PRD §5-OMP 主方案，最高优先级引擎）。
 //!
 //! 协议事实全部来自本机安装源码
-//! （/Users/zhukunpeng/node_modules/@oh-my-pi/pi-coding-agent）与
+//! （`@oh-my-pi/pi-coding-agent` npm 包）与
 //! p0-evidence-plan-approval-2026-09-24.md §OMP：
 //! - 入口：`omp --mode acp`（src/cli/flag-tables.ts:123-127；`omp acp`
 //!   子命令等价，src/commands/acp.ts:30-33）。裸 `--plan <value>` 是计划

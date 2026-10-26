@@ -56,7 +56,7 @@ describe("session-cleanup & evidence-based cache window", () => {
 
     // Activity and streaming cannot create cache evidence for the gradient.
     expect(getPromptCacheHeatRatio(undefined, NOW, true, NOW)).toBe(0);
-    expect(classifySessionForCleanup({ session: makeSession({ updatedAt: NOW }), streaming: true, now: NOW }).heatRatio).toBe(0);
+    expect(classifySessionForCleanup({ session: makeSession({ engine: "claude", updatedAt: NOW }), streaming: true, now: NOW }).heatRatio).toBe(0);
 
     const cache = {
       startedAt: NOW - 120_000,
@@ -79,6 +79,14 @@ describe("session-cleanup & evidence-based cache window", () => {
       backgroundColor:
         "color-mix(in oklab, var(--color-background-tertiary-error) 64%, var(--color-background-tertiary-default))",
     });
+  });
+
+  it("keeps Codex cleanup colors permanently red without inventing cache-hit evidence", () => {
+    for (const now of [NOW, NOW + 365 * 24 * 60 * 60_000]) {
+      const item = classifySessionForCleanup({ session: makeSession(), now });
+      expect(item.heatRatio).toBe(1);
+      expect(item.heat).toBe("unknown");
+    }
   });
 
   it("pre-selects long-idle settled sessions and protects drafts, errors, approvals, pins, and Leader groups", () => {

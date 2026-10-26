@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import ZoomIn from "lucide-react/dist/esm/icons/zoom-in";
 import ZoomOut from "lucide-react/dist/esm/icons/zoom-out";
@@ -66,6 +66,7 @@ export function ImageLightbox({
   nav,
   sourcePath,
   unavailable = false,
+  unavailableContent,
   sizeBytes: knownSize,
   imageBlob,
 }: {
@@ -76,6 +77,8 @@ export function ImageLightbox({
   nav?: ImageLightboxNav;
   sourcePath?: string;
   unavailable?: boolean | string;
+  /** Optional actionable explanation, shown only when no image is available. */
+  unavailableContent?: ReactNode;
   /** File size when `src` is not a data URL (e.g. an object URL). */
   sizeBytes?: number;
   /** The image bytes behind an object URL, for copying without a re-encode. */
@@ -391,7 +394,9 @@ export function ImageLightbox({
           ...(quarterTurn ? { maxWidth: "100vh", maxHeight: "100vw" } : null),
         }}
         className="max-h-full max-w-full select-none object-contain"
-      /> : unavailable ? (
+      /> : unavailableContent ? (
+        <div className="max-w-[80%]">{unavailableContent}</div>
+      ) : unavailable ? (
         <span className="max-w-[80%] text-center text-body-regular text-white/70">{typeof unavailable === "string" ? unavailable : t("chat.imageUnavailable")}</span>
       ) : (
         <span className="h-48 w-64 max-w-full animate-pulse rounded-lg bg-white/10" aria-hidden />

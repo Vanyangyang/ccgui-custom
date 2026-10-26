@@ -105,6 +105,8 @@ export interface CommandDef {
 export interface SessionMenuTarget {
   engine: string;
   sessionId: string;
+  /** 0.3.22: exact source cwd when known from the clicked row. Never inferred from the active chat. */
+  workspacePath?: string;
 }
 
 /** Sidebar session context-menu item: one extra row under the host's

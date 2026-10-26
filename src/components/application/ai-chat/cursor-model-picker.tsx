@@ -16,11 +16,12 @@ import {
   readCursorParams,
   readCursorPins,
   writeCursorModelParams,
-  writeCursorPins,
   type CursorModel,
   type CursorParameter,
   type CursorParamValues,
 } from "./cursor-models";
+import { isConcreteCursorModel } from "./cursor-model-selection";
+import { useCursorModelSelection } from "./use-cursor-model-selection";
 
 const EFFORT_IDS = new Set(["reasoning_effort", "effort", "reasoning"]);
 
@@ -56,17 +57,19 @@ function orderedParameters(model: CursorModel): CursorParameter[] {
     .sort((a, b) => rank(a.id) - rank(b.id) || a.name.localeCompare(b.name));
 }
 
-/** 基础模型一行：点名称选中，右侧开关决定它是否排到前面。 */
+/** 点名称选择并启用模型；开关同步保存使用授权并将已启用项排到前面。 */
 function CursorModelRow({
   model,
   selected,
   pinned,
+  disabled,
   onPick,
   onPin,
 }: {
   model: CursorModel;
   selected: boolean;
   pinned: boolean;
+  disabled: boolean;
   onPick: () => void;
   onPin: (pinned: boolean) => void;
 }) {
@@ -77,8 +80,9 @@ function CursorModelRow({
         type="button"
         role="radio"
         aria-checked={selected}
+        disabled={disabled}
         onClick={onPick}
-        className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-left outline-none hover:bg-background-primary-hover focus-visible:bg-background-primary-hover"
+        className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-left outline-none hover:bg-background-primary-hover focus-visible:bg-background-primary-hover disabled:cursor-not-allowed disabled:opacity-50"
       >
         <EngineIcon engine={inferModelEngine(model.name) ?? inferModelEngine(model.id) ?? "cursor"} size={18} className="shrink-0 text-foreground-icon-primary" />
         <span className="min-w-0 flex-1 truncate text-body-medium text-text-primary">{model.name}</span>
@@ -86,7 +90,8 @@ function CursorModelRow({
       </button>
       <Switch
         size="sm"
-        aria-label={t("chat.cursorPinModel", { model: model.name })}
+        aria-label={t("chat.cursorEnableModel", { model: model.name })}
+        isDisabled={disabled}
         isSelected={pinned}
         onChange={onPin}
       />
@@ -173,21 +178,36 @@ export function CursorModelList({
   onPick: (id: string) => void;
 }) {
   const { t } = useTranslation();
-  const { pins, params } = useCursorModelPrefs();
-  const visible = orderCursorModels(models, pins, query);
+  const { params } = useCursorModelPrefs();
+  const selection = useCursorModelSelection(models);
+  const visible = orderCursorModels(models, selection.selected, query);
+  const pick = async (id: string) => {
+    if (await selection.change(id, true)) onPick(id);
+  };
   // 【cursor模型】旧的 high/fast 后缀仍应对到同一基础模型，不能另起一行。
   const selected = matchCursorBase(selectedModelId, models);
   return (
     <>
+      <p className="px-2 py-1 text-caption-1-regular text-text-secondary">
+        {t("chat.cursorSelectionNote")}
+      </p>
+      {(selection.loading || selection.saving) && <p role="status" className="px-2 py-1 text-caption-1-regular text-text-secondary">
+        {t(selection.saving ? "chat.cursorSelectionSaving" : "common.loading")}
+      </p>}
+      {selection.error && <div className="px-2 py-1 text-caption-1-regular text-text-error-primary">
+        <p role="alert">{selection.error}</p>
+        <button type="button" className="cursor-pointer underline" onClick={() => void selection.refresh()}>{t("common.refresh")}</button>
+      </div>}
       <div className="flex max-h-[280px] w-full flex-col overflow-y-auto" role="radiogroup" aria-label={t("chat.modelPicker")}>
         {visible.map((model) => (
           <CursorModelRow
             key={model.id}
             model={model}
             selected={model.id === (selected?.id ?? selectedModelId)}
-            pinned={pins.includes(model.id)}
-            onPick={() => onPick(model.id)}
-            onPin={(on) => writeCursorPins(on ? [...pins, model.id] : pins.filter((id) => id !== model.id))}
+            pinned={selection.selected.includes(model.id)}
+            disabled={selection.loading || selection.saving || !isConcreteCursorModel(model.id)}
+            onPick={() => void pick(model.id)}
+            onPin={(on) => { void selection.change(model.id, on); }}
           />
         ))}
         {visible.length === 0 && <span className="p-2 text-body-medium text-text-tertiary">{t("chat.noMatchingModels")}</span>}

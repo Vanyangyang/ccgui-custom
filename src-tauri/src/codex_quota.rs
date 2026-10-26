@@ -1,5 +1,5 @@
 //! Account quotas come from Codex's official app-server, independently of token usage.
-//! Cache keys contain only auth/config file metadata; credentials never leave the CLI.
+//! Cache keys use auth metadata and normalized configuration hashes; credentials never leave the CLI.
 use crate::claude_quota::{QuotaAccount, QuotaWindow, QuotaWindows};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -80,30 +80,21 @@ impl CodexQuotaSnapshot {
     }
 
     fn expire(&mut self, now: u64) {
-        for window in [&mut self.windows.five_hour, &mut self.windows.seven_day] {
-            if window
-                .as_ref()
-                .and_then(|w| w.resets_at)
-                .is_some_and(|at| at <= now)
-            {
-                *window = None;
-            }
+        if self.collected_at.is_none_or(|at| at > now) {
+            self.windows = QuotaWindows::default();
         }
-        if self
-            .collected_at
-            .is_some_and(|at| at > now || now - at >= MAX_CACHE_AGE)
-        {
-            self.windows = Default::default();
+        if self.collected_at.is_none_or(|at| at > now || now - at >= MAX_CACHE_AGE) {
             self.credits = None;
             self.reset_credits = None;
-            self.error_code.get_or_insert("quota_expired");
         }
         if self.windows == QuotaWindows::default() {
             self.status = "unavailable";
             self.error_code.get_or_insert("quota_not_available");
-        } else if self
+        } else if [&self.windows.five_hour, &self.windows.seven_day]
+            .into_iter().flatten().any(|w| w.resets_at.is_some_and(|at| at <= now))
+            || self
             .collected_at
-            .is_some_and(|at| now.saturating_sub(at) >= COOLDOWN.as_secs())
+            .is_some_and(|at| at > now || now.saturating_sub(at) >= COOLDOWN.as_secs())
         {
             self.status = "stale";
         }
@@ -222,20 +213,35 @@ fn stamp_file(stamp: &mut String, path: &Path) -> Result<(), &'static str> {
 }
 
 fn stamp_config(stamp: &mut String, path: &Path) -> Result<(), &'static str> {
-    stamp_file(stamp, path)?;
+    stamp.push_str(&path.to_string_lossy());
     match std::fs::read_to_string(path) {
         Ok(text) => {
             let config: toml::Value =
                 toml::from_str(&text).map_err(|_| "unsupported_auth_context")?;
-            let value = serde_json::to_value(config).map_err(|_| "unsupported_auth_context")?;
+            let mut value = serde_json::to_value(config).map_err(|_| "unsupported_auth_context")?;
             if !official_config(&value) {
                 return Err("provider_auth_unavailable");
             }
+            strip_display_model_options(&mut value);
+            let normalized = serde_json::to_vec(&value).map_err(|_| "unsupported_auth_context")?;
+            stamp.push_str(&format!("|{:x};", Sha256::digest(normalized)));
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => stamp.push_str("|missing;"),
         Err(_) => return Err("auth_metadata_unavailable"),
     }
     Ok(())
+}
+
+fn strip_display_model_options(config: &mut Value) {
+    let Some(object) = config.as_object_mut() else { return; };
+    for key in ["model", "model_reasoning_effort", "model_reasoning_summary", "model_verbosity", "service_tier"] {
+        object.remove(key);
+    }
+    if let Some(profiles) = object.get_mut("profiles").and_then(Value::as_object_mut) {
+        for profile in profiles.values_mut() {
+            strip_display_model_options(profile);
+        }
+    }
 }
 
 pub(crate) fn binding(
@@ -276,7 +282,7 @@ pub(crate) fn binding(
     stamp_file(&mut stamp, &home.join("auth.json"))?;
     stamp_config(&mut stamp, &home.join("config.toml"))?;
     // Project config can override the native account route. Include all ancestors
-    // so editing/removing a local override invalidates old snapshots immediately.
+    // so changing/removing an identity-relevant override invalidates old snapshots immediately.
     for ancestor in workspace.ancestors() {
         let config = ancestor.join(".codex/config.toml");
         if config != home.join("config.toml") {
@@ -475,7 +481,9 @@ impl CodexQuotaState {
     fn register_binding(&self, binding: &Binding) {
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         if cache.len() >= MAX_BINDINGS && !cache.contains_key(&binding.stamp) {
-            cache.clear();
+            if let Some(oldest) = cache.iter().min_by_key(|(_, entry)| entry.last_attempt).map(|(key, _)| key.clone()) {
+                cache.remove(&oldest);
+            }
         }
         cache.entry(binding.stamp.clone()).or_default().binding = Some(binding.clone());
     }
@@ -564,7 +572,9 @@ impl CodexQuotaState {
         let (revision, auth_revision, query_started_at_ms) = {
             let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
             if cache.len() >= MAX_BINDINGS && !cache.contains_key(stamp) {
-                cache.clear();
+                if let Some(oldest) = cache.iter().min_by_key(|(_, entry)| entry.last_attempt).map(|(key, _)| key.clone()) {
+                    cache.remove(&oldest);
+                }
             }
             let entry = cache.entry(stamp.to_owned()).or_default();
             if entry.last_attempt.is_some_and(|at| at.elapsed() < COOLDOWN) {
@@ -591,26 +601,42 @@ impl CodexQuotaState {
             }
             let snapshot = match result {
                 Ok(result) => {
+                    let identity_changed = entry.snapshot.as_ref().and_then(|s| s.account.as_ref())
+                        .and_then(|a| a.email.as_ref()).zip(result.account.as_ref().and_then(|a| a.email.as_ref()))
+                        .is_some_and(|(old, new)| old != new);
+                    if identity_changed {
+                        entry.snapshot = None;
+                    }
                     entry.verified = true;
                     // Worker delivery can lag behind the query. Observations
                     // created during it remain newer than its baseline, even
                     // when they arrive after this future has completed.
                     entry.observed_at_ms = entry.observed_at_ms.max(query_started_at_ms);
                     entry.auth_checked_at_ms = query_started_at_ms;
-                    if entry.revision != revision {
+                    if entry.revision != revision && !identity_changed {
                         let mut latest = entry
                             .snapshot
                             .clone()
                             .unwrap_or_else(|| CodexQuotaSnapshot::unavailable("not_loaded"));
-                        latest.account = result.account;
+                        if result.account.is_some() { latest.account = result.account; }
                         latest.credits = result.credits;
                         latest.reset_credits = result.reset_credits;
+                        latest
+                    } else if result.windows == QuotaWindows::default() {
+                        // A successful account read with sparse limits does not
+                        // replace the last usage sample or renew its timestamp.
+                        let mut latest = entry.snapshot.clone()
+                            .unwrap_or_else(|| CodexQuotaSnapshot::unavailable("quota_not_available"));
+                        if result.account.is_some() { latest.account = result.account; }
+                        latest.credits = result.credits;
+                        latest.reset_credits = result.reset_credits;
+                        latest.status = "stale";
                         latest
                     } else {
                         CodexQuotaSnapshot {
                             status: "ready",
                             windows: result.windows,
-                            account: result.account,
+                            account: result.account.or_else(|| entry.snapshot.as_ref().and_then(|s| s.account.clone())),
                             credits: result.credits,
                             reset_credits: result.reset_credits,
                             collected_at: Some(now_seconds()),
@@ -957,6 +983,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn config_stamp_ignores_only_known_model_options_and_still_validates_auth() {
+        let path = std::env::temp_dir().join(format!("ccgui-quota-{}.toml", uuid::Uuid::new_v4()));
+        let stamp = |text: &str| {
+            std::fs::write(&path, text).unwrap();
+            let mut result = String::new();
+            stamp_config(&mut result, &path).map(|_| result)
+        };
+        let baseline = stamp("model='first'\nmodel_reasoning_effort='high'\n[profiles.coding]\nmodel='first'\nservice_tier='fast'\n").unwrap();
+        assert_eq!(baseline, stamp("model='second'\nmodel_reasoning_effort='low'\n[profiles.coding]\nmodel='second'\nservice_tier='default'\n").unwrap());
+        assert_ne!(baseline, stamp("forced_chatgpt_workspace_id='different'\n[profiles.coding]\n").unwrap());
+        assert_ne!(baseline, stamp("unknown_auth_setting='different'\n[profiles.coding]\n").unwrap());
+        assert_eq!(stamp("model_provider='relay'"), Err("provider_auth_unavailable"));
+        assert_eq!(stamp("cli_auth_credentials_store='keyring'"), Err("provider_auth_unavailable"));
+        let empty = stamp("").unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let mut missing = String::new();
+        stamp_config(&mut missing, &path).unwrap();
+        assert_ne!(empty, missing);
+    }
+
     #[tokio::test]
     async fn codex_quota_merges_concurrent_reads_and_enforces_cooldown() {
         let state = CodexQuotaState::default();
@@ -1112,8 +1159,56 @@ mod tests {
         snapshot.expire(1120);
         assert_eq!(snapshot.status, "stale");
         snapshot.expire(1200);
-        assert_eq!(snapshot.status, "unavailable");
-        assert!(snapshot.windows.seven_day.is_none());
+        snapshot.expire(100_000);
+        assert_eq!(snapshot.status, "stale");
+        assert_eq!(snapshot.windows.seven_day.unwrap().used_percentage, 40.0);
+        assert_eq!(snapshot.collected_at, Some(1000));
+    }
+
+    #[test]
+    fn quota_rejects_missing_and_future_sample_times() {
+        for collected_at in [None, Some(2000)] {
+            let mut snapshot = CodexQuotaSnapshot {
+                status: "ready", windows: query(40.0).windows, collected_at,
+                ..Default::default()
+            };
+            snapshot.expire(1000);
+            assert_eq!(snapshot.status, "unavailable");
+            assert_eq!(snapshot.windows, QuotaWindows::default());
+        }
+    }
+
+    #[tokio::test]
+    async fn sparse_refresh_preserves_old_sample_but_never_another_account() {
+        let state = CodexQuotaState::default();
+        let first = state.read_bound("a", async { Ok(query(45.0)) }, || true).await;
+        {
+            let mut cache = state.cache.lock().unwrap();
+            let entry = cache.get_mut("a").unwrap();
+            entry.last_attempt = None;
+            entry.snapshot.as_mut().unwrap().collected_at = Some(1);
+        }
+        let sparse = state.read_bound("a", async { Ok(QueryResult::default()) }, || true).await;
+        assert_eq!(sparse.windows, first.windows);
+        assert_eq!(sparse.account, first.account);
+        assert_eq!(sparse.collected_at, Some(1));
+        assert_eq!(sparse.status, "stale");
+        state.cache.lock().unwrap().get_mut("a").unwrap().last_attempt = None;
+        let changed = state.read_bound("a", async { Ok(QueryResult {
+            account: Some(QuotaAccount { email: Some("different@example.test".into()), plan: "plus".into() }),
+            ..Default::default()
+        }) }, || true).await;
+        assert_eq!(changed.windows, QuotaWindows::default());
+    }
+
+    #[tokio::test]
+    async fn cache_capacity_evicts_only_one_binding() {
+        let state = CodexQuotaState::default();
+        for n in 0..=MAX_BINDINGS {
+            state.read_bound(&n.to_string(), async { Ok(query(20.0)) }, || true).await;
+        }
+        assert_eq!(state.cache.lock().unwrap().len(), MAX_BINDINGS);
+        assert!(state.cached(&MAX_BINDINGS.to_string(), || true).windows.seven_day.is_some());
     }
 
     fn fixture_binding() -> Binding {

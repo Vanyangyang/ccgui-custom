@@ -1,4 +1,4 @@
-import { useCallback, useMemo } from "react";
+import { useCallback, useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { useShallow } from "zustand/react/shallow";
 import type { ComposerInputHandle } from "@/components/application/ai-chat/ai-chat-composer";
@@ -20,8 +20,12 @@ import { useLeaderStore, manageLeader } from "@/features/leader/store";
 import { groupLeaderThreads } from "@/features/leader/tree";
 import { isLeaderGroupMember } from "@/features/leader/types";
 import { isManagedLeaderSession } from "@/features/leader/event-state";
-import { sameLeaderWorkspace } from "@/features/leader/workspace-path";
 import { useSelfDevWorkspace } from "@/features/update/use-self-dev-workspace";
+import { useProjectsStore, useProjectsSubscription } from "@/features/projects/store";
+import { normalizeProjectPath, projectForPath } from "@/features/projects/paths";
+import { launchProjectPath } from "@/features/projects/launch";
+import { organizeSidebarProjects, projectLaunchTarget } from "@/features/projects/sidebar";
+import { workspaceCatalogPathKey } from "@/lib/workspace-path";
 
 /** Sidebar data and actions: the workspace/thread repo list plus thread
  * selection, pin/rename/delete dispatch, workspace add/remove/reorder, and
@@ -42,6 +46,9 @@ export function useChatSidebar({
   setDialog: (dialog: ChatPageDialog) => void;
 }) {
   const { t, i18n } = useTranslation();
+  useProjectsSubscription();
+  const projects = useProjectsStore((s) => s.projects);
+  const launchingProject = useRef(false);
   const leaderSnapshot = useLeaderStore((s) => s.snapshot);
   const selfDev = useSelfDevWorkspace();
   const selfDevWorkspaceId = selfDev.workspace?.id ?? null;
@@ -114,6 +121,23 @@ export function useChatSidebar({
       if (threadStreaming[i]) streamingById.set(`${s.engine}/${s.sessionId}`, true);
       if (threadRetrying[i]) retryingById.set(`${s.engine}/${s.sessionId}`, true);
     });
+    const sessionRows = sorted.map((s) => ({
+      id: `${s.engine}/${s.sessionId}`,
+      workspacePath: s.workspacePath,
+      sidebarWorkspacePath: s.sidebarWorkspacePath,
+      label: s.customTitle || s.title || s.sessionId.slice(0, 8),
+      engine: s.engine,
+      auxiliaryKind: s.auxiliaryKind,
+      time: relativeTime(s.updatedAt),
+      // 【最后对话时间】全部会话视图靠这个时间戳排序。
+      updatedAt: s.updatedAt,
+      promptCache: s.promptCache,
+      pinned: s.pinned,
+      streaming: streamingById.get(`${s.engine}/${s.sessionId}`) ?? false,
+      retrying: retryingById.get(`${s.engine}/${s.sessionId}`) ?? false,
+      unseen: unseen[`${s.engine}/${s.sessionId}`] ?? false,
+      protectedFromDeletion: isLeaderGroupMember(leaderSnapshot, s) || isManagedLeaderSession(`${s.engine}/${s.sessionId}`),
+    }));
     const buildRepo = (w: Workspace, defaultOpen: boolean): AiChatRepo => {
       // Sidebar alias: a user-set name replaces the folder name in the
       // sidebar only; the original stays on the row tooltip.
@@ -135,7 +159,7 @@ export function useChatSidebar({
         worktrees: children?.map((c) => buildRepo(c, false)),
         threads: groupLeaderThreads([
           ...openTabs.flatMap((tab) => {
-            if (tab.sessionId !== null || !sameLeaderWorkspace(tab.workspacePath, w.path)) return [];
+            if (tab.sessionId !== null || workspaceCatalogPathKey(tab.workspacePath) !== workspaceCatalogPathKey(w.path)) return [];
             return [
               {
                 id: sessionKey(tab.engine, null, tab.workspacePath),
@@ -146,28 +170,8 @@ export function useChatSidebar({
               },
             ];
           }),
-          ...sorted.flatMap((s) => {
-            if (!sameLeaderWorkspace(s.workspacePath, w.path)) return [];
-            return [
-              {
-                id: `${s.engine}/${s.sessionId}`,
-                workspacePath: s.workspacePath,
-                label: s.customTitle || s.title || s.sessionId.slice(0, 8),
-                engine: s.engine,
-                auxiliaryKind: s.auxiliaryKind,
-                time: relativeTime(s.updatedAt),
-                // 【最后对话时间】全部会话视图靠这个时间戳排序。
-                updatedAt: s.updatedAt,
-                promptCache: s.promptCache,
-                pinned: s.pinned,
-                streaming: streamingById.get(`${s.engine}/${s.sessionId}`) ?? false,
-                retrying: retryingById.get(`${s.engine}/${s.sessionId}`) ?? false,
-                unseen: unseen[`${s.engine}/${s.sessionId}`] ?? false,
-                protectedFromDeletion: isLeaderGroupMember(leaderSnapshot, s) || isManagedLeaderSession(`${s.engine}/${s.sessionId}`),
-              },
-            ];
-          }),
-        ], leaderSnapshot, w.path),
+          ...sessionRows.filter((s) => workspaceCatalogPathKey(s.sidebarWorkspacePath ?? s.workspacePath) === workspaceCatalogPathKey(w.path)),
+        ], leaderSnapshot, w.path, sessionRows),
       };
     };
     return parentWorkspaces.map((w, index) => buildRepo(w, index === 0));
@@ -178,7 +182,6 @@ export function useChatSidebar({
   // ones so a freshly created group is visible before it has members.
   const sections: AiChatRepoSection[] | undefined = useMemo(() => {
     const groups = sortedWorkspaceGroups(workspaceGroups);
-    if (groups.length === 0) return undefined;
     const groupIds = new Set(groups.map((g) => g.id));
     const ungrouped: AiChatRepo[] = [];
     const byGroup = new Map<string, AiChatRepo[]>();
@@ -199,8 +202,8 @@ export function useChatSidebar({
     groups.forEach((group) => {
       result.push({ id: group.id, name: group.name, repos: byGroup.get(group.id) ?? [] });
     });
-    return result.some((s) => s.id !== null) ? result : undefined;
-  }, [repos, parentWorkspaces, workspaceGroups]);
+    return organizeSidebarProjects(result, projects, workspaces, archivedIds, workspaceAliases);
+  }, [repos, parentWorkspaces, workspaceGroups, projects, workspaces, archivedIds, workspaceAliases]);
 
   // 已归档 section: archived workspaces in sidebar order, labels resolved
   // with the same alias rule as the main tree. Threads stay hidden — the
@@ -252,7 +255,8 @@ export function useChatSidebar({
         const branch = leaderSnapshot.branches.find((b) => `${b.engine}/${b.sessionId}` === id || `${b.parentEngine}/${b.parentSessionId}` === id);
         if (branch) {
           const slash = id.indexOf("/");
-          void selectSession(id.slice(0, slash), id.slice(slash + 1), branch.workspacePath);
+          const source = `${branch.engine}/${branch.sessionId}` === id ? branch.workspacePath : (branch.parentWorkspacePath ?? branch.workspacePath);
+          void selectSession(id.slice(0, slash), id.slice(slash + 1), source);
           collapseSidebarOnMobile();
           return;
         }
@@ -330,9 +334,16 @@ export function useChatSidebar({
   );
   const handleWorkspaceAlias = useCallback(
     (workspaceId: string) => {
+      const workspace = workspaces.find((w) => w.id === workspaceId);
+      const project = workspace && workspaceId !== selfDevWorkspaceId ? projectForPath(projects, workspace.path) : null;
+      const member = project?.members.find((m) => normalizeProjectPath(m.path) === normalizeProjectPath(workspace!.path));
+      if (project && !project.sourcePluginId && member) {
+        setDialog({ kind: "projectMemberName", projectId: project.id, memberId: member.id });
+        return;
+      }
       setDialog({ kind: "workspaceAlias", workspaceId });
     },
-    [setDialog],
+    [setDialog, projects, workspaces, selfDevWorkspaceId],
   );
   const handleSetWorkspaceArchived = useCallback(
     (workspaceId: string, archived: boolean) => {
@@ -389,14 +400,34 @@ export function useChatSidebar({
   // workspace.
   const handleNewSessionInWorkspace = useCallback(
     (workspaceId: string) => {
+      const target = projectLaunchTarget(projects, workspaceId);
+      if (target) {
+        if (launchingProject.current) return;
+        if (target.status !== "available") {
+          useChatStore.setState({ actionError: t("projects.unavailable") });
+          return;
+        }
+        launchingProject.current = true;
+        void launchProjectPath(target.path, t("projects.registrationFailed")).then(() => {
+          focusComposerWhenVisible(composerInputRef);
+          collapseSidebarOnMobile();
+        }).catch((error) => useChatStore.setState({ actionError: String(error) }))
+          .finally(() => { launchingProject.current = false; });
+        return;
+      }
       const workspace = workspaces.find((w) => w.id === workspaceId);
       if (!workspace) return;
+      const member = projects.flatMap((p) => p.members).find((m) => normalizeProjectPath(m.path) === normalizeProjectPath(workspace.path) && m.status !== "available");
+      if (member) {
+        useChatStore.setState({ actionError: t("projects.unavailable") });
+        return;
+      }
       dismissCenterSurfaces();
       startNewChat(workspace.path);
       focusComposerWhenVisible(composerInputRef);
       collapseSidebarOnMobile();
     },
-    [workspaces, startNewChat, collapseSidebarOnMobile, composerInputRef],
+    [workspaces, startNewChat, collapseSidebarOnMobile, composerInputRef, projects, t],
   );
   // Sidebar 新建浏览器 nav entry: open a fresh browser tab in the center
   // strip. Other center surfaces step aside (same mutual exclusion as

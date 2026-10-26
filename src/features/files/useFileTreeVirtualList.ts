@@ -9,7 +9,7 @@ import type { VisibleNode } from "./FileTreeRow";
  * hidden-panel scroll/measure safeguards.
  */
 export function useFileTreeVirtualList() {
-  const root = useFilesStore((s) => s.root);
+  const roots = useFilesStore((s) => s.roots);
   const children = useFilesStore((s) => s.children);
   const expanded = useFilesStore((s) => s.expanded);
   const loadingDirs = useFilesStore((s) => s.loadingDirs);
@@ -21,11 +21,12 @@ export function useFileTreeVirtualList() {
   // Load the root level and keep the synthetic root row expanded: the tree
   // roots at the workspace, so its children are always the first content.
   useEffect(() => {
-    if (root) {
-      void ensureDir(root);
-      if (!useFilesStore.getState().expanded[root]) void toggleDir(root);
+    for (const root of roots) {
+      if (root.status !== "available") continue;
+      void ensureDir(root.path);
+      if (!useFilesStore.getState().expanded[root.path]) void toggleDir(root.path);
     }
-  }, [root, ensureDir, toggleDir]);
+  }, [roots, ensureDir, toggleDir]);
 
 
   const visible = useMemo<VisibleNode[]>(() => {
@@ -33,9 +34,11 @@ export function useFileTreeVirtualList() {
     // Synthetic root row: the workspace root itself is the first tree row
     // with its repository badge (`open-reverselab main M1 ?12`); clicking
     // it expands the tree below it.
-    if (root) {
+    const addRoot = (member: typeof roots[number]) => {
+      const root = member.path;
       out.push({
-        name: fileName(root),
+        name: member.label || fileName(root),
+        projectRoot: member,
         isDir: true,
         size: 0,
         mtimeMs: 0,
@@ -48,7 +51,7 @@ export function useFileTreeVirtualList() {
         // repo dirs get theirs from the backend color pass).
         color: repositories[root] ? "repository" : undefined,
       });
-    }
+    };
     const walk = (dirPath: string, depth: number) => {
       const entries = children[dirPath];
       if (!entries) return;
@@ -71,9 +74,12 @@ export function useFileTreeVirtualList() {
         if (e.isDir && expanded[path]) walk(path, depth + 1);
       }
     };
-    if (root && expanded[root]) walk(root, 1);
+    for (const root of roots) {
+      addRoot(root);
+      if (expanded[root.path]) walk(root.path, 1);
+    }
     return out;
-  }, [children, expanded, loadingDirs, repositories, fileColors, root]);
+  }, [children, expanded, loadingDirs, repositories, fileColors, roots]);
 
   const parentRef = useRef<HTMLDivElement>(null);
   const virtualizer = useVirtualizer({

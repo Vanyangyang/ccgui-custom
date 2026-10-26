@@ -36,6 +36,7 @@ use std::{
 };
 
 pub(crate) mod observer;
+pub(crate) mod memory;
 
 /// Model argument handed to `agy --model`. The segment after the scheme is
 /// ignored by agy (it only needs `…/models/<name>`); it carries the effort.

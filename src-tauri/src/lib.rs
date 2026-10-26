@@ -24,6 +24,8 @@ pub mod dsh_host;
 pub mod engine;
 pub mod event_sink;
 pub mod files;
+pub mod image_preview;
+pub mod workspace_projects;
 pub mod fonts;
 pub mod git;
 pub mod git_worktree;
@@ -45,6 +47,13 @@ pub mod test_harness;
 pub mod pet_overlay;
 pub mod pets;
 pub mod plugin_caps;
+pub mod plugin_tasks;
+mod plugin_memory;
+mod plugin_conversations;
+mod session_sidebar;
+mod session_sidebar_host;
+mod plugin_images;
+mod plugin_windows;
 pub mod plugins;
 pub mod prompts;
 pub mod provider_files;
@@ -504,6 +513,8 @@ pub fn run() {
                 if window.label() != "main" {
                     return;
                 }
+                plugin_windows::shutdown(window.app_handle());
+                plugin_memory::cancel_all(true);
                 // A secondary reminder window must not keep the process alive
                 // after the main window is gone. stop() never waits on presentation.
                 if let Some(notices) = window.try_state::<Arc<assistant_notices::Service>>() {
@@ -552,6 +563,10 @@ pub fn run() {
             assistant_notices::assistant_notices_status,
             assistant_notices::assistant_notices_configure,
             assistant_notices::assistant_notices_displays,
+            assistant_notices::assistant_notices_audio_settings,
+            assistant_notices::assistant_notices_audio_configure,
+            assistant_notices::assistant_notices_audio_voices,
+            assistant_notices::assistant_notices_audio_preview,
             assistant_notices::assistant_notices_attach,
             assistant_notices::assistant_notices_sync,
             assistant_notices::assistant_notices_list,
@@ -569,6 +584,9 @@ pub fn run() {
             // Private desktop chat relay; only the main webview may answer.
             host_chat::host_chat_ready,
             host_chat::host_chat_respond,
+            host_chat::host_chat_request_active,
+            #[cfg(all(feature = "test-harness", debug_assertions))]
+            host_chat::host_chat_plugin_fixture_call,
             host_chat::host_chat_is_running,
             host_chat::host_chat_ledger_get,
             host_chat::host_chat_ledger_set,
@@ -615,6 +633,7 @@ pub fn run() {
             // settings
             settings::get_app_settings,
             settings::update_app_settings,
+            settings::update_cursor_model_selection,
             settings::set_window_theme,
             // uploaded font files (设置 → 外观 字体行)
             fonts::read_font_file,
@@ -631,6 +650,7 @@ pub fn run() {
             updater::fetch_latest_release_info,
             // plugins
             plugins::plugin_list,
+            plugins::plugin_inspect_path,
             plugins::plugin_install_from_path,
             plugins::plugin_uninstall,
             plugins::plugin_set_enabled,
@@ -641,6 +661,21 @@ pub fn run() {
             plugins::plugin_storage_get,
             plugins::plugin_storage_set,
             plugins::plugin_storage_delete,
+            plugin_windows::plugin_window_open,
+            plugin_windows::plugin_window_presentation_register,
+            plugin_windows::plugin_window_presentation_set,
+            plugin_windows::plugin_window_init,
+            plugin_windows::plugin_window_publish,
+            plugin_windows::plugin_window_action,
+            plugin_windows::plugin_window_inspect_action,
+            plugin_windows::plugin_window_focus_owner,
+            plugin_windows::plugin_window_respond,
+            plugin_windows::plugin_window_return,
+            plugin_windows::plugin_window_request_return,
+            plugin_windows::plugin_window_cancel_return,
+            plugin_windows::plugin_window_dispose,
+            plugin_windows::plugin_window_owner_alive,
+            plugin_windows::plugin_window_status,
             // plugin marketplace (Phase 3, plan §6)
             plugins::market::plugin_fetch_index,
             plugins::market::plugin_fetch_market_readme,
@@ -688,6 +723,7 @@ pub fn run() {
             history::reader::restore_session,
             usage::usage_record,
             usage::usage_summary,
+            usage::usage_window_totals,
             usage::usage_clear,
             history::reader::load_session_page,
             history::reader::load_remote_session_page,
@@ -716,6 +752,21 @@ pub fn run() {
             files::list_dir,
             files::read_file,
             files::read_image_bytes,
+            image_preview::read_preview_image_bytes,
+            image_preview::read_preview_image,
+            image_preview::image_preview_scope,
+            image_preview::list_image_preview_grants,
+            image_preview::grant_image_preview,
+            image_preview::revoke_image_preview_grant,
+            workspace_projects::list_workspace_projects,
+            workspace_projects::management::host_get_workspace_organization,
+            workspace_projects::management::host_save_workspace_project,
+            session_sidebar::get_session_sidebar_workspaces,
+            session_sidebar::assign_session_sidebar_workspaces,
+            session_sidebar_host::host_get_session_sidebar_workspaces,
+            session_sidebar_host::host_assign_session_sidebar_workspaces,
+            workspace_projects::save_workspace_project,
+            workspace_projects::remove_workspace_project,
             image_export::save_image_as,
             files::write_file,
             files::create_dir,
@@ -792,12 +843,29 @@ pub fn run() {
             metrics::performance_diagnostics_set_enabled,
             // plugin capability egress (network:/exec: manifest grants)
             plugin_caps::plugin_http_request,
+            plugin_caps::plugin_fixed_instructions_supported,
             plugin_caps::plugin_add_workspace,
+            plugin_caps::plugin_publish_workspace_project,
             plugin_caps::plugin_exec_run,
             plugin_caps::plugin_exec_spawn,
             plugin_caps::plugin_exec_kill,
             plugin_caps::plugin_agent_start,
             plugin_caps::plugin_agent_interrupt,
+            // plugin task routing (host:tasks)
+            plugin_tasks::plugin_task_plan,
+            plugin_memory::plugin_memory_status,
+            plugin_memory::plugin_memory_checkpoint,
+            plugin_memory::plugin_memory_prepare,
+            plugin_memory::plugin_memory_extract,
+            plugin_memory::plugin_memory_cancel,
+            plugin_tasks::plugin_task_plan_cancel,
+            plugin_tasks::plugin_task_resolve,
+            plugin_tasks::plugin_task_pending_claims,
+            plugin_conversations::plugin_conversation_claim,
+            plugin_conversations::plugin_conversation_resolve,
+            plugin_images::plugin_image_import,
+            plugin_images::plugin_image_preview,
+            plugin_images::plugin_image_resolve,
             mission::mission_agent_start,
             mission::mission_agent_interrupt,
             // web access
@@ -832,6 +900,8 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| {
             if matches!(event, tauri::RunEvent::Exit) {
+                plugin_memory::cancel_all(true);
+                plugin_windows::shutdown(app);
                 if let Some(host) = app.try_state::<Arc<assistant_notices::Service>>() {
                     host.stop();
                 }

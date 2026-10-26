@@ -19,7 +19,7 @@ type GrantState = NonNullable<Message["grant"]>;
  * card is the real answer: grant the directory (persisted; the next claude
  * launch gets --add-dir) or decline.
  */
-export function GrantCard({ message }: { message: Message }) {
+export function GrantCard({ message, onAnswer, readOnly = false }: { message: Message; onAnswer?: (accept: boolean) => void; readOnly?: boolean }) {
   const { t } = useTranslation();
   const respondToGrant = useChatStore((s) => s.respondToGrant);
   const resendLastUser = useChatStore((s) => s.resendLastUser);
@@ -31,7 +31,9 @@ export function GrantCard({ message }: { message: Message }) {
   const path = message.path ?? "";
 
   const answer = (accept: boolean) => {
-    if (key) void respondToGrant(key, message.seq, accept);
+    if (readOnly) return;
+    if (onAnswer) onAnswer(accept);
+    else if (key) void respondToGrant(key, message.seq, accept);
   };
 
   return (
@@ -50,15 +52,15 @@ export function GrantCard({ message }: { message: Message }) {
           {path}
         </div>
       )}
-      {grant.status === "pending" && (
+      {grant.status === "pending" && !readOnly && (
         <PendingGrant grant={grant} path={path} onAnswer={answer} />
       )}
       {grant.status === "granted" && (
         <GrantedGrant
           grant={grant}
           path={path}
-          streaming={streaming}
-          onResend={() => key && void resendLastUser(key)}
+          streaming={streaming || readOnly || !!onAnswer}
+          onResend={() => !readOnly && !onAnswer && key && void resendLastUser(key)}
         />
       )}
       {grant.status === "declined" && (

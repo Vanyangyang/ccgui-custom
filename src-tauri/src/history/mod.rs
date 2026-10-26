@@ -65,6 +65,9 @@ pub struct SessionMeta {
     pub auxiliary_kind: Option<String>,
     pub session_id: String,
     pub workspace_path: String,
+    /// Sidebar placement only. Never use for history, execution, or task ownership.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidebar_workspace_path: Option<String>,
     pub file_path: String,
     pub file_size: i64,
     pub file_mtime_ms: i64,

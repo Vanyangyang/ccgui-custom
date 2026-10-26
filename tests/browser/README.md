@@ -1,5 +1,24 @@
 # Chat streaming regression
 
+## Project views and read-only image preview
+
+Run `node scripts/test-project-views.mjs` from the repository root. The runner
+uses installed `playwright-core` and Chrome, verifies port 1431 is free, starts
+its own hidden Vite process, and closes only its browser and process tree.
+`PROJECT_VIEWS_PORT` and `PROJECT_VIEWS_BROWSER` override those defaults.
+Reports and screenshots are saved to a new `.artifacts/project-views/<time>/`.
+
+The fixture renders production project settings/sidebar, file tree and image
+components with an isolated simulated IPC surface. At 1280px and 380px it checks
+distinct roots and reference labels, explicit default/member launches without
+changing the existing session, save-failure draft retention, relationship-only
+removal, file-only inline preview authorization without `grant_root`, and
+revocation of both thumbnails and an open lightbox. Draft and normal layouts
+must not overflow horizontally; console/page errors fail the run. Require
+`passed: true` and `cleanup: true`, and inspect the narrow screenshots for
+readability. This is browser component acceptance, not a real native save
+dialog, CLI permission test, or production project import.
+
 Open `/tests/browser/onboarding.html` for the production feature guide and
 Sidechat toolbar button, with synthetic input/settings/image/notice controls.
 Use `?topic=handoff`, `btw`, `imageAnnotation`, `proxy`, `selfUpdate`,

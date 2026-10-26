@@ -4,7 +4,7 @@ import { PassThrough } from 'node:stream';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { jsonLines, rpcClient, validateCommand, validateServer, within } from './live-update-smoke-mcp.mjs';
+import { jsonLines, rpcClient, validateCommand, validateServer, within, toolCall, MANAGED_TASK } from './live-update-smoke-mcp.mjs';
 
 test('MCP lines preserve split Chinese and emoji bytes', () => {
   const stream = new PassThrough();
@@ -75,4 +75,20 @@ test('fixture validation confines directories and validates executable, IDs and 
     assert.match(path.basename(root), /^ccgui-helper-test-/);
     await fs.rm(root, { recursive: true, force: true });
   }
+});
+
+test('managed fixture operations use fixed spawn content and the original request identity', async () => {
+  const spawn = { action: 'spawn', id: 'managed-child-spawn', task: 'must not override fixture task' };
+  await validateCommand(spawn, '/unused');
+  assert.deepEqual(toolCall(spawn), { name: 'task_spawn', arguments: {
+    request_id: spawn.id, engine: 'claude', title: 'Managed smoke child', task: MANAGED_TASK,
+  } });
+  assert.deepEqual(toolCall(spawn), toolCall(spawn));
+  const stop = { action: 'stop', id: 'managed-child-stop', branchId: 'fixture-child-1' };
+  await validateCommand(stop, '/unused');
+  assert.deepEqual(toolCall(stop), { name: 'task_stop', arguments: { branch_id: 'fixture-child-1' } });
+  for (const branchId of [undefined, '', '../outside', 42]) {
+    await assert.rejects(validateCommand({ ...stop, branchId }, '/unused'), { code: 'FIXTURE_COMMAND_INVALID' });
+  }
+  await assert.rejects(validateCommand({ action: 'task_spawn', id: 'unknown' }, '/unused'), { code: 'FIXTURE_COMMAND_INVALID' });
 });

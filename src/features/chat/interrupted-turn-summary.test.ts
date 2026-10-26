@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "./store";
-import { handleEngineEvents, settledRuns, type ChatEngineEvent } from "./store/engine-events";
+import { captureEngineEventRuntime, restoreEngineEventRuntime, handleEngineEvents, settledRunOutcomes, settledRuns, type ChatEngineEvent } from "./store/engine-events";
 import { drainPending, EMPTY_SESSION, runRouting } from "./store/stream";
 import { sessionKey } from "./store/persistence";
 import { averageTps, beginThroughput } from "./throughput";
@@ -18,7 +18,7 @@ let serial = 0;
 const keys: string[] = [];
 beforeEach(() => {
   vi.spyOn(Date, "now").mockReturnValue(1_000_000);
-  localStorage.clear(); runRouting.clear(); settledRuns.clear();
+  localStorage.clear(); runRouting.clear(); settledRuns.clear(); settledRunOutcomes.clear();
 });
 afterEach(() => {
   for (const key of keys.splice(0)) drainPending(key);
@@ -90,6 +90,17 @@ it("handles the AGY local Stop flag even if Done has no interruption field", () 
   const f = fixture("agy", true);
   f.emit(f.event("throughput", 3, f.sample("complete")), f.event("done", 4, { usage: f.usage }));
   expect(buildTurnSummary(f.reply())?.outputTps).toBeNull();
+  expect(settledRunOutcomes.get(f.runId)).toEqual({ key: f.key, status: "cancelled" });
+});
+
+it("preserves each native terminal outcome across checkpoint restore and later session errors", () => {
+  const f = fixture("agy");
+  f.emit(f.event("done", 4, { usage: f.usage }));
+  expect(settledRunOutcomes.get(f.runId)).toEqual({ key: f.key, status: "completed" });
+  const cut = structuredClone(captureEngineEventRuntime());
+  settledRunOutcomes.clear(); restoreEngineEventRuntime(cut);
+  useChatStore.setState(s => ({ bySession: { ...s.bySession, [f.key]: { ...s.bySession[f.key], error: "later run failed", interrupted: true } } }));
+  expect(settledRunOutcomes.get(f.runId)).toEqual({ key: f.key, status: "completed" });
 });
 
 it("keeps an interrupted Claude response partial when the same run successfully continues", () => {

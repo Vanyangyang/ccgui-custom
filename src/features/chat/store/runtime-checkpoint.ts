@@ -65,8 +65,9 @@ function parseCheckpoint(value: unknown): ChatCheckpoint {
   }
   for (const key of ["routes", "activity", "pending"]) if (!Array.isArray(candidate.stream[key])) throw new Error("Invalid checkpoint stream");
   for (const key of Object.keys(captureEngineEventRuntime())) {
-    // Older renderers did not record provisional-to-native placeholder origins.
-    if (key === "pendingSessionOrigins" && !(key in candidate.events)) continue;
+    // Older renderers omitted placeholder origins and per-run outcome evidence.
+    // Restore those absent additions as empty; a present malformed value still fails.
+    if ((key === "pendingSessionOrigins" || key === "settledRunOutcomes") && !(key in candidate.events)) continue;
     if (!Array.isArray(candidate.events[key])) throw new Error("Incomplete checkpoint event bookkeeping");
   }
   return candidate as unknown as ChatCheckpoint;

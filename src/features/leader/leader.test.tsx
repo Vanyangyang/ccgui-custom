@@ -92,7 +92,9 @@ describe("Leader sidebar tree", () => {
     expect(childChip?.textContent).toBe("child-age");
     expect(childChip?.classList.contains("group-hover:hidden")).toBe(false);
     expect(row("child conversation").textContent).toContain("leader.state.completed");
-    expect(chip("grandchild conversation")?.dataset.cacheHeat).toBe("hot");
+    // Codex's existing permanent-cache policy has no finite-cache chip.
+    expect(chip("grandchild conversation")).toBeNull();
+    expect(row("grandchild conversation").querySelector('[data-cache-heat-ratio="1"]')?.getAttribute("title")).toBe("chat.cachePermanent");
     expect(row("grandchild conversation").textContent).toContain("leader.state.running");
     expect(chip("unknown conversation")?.dataset.cacheHeat).toBe("unknown");
     expect(row("unknown conversation").textContent).toContain("leader.state.failed");
@@ -1021,6 +1023,93 @@ describe("parent management and lifecycle", () => {
     }
   });
 
+  it("keeps native status timestamps authoritative while accepting only the current run's stream", async () => {
+    const child = { ...branch("status-stream", "agy"), state: "starting" as const, updatedAt: 10 };
+    const initial = { leaders: [parent], branches: [child] };
+    useLeaderStore.setState({ snapshot: initial });
+    vi.mocked(invoke).mockResolvedValue(initial);
+    const off = startLeaderRuntime();
+    const current = () => useCrossSessionActivityStore.getState().records.find((r) => r.scopedId === "leader:status-stream")!;
+    const delta = (runId: string, text: string, seq: number) => handleEngineEvents([{
+      engine: "agy", sessionId: child.sessionId, runId, seq, kind: "delta", data: text,
+      leader: { branchId: child.id, workspacePath: child.workspacePath, title: child.title },
+    }], deps());
+    try {
+      await Promise.resolve(); await Promise.resolve();
+      act(() => delta(child.runId!, "First reply", 1));
+      expect(current()).toMatchObject({ status: "received", updatedAt: 10, replyText: "First reply" });
+      act(() => useLeaderStore.setState({ snapshot: { leaders: [parent], branches: [
+        { ...child, state: "running", runId: "replacement-run", updatedAt: 20, result: "New reply" },
+      ] } }));
+      act(() => delta(child.runId!, " old tail", 2));
+      expect(current()).toMatchObject({ status: "executing", runId: "replacement-run", updatedAt: 20, replyText: "New reply" });
+      act(() => delta("replacement-run", " continues", 1));
+      expect(current().replyText).toBe("New reply continues");
+    } finally { off(); }
+  });
+
+  it("ignores older branch snapshots but allows a newer real continuation and permission recovery", async () => {
+    const child = { ...branch("status-order", "claude"), state: "completed" as const, updatedAt: 30, result: "Finished" };
+    const initial = { leaders: [parent], branches: [child] };
+    useLeaderStore.setState({ snapshot: initial });
+    vi.mocked(invoke).mockResolvedValue(initial);
+    const off = startLeaderRuntime();
+    const current = () => useCrossSessionActivityStore.getState().records.find((r) => r.scopedId === "leader:status-order")!;
+    const publish = (state: LeaderBranch["state"], updatedAt: number) => act(() => useLeaderStore.setState({
+      snapshot: { leaders: [parent], branches: [{ ...child, state, updatedAt }] },
+    }));
+    try {
+      await Promise.resolve(); await Promise.resolve();
+      publish("running", 20);
+      expect(current()).toMatchObject({ status: "completed", updatedAt: 30 });
+      publish("running", 40);
+      expect(current()).toMatchObject({ status: "executing", updatedAt: 40 });
+      publish("waiting", 50);
+      publish("running", 40);
+      expect(current()).toMatchObject({ status: "awaiting_permission", updatedAt: 50 });
+      publish("running", 60);
+      expect(current()).toMatchObject({ status: "executing", updatedAt: 60 });
+      publish("completed", 70);
+      expect(current().status).toBe("completed");
+    } finally { off(); }
+  });
+
+  it("reconciles legacy preview timestamps against the first native snapshot", async () => {
+    const child = { ...branch("legacy-status"), state: "completed" as const, updatedAt: 30, result: "Native final result" };
+    const initial = { leaders: [parent], branches: [child] };
+    useLeaderStore.setState({ snapshot: initial });
+    useCrossSessionActivityStore.getState().upsertRecord({
+      scopedId: "leader:legacy-status", requestId: child.id, runId: child.runId!, kind: "subtask",
+      sender: parent, target: { engine: child.engine, sessionId: child.sessionId!, workspacePath: child.workspacePath },
+      message: child.task, status: "executing", acceptedAt: 1, updatedAt: Date.now(), replyText: "Old preview",
+    });
+    vi.mocked(invoke).mockResolvedValue(initial);
+    const off = startLeaderRuntime();
+    try {
+      await Promise.resolve(); await Promise.resolve();
+      expect(useCrossSessionActivityStore.getState().records[0]).toMatchObject({
+        status: "completed", replyText: "Native final result", updatedAt: 30, leaderUpdatedAt: 30,
+      });
+    } finally { off(); }
+  });
+
+  it("does not preview a delta that the chat rejects as already settled", async () => {
+    const child = branch("status-settled", "agy");
+    const initial = { leaders: [parent], branches: [child] };
+    useLeaderStore.setState({ snapshot: initial });
+    vi.mocked(invoke).mockResolvedValue(initial);
+    useChatStore.setState({ bySession: { "agy/status-settled": { ...EMPTY_SESSION, settledRunIds: [child.runId!] } } });
+    const off = startLeaderRuntime();
+    try {
+      await Promise.resolve(); await Promise.resolve();
+      act(() => handleEngineEvents([{
+        engine: "agy", sessionId: child.sessionId, runId: child.runId!, seq: 10, kind: "delta", data: "late tail",
+        leader: { branchId: child.id, workspacePath: child.workspacePath, title: child.title },
+      }], deps()));
+      expect(useCrossSessionActivityStore.getState().records.find((r) => r.scopedId === "leader:status-settled")?.replyText).toBeUndefined();
+    } finally { off(); }
+  });
+
   it("syncs subtask communication UI across live streaming, completion, and archival/reclaim cleanup", async () => {
     const initialCompleted = { ...branch("old-done"), state: "completed" as const, result: "old result" };
     useLeaderStore.setState({ snapshot: { leaders: [parent], branches: [] } });
@@ -1034,7 +1123,7 @@ describe("parent management and lifecycle", () => {
       const oldRecord = useCrossSessionActivityStore.getState().records.find((r) => r.scopedId === "leader:old-done")!;
       expect(isCrossSessionRecordUnread(oldRecord)).toBe(false);
 
-      // A newly spawned branch transitions to running, streams deltas, and completes unread.
+      // A newly spawned branch streams deltas and retains its result without a completion notification.
       const liveChild = { ...branch("live-child", "agy"), state: "running" as const, task: "Refactor architecture", result: "" };
       await act(async () => {
         useLeaderStore.setState({ snapshot: { leaders: [parent], branches: [initialCompleted, liveChild] } });
@@ -1073,7 +1162,7 @@ describe("parent management and lifecycle", () => {
       const finishedRecord = useCrossSessionActivityStore.getState().records.find((r) => r.scopedId === "leader:live-child")!;
       expect(finishedRecord.status).toBe("completed");
       expect(finishedRecord.replyText).toBe("Final subtask report");
-      expect(isCrossSessionRecordUnread(finishedRecord)).toBe(true);
+      expect(isCrossSessionRecordUnread(finishedRecord)).toBe(false);
 
       // Reclaiming or archiving removes the communication records
       await act(async () => {

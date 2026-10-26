@@ -64,67 +64,108 @@ export function needsProbe(
   return now - state.checkedAt > PROBE_TTL_MS;
 }
 
-export const useMcpProbeStore = create<McpProbeStore>((set, get) => ({
-  results: {},
-  pending: {},
-  runningAll: false,
-  error: null,
+export const useMcpProbeStore = create<McpProbeStore>((set, get) => {
+  interface Request {
+    promise: Promise<void>;
+    run: () => Promise<void>;
+  }
+  const inflight = new Map<string, Request>();
+  const latest = new Map<string, Request>();
+  const pendingCounts = new Map<string, number>();
+  const queue: Request[] = [];
+  let active = 0;
+  const drain = () => {
+    while (active < PROBE_CONCURRENCY && queue.length) {
+      const request = queue.shift()!;
+      active++;
+      void request.run().finally(() => {
+        active--;
+        drain();
+      });
+    }
+  };
+  return {
+    results: {},
+    pending: {},
+    runningAll: false,
+    error: null,
 
-  probe: async (entry, workspace) => {
-    if (!probeable(entry)) return;
-    set((state) => ({ pending: { ...state.pending, [entry.id]: true }, error: null }));
-    try {
-      const result = await mcpApi.probe(entry, workspace);
-      // 边界校验：缺字段的响应不能当成「已连接」写进状态，否则一条坏响应
-      // 就会把整个列表画崩。
-      if (!result || typeof result.status !== "string") {
-        throw new Error("MCP 检测返回了无法识别的结果");
+    probe: (entry, workspace) => {
+      if (!probeable(entry)) return Promise.resolve();
+      const key = JSON.stringify([entry.id, entry.version, workspace]);
+      const existing = inflight.get(key);
+      if (existing) {
+        latest.set(entry.id, existing);
+        return existing.promise;
       }
-      set((state) => ({
-        results: {
-          ...state.results,
-          [entry.id]: { result, checkedAt: Date.now(), version: entry.version },
+      let resolve!: () => void;
+      const promise = new Promise<void>((done) => { resolve = done; });
+      const request: Request = {
+        promise,
+        run: async () => {
+          try {
+            const result = await mcpApi.probe(entry, workspace);
+            // 缺字段的响应不能当成「已连接」写进状态。
+            if (!result || typeof result.status !== "string") {
+              throw new Error("MCP 检测返回了无法识别的结果");
+            }
+            if (latest.get(entry.id) === request) {
+              set((state) => ({
+                results: {
+                  ...state.results,
+                  [entry.id]: { result, checkedAt: Date.now(), version: entry.version },
+                },
+              }));
+            }
+          } catch (probeError) {
+            if (latest.get(entry.id) === request) {
+              set({ error: probeError instanceof Error ? probeError.message : String(probeError) });
+            }
+          } finally {
+            inflight.delete(key);
+            if (latest.get(entry.id) === request) latest.delete(entry.id);
+            const remaining = (pendingCounts.get(entry.id) ?? 1) - 1;
+            if (remaining) pendingCounts.set(entry.id, remaining);
+            else pendingCounts.delete(entry.id);
+            if (!remaining) {
+              set((state) => {
+                const pending = { ...state.pending };
+                delete pending[entry.id];
+                return { pending };
+              });
+            }
+            resolve();
+          }
         },
-      }));
-    } catch (probeError) {
-      set({
-        error: probeError instanceof Error ? probeError.message : String(probeError),
-      });
-    } finally {
-      set((state) => {
-        const pending = { ...state.pending };
-        delete pending[entry.id];
-        return { pending };
-      });
-    }
-  },
-
-  probeAll: async (entries, workspace, options) => {
-    const force = options?.force ?? false;
-    const targets = entries.filter((entry) =>
-      force ? entry.enabled && probeable(entry) : needsProbe(entry, get().results),
-    );
-    if (targets.length === 0 || get().runningAll) return;
-    set({ runningAll: true, error: null });
-    try {
-      // 有限并行：逐个 shift 取任务，谁先空谁退出。
-      const queue = [...targets];
-      const worker = async (): Promise<void> => {
-        const next = queue.shift();
-        if (!next) return;
-        await get().probe(next, workspace);
-        await worker();
       };
-      await Promise.all(
-        Array.from({ length: Math.min(PROBE_CONCURRENCY, queue.length) }, worker),
-      );
-    } finally {
-      set({ runningAll: false });
-    }
-  },
+      // Register queued requests too: a manual check must join a batch item
+      // even before a concurrency slot is available for that item.
+      inflight.set(key, request);
+      latest.set(entry.id, request);
+      pendingCounts.set(entry.id, (pendingCounts.get(entry.id) ?? 0) + 1);
+      set((state) => ({ pending: { ...state.pending, [entry.id]: true }, error: null }));
+      queue.push(request);
+      drain();
+      return promise;
+    },
 
-  clear: () => set({ results: {}, error: null }),
-}));
+    probeAll: async (entries, workspace, options) => {
+      const force = options?.force ?? false;
+      const targets = entries.filter((entry) =>
+        force ? entry.enabled && probeable(entry) : needsProbe(entry, get().results),
+      );
+      if (targets.length === 0 || get().runningAll) return;
+      set({ runningAll: true, error: null });
+      try {
+        await Promise.all(targets.map((entry) => get().probe(entry, workspace)));
+      } finally {
+        set({ runningAll: false });
+      }
+    },
+
+    clear: () => set({ results: {}, error: null }),
+  };
+});
 
 /**
  * 打开（或切到某个引擎）时自动检测：指纹由「启用且可检测条目的 id + 配置

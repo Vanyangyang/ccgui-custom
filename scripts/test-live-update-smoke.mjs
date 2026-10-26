@@ -18,6 +18,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { packageLocal } from './live-update-package.mjs';
 import { FixtureRemoteObserver } from './live-update-smoke-remote.mjs';
+import { MANAGED_TASK } from './live-update-smoke-mcp.mjs';
 
 const PROJECT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const BOOT_TIMEOUT = 90_000;
@@ -51,6 +52,18 @@ function jsonFile(filename, limit = 64 * 1024) {
 function writeNew(filename, value) { fs.writeFileSync(filename, value, { flag: 'wx', mode: 0o600 }); }
 function psQuote(value) { return `'${String(value).replaceAll("'", "''")}'`; }
 
+export function fixtureEngineConfiguration(fake) {
+  // Every installed engine must be pinned to the fixture. Registry PATH lookup
+  // can find real CLIs even when the launch environment has an isolated PATH.
+  const engines = ['claude', 'kimi', 'grok', 'codex', 'pi', 'omp', 'dsh', 'agy', 'opencode', 'qoder', 'qoder-cn', 'cursor'];
+  return {
+    bins: Object.fromEntries(engines.map(engine => [`${engine === 'qoder-cn' ? 'qoderCn' : engine}Bin`, fake])),
+    config: Object.fromEntries(engines.map(engine => [engine, {
+      current: engine === 'claude' ? '__local_settings_json__' : '__disabled__', providers: {},
+    }])),
+  };
+}
+
 export function parseArgs(argv) {
   const result = { rollback: true };
   const names = new Map([['--exe', 'exe'], ['--url', 'url'], ['--resources', 'resources'], ['--artifacts', 'artifacts']]);
@@ -58,6 +71,10 @@ export function parseArgs(argv) {
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--help') { result.help = true; continue; }
+    if (arg === '--managed-child') {
+      requireThat(!seen.has('managedChild'), 'arguments', 'Managed child option was repeated');
+      seen.add('managedChild'); result.managedChild = true; continue;
+    }
     if (arg === '--rollback' || arg === '--no-rollback') {
       requireThat(!seen.has('rollback'), 'arguments', 'Rollback option was repeated');
       seen.add('rollback'); result.rollback = arg === '--rollback';
@@ -71,7 +88,7 @@ export function parseArgs(argv) {
   return result;
 }
 
-function environment(root, profile, failRelease) {
+export function environment(root, profile, failRelease = '') {
   const systemRoot = process.env.SystemRoot ?? process.env.WINDIR;
   requireThat(systemRoot && path.isAbsolute(systemRoot), 'environment', 'Windows SystemRoot is required');
   const system32 = path.join(systemRoot, 'System32');
@@ -98,8 +115,8 @@ function environment(root, profile, failRelease) {
   return env;
 }
 
-export function fakeClaudeScript(workspace, fallbackSession, mcpHelperPath) {
-  const owned = name => psQuote(path.join(workspace, name));
+export function fakeClaudeScript(workspace, fallbackSession, mcpHelperPath, managedChild = false) {
+  const owned = name => `([IO.Path]::Combine($fixtureOutput,${psQuote(name)}))`;
   return '\uFEFF' + `# Fixture only: no external requests, credentials, tools or model invocation.\r
 [Console]::InputEncoding = New-Object Text.UTF8Encoding($false)\r
 [Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)\r
@@ -108,18 +125,24 @@ if ($args -contains '--version') { [Console]::Out.WriteLine('2.1.100 (Claude Cod
 if ($args -contains '--help') { [Console]::Out.WriteLine('Fixture CLI: --session-id --include-partial-messages'); exit 0 }\r
 if ($args -notcontains '--input-format' -or $args -notcontains '--output-format') { exit 1 }\r
 $session = ${psQuote(fallbackSession)}\r
+$explicitSession = $false\r
 for ($i = 0; $i -lt $args.Count; $i++) {\r
-  if ($args[$i] -eq '--session-id' -and $i + 1 -lt $args.Count) { $session = [string]$args[$i + 1] }\r
-  if ([string]$args[$i] -like '--session-id=*') { $session = ([string]$args[$i]).Substring(13) }\r
+  if (($args[$i] -eq '--session-id' -or $args[$i] -eq '--resume') -and $i + 1 -lt $args.Count) { $session = [string]$args[$i + 1]; $explicitSession = $true }\r
+  if ([string]$args[$i] -like '--session-id=*') { $session = ([string]$args[$i]).Substring(13); $explicitSession = $true }\r
 }\r
+$initial = [Console]::In.ReadLine()\r
+if ($null -eq $initial) { exit 3 }\r
+$isManagedChild = ${managedChild ? `$initial.Contains(${psQuote(MANAGED_TASK)})` : '$false'}\r
+if ($isManagedChild -and !$explicitSession) { $session = [Guid]::NewGuid().ToString() }\r
+$fixtureOutput = ${psQuote(workspace)}\r
+if ($isManagedChild) { $fixtureOutput = [IO.Path]::Combine($fixtureOutput,'managed-child') }\r
 $record = @{ pid = $PID; startedAt = [DateTime]::UtcNow.ToString('o') } | ConvertTo-Json -Compress\r
 [IO.File]::AppendAllText(${owned('launches.jsonl')}, $record + [Environment]::NewLine, $utf8)\r
 [IO.File]::WriteAllText(${owned('fake.pid')}, [string]$PID, $utf8)\r
-$initial = [Console]::In.ReadLine()\r
-if ($null -eq $initial) { exit 3 }\r
 [Console]::Out.WriteLine((@{ type='system'; subtype='init'; session_id=$session } | ConvertTo-Json -Compress))\r
 [Console]::Out.Flush()\r
-${mcpHelperPath ? `$mcpConfig=$null\r
+${mcpHelperPath ? `if (!$isManagedChild) {\r
+$mcpConfig=$null\r
 for ($i=0; $i -lt $args.Count-1; $i++) { if ($args[$i] -eq '--mcp-config') { $mcpConfig=[string]$args[$i+1] } }\r
 if ([string]::IsNullOrWhiteSpace($mcpConfig)) { throw 'Fixture host MCP config is missing' }\r
 $mcpStart=New-Object Diagnostics.ProcessStartInfo\r
@@ -138,10 +161,16 @@ $mcpHelperProcess.BeginOutputReadLine()\r
 $mcpHelperProcess.BeginErrorReadLine()\r
 $mcpHelperProcess.StandardInput.WriteLine($mcpConfig)\r
 $mcpHelperProcess.StandardInput.Close()\r
+}\r
 ` : ''}
 $sequence = 0\r
 $deadline = [DateTime]::UtcNow.AddSeconds(${FIXTURE_LIFETIME_SECONDS})\r
 while ([IO.File]::Exists(${owned('keep-running')}) -and [DateTime]::UtcNow -lt $deadline) {\r
+  if ($isManagedChild -and [IO.File]::Exists(${owned('pause-before-stop')})) {\r
+    [IO.File]::WriteAllText(${owned('paused-for-stop')}, [string]$sequence, $utf8)\r
+    while ([DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 100 }\r
+    exit 4\r
+  }\r
   $sequence++\r
   $text = '${FRAME_PREFIX}' + $sequence.ToString('D6') + ' 中文🙂' + [char]10\r
   $frame = @{ type='stream_event'; event=@{ type='content_block_delta'; delta=@{ type='text_delta'; text=$text } } }\r
@@ -156,7 +185,7 @@ exit 0\r
 `;
 }
 
-function processHelperScript() {
+export function processHelperScript() {
   return `param(\n  [ValidateSet('inspect','terminate')][string]$Operation = 'inspect',\n  [Parameter(Mandatory=$true)][string]$Profile,\n  [Parameter(Mandatory=$true)][string]$FakeCli,\n  [int]$TargetPid = 0,\n  [string]$ExpectedExe = '',\n  [long]$ExpectedStarted = 0\n)\n` +
 `$ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)
@@ -201,7 +230,7 @@ $items = @(Get-CimInstance Win32_Process -Filter "Name='ccgui-next.exe' OR Name=
 `;
 }
 
-function watchdogScript() {
+export function watchdogScript() {
   return `param([int]$ControllerPid,[string]$ControllerExe,[string]$Root,[string]$Profile,[string]$FakeCli,[string]$Helper,[int]$LifetimeSeconds=480)
 $ErrorActionPreference='Stop'
 $cancel=[IO.Path]::Combine($Root,'watchdog.cancel')
@@ -222,17 +251,27 @@ try {
   $marker=[IO.Path]::Combine($Root,'workspace\\keep-running')
   if ([IO.File]::Exists($marker)) { [IO.File]::Delete($marker) }
   # Only the same bounded identity verifier used by ordinary fixture cleanup.
+  $failures=@()
   foreach ($role in @('supervisor','worker','host-mcp','host','fake-cli','webview')) {
     $raw=& $powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $Helper -Operation inspect -Profile $Profile -FakeCli $FakeCli
-    if ($LASTEXITCODE -ne 0) { throw 'Watchdog process inventory failed' }
-    $items=@($raw | ConvertFrom-Json)
+    if ($LASTEXITCODE -ne 0) { $failures+=@{role=$role;stage='inventory';exitCode=$LASTEXITCODE}; continue }
+    # PS 5.1 emits a JSON array as ONE pipeline object. Parenthesize the
+    # conversion so each iteration has one identity, including the empty case.
+    $items=@((ConvertFrom-Json -InputObject $raw))
     foreach ($item in $items) {
       if ($item.role -eq $role -and $item.pid -ne $PID) {
-        $null=& $powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $Helper -Operation terminate -Profile $Profile -FakeCli $FakeCli -TargetPid $item.pid -ExpectedExe $item.executable -ExpectedStarted $item.started
-        if ($LASTEXITCODE -ne 0) { throw 'Watchdog refused an unverified process' }
+        try {
+          $detail=(& $powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $Helper -Operation terminate -Profile $Profile -FakeCli $FakeCli -TargetPid $item.pid -ExpectedExe $item.executable -ExpectedStarted $item.started 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0) { $failures+=@{role=$role;pid=$item.pid;executable=$item.executable;started=$item.started;exitCode=$LASTEXITCODE;detail=$detail.Substring(0,[Math]::Min(1200,$detail.Length))} }
+        } catch { $failures+=@{role=$role;pid=$item.pid;executable=$item.executable;started=$item.started;detail=$_.Exception.Message} }
       }
     }
   }
+  $raw=& $powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $Helper -Operation inspect -Profile $Profile -FakeCli $FakeCli
+  if ($LASTEXITCODE -ne 0) { throw 'Watchdog final process inventory failed' }
+  $remaining=@((ConvertFrom-Json -InputObject $raw) | Where-Object { $_.pid -ne $PID })
+  [IO.File]::WriteAllText([IO.Path]::Combine($Root,'watchdog.cleanup.json'), (@{failures=$failures;remaining=$remaining} | ConvertTo-Json -Depth 6 -Compress))
+  if ($failures.Count -gt 0 -or $remaining.Count -gt 0) { throw 'Watchdog cleanup incomplete; inspect watchdog.cleanup.json' }
 } catch {
   [IO.File]::WriteAllText([IO.Path]::Combine($Root,'watchdog.error.json'), (@{message=$_.Exception.Message} | ConvertTo-Json -Compress))
   exit 1
@@ -247,7 +286,7 @@ function windowsArgument(value) {
 // Node's detached flag uses DETACHED_PROCESS: Windows PowerShell can exit
 // successfully without executing its script in that mode. Explicit breakaway
 // also keeps this bounded guard alive if the controller's enclosing Job closes.
-function watchdogLauncherScript(executable, args, cwd) {
+export function watchdogLauncherScript(executable, args, cwd) {
   const command = [executable, ...args].map(windowsArgument).join(' ');
   return `$ErrorActionPreference='Stop'
 Add-Type -TypeDefinition @'
@@ -274,7 +313,7 @@ finally { $null=[FixtureGuardLauncher]::CloseHandle($result.thread); $null=[Fixt
 `;
 }
 
-async function childOutput(executable, args, { env, cwd, timeout = 15_000 } = {}) {
+export async function childOutput(executable, args, { env, cwd, timeout = 15_000 } = {}) {
   const child = spawn(executable, args, { env, cwd, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
   return await new Promise((resolve, reject) => {
     let stdout = '', stderr = '', done = false;
@@ -287,7 +326,7 @@ async function childOutput(executable, args, { env, cwd, timeout = 15_000 } = {}
   });
 }
 
-class FixturePage {
+export class FixturePage {
   constructor(directory) { this.directory = directory; this.closed = false; }
   async evaluate(expression, timeout = 30_000) {
     requireThat(!this.closed, 'fixture-page-closed', 'Fixture page connection is closed');
@@ -360,6 +399,7 @@ export async function runSmoke(options) {
   const root = fs.realpathSync.native(fs.mkdtempSync(path.join(artifactParent, 'run-')));
   const profile = path.join(root, 'profile');
   const workspace = path.join(root, 'workspace');
+  const taskOutput = options.managedChild ? path.join(workspace, 'managed-child') : workspace;
   const successorWorkspace = path.join(root, 'successor-workspace');
   const fake = path.join(root, 'bin/claude.ps1');
   const successorFake = path.join(root, 'bin/successor-claude.ps1');
@@ -371,12 +411,13 @@ export async function runSmoke(options) {
   const goodRelease = `smoke-good-${suffix}`;
   const badRelease = `smoke-bad-${suffix}`;
   const report = { schemaVersion: 1, startedAt: new Date().toISOString(), fixtureRoot: root,
-    inputs: { executable, resources, frontendUrl: vite.origin, rollbackRequested: options.rollback !== false, packageMode: 'working-tree' },
+    inputs: { executable, resources, frontendUrl: vite.origin, rollbackRequested: options.rollback !== false, managedChild: !!options.managedChild, packageMode: 'working-tree' },
     fixtureLifetimeSeconds: FIXTURE_LIFETIME_SECONDS, results: [], status: 'running', cleanup: { complete: false } };
   const abort = new AbortController();
   const connections = new Set();
   let phase = 'setup'; let initialChild; let watchdog; let ownedProfileConfirmed = false; let ps; let env;
   let workerBefore; let currentPage; let initialHost; let goodPackage; let badPackage; let remote; let webIdentity;
+  let managedBranch; let parentSessionId; let parentWorkerBefore;
   const signal = () => { abort.abort(); for (const connection of connections) connection.close(); };
   process.once('SIGINT', signal); process.once('SIGTERM', signal);
   const saveReport = () => fs.writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`, { mode: 0o600 });
@@ -418,11 +459,11 @@ export async function runSmoke(options) {
     });
   };
   const fakePid = () => {
-    try { const value = Number(fs.readFileSync(path.join(workspace, 'fake.pid'), 'utf8').trim()); return Number.isInteger(value) && value > 0 ? value : null; }
+    try { const value = Number(fs.readFileSync(path.join(taskOutput, 'fake.pid'), 'utf8').trim()); return Number.isInteger(value) && value > 0 ? value : null; }
     catch (error) { if (error.code === 'ENOENT') return null; throw error; }
   };
   const launches = () => {
-    try { return fs.readFileSync(path.join(workspace, 'launches.jsonl'), 'utf8').trim().split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line)); }
+    try { return fs.readFileSync(path.join(taskOutput, 'launches.jsonl'), 'utf8').trim().split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line)); }
     catch (error) { if (error.code === 'ENOENT') return []; throw error; }
   };
   const assertProcesses = async expected => {
@@ -468,9 +509,32 @@ export async function runSmoke(options) {
         // would itself break initialization. React mounts only AFTER that cut.
         await wait('fixture React mount', 30_000, async () => connection.evaluate(
           "document.documentElement.dataset.appMounted === '1'", 3000));
+        // A fresh profile opens the real feature guide. Dismiss it through its
+        // normal control; never remove the open-dialog readiness protection.
+        const tourOpen = await connection.evaluate(`(async()=>{
+          const {useOnboardingStore}=await import('/src/features/onboarding/store.ts');
+          useOnboardingStore.getState().autoStartIfFirstInstall();
+          return useOnboardingStore.getState().open;
+        })()`);
+        if (tourOpen) await wait('fixture guide dismissal', 10_000, async () => connection.evaluate(`(async()=>{
+          document.querySelector('[data-testid="onboarding-close-button"]')?.click();
+          const {useOnboardingStore}=await import('/src/features/onboarding/store.ts');
+          return !useOnboardingStore.getState().open && !document.querySelector('[data-testid="onboarding-tour-overlay"]');
+        })()`));
         ownedProfileConfirmed = true;
         return { connection, host: matching[0] };
       } catch (error) {
+        if (connection && !connection.closed) {
+          try {
+            report.bootDiagnostics = await connection.evaluate(`({
+              location:location.origin+location.pathname,
+              readyState:document.readyState,
+              mounted:document.documentElement.dataset.appMounted ?? null,
+              bodyText:(document.body?.innerText ?? '').slice(0,4000),
+              scripts:[...document.scripts].map(script=>script.src).slice(0,12)
+            })`, 3000);
+          } catch { /* The original startup failure remains authoritative. */ }
+        }
         connection?.close(); if (connection) connections.delete(connection);
         if (error instanceof SmokeError && error.code === 'frontend-evaluation') throw error;
       }
@@ -539,15 +603,43 @@ export async function runSmoke(options) {
     writeNew(temporary, JSON.stringify(command));
     fs.renameSync(temporary, path.join(workspace, 'self-update-command.json'));
   };
+  const branchSnapshot = async () => currentPage.connection.evaluate("window.__TAURI_INTERNALS__.invoke('task_snapshot', {})");
+  const assertManagedBranch = async (expectedState) => {
+    if (!options.managedChild) return;
+    return wait('restored managed branch identity', 30_000, async () => {
+      const branch = (await branchSnapshot()).branches?.find(item => item.id === managedBranch.id);
+      if (!branch || (expectedState && branch.state !== expectedState)) return null;
+      requireThat(branch.runId === managedBranch.runId && branch.sessionId === managedBranch.sessionId
+        && branch.parentSessionId === parentSessionId && branch.parentEngine === 'claude'
+        && branch.engine === 'claude' && branch.workspacePath === workspace,
+      'managed-identity', 'Managed child identity or parent relationship changed across handoff');
+      const parentWorker = manifests().find(item => item.runId === parentWorkerBefore.runId);
+      requireThat(parentWorker?.pid === parentWorkerBefore.pid && parentWorker.processStartTime === parentWorkerBefore.processStartTime,
+        'managed-parent-worker', 'The parent worker identity changed across handoff');
+      requireThat(fs.readFileSync(path.join(workspace, 'launches.jsonl'), 'utf8').trim().split(/\r?\n/).filter(Boolean).length === 1,
+        'duplicate-parent', 'Parent CLI was relaunched across handoff');
+      return branch;
+    });
+  };
+  const updateDiagnostic = async page => page.connection.evaluate(`(async()=>{
+    const {useLiveUpdateStore}=await import('/src/features/update/live-update.ts');
+    const {getRuntimeCheckpointReadiness}=await import('/src/lib/runtime-checkpoint.ts');
+    const s=useLiveUpdateStore.getState();
+    return {support:s.support,stage:s.stage,error:s.error,errorCode:s.errorCode,blockers:s.blockers,readiness:getRuntimeCheckpointReadiness()};
+  })()`, 3000);
   const stage = async (_page, bundle, id) => {
     // Only the fake CLI's persistent MCP client initiates the update. The test
     // controller never invokes stage/activate or installs an extra UI watcher.
+    report.updateDiagnostics ??= [];
+    try { report.updateDiagnostics.push({ at:'before-stage', state:await updateDiagnostic(_page) }); saveReport(); } catch {}
     writeMcpCommand({ id,
       packageDir: bundle.output, manifestSha256: bundle.manifestSha256 });
-    return wait('staged production transaction', 30_000, async () => {
+    const transaction = await wait('staged production transaction', 30_000, async () => {
       const state = readUpdate();
       return state?.transaction?.candidate?.manifestSha256 === bundle.manifestSha256 ? state.transaction : null;
     });
+    try { report.updateDiagnostics.push({ at:'after-stage', state:await updateDiagnostic(_page) }); saveReport(); } catch {}
+    return transaction;
   };
   const privateShutdown = async manifest => {
     const matches = (await inventory()).find(item => item.role === 'worker' && item.pid === manifest.pid
@@ -565,7 +657,7 @@ export async function runSmoke(options) {
 
   try {
     for (const directory of ['bin', 'appdata', 'localappdata', 'tmp', 'workspace/.claude', 'successor-workspace/.claude', 'profile/webview-data',
-      'profile/engine-home/.claude', 'profile/engine-home/.codex', 'profile/engine-home/.pi', 'profile/engine-home/.omp', 'profile/engine-home/.kimi-code', 'profile/engine-home/.grok']) {
+      'profile/engine-home/.claude', 'profile/engine-home/.codex', 'profile/engine-home/.pi', 'profile/engine-home/.omp', 'profile/engine-home/.kimi-code', 'profile/engine-home/.grok', 'profile/engine-home/.cursor']) {
       fs.mkdirSync(inside(root, path.join(root, directory)), { recursive: true });
     }
     env = environment(root, profile, badRelease);
@@ -573,17 +665,16 @@ export async function runSmoke(options) {
     writeNew(helper, processHelperScript());
     writeNew(watchdogPath, watchdogScript());
     writeNew(mcpHelper, fs.readFileSync(path.join(PROJECT, 'scripts/live-update-smoke-mcp.mjs')));
-    writeNew(fake, fakeClaudeScript(workspace, randomUUID(), mcpHelper));
+    if (options.managedChild) fs.mkdirSync(taskOutput);
+    writeNew(fake, fakeClaudeScript(workspace, randomUUID(), mcpHelper, !!options.managedChild));
     writeNew(successorFake, fakeClaudeScript(successorWorkspace, randomUUID()));
     writeNew(path.join(workspace, 'keep-running'), 'owned fixture lifetime\n');
+    if (options.managedChild) writeNew(path.join(taskOutput, 'keep-running'), 'owned managed child; cancel through task_stop\n');
     writeNew(path.join(workspace, '.claude/settings.local.json'), JSON.stringify({ env: { CLAUDE_CONFIG_DIR: env.CLAUDE_CONFIG_DIR } }));
-    const fixtureBins = Object.fromEntries(['claude', 'kimi', 'grok', 'codex', 'pi', 'omp', 'dsh', 'agy', 'opencode', 'qoder', 'qoderCn']
-      .map(engine => [`${engine}Bin`, fake]));
+    const { bins: fixtureBins, config } = fixtureEngineConfiguration(fake);
     writeNew(path.join(profile, 'settings.json'), JSON.stringify({ ...fixtureBins, autoTitleEnabled: false,
       defaultClaudeUltracode: false, codexDesktopHandoffEnabled: false, dshAutoStart: false,
       webRelayOn: false, systemProxyEnabled: false, petEnabled: false, language: 'en' }));
-    const config = Object.fromEntries(['claude', 'kimi', 'grok', 'codex', 'pi', 'omp', 'dsh', 'agy', 'opencode', 'qoder', 'qoder-cn']
-      .map(engine => [engine, { current: engine === 'claude' ? '__local_settings_json__' : '__disabled__', providers: {} }]));
     writeNew(path.join(profile, 'config.json'), JSON.stringify(config));
     saveReport();
     event(phase, { fixtureRoot: root, pageBridge: 'test-harness-files', rollbackRequested: options.rollback !== false });
@@ -626,6 +717,18 @@ export async function runSmoke(options) {
     currentPage = await ownPage(baselineExe);
     initialHost = currentPage.host;
     requireThat(initialHost.pid === initialChild.pid, 'host-identity', 'The page did not belong to the launched fixture host');
+    report.engineProbeIsolation = await currentPage.connection.evaluate(`(async()=>{
+      const invoke=window.__TAURI_INTERNALS__.invoke;
+      let pickerError=null;
+      try { await invoke('cursor_model_catalog'); } catch(error) { pickerError=String(error); }
+      const generic=await invoke('list_engine_models',{engine:'cursor',workspace:null});
+      return {pickerError,generic};
+    })()`);
+    requireThat(report.engineProbeIsolation.pickerError?.includes('disabled in development profiles')
+      && report.engineProbeIsolation.generic.authoritative === false
+      && report.engineProbeIsolation.generic.models?.[0]?.id === 'auto',
+      'engine-probe-isolation', 'Both native Cursor catalog paths must reject automatic discovery in the isolated profile');
+    saveReport();
     phase = 'start-fake-run';
     await currentPage.connection.evaluate(`(async()=>{
       const {useChatStore}=await import('/src/features/chat/store.ts');
@@ -639,12 +742,43 @@ export async function runSmoke(options) {
       await useChatStore.getState().send('fixture task',[],{computerUse:false});
       return true;
     })()`, 60_000);
+    if (options.managedChild) {
+      const parent = await wait('parent worker and MCP client', 45_000, async () => {
+        const state = await snapshot(currentPage);
+        return state.ready && state.sessionId && state.text && manifests().length === 1
+          && jsonFile(path.join(workspace, 'self-update-mcp-ready.json')) ? state : null;
+      });
+      parentSessionId = parent.sessionId;
+      parentWorkerBefore = manifests()[0];
+      // Exactly one command ID is sent; the helper and native receipt each
+      // retain it. No polling path resubmits task_spawn.
+      writeMcpCommand({ id: 'managed-child-spawn', action: 'spawn' });
+      await mcpReceipt('managed-child-spawn');
+      managedBranch = await wait('managed child native session and worker', 45_000, async () => {
+        const branches = (await branchSnapshot()).branches?.filter(branch =>
+          branch.parentSessionId === parentSessionId && branch.parentEngine === 'claude'
+          && branch.workspacePath === workspace && branch.title === 'Managed smoke child') ?? [];
+        requireThat(branches.length <= 1, 'duplicate-branch', 'Managed spawn created duplicate branches');
+        const branch = branches[0];
+        return branch?.sessionId && branch.runId && manifests().some(item => item.runId === branch.runId)
+          && fakePid() ? branch : null;
+      });
+      requireThat(manifests().length === 2, 'managed-workers', 'Expected one parent and one child worker');
+      const parentLaunches = fs.readFileSync(path.join(workspace, 'launches.jsonl'), 'utf8').trim().split(/\r?\n/).filter(Boolean);
+      requireThat(parentLaunches.length === 1, 'duplicate-parent', 'Parent CLI was launched more than once');
+      await currentPage.connection.evaluate(`(async()=>{
+        const {useChatStore}=await import('/src/features/chat/store.ts');
+        await useChatStore.getState().selectSession('claude',${JSON.stringify(managedBranch.sessionId)},${JSON.stringify(workspace)});return true;
+      })()`);
+    }
     const initial = await wait('first actual worker and fake CLI output', 45_000, async () => {
       const state = await snapshot(currentPage);
       const found = manifests();
-      if (!state.ready || !state.sessionId || !state.text || found.length !== 1 || !fakePid()) return null;
+      if (!state.ready || !state.sessionId || !state.text || found.length !== (options.managedChild ? 2 : 1) || !fakePid()) return null;
+      const target = options.managedChild ? found.find(item => item.runId === managedBranch.runId) : found[0];
+      if (!target || (options.managedChild && state.sessionId !== managedBranch.sessionId)) return null;
       const count = frames(state.text); if (count < 3) return null;
-      return { state, manifest: found[0] };
+      return { state, manifest: target };
     });
     const processes = await inventory();
     const worker = processes.find(item => item.pid === initial.manifest.pid && item.role === 'worker');
@@ -686,6 +820,7 @@ export async function runSmoke(options) {
     requireThat(afterGood.cursors[workerBefore.workerId] >= beforeGood.cursors[workerBefore.workerId], 'handoff-cursor', 'Successful handoff regressed the worker cursor');
     requireThat(!(await inventory()).some(item => item.pid === initialHost.pid && item.started === initialHost.started), 'old-host-alive', 'The old GUI host did not exit');
     await assertProcesses(workerBefore);
+    const restoredBranch = await assertManagedBranch();
     const remoteAfterGood = await assertRemote(currentPage, remoteBeforeGood.helloCount + 1, beforeGood.text);
     const goodReceipt = await mcpReceipt(goodRelease);
     requireThat(goodReceipt.accepted === true && goodReceipt.transactionId === transaction.id,
@@ -697,11 +832,14 @@ export async function runSmoke(options) {
     report.results.push({ scenario: 'successful-handoff', passed: true, transactionId: transaction.id,
       phase: committed.transaction.phase, releaseId: committed.active?.releaseId,
       before: summarize({ host: initialHost }, beforeGood), after: summarize(currentPage, afterGood),
-      remoteBefore: remoteBeforeGood, remoteAfter: remoteAfterGood, initiatedByTaskMcp: true, taskConfirmedCommitted: true });
+      remoteBefore: remoteBeforeGood, remoteAfter: remoteAfterGood, initiatedByTaskMcp: true, taskConfirmedCommitted: true,
+      ...(restoredBranch ? { managedBranch: { id: restoredBranch.id, runId: restoredBranch.runId,
+        sessionId: restoredBranch.sessionId, parentSessionId: restoredBranch.parentSessionId } } : {}) });
     saveReport(); event(phase, { passed: true, sameWorker: true, sameFakeCli: true, launches: 1 });
 
     // A successful first replacement must also admit a NEW independent worker,
     // otherwise a restrictive outer Job can leave the new GUI unable to work.
+    if (!options.managedChild) {
     phase = 'new-task-after-update'; event(phase);
     writeNew(path.join(successorWorkspace, 'keep-running'), 'owned successor task\n');
     await currentPage.connection.evaluate(`(async()=>{
@@ -736,6 +874,7 @@ export async function runSmoke(options) {
     await assertProcesses(workerBefore);
     report.results.push({ scenario: 'new-task-after-update', passed: true, ...successor, usesCommittedExecutable: true });
     saveReport(); event(phase, { passed: true });
+    }
 
     if (options.rollback !== false) {
       phase = 'candidate-health-rollback'; event(phase, { nativeHealthDeadlineMs: 120_000 });
@@ -766,6 +905,7 @@ export async function runSmoke(options) {
       requireThat(!afterProcesses.some(item => [previousHost.pid, rejectedPage.host.pid].includes(item.pid)), 'retired-host-alive', 'A retired fixture host remained alive after rollback');
       await assertProcesses(workerBefore);
       const remoteAfterRollback = await assertRemote(currentPage, remoteAfterGood.helloCount + 1, beforeBad.text);
+      const rolledBackBranch = options.managedChild ? await assertManagedBranch() : null;
       const badReceipt = await mcpReceipt(badRelease);
       requireThat(badReceipt.accepted === true && badReceipt.transactionId === badTransaction.id,
         'mcp-acceptance', 'Originating task lost the failed candidate preparation result');
@@ -776,16 +916,31 @@ export async function runSmoke(options) {
       report.results.push({ scenario: 'candidate-health-rollback', passed: true, transactionId: badTransaction.id,
         phase: rolledBack.transaction.phase, failureReason: rolledBack.transaction.failureReason,
         before: summarize({ host: previousHost }, beforeBad), after: summarize(currentPage, afterRollback),
-        remoteAfter: remoteAfterRollback, initiatedByTaskMcp: true, taskConfirmedRollback: true });
+        remoteAfter: remoteAfterRollback, initiatedByTaskMcp: true, taskConfirmedRollback: true,
+        ...(rolledBackBranch ? { managedBranch: { id: rolledBackBranch.id, runId: rolledBackBranch.runId,
+          sessionId: rolledBackBranch.sessionId, parentSessionId: rolledBackBranch.parentSessionId } } : {}) });
       saveReport(); event(phase, { passed: true, sameWorker: true, sameFakeCli: true, launches: 1 });
     } else {
       report.results.push({ scenario: 'candidate-health-rollback', passed: null, reason: 'Explicit --no-rollback selection' });
     }
 
     phase = 'final-drain';
-    fs.unlinkSync(inside(root, path.join(workspace, 'keep-running')));
+    if (options.managedChild) {
+      phase = 'managed-child-stop'; event(phase);
+      // Quiesce only fake output (not its process or reader) to make the final
+      // emitted-frame count exact across an asynchronous real Interrupt.
+      writeNew(path.join(taskOutput, 'pause-before-stop'), 'fixture output gate\n');
+      await wait('managed fake output paused', 10_000, async () => fs.existsSync(path.join(taskOutput, 'paused-for-stop')));
+      writeMcpCommand({ id: 'managed-child-stop', action: 'stop', branchId: managedBranch.id });
+      await mcpReceipt('managed-child-stop');
+      await assertManagedBranch('stopped');
+      await wait('managed child registration retired', 30_000, async () => currentPage.connection.evaluate(
+        `window.__TAURI_INTERNALS__.invoke('active_run_ids',{runIds:[${JSON.stringify(managedBranch.runId)}]}).then(ids=>ids.length===0)`));
+      requireThat(fs.existsSync(path.join(taskOutput, 'keep-running')), 'managed-cancel', 'Child lifetime marker was removed instead of cancelling through MCP');
+      report.results.push({ scenario: 'managed-child-stop', passed: true, branchId: managedBranch.id, viaParentTaskMcp: true, registryRetired: true });
+    } else fs.unlinkSync(inside(root, path.join(workspace, 'keep-running')));
     await wait('fake CLI clean exit', 20_000, async () => !(await inventory()).some(item => item.pid === workerBefore.fakePid && item.started === workerBefore.fakeStarted));
-    const finalCount = Number(fs.readFileSync(path.join(workspace, 'emitted.seq'), 'utf8').trim());
+    const finalCount = Number(fs.readFileSync(path.join(taskOutput, 'emitted.seq'), 'utf8').trim());
     const final = await wait('complete final GUI stream', 30_000, async () => {
       const value = await snapshot(currentPage);
       if (!value.ready || value.streaming || !value.text) return null;
@@ -861,7 +1016,7 @@ export async function runSmoke(options) {
 if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
   try {
     const options = parseArgs(process.argv.slice(2));
-    if (options.help) console.log('node scripts/test-live-update-smoke.mjs --exe <cargo-built-debug-test-harness.exe> --url http://localhost:1420 [--resources <resource-tree>] [--artifacts <artifact-parent>] [--no-rollback]');
+    if (options.help) console.log('node scripts/test-live-update-smoke.mjs --exe <cargo-built-debug-test-harness.exe> --url http://localhost:1420 [--resources <resource-tree>] [--artifacts <artifact-parent>] [--no-rollback] [--managed-child --no-rollback]');
     else process.exitCode = (await runSmoke(options)).exitCode;
   } catch (error) {
     console.error(JSON.stringify({ event: 'live-update-smoke', status: 'failed', code: error.code ?? 'setup', message: String(error.message ?? error).slice(0, 1200) }));

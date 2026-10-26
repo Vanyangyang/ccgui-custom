@@ -86,6 +86,12 @@ export async function prepareLiveUpdateBootstrap(): Promise<() => Promise<void>>
             const { prewarmHostChatBridges } = await import("@/features/plugins/runtime/loader");
             await prewarmHostChatBridges(ids);
           }
+          const { pendingHostTaskPluginIds } = await import("@/features/plugins/runtime/task-bridge");
+          const taskIds = pendingHostTaskPluginIds(recovery.checkpoint);
+          if (taskIds.length) {
+            const { prewarmHostTaskBridges } = await import("@/features/plugins/runtime/loader");
+            await prewarmHostTaskBridges(taskIds);
+          }
         }
         await awaitRuntimeCheckpointReady();
         lastError = undefined;

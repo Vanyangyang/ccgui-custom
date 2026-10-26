@@ -1,6 +1,7 @@
 import { resolveFilePath } from "@/lib/fileLinks";
 import { ipc, type FileIndexEntry } from "@/lib/ipc";
 import { fileName, joinPath, parentPath } from "@/features/files/store";
+import { distinctProjectRoots } from "@/features/files/project-roots";
 
 /**
  * Canonical form for comparing two paths: forward slashes (Windows accepts
@@ -49,18 +50,18 @@ export function isPathUnder(path: string, root: string): boolean {
  * `release/app.exe` must not silently bind to `dist/app.exe`: only an
  * unambiguous suffix match counts.
  */
-function matchBySuffix(entries: FileIndexEntry[], key: string): FileIndexEntry | null {
+function matchBySuffix(entries: FileIndexEntry[], key: string): FileIndexEntry[] {
   const wanted = key.toLowerCase();
   const matches = entries.filter((entry) => {
     const rel = pathKey(entry.rel);
     return rel === wanted || rel.endsWith(`/${wanted}`);
   });
-  return matches.length === 1 ? matches[0] : null;
+  return matches;
 }
 
-async function findByIndex(root: string, rel: string): Promise<string | null> {
+async function findByIndex(root: string, rel: string): Promise<string[]> {
   const segments = rel.split("/").filter(Boolean);
-  if (segments.length === 0) return null;
+  if (segments.length === 0) return [];
   // Longest suffix first; a bare basename only as the last resort, and only
   // when it is unambiguous (matchBySuffix enforces that).
   const keys = segments.length > 1 ? [rel, segments[segments.length - 1]] : [rel];
@@ -70,13 +71,13 @@ async function findByIndex(root: string, rel: string): Promise<string | null> {
     // normal index cannot see them, so ask for the ignored files too.
     entries = await ipc.listFileIndex(root, true);
   } catch {
-    return null;
+    return [];
   }
   for (const key of keys) {
     const match = matchBySuffix(entries, key);
-    if (match) return joinPath(root, match.rel);
+    if (match.length) return match.map((entry) => joinPath(root, entry.rel));
   }
-  return null;
+  return [];
 }
 
 /**
@@ -104,6 +105,7 @@ async function findByIndex(root: string, rel: string): Promise<string | null> {
 export async function resolveChatFileLink(
   rawPath: string,
   workspacePath: string,
+  projectRoots: readonly string[] = [],
 ): Promise<string | null> {
   const candidate = resolveFilePath(rawPath, workspacePath);
   if (!candidate) return null;
@@ -112,5 +114,17 @@ export async function resolveChatFileLink(
   if (await existsInParent(candidate)) return candidate;
   const trimmedRoot = root.replace(/\\/g, "/").replace(/\/+$/, "");
   const rel = candidate.replace(/\\/g, "/").slice(trimmedRoot.length).replace(/^\/+/, "");
-  return (await findByIndex(root, rel)) ?? candidate;
+  const local = await findByIndex(root, rel);
+  if (local.length) return local.length === 1 ? local[0] : candidate;
+  // Absolute links never acquire a different meaning from project membership.
+  if (/^(?:[a-z]:[/\\]|\/)/i.test(rawPath.trim())) return candidate;
+  const alternatives = distinctProjectRoots(projectRoots.map((path) => ({ path })))
+    .filter((entry) => !isUnder(entry.path, root));
+  const matches = await Promise.all(alternatives.map(async ({ path }) => {
+    const direct = joinPath(path, rel);
+    if (await existsInParent(direct)) return [direct];
+    return findByIndex(path, rel);
+  }));
+  const found = [...new Set(matches.flat())];
+  return found.length === 1 ? found[0] : candidate;
 }

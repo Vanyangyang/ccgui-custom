@@ -2,14 +2,51 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { HostChatTarget, HostChatSession, HostChatReceipt } from "@ccgui/plugin-sdk";
 import type { EngineEventPayload } from "@/lib/events";
 import { HostChatBusyError } from "@/features/chat/store/types";
-import { createHostChatBridge, hostChatCheckpointId, hostChatLedgerKey, pendingHostChatPluginIds, type HostChatFacade } from "./chat-bridge";
+import { createHostChatBridge, desktopChatFacade, hostChatCheckpointId, hostChatLedgerKey, pendingHostChatPluginIds, type HostChatFacade } from "./chat-bridge";
 import { createRuntimeCheckpointCoordinator, type RuntimeCheckpoint } from "@/lib/runtime-checkpoint";
+import type { ChatStore } from "@/features/chat/store/types";
+import { EMPTY_SESSION } from "@/features/chat/store/stream";
+import { sessionKey } from "@/features/chat/store/persistence";
+
+const desktop = vi.hoisted(() => ({ state: {} as ChatStore, listSessions: vi.fn() }));
+vi.mock("@/features/chat/store", async () => ({
+  sessionKey: (await import("@/features/chat/store/persistence")).sessionKey,
+  useChatStore: { getState: () => desktop.state },
+}));
+vi.mock("@/lib/ipc", () => ({ ipc: { listSessions: desktop.listSessions } }));
+vi.mock("@/lib/transport", async (original) => ({ ...await original<typeof import("@/lib/transport")>(), isWeb: false }));
 
 const bridges: Array<ReturnType<typeof createHostChatBridge>> = [];
 afterEach(() => { bridges.splice(0).forEach((bridge) => bridge.dispose()); });
 const a: HostChatTarget = { client: "ccgui", engine: "claude", nativeSessionId: "11111111-1111-1111-1111-111111111111",
   guiSessionId: "11111111-1111-1111-1111-111111111111", workspacePath: "G:/one", clientInstanceId: "desktop-1", windowId: "window-1" };
 const b: HostChatTarget = { ...a, nativeSessionId: "22222222-2222-2222-2222-222222222222", guiSessionId: "22222222-2222-2222-2222-222222222222", workspacePath: "G:/two" };
+
+describe("desktop facade cost approval", () => {
+  it.each([
+    ["claude", "saved-model", 43920, false, false],
+    ["claude", "saved-model", 49999, false, false],
+    ["claude", "saved-model", 50000, false, true],
+    ["codex", "gpt-6-astra", 90000, false, false],
+    ["claude", "saved-model", 43920, true, true],
+    ["codex", "gpt-6-astra", 43920, true, true],
+  ] as const)("uses shared policy for %s/%s, %i tokens, mismatch=%s", async (engine, model, used, mismatch, approval) => {
+    const facade = await desktopChatFacade();
+    const target = { ...a, engine, ...facade.identity };
+    const meta = { engine, sessionId: target.nativeSessionId, workspacePath: target.workspacePath, model, promptCache: null };
+    const usage = engine === "codex" ? { info: { last_token_usage: { input_tokens: used } } } : { input_tokens: used };
+    desktop.state = {
+      initialized: true, archivedSessionKeys: {}, models: { [engine]: model }, sessions: [meta],
+      openTabs: [{ ...meta }],
+      bySession: { [sessionKey(engine, meta.sessionId, meta.workspacePath)]: {
+        ...EMPTY_SESSION, usage, messages: [{ model: mismatch ? "old-model" : model, usage }],
+      } },
+    } as unknown as ChatStore;
+    desktop.listSessions.mockResolvedValue([meta]);
+    expect(facade.inspect(target)?.status).toBe("idle");
+    expect(await facade.requiresCostApproval!(target)).toBe(approval);
+  });
+});
 
 function coordinator(snapshot?: RuntimeCheckpoint) {
   const checkpoint = createRuntimeCheckpointCoordinator();

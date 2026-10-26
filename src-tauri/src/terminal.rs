@@ -190,6 +190,28 @@ pub async fn kill_all(registry: &TerminalRegistry) {
 /// reader thread, so unbounded tabs would leak real resources.
 const MAX_TERMINAL_SESSIONS: usize = 32;
 
+/// Keep creation and insertion under the registry lock. Close/kill_all must
+/// observe an in-progress open before they can remove its resulting session.
+/// The generic factory lets lifecycle tests use fake sessions, never shells.
+async fn open_registered_session<T, R>(
+    registry: &Mutex<HashMap<String, Arc<T>>>,
+    id: &str,
+    create: impl FnOnce() -> Result<(Arc<T>, R), String>,
+) -> Result<Option<(Arc<T>, R)>, String> {
+    let mut sessions = registry.lock().await;
+    if sessions.contains_key(id) {
+        return Ok(None);
+    }
+    if sessions.len() >= MAX_TERMINAL_SESSIONS {
+        return Err(format!(
+            "terminal session limit ({MAX_TERMINAL_SESSIONS}) reached; close one first"
+        ));
+    }
+    let (session, resource) = create()?;
+    sessions.insert(id.to_owned(), Arc::clone(&session));
+    Ok(Some((session, resource)))
+}
+
 #[tauri::command]
 pub async fn terminal_open(
     id: String,
@@ -202,18 +224,28 @@ pub async fn terminal_open(
     if id.is_empty() {
         return Err("terminal id is required".to_string());
     }
-    {
-        let sessions = state.terminals.lock().await;
-        if sessions.contains_key(&id) {
-            return Ok(());
-        }
-        if sessions.len() >= MAX_TERMINAL_SESSIONS {
-            return Err(format!(
-                "terminal session limit ({MAX_TERMINAL_SESSIONS}) reached; close one first"
-            ));
-        }
+    let created = open_registered_session(&state.terminals, &id, || {
+        create_terminal_session(&cwd, cols, rows)
+    })
+    .await?;
+    if let Some((session, reader)) = created {
+        spawn_reader(
+            Arc::clone(&state.terminal_sink),
+            Arc::clone(&state.terminals),
+            id,
+            session,
+            reader,
+        );
     }
-    let cwd_path = std::path::Path::new(&cwd);
+    Ok(())
+}
+
+fn create_terminal_session(
+    cwd: &str,
+    cols: u16,
+    rows: u16,
+) -> Result<(Arc<TerminalSession>, Box<dyn Read + Send>), String> {
+    let cwd_path = std::path::Path::new(cwd);
     if !cwd_path.is_dir() {
         return Err(format!("terminal cwd does not exist: {cwd}"));
     }
@@ -231,7 +263,9 @@ pub async fn terminal_open(
     let mut cmd = CommandBuilder::new(resolve_shell_path());
     if let Some(env) = crate::development_profile::child_environment() {
         cmd.env_clear();
-        for (key, value) in env { cmd.env(key, value); }
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
     }
     cmd.cwd(cwd_path);
     // `-i` for an interactive shell (aliases, prompt). N/A for cmd.exe.
@@ -244,10 +278,8 @@ pub async fn terminal_open(
     cmd.env("LC_ALL", &locale);
     cmd.env("LC_CTYPE", &locale);
 
-    let child = pair
-        .slave
-        .spawn_command(cmd)
-        .map_err(|e| format!("failed to spawn shell: {e}"))?;
+    // Acquire every fallible PTY handle before starting the shell: an error
+    // after spawn must never drop an untracked, still-running child.
     let reader = pair
         .master
         .try_clone_reader()
@@ -256,6 +288,10 @@ pub async fn terminal_open(
         .master
         .take_writer()
         .map_err(|e| format!("failed to open pty writer: {e}"))?;
+    let child = pair
+        .slave
+        .spawn_command(cmd)
+        .map_err(|e| format!("failed to spawn shell: {e}"))?;
 
     let session = Arc::new(TerminalSession {
         master: Mutex::new(pair.master),
@@ -263,24 +299,7 @@ pub async fn terminal_open(
         child: Mutex::new(child),
     });
 
-    {
-        let mut sessions = state.terminals.lock().await;
-        // Lost a concurrent open race: keep the existing session.
-        if sessions.contains_key(&id) {
-            drop(sessions);
-            kill_session(session).await;
-            return Ok(());
-        }
-        sessions.insert(id.clone(), Arc::clone(&session));
-    }
-    spawn_reader(
-        Arc::clone(&state.terminal_sink),
-        Arc::clone(&state.terminals),
-        id,
-        session,
-        reader,
-    );
-    Ok(())
+    Ok((session, reader))
 }
 
 #[tauri::command]
@@ -349,3 +368,6 @@ pub async fn terminal_close(id: String, state: State<'_, AppState>) -> Result<()
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

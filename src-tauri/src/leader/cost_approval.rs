@@ -15,6 +15,47 @@ pub struct TaskCostApproval {
 
 // Fixed safety allowance for starting the next request, not measured latency.
 const CACHE_START_SAFETY_MARGIN_MS: i64 = 10_000;
+const MIN_COST_APPROVAL_TOKENS: u64 = 50_000;
+
+pub(super) struct SmallContextEvidence {
+    source: (String, Option<String>),
+}
+
+// Only per-request/current-context counts can establish the small-context
+// exemption. Session billing totals and missing/malformed counts cannot.
+fn context_tokens(engine: &str, usage: &Value) -> Option<u64> {
+    let counts = match engine {
+        "claude" => usage,
+        "codex" if usage["usage_scope"] == "last_request" => usage,
+        "codex" => usage.get("info").unwrap_or(usage).get("last_token_usage")?,
+        "cursor" if usage["context_usage_kind"] == "current_context" => {
+            return usage["context_usage"]["used_tokens"].as_u64();
+        }
+        _ => return None,
+    };
+    let keys: &[&str] = if engine == "claude" {
+        &[
+            "input_tokens",
+            "output_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+        ]
+    } else {
+        // Codex's cached input is already included in input_tokens.
+        &["input_tokens", "output_tokens"]
+    };
+    // Output-only/error reports do not establish prompt occupancy.
+    counts.get("input_tokens")?.as_u64()?;
+    let mut total = 0u64;
+    let mut reported = false;
+    for key in keys {
+        if let Some(value) = counts.get(*key) {
+            total = total.checked_add(value.as_u64()?)?;
+            reported = true;
+        }
+    }
+    (reported && total > 0).then_some(total)
+}
 
 pub(super) fn requires_approval(cache: Option<&CacheWindow>, now: i64) -> bool {
     let Some(cache) = cache else {
@@ -43,6 +84,88 @@ fn held_response(request_id: &str, branch: &LeaderBranch) -> Result<Value, Strin
 }
 
 impl LeaderManager {
+    pub(super) fn small_context_source(
+        &self,
+        branch: &LeaderBranch,
+    ) -> Result<Option<(String, Option<String>)>, String> {
+        self.db
+            .0
+            .lock()
+            .query_row(
+                "SELECT s.file_path,m.model FROM sessions s LEFT JOIN session_models m
+             ON m.engine=s.engine AND m.session_id=s.session_id
+             WHERE s.engine=?1 AND s.session_id=?2 AND s.workspace_path=?3",
+                params![branch.engine, branch.session_id, branch.workspace_path],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+
+    pub(super) fn small_context_still_matches(
+        &self,
+        branch: &LeaderBranch,
+        evidence: &SmallContextEvidence,
+    ) -> Result<bool, String> {
+        Ok(self.small_context_source(branch)?.as_ref() == Some(&evidence.source))
+    }
+
+    /// Read the same native occupancy/history sources used by the conversation
+    /// gauge. Called off the async runtime and without the task-ledger lock.
+    pub(super) fn read_small_context(
+        &self,
+        branch: &LeaderBranch,
+    ) -> Result<Option<SmallContextEvidence>, String> {
+        let (Some(session), Some(model)) = (branch.session_id.as_deref(), branch.model.as_deref())
+        else {
+            return Ok(None);
+        };
+        let Some(source) = self.small_context_source(branch)? else {
+            return Ok(None);
+        };
+        let (path, saved_model) = &source;
+        // Native background tasks need not have a picker preference recorded.
+        // A known conflicting model is not evidence for this continuation.
+        if model.trim().is_empty() || saved_model.as_deref().is_some_and(|saved| saved != model) {
+            return Ok(None);
+        }
+        let used = if branch.engine == "agy" {
+            // AGY's native estimate is current occupancy; last-prompt/billing
+            // counters are not. Reuse compaction handling from the gauge.
+            crate::history::agy::read_native_context(std::path::Path::new(&path))
+                .filter(|context| context.max_tokens.is_some())
+                .and_then(|context| context.estimated_tokens)
+        } else {
+            // Unreadable history is unknown, not a zero-token exemption.
+            let page = crate::history::reader::load_session_page_blocking(
+                &self.db,
+                &branch.engine,
+                session,
+                Some(500),
+                None,
+            )
+            .ok();
+            // Do not walk past a newer unknown/malformed sample to grant an
+            // exemption using older, smaller occupancy.
+            page.and_then(|page| {
+                page.messages
+                    .iter()
+                    .rev()
+                    .find(|message| message.usage.is_some())
+                    .filter(|message| {
+                        message
+                            .model
+                            .as_deref()
+                            .is_none_or(|source| source == model)
+                    })
+                    .and_then(|message| context_tokens(&branch.engine, message.usage.as_ref()?))
+            })
+        };
+        Ok(used
+            .filter(|used| *used < MIN_COST_APPROVAL_TOKENS)
+            .map(|_| SmallContextEvidence { source }))
+    }
+
     pub(super) fn send_cache(&self, branch: &LeaderBranch) -> Result<Option<CacheWindow>, String> {
         let cache =
             crate::history::prompt_cache::load_all(&self.db.0.lock()).map_err(|e| e.to_string())?;
@@ -62,6 +185,7 @@ impl LeaderManager {
         cache: Option<CacheWindow>,
     ) -> Result<Value, String> {
         let mut record = self.child(inner, parent, &args.branch_id)?.clone();
+        let frozen = delegation::freeze_request(inner, &record.branch, &args.request_id)?;
         if record
             .branch
             .model
@@ -90,6 +214,7 @@ impl LeaderManager {
             cache,
             model: record.branch.model.clone(),
         });
+        delegation::begin(&mut record.branch, &args.request_id);
         record.output = Output::default();
         record.questions.clear();
         record.plans.clear();
@@ -105,13 +230,19 @@ impl LeaderManager {
             state: "awaiting_cost_approval".into(),
             response: Some(response.clone()),
             error: None,
+            projection: None,
+            projection_invalid: false,
         };
         let mut conn = self.db.0.lock();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
-        write_branch(&tx, &record)?;
+        if let Some(request) = &frozen { write_request(&tx, request)?; }
         write_request(&tx, &request)?;
+        write_branch(&tx, &record)?;
         tx.commit().map_err(|e| e.to_string())?;
         inner.branches.insert(args.branch_id.clone(), record);
+        if let Some(request) = frozen {
+            inner.requests.insert((key(&request.parent), request.request_id.clone()), request);
+        }
         inner
             .requests
             .insert((key(parent), args.request_id.clone()), request);
@@ -143,6 +274,7 @@ impl LeaderManager {
         record.branch.state = "stopped".into();
         record.branch.updated_at = (self.clock)();
         record.branch.error = Some("Cancelled by the user before delivery".into());
+        delegation::sync(&mut record.branch);
         record.dirty = false;
         request.state = "cancelled".into();
         request.error = record.branch.error.clone();
@@ -154,8 +286,8 @@ impl LeaderManager {
         }));
         let mut conn = self.db.0.lock();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
-        write_branch(&tx, &record)?;
         write_request(&tx, &request)?;
+        write_branch(&tx, &record)?;
         tx.commit().map_err(|e| e.to_string())?;
         let branch = record.branch.clone();
         inner.branches.insert(branch_id.into(), record);
@@ -231,11 +363,12 @@ impl LeaderManager {
                     .expect("held approval checked")
                     .model = Some(model);
                 record.branch.updated_at = (self.clock)();
+                delegation::sync(&mut record.branch);
                 request.response = Some(held_response(request_id, &record.branch)?);
                 let mut conn = self.db.0.lock();
                 let tx = conn.transaction().map_err(|e| e.to_string())?;
-                write_branch(&tx, &record)?;
                 write_request(&tx, &request)?;
+                write_branch(&tx, &record)?;
                 tx.commit().map_err(|e| e.to_string())?;
                 inner.branches.insert(branch_id.into(), record);
                 inner

@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import {
   buildCreatorSkillFiles,
@@ -19,6 +19,8 @@ const files = buildCreatorSkillFiles(repoRoot);
 for (const file of files) {
   const target = path.join(repoRoot, CREATOR_SKILL_DIR, file.path);
   mkdirSync(path.dirname(target), { recursive: true });
-  writeFileSync(target, file.content);
+  if (!existsSync(target) || readFileSync(target, "utf8") !== file.content) {
+    writeFileSync(target, file.content);
+  }
   console.log(`wrote ${path.relative(repoRoot, target)} (${file.content.length} bytes)`);
 }

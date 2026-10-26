@@ -17,6 +17,8 @@ use tokio::io::AsyncWriteExt;
 const WORKER: &str = "continuity-worker";
 const RUN: &str = "continuity-run";
 const START: &str = "continuity-start";
+const SESSION: &str = "continuity-session";
+const BRANCH: &str = "continuity-managed-branch";
 
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
@@ -54,11 +56,11 @@ fn isolated_environment(command: &mut ProcessCommand, root: &Path) {
     }
 }
 
-fn start_args(root: &Path) -> StartArgs {
+fn start_args(root: &Path, managed: bool) -> StartArgs {
     StartArgs {
         engine: "claude".into(),
         workspace_path: root.join("ws").to_string_lossy().into_owned(),
-        session_id: None,
+        session_id: managed.then(|| SESSION.into()),
         prompt: "fixture initial task".into(),
         image_paths: None,
         model: None,
@@ -77,7 +79,7 @@ fn write_cli(fixture: &TestHarness) -> PathBuf {
     // A bounded 1 MiB follow-up cannot fit in the CLI stdin pipe while this gate
     // is closed. This creates a real accepted-but-not-completed command, without
     // inserting an execution barrier into production worker code.
-    let initial = json!({"type":"system","subtype":"init","session_id":"continuity-session"});
+    let initial = json!({"type":"system","subtype":"init","session_id":SESSION});
     let delta = json!({"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"before 中文😀"}}});
     let next = json!({"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":" after 中文😀"}}});
     #[cfg(windows)]
@@ -215,11 +217,14 @@ impl Drop for HelperChild {
 #[test]
 #[ignore = "subprocess entry point; outer continuity test invokes it explicitly"]
 fn launcher_helper() {
+    #[cfg(windows)]
+    let _launcher_scope = acquire_launcher_scope().expect("fixture desktop launch scope");
     let root = PathBuf::from(
         std::env::var_os("CCGUI_CONTINUITY_ROOT").expect("fixture-only launcher root"),
     );
     let executable =
         PathBuf::from(std::env::var_os("CCGUI_CONTINUITY_BINARY").expect("fixture-only binary"));
+    let managed = std::env::var("CCGUI_CONTINUITY_MANAGED").as_deref() == Ok("1");
     assert!(root
         .file_name()
         .unwrap()
@@ -271,7 +276,7 @@ fn launcher_helper() {
         token: manifest.token.clone(),
         id: START.into(),
         command: Command::Start {
-            args: start_args(&root),
+            args: start_args(&root, managed),
         },
     };
     let mut stream =
@@ -305,6 +310,83 @@ fn launcher_helper() {
 
 #[test]
 fn independent_worker_survives_parent_and_recovers_exact_receipts_and_events() {
+    worker_continuity(false);
+}
+
+#[test]
+fn managed_child_worker_survives_parent_and_recovers_exact_receipts_and_events() {
+    worker_continuity(true);
+}
+
+#[test]
+fn selected_worker_executable_matches_current_contract() {
+    let fixture = TestHarness::new().unwrap();
+    let root = dunce::canonicalize(fixture.root()).unwrap();
+    // The pure probe works for release executables too: it runs before any
+    // profile initialization and does not require --dev-profile support.
+    continuity_executable(&root, true);
+}
+
+fn continuity_executable(root: &Path, managed: bool) -> PathBuf {
+    let selected = match std::env::var_os("CCGUI_CONTINUITY_TEST_BINARY") {
+        Some(path) => {
+            let path = PathBuf::from(path);
+            assert!(path.is_absolute(), "CCGUI_CONTINUITY_TEST_BINARY must be an explicit absolute executable path");
+            path
+        }
+        None => PathBuf::from(env!("CARGO_BIN_EXE_ccgui-next")),
+    };
+    let executable = dunce::canonicalize(selected).expect("explicit continuity test executable");
+    let mut probe_command = ProcessCommand::new(&executable);
+    isolated_environment(&mut probe_command, root);
+    let output = probe_command.arg("--task-worker-probe").stdin(Stdio::null()).output().expect("continuity executable compatibility probe");
+    assert!(output.status.success(), "continuity executable probe failed");
+    let probe: Value = serde_json::from_slice(&output.stdout).expect("continuity executable probe JSON");
+    assert_eq!(probe["protocol"], PROTOCOL);
+    assert_eq!(probe["checkpointSchema"], 1);
+    assert_eq!(probe["schemaHash"], schema_hash());
+    assert_eq!(probe["capabilities"]["hostChat"], true);
+    if managed { assert_eq!(probe["capabilities"]["managedTaskHandoff"], 1); }
+    executable
+}
+
+fn seed_managed_branch(db: &Db, root: &Path) {
+    // Persist the host's existing branch reservation. This is test data, not a
+    // production admission bypass or an in-memory Leader coordinator.
+    let branch = LeaderBranch {
+        id: BRANCH.into(),
+        parent_engine: "claude".into(),
+        parent_session_id: "continuity-parent-session".into(),
+        workspace_path: root.join("ws").to_string_lossy().into_owned(),
+        engine: "claude".into(),
+        session_id: Some(SESSION.into()),
+        title: "Managed continuity fixture".into(),
+        task: "fixture initial task".into(),
+        model: None,
+        effort: None,
+        run_id: Some(RUN.into()),
+        state: "starting".into(),
+        created_at: 1,
+        updated_at: 1,
+        last_activity_at: 1,
+        deadline_at: i64::MAX,
+        expired: false,
+        result: String::new(),
+        result_truncated: false,
+        error: None,
+        cost_approval: None,
+        delegation: None,
+    };
+    db.0.lock().execute(
+        "INSERT INTO leader_branches(id,parent_engine,parent_session_id,workspace_path,engine,session_id,state,record_json,permission)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'manual')",
+        rusqlite::params![branch.id, branch.parent_engine, branch.parent_session_id,
+            branch.workspace_path, branch.engine, branch.session_id, branch.state,
+            serde_json::to_string(&branch).unwrap()],
+    ).unwrap();
+}
+
+fn worker_continuity(managed: bool) {
     let fixture = TestHarness::new().unwrap();
     let root = dunce::canonicalize(fixture.root()).unwrap();
     let profile = root.join("profile");
@@ -312,6 +394,9 @@ fn independent_worker_survives_parent_and_recovers_exact_receipts_and_events() {
     paths::ensure_dirs().unwrap();
     let db = Db::open_at(&paths::db_path()).unwrap();
     initialize_worker_schema(&db).unwrap();
+    if managed {
+        seed_managed_branch(&db, &root);
+    }
     drop(db);
     let fake = write_cli(&fixture);
     std::fs::write(
@@ -320,24 +405,29 @@ fn independent_worker_survives_parent_and_recovers_exact_receipts_and_events() {
     )
     .unwrap();
     std::fs::write(paths::config_path(), b"{}").unwrap();
-    let executable = dunce::canonicalize(env!("CARGO_BIN_EXE_ccgui-next"))
-        .expect("cargo-built actual ccgui-next binary");
+    let executable = continuity_executable(&root, managed);
     let _cleanup = Cleanup {
         root: root.clone(),
         executable: executable.clone(),
     };
     // This socket reserves a fixture-only host-chat URL. The fake CLI never
     // executes MCP tools; protocol/config validation is covered, relay semantics
-    // deliberately are not claimed by this ordinary-worker process test.
+    // deliberately are not claimed by either worker process scenario. The
+    // managed variant tests trusted branch admission and worker continuity,
+    // not host relay MCP calls or GUI Leader projection restoration.
     let host_chat = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let config: WorkerConfig = serde_json::from_value(json!({
+    let mut config_json = json!({
         "protocol":PROTOCOL,"workerId":WORKER,"runId":RUN,"profile":profile,
         "token":"a".repeat(64),"schemaHash":schema_hash(),
-        "hostContext":{"profile":profile,"runId":RUN,"engine":"claude","sessionId":null,
+        "hostContext":{"profile":profile,"runId":RUN,"engine":"claude","sessionId":start_args(&root, managed).session_id,
             "workspacePath":root.join("ws"),"serverConfig":{"command":executable,
                 "args":["--host-chat-mcp","--dev-profile",profile],
                 "env":{"CCGUI_HOST_CHAT_URL":format!("http://127.0.0.1:{}/host-chat",host_chat.local_addr().unwrap().port()),"CCGUI_HOST_CHAT_TOKEN":uuid::Uuid::new_v4().to_string()}}}
-    })).unwrap();
+    });
+    if managed {
+        config_json["hostContext"]["managedBranchId"] = json!(BRANCH);
+    }
+    let config: WorkerConfig = serde_json::from_value(config_json).unwrap();
     std::fs::write(
         root.join("worker-config.json"),
         serde_json::to_vec(&config).unwrap(),
@@ -349,6 +439,7 @@ fn independent_worker_survives_parent_and_recovers_exact_receipts_and_events() {
         .args(["--exact", "launcher_helper", "--ignored", "--nocapture"])
         .env("CCGUI_CONTINUITY_ROOT", &root)
         .env("CCGUI_CONTINUITY_BINARY", &executable)
+        .env("CCGUI_CONTINUITY_MANAGED", if managed { "1" } else { "0" })
         .stdout(Stdio::null())
         .stderr(Stdio::from(
             std::fs::File::create(root.join("launcher.stderr")).unwrap(),
@@ -380,6 +471,11 @@ fn independent_worker_survives_parent_and_recovers_exact_receipts_and_events() {
             "native CLI died with the launcher"
         );
         let first_client = WorkerClient::new(manifest.clone());
+        let status = first_client
+            .request("check-managed-admission", Command::Status)
+            .await
+            .unwrap();
+        assert_eq!(status["managedTask"], managed);
         let original: Outcome =
             serde_json::from_slice(&std::fs::read(root.join("start-outcome.json")).unwrap())
                 .unwrap();
@@ -388,7 +484,7 @@ fn independent_worker_survives_parent_and_recovers_exact_receipts_and_events() {
                 .request(
                     START,
                     Command::Start {
-                        args: start_args(&root)
+                        args: start_args(&root, managed)
                     }
                 )
                 .await,

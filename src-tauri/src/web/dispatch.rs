@@ -286,7 +286,7 @@ struct PluginExecSpawnArgs {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct PluginCapabilityArgs { plugin_id: String }
+struct PluginExecKillArgs { plugin_id: String, only_exited: Option<bool> }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -362,6 +362,12 @@ struct FetchProviderModelsArgs {
 #[serde(rename_all = "camelCase")]
 struct UpdateSettingsArgs {
     settings: crate::settings::AppSettings,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateCursorModelSelectionArgs {
+    add: Vec<String>,
+    remove: Vec<String>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -468,6 +474,11 @@ struct UsageSummaryArgs {
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct UsageWindowTotalsArgs {
+    windows: Vec<crate::usage::UsageWindowSpan>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct UsageRecordArgs {
     entry: crate::usage::UsageEntry,
 }
@@ -563,6 +574,25 @@ struct PluginAddWorkspaceArgs {
     plugin_id: String,
     path: String,
     meta: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct SaveWorkspaceProjectArgs {
+    input: crate::workspace_projects::ProjectInput,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PublishWorkspaceProjectArgs {
+    plugin_id: String,
+    source_key: String,
+    input: crate::workspace_projects::ProjectInput,
+}
+
+#[derive(Deserialize)]
+struct ImagePreviewGrantArgs {
+    path: String,
+    scope: String,
 }
 
 #[derive(Deserialize)]
@@ -858,6 +888,10 @@ pub(super) async fn dispatch(
             let a: UpdateSettingsArgs = parse_args(&raw)?;
             ser(crate::settings::update_app_settings(app.clone(), a.settings))
         }
+        "update_cursor_model_selection" => {
+            let a: UpdateCursorModelSelectionArgs = parse_args(&raw)?;
+            ser(crate::settings::update_cursor_model_selection(app.clone(), a.add, a.remove))
+        }
         // Engine management always executes on the host, including probes and installers.
         "cli_version_status" => {
             let a: EngineArgs = parse_args(&raw)?;
@@ -933,11 +967,13 @@ pub(super) async fn dispatch(
         }
         "task_snapshot" => ser(crate::leader::snapshot()),
         "task_branch_action" => {
+            let _update_guard = crate::worker_host::task_action_guard().await?;
             let a: LeaderBranchArgs = parse_args(&raw)?;
             ser(crate::leader::branch_action(&app.state::<crate::AppState>().db,
                 a.parent_engine, a.parent_session_id, a.workspace_path, a.branch_id, a.action, a.ttl_seconds).await)
         }
         "task_group_action" => {
+            let _update_guard = crate::worker_host::task_action_guard().await?;
             let a: LeaderGroupArgs = parse_args(&raw)?;
             ser(crate::leader::group_action(&app.state::<crate::AppState>().db,
                 a.engine, a.session_id, a.workspace_path, a.action).await)
@@ -1115,6 +1151,13 @@ pub(super) async fn dispatch(
                 a.tz_offset_minutes,
             ))
         }
+        "usage_window_totals" => {
+            let a: UsageWindowTotalsArgs = parse_args(&raw)?;
+            ser(crate::usage::usage_window_totals(
+                app.state(),
+                a.windows,
+            ))
+        }
         "usage_record" => {
             let a: UsageRecordArgs = parse_args(&raw)?;
             ser(crate::usage::usage_record(
@@ -1244,6 +1287,27 @@ pub(super) async fn dispatch(
             Ok(Value::Null)
         }
         "list_workspaces" => ser(crate::history::reader::list_workspaces(app.state())),
+        "get_session_sidebar_workspaces" => ser(crate::session_sidebar::list(&app.state::<crate::AppState>().db)),
+        "assign_session_sidebar_workspaces" => {
+            let a: crate::session_sidebar::AssignArgs = parse_args(&raw)?;
+            let state = app.state::<crate::AppState>();
+            let result = crate::session_sidebar::assign(&state.db, a.request_id, a.assignments)?;
+            if !result.replayed { state.sink.emit_sessions_changed(); }
+            ser(Ok(result))
+        }
+        "list_workspace_projects" => ser(crate::workspace_projects::list_workspace_projects(app.state())),
+        "save_workspace_project" => {
+            let a: SaveWorkspaceProjectArgs = parse_args(&raw)?;
+            ser(crate::workspace_projects::save_workspace_project(app.state(), a.input))
+        }
+        "remove_workspace_project" => {
+            let a: IdArgs = parse_args(&raw)?;
+            ser(crate::workspace_projects::remove_workspace_project(app.state(), a.id))
+        }
+        "plugin_publish_workspace_project" => {
+            let a: PublishWorkspaceProjectArgs = parse_args(&raw)?;
+            ser(crate::plugin_caps::plugin_publish_workspace_project(app.state(), a.plugin_id, a.source_key, a.input).await)
+        }
         "reorder_workspaces" => {
             let a: IdsArgs = parse_args(&raw)?;
             ser(crate::history::reader::reorder_workspaces(
@@ -1271,6 +1335,10 @@ pub(super) async fn dispatch(
         "read_file" => {
             let a: PathArgs = parse_args(&raw)?;
             ser(crate::files::read_file(app.state(), a.path).await)
+        }
+        "read_preview_image" => {
+            let a: PathArgs = parse_args(&raw)?;
+            ser(crate::image_preview::read_preview_image(app.state(), a.path).await)
         }
         "write_file" => {
             let a: WriteFileArgs = parse_args(&raw)?;
@@ -1434,6 +1502,15 @@ pub(super) async fn dispatch(
             ser(crate::files::grant_root(app.state(), a.path))
         }
         "list_granted_roots" => ser(crate::files::list_granted_roots(app.state())),
+        "list_image_preview_grants" => ser(crate::image_preview::list_image_preview_grants(app.state())),
+        "image_preview_scope" => {
+            let a: PathArgs = parse_args(&raw)?;
+            ser(crate::image_preview::image_preview_scope(a.path))
+        }
+        "revoke_image_preview_grant" => {
+            let a: ImagePreviewGrantArgs = parse_args(&raw)?;
+            ser(crate::image_preview::revoke_image_preview_grant(app.state(), a.path, a.scope))
+        }
         "revoke_granted_root" => {
             let a: GrantPathArgs = parse_args(&raw)?;
             ser(crate::files::revoke_granted_root(app.state(), a.path))
@@ -1611,7 +1688,7 @@ pub(super) async fn dispatch(
         "plugin_list" => ser(crate::plugins::plugin_list(app.state())),
         "plugin_install_from_path" => {
             let a: PluginInstallPathArgs = parse_args(&raw)?;
-            ser(crate::plugins::plugin_install_from_path(app.state(), a.path, a.request_id).await)
+            ser(crate::plugins::plugin_install_from_path(app.clone(), app.state(), a.path, a.request_id, None, None, None).await)
         }
         "plugin_install_from_marketplace" => {
             let a: PluginInstallMarketArgs = parse_args(&raw)?;
@@ -1619,15 +1696,15 @@ pub(super) async fn dispatch(
         }
         "plugin_set_enabled" => {
             let a: PluginEnabledArgs = parse_args(&raw)?;
-            ser(crate::plugins::plugin_set_enabled(app.state(), a.id, a.enabled))
+            ser(crate::plugins::plugin_set_enabled(app.clone(), app.state(), a.id, a.enabled))
         }
         "plugin_uninstall" => {
             let a: PluginUninstallArgs = parse_args(&raw)?;
-            ser(crate::plugins::plugin_uninstall(app.state(), app.state(), a.id, a.delete_data))
+            ser(crate::plugins::plugin_uninstall(app.clone(), app.state(), app.state(), a.id, a.delete_data))
         }
         "plugin_reload" => {
             let a: PluginIdArgs = parse_args(&raw)?;
-            ser(crate::plugins::plugin_reload(app.state(), a.id))
+            ser(crate::plugins::plugin_reload(app.clone(), app.state(), a.id, None, None, None, None))
         }
         "creator_skill_install" => Ok(serde_json::json!(crate::creator_skill::creator_skill_install(app.clone()))),
         "plugin_read_artwork" => {
@@ -1652,6 +1729,7 @@ pub(super) async fn dispatch(
         }
         // All egress goes through enabled/manifest grant checks in plugin_caps;
         // interrupt and cleanup also retain native plugin ownership checks.
+        "plugin_fixed_instructions_supported" => Ok(serde_json::json!(crate::plugin_caps::plugin_fixed_instructions_supported())),
         "plugin_agent_start" => {
             let a: PluginAgentStartArgs = parse_args(&raw)?;
             ser(crate::plugin_caps::plugin_agent_start(app.clone(), a.plugin_id,
@@ -1675,8 +1753,8 @@ pub(super) async fn dispatch(
             ser(crate::plugin_caps::plugin_exec_spawn(a.plugin_id, a.bin, a.args, a.env, a.lifecycle).await)
         }
         "plugin_exec_kill" => {
-            let a: PluginCapabilityArgs = parse_args(&raw)?;
-            ser(crate::plugin_caps::plugin_exec_kill(a.plugin_id).await)
+            let a: PluginExecKillArgs = parse_args(&raw)?;
+            ser(crate::plugin_caps::plugin_exec_kill(a.plugin_id, a.only_exited).await)
         }
         // Marketplace browsing is read-only too, so the web client renders
         // the market page; installation uses the host lifecycle routes above.
@@ -1696,6 +1774,7 @@ pub(super) async fn dispatch(
 fn collaboration_write_required(command: &str) -> Option<bool> {
     match command {
         "active_run_ids" | "task_snapshot" | "list_plan_reviews" | "mcp_inventory" | "skills_hub_query"
+        | "list_workspace_projects" | "get_session_sidebar_workspaces" | "list_image_preview_grants" | "image_preview_scope" | "read_preview_image"
         | "grant_scope" | "list_granted_roots" | "plugin_list" | "plugin_read_artwork"
         | "plugin_read_file" | "plugin_storage_get"
         | "cli_version_status" | "cli_update_plan" | "cli_update_snapshot"
@@ -1703,6 +1782,7 @@ fn collaboration_write_required(command: &str) -> Option<bool> {
         | "claude_quota_read" | "codex_quota_read" | "codex_context_window_read" | "agy_quota_read" | "agy_vertex_credits_read" | "throughput_stats_read" | "git_worktree_list" | "git_worktree_creation_snapshot"
         | "git_branch_merged" | "git_resolve_pr" | "remote_control_active" => Some(false),
         "runtime_worker_start" | "runtime_worker_control" | "runtime_worker_plan_review"
+        | "save_workspace_project" | "assign_session_sidebar_workspaces" | "remove_workspace_project" | "plugin_publish_workspace_project" | "revoke_image_preview_grant"
         | "task_branch_action" | "task_group_action"
         | "respond_plan_review" | "add_workspace" | "plugin_add_workspace" | "mcp_set_enabled"
         | "mcp_probe" | "skills_hub_mutate" | "grant_root" | "revoke_granted_root"
@@ -1771,6 +1851,11 @@ mod follow_up_args_tests {
         let db = crate::db::Db::open_at(std::path::Path::new(":memory:")).unwrap();
         let commands = [
             ("active_run_ids", false),
+            ("list_workspace_projects", false), ("save_workspace_project", true),
+            ("get_session_sidebar_workspaces", false), ("assign_session_sidebar_workspaces", true),
+            ("remove_workspace_project", true), ("plugin_publish_workspace_project", true),
+            ("list_image_preview_grants", false), ("image_preview_scope", false),
+            ("read_preview_image", false), ("revoke_image_preview_grant", true),
             ("task_snapshot", false), ("task_branch_action", true),
             ("task_group_action", true), ("list_plan_reviews", false),
             ("respond_plan_review", true), ("runtime_worker_plan_review", true), ("mcp_inventory", false), ("mcp_set_enabled", true),
@@ -1997,11 +2082,15 @@ mod follow_up_args_tests {
         assert_eq!((spawn.plugin_id.as_str(),spawn.bin.as_str()), ("tools","node"));
         assert!(spawn.args.is_empty() && spawn.env.is_none());
         assert_eq!(spawn.lifecycle.as_deref(), Some("plugin"));
-        let kill: PluginCapabilityArgs = parse_args(&json!({"pluginId":"tools"})).unwrap();
+        let kill: PluginExecKillArgs = parse_args(&json!({"pluginId":"tools"})).unwrap();
         assert_eq!(kill.plugin_id, "tools");
+        assert_eq!(kill.only_exited, None);
+        let reap: PluginExecKillArgs = parse_args(&json!({"pluginId":"tools","onlyExited":true})).unwrap();
+        assert_eq!(reap.only_exited, Some(true));
         assert!(parse_args::<PluginExecRunArgs>(&json!({"pluginId":"tools","bin":"node","args":[],"timeoutMs":-1})).is_err());
         assert!(parse_args::<PluginExecSpawnArgs>(&json!({"pluginId":"tools","bin":"node"})).is_err());
-        assert!(parse_args::<PluginCapabilityArgs>(&json!({"pluginId":"tools","pid":42})).is_err());
+        assert!(parse_args::<PluginExecKillArgs>(&json!({"pluginId":"tools","pid":42})).is_err());
+        assert!(parse_args::<PluginExecKillArgs>(&json!({"pluginId":"tools","onlyExited":"true"})).is_err());
     }
 
     #[test]

@@ -395,9 +395,9 @@ export const builtinSearchEntries: SettingsSearchEntry[] = [
 
   ...ENGINE_IDS.flatMap(cliPageEntries),
 
-  ...(!isWeb ? ["enabled", "sources", "observerEnabled", "paused", "focusMode", "observerModel", "observerEffort", "voiceEnabled", "displayTarget", "bodyTextPercent", "titleTextPercent", "interfaceTextPercent"].map(anchor => ({
+  ...(!isWeb ? ["enabled", "sources", "observerEnabled", "paused", "focusMode", "observerModel", "observerEffort", "voiceEnabled", "completionAudioMode", "chimeVolume", "voiceVolume", "quietHours", "displayTarget", "bodyTextPercent", "titleTextPercent", "interfaceTextPercent"].map(anchor => ({
     page: "assistantNotices", anchor, labelKey: `assistantNotices.${anchor}`, sectionKey: "assistantNotices.title",
-    keywords: ["assistant", "aside", "reminder", "voice", "助手", "旁白", "播报"],
+    keywords: ["assistant", "aside", "reminder", "voice", "chime", "sound", "volume", "preview", "quiet", "助手", "旁白", "播报", "提示音", "人声", "音量", "试听", "静音"],
   })) : []),
 
   ...agentsPromptsEntries,

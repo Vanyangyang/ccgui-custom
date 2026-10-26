@@ -1,7 +1,7 @@
 //! MCP 连接检测：按配置真的连一次，做 `initialize` + `tools/list` 握手。
 //!
-//! 这是显式动作（UI 上的「检测」/「检测全部」）：stdio 服务会被拉起来，
-//! `npx` 可能顺带下载包，所以不在打开页面时自动执行。结果只说明「本应用
+//! 设置页和 MCP 面板打开时会自动检测，也支持「检测」/「检测全部」；前端
+//! 复用新鲜结果。stdio 服务会被拉起来，`npx` 可能顺带下载包。结果只说明「本应用
 //! 此刻能连上并握手成功」，与某个 CLI 会话里报告的连接状态分开表达。
 //!
 //! 安全边界：目标命令、参数、环境变量与请求头一律从配置文件重新解析
@@ -101,7 +101,7 @@ impl Default for McpProbeResult {
     }
 }
 
-/// 检测一台 MCP 服务：显式动作，不缓存结果（UI 自己保存展示状态）。
+/// 检测一台 MCP 服务：供自动与手动检测调用，不缓存结果（UI 保存结果与新鲜度）。
 #[tauri::command]
 pub(crate) async fn mcp_probe(
     db: tauri::State<'_, std::sync::Arc<crate::db::Db>>,
@@ -148,10 +148,16 @@ async fn probe_stdio_within(target: &ProbeTarget, timeout: Duration) -> McpProbe
     // 自己的进程组：npx / uvx 还会再拉子进程，收尾时要整组杀掉。
     #[cfg(unix)]
     cmd.process_group(0);
+    #[cfg(windows)]
+    crate::engine::hide_console(&mut cmd);
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(error) => return McpProbeResult::failed(format!("启动失败：{error}")),
     };
+    // A wrapper may exit while its MCP child still owns stdout. Keep the tree
+    // owned across handshake timeout and future cancellation, not just taskkill.
+    #[cfg(windows)]
+    let _tree_guard = crate::engine::job::assign_kill_on_close(&child);
     let pid = child.id().unwrap_or(0);
     let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
         finish_process(pid, &mut child).await;

@@ -3,10 +3,13 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AppSettings, EngineCatalog } from "@/lib/ipc";
 
-const { refreshAppSettings, updateAppSettings, listEngineModels } = vi.hoisted(() => ({
-  refreshAppSettings: vi.fn(), updateAppSettings: vi.fn(), listEngineModels: vi.fn(),
+const { refreshAppSettings, updateAppSettings, updateCursorModelSelection, listEngineModels, settingsListeners } = vi.hoisted(() => ({
+  refreshAppSettings: vi.fn(), updateAppSettings: vi.fn(), updateCursorModelSelection: vi.fn(), listEngineModels: vi.fn(), settingsListeners: new Set<() => void>(),
 }));
-vi.mock("@/lib/ipc", () => ({ ipc: { refreshAppSettings, updateAppSettings, listEngineModels } }));
+vi.mock("@/lib/ipc", () => ({ ipc: { refreshAppSettings, updateAppSettings, updateCursorModelSelection, listEngineModels } }));
+vi.mock("@/lib/events", () => ({ listenSettingsChanged: async (callback: () => void) => {
+  settingsListeners.add(callback); return () => settingsListeners.delete(callback);
+} }));
 import i18n from "@/lib/i18n";
 import { LeaderSection } from "./LeaderSection";
 import { CLI_DISPLAY_NAMES } from "@/components/foundations/icons/engine-brands";
@@ -66,6 +69,12 @@ beforeEach(() => {
   stored = makeSettings();
   refreshAppSettings.mockReset().mockImplementation(async () => stored);
   updateAppSettings.mockReset().mockImplementation(async (settings: AppSettings) => { stored = settings; });
+  updateCursorModelSelection.mockReset().mockImplementation(async (add: string[], remove: string[]) => {
+    const cursor = [...new Set([...(stored.leaderAllowedModels?.cursor ?? []).map(id => id.trim()), ...add])]
+      .filter(id => !remove.includes(id) && !["auto", "default"].includes(id.toLowerCase()));
+    stored = { ...stored, leaderAllowedModels: { ...stored.leaderAllowedModels, cursor } };
+    return cursor;
+  });
   listEngineModels.mockReset().mockImplementation(async (engine: string) => catalog(engine === "claude" ? ["catalog-first", "default-claude"] : engine === "agy" ? ["gemini-3.8-flash-high", "claude-opus-4-6"] : ["codex-first", "codex-second"]));
   container = document.createElement("div"); document.body.appendChild(container);
   root = createRoot(container); unmounted = false;
@@ -126,11 +135,43 @@ describe("LeaderSection", () => {
     await click(mode("codex", "disabled")); await save();
     expect(stored.leaderAllowedModels?.cursor).toEqual(cursor);
   });
+  it("reflects composer selections while preserving other unsaved policy edits", async () => {
+    stored = makeSettings({ leaderAllowedModels: { cursor: ["cursor-one"] } });
+    listEngineModels.mockImplementation(async () => catalog(["cursor-one", "cursor-two"]));
+    await render();
+    await click(mode("codex", "disabled"));
+    await act(async () => {
+      stored = { ...stored, leaderAllowedModels: { ...stored.leaderAllowedModels, cursor: ["cursor-two"] } };
+      settingsListeners.forEach(callback => callback());
+    });
+    expect(choice("cursor-one").checked).toBe(false);
+    // The catalog is also visible for other engines; inspect Cursor's label.
+    const cursorTwo = container.querySelector<HTMLInputElement>(`input[aria-label="${CLI_DISPLAY_NAMES.cursor}: cursor-two"]`)!;
+    expect(cursorTwo.checked).toBe(true);
+    expectMode("codex", "disabled");
+    await save();
+    expect(stored.leaderAllowedModels?.cursor).toEqual(["cursor-two"]);
+  });
+  it("merges a pending Cursor deselection with newly enabled composer models", async () => {
+    stored = makeSettings({ leaderAllowedModels: { cursor: ["cursor-one"] } });
+    listEngineModels.mockImplementation(async (engine: string) => catalog(engine === "cursor" ? ["cursor-one", "cursor-two"] : []));
+    await render();
+    await click(choice("cursor-one"));
+    await act(async () => {
+      stored = { ...stored, leaderAllowedModels: { cursor: ["cursor-one", "cursor-two"] } };
+      settingsListeners.forEach(callback => callback());
+    });
+    expect(choice("cursor-one").checked).toBe(false);
+    expect(choice("cursor-two").checked).toBe(true);
+    await save();
+    expect(updateCursorModelSelection).toHaveBeenLastCalledWith([], ["cursor-one"]);
+    expect(stored.leaderAllowedModels?.cursor).toEqual(["cursor-two"]);
+  });
   it("preserves Cursor draft on save failure and merges only its changed list", async () => {
     stored = makeSettings({ leaderAllowedModels: { cursor: ["saved-cursor"], claude: ["old"] } });
     await render();
     await click(choice("saved-cursor"));
-    updateAppSettings.mockRejectedValueOnce(new Error("write failed"));
+    updateCursorModelSelection.mockRejectedValueOnce(new Error("write failed"));
     await save();
     expect(choice("saved-cursor").checked).toBe(false);
     expect(container.textContent).toContain("write failed");

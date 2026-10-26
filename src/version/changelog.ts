@@ -32,14 +32,30 @@ export const CHANGELOG_DATA: ChangelogEntry[] = [
     version: "1.1.1+protected.35",
     date: "2026-10-21",
     content: {
-      zh: `定制维护版（Windows x64）
+      zh: `源码同步（2026-10-26）
+- 通用插件 SDK 更新至 0.3.28：项目视图、独立窗口、原生任务与讨论会话、图片附件、固定指令、受限记忆提炼及更新前服务关闭协议。
+- 改善跨工作区任务与会话归属、通信队列、上下文/额度展示、终端进程回收和更新检查点恢复。
+- 本次仅同步宿主与通用 SDK 源码，不包含游戏工作台插件、素材或专属验收脚本，也不创建新的安装包或 tag。已有安装包以各自构建记录和校验值为准，不能作为本次全部源码的二进制证明。详见 docs/releases/main-2026-10-26.md。
+
+V3 构建与升级提示
+当前工作树的跨工作区父子任务使用 V3 数据契约，从 V1/V2 升级须结束任务、退出全部实例并安装新构建的完整包。下方记录对应原始公开 protected.35/V2 安装包；原安装包不能完成本地 V3 升级。请以实际构建记录、安装包校验值和协议探针区分相同显示版本号的构建。
+
+原始公开版本记录（Windows x64，V2）
 - **必须完整重启升级**：本版使用 V2 持久化契约，与 protected.34 的 V1 不兼容。请先结束任务、退出全部 CC GUI 实例及相关 worker/supervisor，再运行完整 NSIS 安装包。保留原数据；首次新版启动会受保护地归档旧更新元数据。不能从 V1 无重启热升，也不要绕过 schema hash 校验或直接降回 V1。
 - **交接与子任务上下文**：交接草稿可选择目标工作区，保留人工编辑、引擎与模型选择；受管子任务的状态、结果摘录与待处理事项可进入交接摘要，不转移原有父子管理权限。
 - **发送与任务成本确认**：已有会话咨询和受管任务可进入真实的待成本批准状态，由界面人工批准或取消。普通发送与自动队列派发对达到 50k tokens 的上下文应用相应冷缓存确认规则，普通发送也检查模型变更；小上下文直接放行，未知用量不虚构费用。
 - **图片工具与通信面板**：会话图库支持切换、缩放、旋转、复制和保存；通信面板增加状态/类型筛选与紧凑/详细视图，保留图片批注与失败反馈。
 - **会话可靠性与模型范围**：完善草稿交接、队列控制、Claude/AGY 用量恢复和缓存证据；Cursor 请求遵守已保存的允许模型名单。子任务按实际启动时的模型策略校验。
 - **发行对应关系**：原始安装包对应 GitHub 提交 28dfbbda1，SHA-256 为 ae912a6b180c82627b691d56f2307712a97587b16e082f43417a7105c46d4fc8。本条版本记录为构建后的补记，原始安装包内未包含本条；详见仓库 docs/releases/1.1.1+protected.35.md。`,
-      en: `Maintained custom build (Windows x64)
+      en: `Source synchronization (2026-10-26)
+- Update the general plugin SDK to 0.3.28: project views, detached windows, native tasks and discussion conversations, image attachments, fixed instructions, bounded memory extraction and service shutdown before updates.
+- Improve cross-workspace task and session ownership, communication queues, context/quota presentation, terminal process cleanup and update checkpoint recovery.
+- This synchronization contains host and general SDK source only. It excludes the game workbench plugin, assets and dedicated acceptance scripts, and creates no new installer or tag. Existing installers retain their own build records and checksums and do not prove that they contain every change in this source update. See docs/releases/main-2026-10-26.md.
+
+V3 build and upgrade notice
+Cross-workspace parent/child tasks in this working tree use the V3 data contract. Upgrading from V1/V2 requires finishing tasks, exiting every instance and installing a newly built complete package. The notes below describe the original public protected.35/V2 installer, which cannot perform this local V3 upgrade. Distinguish builds sharing the display version by their build records, installer checksums and protocol probes.
+
+Original public release notes (Windows x64, V2)
 - **Full restart required**: this release uses the V2 persistence contract, incompatible with protected.34/V1. Finish tasks, exit every CC GUI instance and related worker/supervisor, then run the complete NSIS installer. Existing data is retained; the first V2 startup safely archives old update metadata. Do not hot-upgrade from V1, bypass schema-hash checks, or directly downgrade to V1.
 - **Handoff and child-task context**: choose a destination workspace while preserving edited drafts and engine/model selections. Managed child-task status, result excerpts and outstanding work can be included in handoff summaries without transferring parent/child management rights.
 - **Send and task cost review**: saved-chat consultations and managed tasks can enter a real pending-cost-approval state for a human to approve or cancel. Ordinary sends and automatic queue dispatch apply their cold-cache checks to contexts of at least 50k tokens; ordinary sends also check model changes. Smaller contexts pass through, and missing usage never becomes an invented cost.

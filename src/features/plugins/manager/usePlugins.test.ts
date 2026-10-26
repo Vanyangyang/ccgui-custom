@@ -59,7 +59,7 @@ vi.mock("../marketplace/store", () => ({ useMarketplaceStore: { getState: () => 
 vi.mock("@/lib/i18n", () => ({ default: { t: (key: string) => key } }));
 
 // vi.mock calls above are hoisted, so this static import sees the mocks.
-import { stopPluginSync, usePluginsStore } from "./usePlugins";
+import { refreshPluginsAfterMaintenance, stopPluginSync, usePluginsStore } from "./usePlugins";
 
 function info(over: Partial<PluginInfo> = {}): PluginInfo {
   return {
@@ -160,6 +160,38 @@ describe("retry", () => {
 });
 
 describe("shared host changes", () => {
+  it("holds refresh before draining an old pass and coalesces the late mutation event", async () => {
+    await usePluginsStore.getState().refresh(); vi.clearAllMocks();
+    const oldList = Promise.withResolvers<PluginInfo[]>();
+    const native = Promise.withResolvers<void>();
+    const started = Promise.withResolvers<void>();
+    pluginList.mockReturnValueOnce(oldList.promise);
+    const oldPass = usePluginsStore.getState().refresh();
+    await vi.waitFor(() => expect(pluginList).toHaveBeenCalledOnce());
+    // A store subscriber queues work just before the old pass's finally clears
+    // refreshInFlight. This microtask precedes the maintenance await continuation.
+    const boundary = Promise.withResolvers<void>();
+    const unsubscribe = usePluginsStore.subscribe(() => {
+      unsubscribe();
+      queueMicrotask(() => {
+        listeners.get("plugins://changed")!({ payload: { id: "other", reload: false } });
+        boundary.resolve();
+      });
+    });
+    const maintenance = refreshPluginsAfterMaintenance("p", "maintenance-race", async () => { started.resolve(); await native.promise; });
+    await Promise.resolve(); await Promise.resolve();
+    oldList.resolve([info()]); await boundary.promise; await oldPass; await started.promise;
+    const count = synchronizePlugins.mock.calls.length;
+    await Promise.resolve(); await Promise.resolve();
+    expect(synchronizePlugins).toHaveBeenCalledTimes(count);
+    expect(pluginList).toHaveBeenCalledTimes(1);
+    listeners.get("plugins://changed")!({ payload: { id: "p", reload: true, requestId: "maintenance-race" } });
+    native.resolve(); await maintenance;
+    expect(synchronizePlugins.mock.calls.filter(call => (call[2] as Set<string>).has("p"))).toHaveLength(1);
+    listeners.get("plugins://changed")!({ payload: { id: "p", reload: true, requestId: "maintenance-race" } });
+    await usePluginsStore.getState().refresh();
+    expect(synchronizePlugins.mock.calls.filter(call => (call[2] as Set<string>).has("p"))).toHaveLength(1);
+  });
   it("drops a stale snapshot if a disable arrives during the list read", async () => {
     await usePluginsStore.getState().refresh();
     vi.clearAllMocks();

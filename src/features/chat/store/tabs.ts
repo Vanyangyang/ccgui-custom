@@ -1,3 +1,5 @@
+import type { HostLaunchChoices } from "./host-task-selection";
+import type { EffortLevel } from "@/components/application/ai-chat/effort-levels";
 import { writeStored } from "@/lib/storage";
 import {
   ENGINE_PREF_KEY,
@@ -28,6 +30,54 @@ import { hasComposerImageDraft } from "../components/use-composer-images";
 export interface TabDeps {
   set: StoreSet;
   get: StoreGet;
+}
+
+/** Shared check for whether a pending new-chat draft is free for a background
+ *  host task to open or send into. Protects user focus, unsent text/image
+ *  drafts (even when no pending tab is currently open), sidechats, conversation
+ *  modes, and mismatched per-tab starting choices. */
+export function isBackgroundDraftAvailable(
+  s: ChatStore,
+  engine: string,
+  workspacePath: string,
+  launch?: HostLaunchChoices,
+  options?: { requireOpenTab?: boolean; allowDraftLaunchingId?: string },
+): boolean {
+  if (!s.initialized) return false;
+  const key = sessionKey(engine, null, workspacePath);
+  const existing = s.openTabs.find((t) => sameTab(t, engine, null, workspacePath));
+  if (options?.requireOpenTab && !existing) return false;
+  const state = s.bySession?.[key];
+  const sidechat = useSidechatStore.getState();
+  const launching = state?.draftLaunching && state.draftLaunching !== options?.allowDraftLaunchingId;
+  if (
+    (s.active && sameTab(s.active, engine, null, workspacePath)) ||
+    s.drafts?.[key]?.trim() ||
+    hasComposerImageDraft(key) ||
+    state?.streaming ||
+    state?.loading ||
+    launching ||
+    state?.messages?.length ||
+    state?.queue?.length ||
+    s.streamingByKey?.[key] ||
+    s.retryingByKey?.[key] ||
+    sidechat.btwBySession[key] ||
+    sidechat.sidechatBySession[key] ||
+    getConversationModeState().hasTabMode(key, workspacePath)
+  ) {
+    return false;
+  }
+  if (launch && (launch.providerId !== undefined || launch.defaultProvider !== undefined)) {
+    const expectedProvider = launch.providerId ?? launch.defaultProvider ?? null;
+    const retainedProvider = existing?.provider || state?.activeProvider || expectedProvider;
+    if (retainedProvider !== expectedProvider) return false;
+  }
+  if (existing) {
+    if (launch?.model !== undefined && existing.model !== launch.model) return false;
+    if (launch?.effort !== undefined && existing.effort !== launch.effort) return false;
+    if (launch?.providerId !== undefined && existing.provider !== launch.providerId) return false;
+  }
+  return true;
 }
 
 /** Shared activation path for tab actions and lifecycle cleanup. */
@@ -75,7 +125,7 @@ export function createTabActions(
 ): TabHelpers &
   Pick<
     ChatStore,
-    "startNewChat" | "moveDraftToWorkspace" | "closeTab" | "focusTab" | "moveTab" | "setActiveEngine"
+    "startNewChat" | "openBackgroundDraft" | "moveDraftToWorkspace" | "closeTab" | "focusTab" | "moveTab" | "setActiveEngine"
   > {
   const { set, get } = deps;
 
@@ -211,6 +261,28 @@ export function createTabActions(
         adoptedDraftKeys.delete(key);
         return { openTabs, active: tab };
       });
+    },
+
+    openBackgroundDraft: (engine, workspacePath, launch) => {
+      const s = get();
+      if (!isBackgroundDraftAvailable(s, engine, workspacePath, launch)) return false;
+      const key = sessionKey(engine, null, workspacePath);
+      const existing = s.openTabs.find((t) => sameTab(t, engine, null, workspacePath));
+      if (existing) {
+        adoptedDraftKeys.delete(key);
+        return true;
+      }
+      const tab: ActiveSession = {
+        engine, sessionId: null, workspacePath,
+        ...(launch?.model ? { model: launch.model } : {}),
+        ...((launch?.providerId ?? launch?.defaultProvider) ? { provider: (launch?.providerId ?? launch?.defaultProvider)! } : {}),
+        ...(launch?.effort ? { effort: launch.effort as EffortLevel } : {}),
+      };
+      const openTabs = [...s.openTabs, tab];
+      adoptedDraftKeys.delete(key);
+      persistTabs(openTabs, s.active);
+      set({ openTabs });
+      return true;
     },
 
     moveDraftToWorkspace: (engine, workspacePath, targetWorkspacePath, draft) => {

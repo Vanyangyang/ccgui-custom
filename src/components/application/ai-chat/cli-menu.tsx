@@ -188,6 +188,7 @@ function CliMenuTrigger({
   claudeUltracode,
   ompServiceTier,
   codexServiceTier,
+  allowCodexFast = true,
   modelId,
   isOpen,
   disabled,
@@ -203,6 +204,7 @@ function CliMenuTrigger({
   claudeUltracode?: boolean;
   ompServiceTier?: OmpServiceTier;
   codexServiceTier?: OmpServiceTier;
+  allowCodexFast?: boolean;
   modelId: string;
   /** While open, lock the trigger's min-width so model picks don't shrink it
    *  and nudge the top-end popover. */
@@ -213,7 +215,7 @@ function CliMenuTrigger({
   const { t } = useTranslation();
   const showFast = selectionScope === "chat" && (
     (engine === "omp" && supportsOmpFastMode(modelId) && ompServiceTier === "priority") ||
-    (engine === "codex" && codexServiceTier === "priority"));
+    (engine === "codex" && allowCodexFast && codexServiceTier === "priority"));
   // Snapshot width on open; clear on close. Shorter model labels then can't
   // shrink the trigger mid-session and slide the popover.
   const lockedMinWidth = useLockedMinWidth(isOpen, triggerRef);
@@ -256,7 +258,7 @@ function CliMenuTrigger({
             </span>
           </>
         )}
-        {selectionScope === "chat" && ((engine === "omp" && supportsOmpFastMode(modelId)) || engine === "codex") ? (
+        {selectionScope === "chat" && ((engine === "omp" && supportsOmpFastMode(modelId)) || (engine === "codex" && allowCodexFast)) ? (
           <span aria-hidden={!showFast} className={cx("w-7 shrink-0 text-center text-text-primary", !showFast && "invisible")}>Fast</span>
         ) : null}
         {showUltracode && (
@@ -297,6 +299,7 @@ function EngineMenuBody({
   ompServiceTier,
   onOmpServiceTierChange,
   codexServiceTier,
+  allowCodexFast = true,
   onCodexServiceTierChange,
   onRefreshModels,
   loadingEngines,
@@ -330,6 +333,7 @@ function EngineMenuBody({
   ompServiceTier?: OmpServiceTier;
   onOmpServiceTierChange?: (tier: OmpServiceTier) => Promise<void>;
   codexServiceTier?: OmpServiceTier;
+  allowCodexFast?: boolean;
   onCodexServiceTierChange?: (tier: OmpServiceTier) => Promise<void>;
   onRefreshModels?: () => void | Promise<void>;
   /** Engine ids whose catalog probe has not returned yet. */
@@ -386,6 +390,7 @@ function EngineMenuBody({
             onPickChannel={onPickChannel}
             ompServiceTier={ompServiceTier}
             onOmpServiceTierChange={onOmpServiceTierChange}
+            allowCodexFast={allowCodexFast}
             codexServiceTier={codexServiceTier}
             onCodexServiceTierChange={onCodexServiceTierChange}
             onRefresh={onRefreshModels}
@@ -417,6 +422,7 @@ function EngineModelDialog({
   ompServiceTier,
   onOmpServiceTierChange,
   codexServiceTier,
+  allowCodexFast = true,
   onCodexServiceTierChange,
   onRefreshModels,
   onClose,
@@ -440,6 +446,7 @@ function EngineModelDialog({
   ompServiceTier?: OmpServiceTier;
   onOmpServiceTierChange?: (tier: OmpServiceTier) => Promise<void>;
   codexServiceTier?: OmpServiceTier;
+  allowCodexFast?: boolean;
   onCodexServiceTierChange?: (tier: OmpServiceTier) => Promise<void>;
   onRefreshModels?: () => void | Promise<void>;
   onClose: () => void;
@@ -471,6 +478,7 @@ function EngineModelDialog({
         onPickChannel={onPickChannel}
         ompServiceTier={ompServiceTier}
         onOmpServiceTierChange={onOmpServiceTierChange}
+        allowCodexFast={allowCodexFast}
         codexServiceTier={codexServiceTier}
         onCodexServiceTierChange={onCodexServiceTierChange}
         onRefresh={onRefreshModels}
@@ -506,6 +514,7 @@ export function CliMenu({
   ompServiceTier,
   onOmpServiceTierChange,
   codexServiceTier,
+  allowCodexFast = true,
   onCodexServiceTierChange,
   onRefreshModels,
   loadingEngines,
@@ -533,6 +542,7 @@ export function CliMenu({
   ompServiceTier?: OmpServiceTier;
   onOmpServiceTierChange?: (tier: OmpServiceTier) => Promise<void>;
   codexServiceTier?: OmpServiceTier;
+  allowCodexFast?: boolean;
   onCodexServiceTierChange?: (tier: OmpServiceTier) => Promise<void>;
   /** Re-probe provider configs and model catalogs (flyout refresh button). */
   onRefreshModels?: () => void | Promise<void>;
@@ -720,6 +730,7 @@ export function CliMenu({
         effort={triggerEffort}
         claudeUltracode={claudeUltracode}
         ompServiceTier={ompServiceTier}
+        allowCodexFast={allowCodexFast}
         codexServiceTier={codexServiceTier}
         modelId={selectedModelId}
         isOpen={isOpen}
@@ -757,6 +768,7 @@ export function CliMenu({
             onPickChannel={pickChannel}
             ompServiceTier={ompServiceTier}
             onOmpServiceTierChange={onOmpServiceTierChange && (async (tier) => { if (canSelect("omp")) await onOmpServiceTierChange(tier); })}
+            allowCodexFast={allowCodexFast}
             codexServiceTier={codexServiceTier}
             onCodexServiceTierChange={onCodexServiceTierChange && (async (tier) => { if (canSelect("codex")) await onCodexServiceTierChange(tier); })}
             onRefreshModels={onRefreshModels}
@@ -784,6 +796,7 @@ export function CliMenu({
       onPickChannel={pickChannel}
       ompServiceTier={ompServiceTier}
       onOmpServiceTierChange={onOmpServiceTierChange && (async (tier) => { if (canSelect("omp")) await onOmpServiceTierChange(tier); })}
+      allowCodexFast={allowCodexFast}
       codexServiceTier={codexServiceTier}
       onCodexServiceTierChange={onCodexServiceTierChange && (async (tier) => { if (canSelect("codex")) await onCodexServiceTierChange(tier); })}
       onRefreshModels={onRefreshModels}

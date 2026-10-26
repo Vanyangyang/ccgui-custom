@@ -28,6 +28,29 @@ const ROUTING_KEYS: &[&str] = &[
     "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
 ];
 
+/// Merge restrictions into the single overlay we own, never into a user's
+/// settings file and never by appending a second ambiguous --settings flag.
+pub(super) fn restrict_read_only(built: &mut BuiltCommand) -> Result<(), String> {
+    let args: Vec<_> = built.command.as_std().get_args().map(|a| a.to_os_string()).collect();
+    let overlays: Vec<_> = args.windows(2).filter(|pair| pair[0] == "--settings").map(|pair| pair[1].clone()).collect();
+    if overlays.is_empty() {
+        built.command.args(["--settings", "{\"disableAllHooks\":true,\"apiKeyHelper\":\"\",\"ultracode\":false}"]);
+        return Ok(());
+    }
+    if overlays.len() != 1 { return Err("Read-only Claude requires one host settings overlay".into()); }
+    let path = std::path::PathBuf::from(&overlays[0]);
+    if !built.cleanup_files.contains(&path) { return Err("Read-only Claude refuses a non-host settings overlay".into()); }
+    let mut value: Value = serde_json::from_slice(&std::fs::read(&path).map_err(|_| "Cannot read host settings overlay")?)
+        .map_err(|_| "Invalid host settings overlay")?;
+    let object = value.as_object_mut().ok_or("Invalid host settings overlay")?;
+    object.insert("disableAllHooks".into(), Value::Bool(true));
+    object.insert("apiKeyHelper".into(), Value::String(String::new()));
+    object.insert("ultracode".into(), Value::Bool(false));
+    std::fs::write(&path, serde_json::to_vec(&value).map_err(|_| "Cannot serialize host settings overlay")?)
+        .map_err(|_| "Cannot restrict host settings overlay")?;
+    Ok(())
+}
+
 pub(super) fn resolve_model(
     selected: Option<&str>,
     provider: Option<&Value>,
@@ -222,6 +245,39 @@ mod tests {
             mcp_restore: None,
             preassigned_session_id: None,
         }
+    }
+
+    #[test]
+    fn read_only_restrictions_merge_into_one_owned_overlay_for_both_channels() {
+        let mut official = built();
+        restrict_read_only(&mut official).unwrap();
+        let args: Vec<_> = official.command.as_std().get_args().collect();
+        assert_eq!(args.iter().filter(|arg| **arg == "--settings").count(), 1);
+        let value: Value = serde_json::from_str(&args[1].to_string_lossy()).unwrap();
+        assert_eq!(value["disableAllHooks"], true);
+        assert_eq!(value["apiKeyHelper"], "");
+        assert_eq!(value["ultracode"], false);
+
+        let directory = std::env::temp_dir().join(format!("ccgui-readonly-overlay-{}", uuid::Uuid::new_v4()));
+        let mut custom = built();
+        let env = HashMap::from([("ANTHROPIC_BASE_URL".into(), "https://channel.invalid".into())]);
+        stage_with(&mut custom, &serde_json::json!({}), &env, Some("chosen-model"), &directory, &Map::new()).unwrap();
+        restrict_read_only(&mut custom).unwrap();
+        assert_eq!(custom.command.as_std().get_args().filter(|arg| *arg == "--settings").count(), 1);
+        let value: Value = serde_json::from_slice(&std::fs::read(&custom.cleanup_files[0]).unwrap()).unwrap();
+        assert_eq!(value["disableAllHooks"], true);
+        assert_eq!(value["apiKeyHelper"], "");
+        assert_eq!(value["model"], "chosen-model");
+        assert_eq!(value["env"]["ANTHROPIC_BASE_URL"], "https://channel.invalid");
+        super::super::cleanup_staged_files(&custom.cleanup_files);
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn read_only_restrictions_never_rewrite_foreign_settings() {
+        let mut command = built();
+        command.command.args(["--settings", "user-owned-settings.json"]);
+        assert!(restrict_read_only(&mut command).is_err());
     }
 
     #[test]

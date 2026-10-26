@@ -103,14 +103,41 @@ Promise.resolve().then(async () => await (
 }})();"#, id = serde_json::to_string(id).unwrap())
 }
 
+fn fixture_window_directory(base: &Path, pid: u32, label: &str, profile: &Path) -> Result<PathBuf, String> {
+    if label.is_empty() || label.len() > 128 || !label.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')) {
+        return Err("invalid fixture window label".into());
+    }
+    let process_root = base.join(pid.to_string());
+    if label == "main" {
+        // Keep the original main-window protocol/path for existing fixtures.
+        fs::create_dir(&process_root).map_err(|e| format!("create fresh fixture bridge: {e}"))?;
+        return Ok(process_root);
+    }
+    safe_directory(&process_root, profile)?;
+    let windows = process_root.join("windows");
+    create_directory(&windows, profile)?;
+    let root = windows.join(label);
+    fs::create_dir(&root).map_err(|e| format!("create fresh window fixture bridge: {e}"))?;
+    Ok(root)
+}
+
 pub fn install_runtime_fixture_bridge(app: &tauri::AppHandle, window: &tauri::WebviewWindow) -> Result<(), String> {
     if !super::runtime_fixture_enabled() || std::env::var("CCGUI_RUNTIME_FIXTURE_COMMANDS").as_deref() != Ok("1") { return Ok(()); }
     let profile = dunce::canonicalize(crate::paths::app_home()).map_err(|e| format!("resolve fixture profile: {e}"))?;
     let base = profile.join("runtime-fixture-bridge");
     create_directory(&base, &profile)?;
-    let root = base.join(std::process::id().to_string());
-    // A fresh PID directory prevents stale requests from a previous process being replayed.
-    fs::create_dir(&root).map_err(|e| format!("create fresh fixture bridge: {e}"))?;
+    let root = fixture_window_directory(&base, std::process::id(), window.label(), &profile)?;
+    if window.label() != "main" {
+        // Secondary production windows deliberately cannot emit arbitrary
+        // events. This narrowly named capability exists only in the opt-in,
+        // development-profile test harness, never in production builds.
+        app.add_capability(tauri::ipc::CapabilityBuilder::new(format!("runtime-fixture-{}", window.label()))
+            .window(window.label()).permission("core:event:allow-emit")
+            .permission("core:window:allow-close").permission("core:window:allow-set-size")
+            .permission("core:window:allow-set-position").permission("core:window:allow-inner-size")
+            .permission("core:window:allow-outer-position"))
+            .map_err(|e| format!("grant fixture result event: {e}"))?;
+    }
     let inbox = root.join("inbox");
     let outbox = root.join("outbox");
     create_directory(&inbox, &profile)?;
@@ -131,12 +158,11 @@ pub fn install_runtime_fixture_bridge(app: &tauri::AppHandle, window: &tauri::We
     std::thread::Builder::new().name("runtime-fixture-bridge".into()).spawn(move || {
         poll(app, state, profile, root, inbox, outbox, listener);
     }).map_err(|e| format!("start fixture bridge: {e}"))?;
-    atomic_write(&ready, &serde_json::to_vec(&serde_json::json!({"pid":std::process::id(),"bridgeVersion":1})).unwrap())
+    atomic_write(&ready, &serde_json::to_vec(&serde_json::json!({"pid":std::process::id(),"bridgeVersion":1,"windowLabel":window.label()})).unwrap())
 }
 
 fn poll(app: tauri::AppHandle, state: Arc<Bridge>, profile: PathBuf, root: PathBuf, inbox: PathBuf, outbox: PathBuf, listener: tauri::EventId) {
     loop {
-        let Some(window) = app.get_webview_window(&state.window_label) else { break; };
         // Recheck directories before each batch; never follow a replaced profile child.
         if [root.parent().unwrap(), &root, &inbox, &outbox].iter().any(|p| safe_directory(p, &profile).is_err()) { break; }
         {
@@ -151,6 +177,10 @@ fn poll(app: tauri::AppHandle, state: Arc<Bridge>, profile: PathBuf, root: PathB
                 }
             });
         }
+        // A closing-window expression can publish its result immediately before
+        // destruction. Persist that acknowledged result before leaving the
+        // polling loop, or a successful return appears to the driver as a timeout.
+        let Some(window) = app.get_webview_window(&state.window_label) else { break; };
         if let Ok(entries) = fs::read_dir(&inbox) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -198,5 +228,21 @@ mod tests {
         assert!(source.contains("await (\nPromise.resolve(42)\n)"));
         assert!(source.contains("runtime-fixture-result"));
         assert!(!source.contains("eval("));
+    }
+    #[test]
+    fn main_and_secondary_windows_have_isolated_fresh_inboxes() {
+        let root = std::env::temp_dir().join(format!("ccgui-fixture-window-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let profile = dunce::canonicalize(&root).unwrap();
+        let base = profile.join("runtime-fixture-bridge");
+        create_directory(&base, &profile).unwrap();
+        let main = fixture_window_directory(&base, 42, "main", &profile).unwrap();
+        let child = fixture_window_directory(&base, 42, "plugin-window-fixture", &profile).unwrap();
+        assert_eq!(main, base.join("42"));
+        assert_eq!(child, main.join("windows/plugin-window-fixture"));
+        assert!(fixture_window_directory(&base, 42, "main", &profile).is_err());
+        assert!(fixture_window_directory(&base, 42, "plugin-window-fixture", &profile).is_err());
+        assert!(fixture_window_directory(&base, 42, "../main", &profile).is_err());
+        for path in [child, main.join("windows"), main, base, profile] { fs::remove_dir(path).unwrap(); }
     }
 }

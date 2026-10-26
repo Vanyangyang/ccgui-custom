@@ -21,6 +21,34 @@ beforeEach(() => {
 });
 afterEach(() => vi.restoreAllMocks());
 
+describe("controlled host discussions", () => {
+  it("keeps a controlled uncertain delivery routed until its exact native terminal event", async () => {
+    const runId = "sidechat-controlled-uncertain";
+    vi.mocked(ipc.sendSideMessage).mockRejectedValueOnce({ outcomeUnknown: true, code: "request-uncertain" });
+    await expect(state().sendSidechatMessage({ ...args, sessionKey: "host-uncertain", parentSessionId: null, strictBusy: true, requestedRunId: runId, prompt: "keep this" })).rejects.toMatchObject({ outcomeUnknown: true });
+    expect(state().sidechatBySession["host-uncertain"]).toMatchObject({ streaming: true, runId });
+    event(runId, 100, "delta", "late native reply");
+    expect(state().sidechatBySession["host-uncertain"].messages.at(-1)?.text).toBe("late native reply");
+    event(runId, 101, "done", { sessionId: "side" });
+    expect(state().sidechatBySession["host-uncertain"].streaming).toBe(false);
+    expect(ipc.sendSideMessage).toHaveBeenCalledTimes(1);
+  });
+  it("uses the requested run id and never interrupts a busy branch", async () => {
+    const controlled = { ...args, sessionKey: "host-discussion", parentSessionId: null, strictBusy: true };
+    await state().sendSidechatMessage({ ...controlled, prompt: "first", requestedRunId: "sidechat-controlled-first" });
+    expect(ipc.sendSideMessage).toHaveBeenCalledWith(expect.objectContaining({ runId: "sidechat-controlled-first", parentSessionId: null, permission: null, ephemeral: false }));
+    await expect(state().sendSidechatMessage({ ...controlled, prompt: "second", requestedRunId: "sidechat-controlled-second" })).rejects.toThrow("busy");
+    expect(ipc.interruptSession).not.toHaveBeenCalled();
+    expect(ipc.sendSideMessage).toHaveBeenCalledTimes(1);
+    event("sidechat-controlled-first", 100, "done", { sessionId: "side" });
+  });
+  it("rejects execute, unsupported engines and mismatched owner before invoking", async () => {
+    await expect(state().sendSidechatMessage({ ...args, prompt: "bad", strictBusy: true })).rejects.toThrow("identity");
+    await expect(state().sendSidechatMessage({ ...args, parentSessionId: null, engine: "cursor", prompt: "bad", strictBusy: true })).rejects.toThrow("identity");
+    expect(ipc.sendSideMessage).not.toHaveBeenCalled();
+  });
+});
+
 describe("side run event progress", () => {
   it.each(["sidechat", "btw"] as const)("keeps %s alive across empty-usage response boundaries and approval waits", async (kind) => {
     const clock = vi.spyOn(Date, "now").mockReturnValue(100);

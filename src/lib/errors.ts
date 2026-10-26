@@ -1,13 +1,27 @@
 import i18n from "i18next";
 
+function engineErrorMessage(value: unknown): string | null {
+  if (!value || typeof value !== "object") return null;
+  const error = value as { code?: unknown; message?: unknown; outcomeUnknown?: unknown };
+  return error.code === "engine_error" && typeof error.message === "string" &&
+    typeof error.outcomeUnknown === "boolean" ? error.message : null;
+}
+
 /**
  * Normalize an unknown thrown value to displayable text. Tauri command
  * errors arrive as plain strings or serialized objects, so Error.message
  * alone is not enough; unstringifiable values degrade to String().
  */
 export function errorText(err: unknown): string {
-  const text = typeof err === "string" ? err : err instanceof Error ? err.message : null;
+  let text = engineErrorMessage(err) ?? (typeof err === "string" ? err : err instanceof Error ? err.message : null);
   if (text !== null) {
+    // Worker IPC serializes its engine error DTO. Unwrap only the known
+    // envelope for display; delivery/retry decisions still use the raw error.
+    const candidate = text.startsWith("Error: ") ? text.slice(7) : text;
+    if (candidate.startsWith("{") && candidate.length <= 16 * 1024) {
+      try { text = engineErrorMessage(JSON.parse(candidate)) ?? text; }
+      catch { /* Preserve malformed and unknown envelopes verbatim. */ }
+    }
     const prefix = "CCGUI_PROVIDER_MIGRATION_CONFLICT:";
     if (text.startsWith(prefix)) {
       try {

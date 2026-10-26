@@ -29,6 +29,11 @@ if (import.meta.hot) import.meta.hot.dispose(() => { bootDisposed = true; stopLi
 async function boot() {
   if ("__TAURI_INTERNALS__" in window) {
     const { getCurrentWindow } = await import("@tauri-apps/api/window");
+    if (getCurrentWindow().label.startsWith("plugin-window-")) {
+      const { startPluginWindowApp } = await import("./features/plugins/windows/bootstrap");
+      if (!bootDisposed) startPluginWindowApp();
+      return;
+    }
     if (/^#\/assistant-notices(?:[/?]|$)/.test(window.location.hash)
       || getCurrentWindow().label === "assistant-notices") {
       const { startAssistantNoticesApp } = await import("./features/assistant-notices/bootstrap");

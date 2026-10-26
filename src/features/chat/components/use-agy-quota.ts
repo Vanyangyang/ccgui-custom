@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ipc, type AgyQuotaSnapshot } from "@/lib/ipc";
 import { listenAgyQuotaChanged } from "@/lib/events";
 import { CLI_CONFIG_CHANGED_EVENT } from "@/features/settings/providers";
-import { QUOTA_MAX_AGE, QUOTA_STALE_AGE, isNativeSubscriptionProvider } from "../subscription-quota";
+import { QUOTA_STALE_AGE, isNativeSubscriptionProvider, quotaReadFailed } from "../subscription-quota";
 import { validAgyQuotaSnapshot } from "../agy-quota";
 
 const EMPTY: AgyQuotaSnapshot = { status: "unavailable", groups: [], errorCode: "not_loaded" };
@@ -50,7 +50,7 @@ export function useAgyQuota(engine: string, providerId: string | undefined, work
           }
         } catch {
           initial = false;
-          if (current() && generation === startedGeneration) setState({ route, snapshot: { ...EMPTY, errorCode: "read_failed" }, loading: false });
+          if (current() && generation === startedGeneration) setState(previous => ({ route, snapshot: quotaReadFailed(previous.snapshot, EMPTY), loading: false }));
         } finally {
           pending = undefined;
           if (current()) {
@@ -95,7 +95,7 @@ export function useAgyQuota(engine: string, providerId: string | undefined, work
 
   const snapshot = enabled && state.route === route ? validAgyQuotaSnapshot(state.snapshot, now) : undefined;
   const deadlines = snapshot?.collectedAt && Number.isFinite(snapshot.collectedAt) && snapshot.collectedAt <= now
-    ? [snapshot.collectedAt + QUOTA_STALE_AGE, snapshot.collectedAt + QUOTA_MAX_AGE,
+    ? [snapshot.collectedAt + QUOTA_STALE_AGE,
       ...snapshot.groups.flatMap(group => Object.values(group.windows).map(window => window?.resetsAt ?? 0))].filter(time => time > now) : [];
   const nextDeadline = deadlines.length ? Math.min(...deadlines) : undefined;
   useEffect(() => {

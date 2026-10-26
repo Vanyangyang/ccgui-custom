@@ -18,6 +18,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 mod codex;
+pub(crate) mod diagnostics;
 mod pi;
 
 /// Stdout cap: a structured answer is a few hundred bytes; anything far past

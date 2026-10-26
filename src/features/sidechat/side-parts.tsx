@@ -20,15 +20,17 @@ export function SideMarkdown({
   text,
   workspacePath,
   streaming,
+  onOpenFile,
 }: {
   text: string;
   workspacePath: string;
   streaming: boolean;
+  onOpenFile?: (path: string) => void;
 }) {
   return (
     <Suspense fallback={<div className="whitespace-pre-wrap text-body-regular text-text-primary">{text}</div>}>
       <div className="min-w-0 text-body-regular text-text-primary">
-        <LazyMarkdown text={text} workspacePath={workspacePath} streaming={streaming} />
+        <LazyMarkdown text={text} workspacePath={workspacePath} streaming={streaming} onOpenFile={onOpenFile} />
       </div>
     </Suspense>
   );

@@ -4,8 +4,9 @@ import { useTerminalStore } from "@/features/terminal/store";
 import {
   ensureTerminalOutputListener,
   hasTerminalSession,
+  isTerminalTabAlive,
   markTerminalClosed,
-  markTerminalOpened,
+  openTerminalSession,
 } from "@/features/terminal/sessions";
 
 /**
@@ -55,7 +56,7 @@ export async function runLaunchScript(workspacePath: string, script: string): Pr
   // terminal_open is idempotent per id, and TerminalView reopens with the
   // real cols/rows on mount and refits the PTY, so this placeholder size is
   // transient when the dock is visible.
-  await ipc.terminalOpen({ id, cwd: workspacePath, cols: 120, rows: 30 });
-  markTerminalOpened(id);
+  const opened = await openTerminalSession({ id, cwd: workspacePath, cols: 120, rows: 30 });
+  if (!opened || !isTerminalTabAlive(id)) return;
   await ipc.terminalWrite(id, `${script}\n`);
 }

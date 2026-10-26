@@ -45,17 +45,17 @@ describe("composer subscription quota status", () => {
     const weeklyLabel = [...details.querySelectorAll("dt")].find(node => node.textContent === "7-day remaining");
     expect(weeklyLabel?.nextElementSibling?.textContent).toBe("—");
   });
-  it("clears weekly remaining after reset, snapshot expiry and account changes", async () => {
+  it("retains weekly remaining after reset and age, but clears on account changes", async () => {
     const windows = { sevenDay: { usedPercentage: 14, resetsAt: NOW + 60 } };
     await render({ status: "ready", collectedAt: NOW, windows });
     const details = await openDetails();
     const weeklyValue = () => [...details.querySelectorAll("dt")].find(node => node.textContent === "7-day remaining")?.nextElementSibling?.textContent;
     expect(weeklyValue()).toBe("86%");
     await render({ status: "ready", collectedAt: NOW + 60, windows }, false, NOW + 60);
-    expect(container.textContent).toBe("5h remaining — · 7d remaining —");
-    expect(weeklyValue()).toBe("—");
+    expect(container.textContent).toBe("5h remaining — · 7d remaining 86% · Stale");
+    expect(weeklyValue()).toBe("86%");
     await render({ status: "ready", collectedAt: NOW - 3600, windows });
-    expect(weeklyValue()).toBe("—");
+    expect(weeklyValue()).toBe("86%");
     await render({ status: "unavailable", errorCode: "auth_changed", windows });
     expect(weeklyValue()).toBe("—");
   });
@@ -102,11 +102,11 @@ describe("composer subscription quota status", () => {
     expect(refresh).not.toHaveBeenCalled();
     await render({ ...snapshot, collectedAt: fiveHourReset + 1 }, false, fiveHourReset + 1);
     expect([...container.querySelectorAll("time")].map(node => node.textContent)).toEqual(["7d 10/5 03:59 重置"]);
-    expect(container.textContent).toContain("5h 剩余 — · 7d 剩余 96%");
+    expect(container.textContent).toContain("5h 剩余 69% · 7d 剩余 96%");
     await render({ status: "unavailable", windows: {}, errorCode: "auth_changed" }, false, current);
     expect(container.querySelector("time")).toBeNull();
   });
-  it("exposes stale status accessibly and hides malformed or expired values", async () => {
+  it("exposes stale status accessibly, hides malformed values and retains old samples", async () => {
     await render({ status: "ready", collectedAt: NOW - 120, windows: { fiveHour: { usedPercentage: 35 }, sevenDay: { usedPercentage: Infinity } } });
     expect(container.querySelector("button")?.getAttribute("aria-label")).toContain("Stale");
     const details = await openDetails();
@@ -116,8 +116,8 @@ describe("composer subscription quota status", () => {
     expect(container.textContent).toContain("5h remaining 65%");
     expect(details.textContent).toContain("Last usage received");
     await render({ status: "ready", collectedAt: NOW - 3600, windows: { fiveHour: { usedPercentage: 35 } } });
-    expect(container.textContent).toBe("5h remaining — · 7d remaining —");
-    expect(details.textContent).toContain("over an hour old");
+    expect(container.textContent).toContain("5h remaining 65%");
+    expect(details.textContent).toContain("Last known usage");
   });
   it("shows the CLI account and plan only inside details and clears them with a changed account", async () => {
     const account = { email: "long-account-name.with-extra-characters@example.com", plan: "Codex Team" };

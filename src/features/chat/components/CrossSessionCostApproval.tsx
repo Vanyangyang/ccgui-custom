@@ -7,6 +7,7 @@ import { crossSessionCostReview, requiresSessionSendCostApproval, useSessionSend
 import { useHandoffStore } from "../session-cleanup";
 import { sessionKey, useChatStore, type ActiveSession } from "../store";
 import { usePromptCacheHeat } from "../use-prompt-cache";
+import { usesUnlimitedPromptCache } from "../prompt-cache";
 import { resolveLeaderCostApproval } from "@/features/leader/cost-approval";
 
 function CostReviewTelemetry({
@@ -19,7 +20,7 @@ function CostReviewTelemetry({
   showQueueWarning?: boolean;
 }) {
   const { t } = useTranslation();
-  const liveCacheHeat = usePromptCacheHeat(review?.cache);
+  const liveCacheHeat = usePromptCacheHeat(review?.cacheExpiryDisabled ? undefined : review?.cache);
   const cacheHeat = review?.cache ? liveCacheHeat : review?.cacheHeat ?? "unknown";
   const context = review?.context;
   const used = context?.used;
@@ -40,9 +41,9 @@ function CostReviewTelemetry({
     </div>
     {review && <p className="text-text-tertiary">{t("crossSession.costSampledAt", { time: new Date(review.capturedAt).toLocaleString() })}</p>}
     {snapshotFallback && review && <p className="text-text-tertiary">{t("crossSession.costSnapshotFallback")}</p>}
-    <p>{t(cacheHeat === "hot" ? "crossSession.costCacheHot" : cacheHeat === "cold" ? "crossSession.costCacheCold" : "crossSession.costCacheUnknown")}</p>
+    {!review?.cacheExpiryDisabled && <p>{t(cacheHeat === "hot" ? "crossSession.costCacheHot" : cacheHeat === "cold" ? "crossSession.costCacheCold" : "crossSession.costCacheUnknown")}</p>}
     <p>{t("crossSession.costHistoryWarning")}</p>
-    {showQueueWarning && review && review.targetStatus !== "idle" && <p>{t("crossSession.costQueueWarning")}</p>}
+    {showQueueWarning && review && review.targetStatus !== "idle" && <p>{t(review.cacheExpiryDisabled ? "crossSession.costQueuePending" : "crossSession.costQueueWarning")}</p>}
   </>;
 }
 
@@ -75,8 +76,11 @@ export function CrossSessionCostApproval({ record }: { record: CrossSessionCommu
     tab.sessionId === target.sessionId && tab.workspacePath === target.workspacePath)?.model,
   [tabs, target.engine, target.sessionId, target.workspacePath]);
   const review = useMemo(() => {
-    if (!meta || !inputs[0]) return record.leaderCostApproval && record.costReview
-      ? { ...record.costReview, model: record.leaderCostApproval.model ?? undefined } : record.costReview;
+    if (!meta || !inputs[0]) {
+      if (!record.costReview) return undefined;
+      const model = record.leaderCostApproval ? record.leaderCostApproval.model ?? undefined : record.costReview.model;
+      return { ...record.costReview, model, cacheExpiryDisabled: usesUnlimitedPromptCache(target.engine, model) };
+    }
     const state = useChatStore.getState();
     const session = state.bySession[key];
     const awaiting = session.messages.some((m) => m.question?.status === "pending" || m.grant?.status === "pending" ||
@@ -84,7 +88,7 @@ export function CrossSessionCostApproval({ record }: { record: CrossSessionCommu
     const sample = crossSessionCostReview(meta, state, awaiting ? "awaiting_permission" : session.streaming || session.queue.length ? "busy" : "idle",
       Date.now(), record.leaderCostApproval ? record.leaderCostApproval.model ?? null : undefined);
     return record.leaderCostApproval && record.costReview
-      ? { ...record.costReview, model: sample.model, capturedAt: sample.capturedAt, context: sample.context } : sample;
+      ? { ...record.costReview, model: sample.model, capturedAt: sample.capturedAt, context: sample.context, cacheExpiryDisabled: sample.cacheExpiryDisabled } : sample;
   }, [meta, inputs, tabModel, key, record.costReview, record.leaderCostApproval]);
   const act = async (action: (id: string) => Promise<void>) => {
     if (inFlight.current) return;
@@ -141,7 +145,8 @@ export function SessionSendCostApproval({ active, className }: { active: ActiveS
     : undefined, [tabs, active?.engine, active?.sessionId, active?.workspacePath]);
   const review = useMemo(() => {
     if (!pendingGuard) return undefined;
-    if (!meta || !inputs[0]) return pendingGuard.review;
+    if (!meta || !inputs[0]) return { ...pendingGuard.review,
+      cacheExpiryDisabled: usesUnlimitedPromptCache(pendingGuard.engine, pendingGuard.review.model) };
     const state = useChatStore.getState();
     return crossSessionCostReview(meta, state, "idle");
   }, [pendingGuard, meta, inputs, tabModel, key]);
@@ -197,7 +202,10 @@ export function SessionSendCostApproval({ active, className }: { active: ActiveS
     <div className="flex min-w-0 flex-col gap-2 rounded-xl border border-border-secondary bg-background-secondary-default p-2.5 text-caption-1-regular text-text-secondary [overflow-wrap:anywhere]">
       <div>
         <p className="font-medium text-text-warning-primary">{t("crossSession.costApprovalTitle")}</p>
-        <p>{t(pendingGuard.mode === "queue_drain" ? "crossSession.selfCostQueuePending" : "crossSession.selfCostApprovalPending")}</p>
+        <p>{t(review?.context.modelMismatch
+          ? pendingGuard.mode === "queue_drain" ? "crossSession.selfCostModelQueuePending" : "crossSession.selfCostModelApprovalPending"
+          : review?.cacheExpiryDisabled ? "crossSession.selfCostHeldPending"
+          : pendingGuard.mode === "queue_drain" ? "crossSession.selfCostQueuePending" : "crossSession.selfCostApprovalPending")}</p>
       </div>
       <CostReviewTelemetry review={review} />
       <div className="flex flex-wrap gap-2">

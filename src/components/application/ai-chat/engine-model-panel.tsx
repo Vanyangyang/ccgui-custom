@@ -497,6 +497,7 @@ function EffortFooter({
   ompServiceTier,
   onOmpServiceTierChange,
   codexServiceTier,
+  allowCodexFast = true,
   onCodexServiceTierChange,
   selectionScope,
 }: {
@@ -509,6 +510,7 @@ function EffortFooter({
   ompServiceTier?: OmpServiceTier;
   onOmpServiceTierChange?: (tier: OmpServiceTier) => Promise<void>;
   codexServiceTier?: OmpServiceTier;
+  allowCodexFast?: boolean;
   onCodexServiceTierChange?: (tier: OmpServiceTier) => Promise<void>;
   selectionScope?: "chat" | "task";
 }) {
@@ -517,7 +519,7 @@ function EffortFooter({
   const displayEffort = normalizeEffortLevel(engineId, effort);
   const ompFast = engineId === "omp" && supportsOmpFastMode(selectedModelId);
   const codexFast = engineId === "codex";
-  const showFast = selectionScope !== "task" && (ompFast || codexFast);
+  const showFast = selectionScope !== "task" && (ompFast || (codexFast && allowCodexFast));
   const fastTier = codexFast ? codexServiceTier : ompServiceTier;
   const onFastChange = codexFast ? onCodexServiceTierChange : onOmpServiceTierChange;
   const header = showFast && onFastChange ? (
@@ -586,6 +588,7 @@ export function EngineModelPanel({
   ompServiceTier,
   onOmpServiceTierChange,
   codexServiceTier,
+  allowCodexFast = true,
   onCodexServiceTierChange,
   onRefresh,
   onClose,
@@ -609,6 +612,7 @@ export function EngineModelPanel({
   ompServiceTier?: OmpServiceTier;
   onOmpServiceTierChange?: (tier: OmpServiceTier) => Promise<void>;
   codexServiceTier?: OmpServiceTier;
+  allowCodexFast?: boolean;
   onCodexServiceTierChange?: (tier: OmpServiceTier) => Promise<void>;
   selectionScope?: "chat" | "task";
   /** Re-probe provider configs and model catalogs without an app restart. */
@@ -682,6 +686,7 @@ export function EngineModelPanel({
           onClaudeUltracodeChange={onClaudeUltracodeChange}
           ompServiceTier={ompServiceTier}
           onOmpServiceTierChange={onOmpServiceTierChange}
+          allowCodexFast={allowCodexFast}
           codexServiceTier={codexServiceTier}
           onCodexServiceTierChange={onCodexServiceTierChange}
         />

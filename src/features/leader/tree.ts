@@ -1,28 +1,37 @@
 import type { AiChatThread } from "@/components/application/ai-chat/sidebar-types";
-import type { LeaderBranch, LeaderSnapshot } from "./types";
-import { sameLeaderWorkspace } from "./workspace-path";
+import { leaderGroupRoot, parentWorkspacePath, type LeaderBranch, type LeaderSnapshot } from "./types";
+import { workspaceCatalogPathKey } from "@/lib/workspace-path";
 
-export function groupLeaderThreads(threads: AiChatThread[], snapshot: LeaderSnapshot, workspacePath: string): AiChatThread[] {
-  const archived = (snapshot.archivedGroups ?? []).filter((g) => sameLeaderWorkspace(g.root.workspacePath, workspacePath));
+export function groupLeaderThreads(threads: AiChatThread[], snapshot: LeaderSnapshot, workspacePath: string, allThreads: AiChatThread[] = threads): AiChatThread[] {
+  const allRows = new Map(allThreads.filter((t) => t.id).map((t) => [t.id!, t]));
+  const archived = snapshot.archivedGroups ?? [];
   const hiddenIds = new Set(archived.flatMap((g) => [g.root, ...g.members].map((m) => `${m.engine}/${m.sessionId}`)));
   const hiddenBranches = new Set(archived.flatMap((g) => g.branchIds));
-  const branches = snapshot.branches.filter((b) => sameLeaderWorkspace(b.workspacePath, workspacePath) && b.state !== "reclaimed" && !hiddenBranches.has(b.id)
+  const live = snapshot.branches.filter((b) => b.state !== "reclaimed" && !hiddenBranches.has(b.id)
     && !hiddenIds.has(`${b.parentEngine}/${b.parentSessionId}`) && (!b.sessionId || !hiddenIds.has(`${b.engine}/${b.sessionId}`)));
-  if (!archived.length && !branches.length) return threads;
-  const rows = new Map(threads.filter((t) => t.id && !hiddenIds.has(t.id) && !hiddenBranches.has(t.id.replace(/^leader-branch:/, ""))).map((t) => [t.id!, { ...t }]));
+  // A group stays under its root's workspace, while each child row retains its
+  // real cwd for selection and controls. Do not clone the group under every member.
+  const branches = live.filter((branch) => {
+    const root = leaderGroupRoot(snapshot, parentOfBranch(branch));
+    const sidebarPath = allRows.get(`${root.engine}/${root.sessionId}`)?.sidebarWorkspacePath;
+    return workspaceCatalogPathKey(sidebarPath ?? root.workspacePath) === workspaceCatalogPathKey(workspacePath);
+  });
+  const elsewhere = new Set(live.filter((branch) => !branches.includes(branch)).map((branch) => branch.sessionId ? `${branch.engine}/${branch.sessionId}` : `leader-branch:${branch.id}`));
+  if (!archived.length && !branches.length && !elsewhere.size) return threads;
+  const rows = new Map(threads.filter((t) => t.id && !hiddenIds.has(t.id) && !elsewhere.has(t.id) && !hiddenBranches.has(t.id.replace(/^leader-branch:/, ""))).map((t) => [t.id!, { ...t }]));
   const childIds = new Set<string>();
   for (const branch of branches) {
     const id = branch.sessionId ? `${branch.engine}/${branch.sessionId}` : `leader-branch:${branch.id}`;
     childIds.add(id);
-    const row = rows.get(id) ?? { id, label: branch.title, engine: branch.engine, workspacePath: branch.workspacePath, time: "" };
+    const row = rows.get(id) ?? allRows.get(id) ?? { id, label: branch.title, engine: branch.engine, workspacePath: branch.workspacePath, time: "" };
     rows.set(id, { ...row, workspacePath: row.workspacePath ?? branch.workspacePath, label: row.label || branch.title, leaderBranch: branch, protectedFromDeletion: true, selectable: !!branch.sessionId });
     const parentId = `${branch.parentEngine}/${branch.parentSessionId}`;
-    if (!rows.has(parentId)) rows.set(parentId, { id: parentId, label: branch.parentSessionId.slice(0, 8), engine: branch.parentEngine, workspacePath: branch.workspacePath, time: "", leaderParentFallback: true });
+    if (!rows.has(parentId)) rows.set(parentId, { ...(allRows.get(parentId) ?? { id: parentId, label: branch.parentSessionId.slice(0, 8), engine: branch.parentEngine, workspacePath: parentWorkspacePath(branch), time: "", leaderParentFallback: true }) });
   }
   for (const branch of branches) {
     const id = branch.sessionId ? `${branch.engine}/${branch.sessionId}` : `leader-branch:${branch.id}`;
     const parent = rows.get(`${branch.parentEngine}/${branch.parentSessionId}`)!;
-    parent.workspacePath ??= branch.workspacePath;
+    parent.workspacePath ??= parentWorkspacePath(branch);
     parent.isLeader = true;
     parent.protectedFromDeletion = true;
     (parent.children ??= []).push(rows.get(id)!);
@@ -49,5 +58,5 @@ export function flattenLeaderThreads(rows: AiChatThread[]): AiChatThread[] {
 }
 
 export function parentOfBranch(branch: LeaderBranch) {
-  return { engine: branch.parentEngine, sessionId: branch.parentSessionId, workspacePath: branch.workspacePath };
+  return { engine: branch.parentEngine, sessionId: branch.parentSessionId, workspacePath: parentWorkspacePath(branch) };
 }

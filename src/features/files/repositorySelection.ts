@@ -45,6 +45,7 @@ export interface RepositorySelectionInput {
   repositoryRoots: readonly string[];
   /** Active workspace path — the outer boundary of the walk. */
   workspacePath: string;
+  projectRoots?: readonly string[];
 }
 
 /**
@@ -81,5 +82,7 @@ export function resolveSelectedRepository(
 
 /** Resolve the Git path used by a workspace-scoped surface. */
 export function resolveWorkspaceRepository(input: RepositorySelectionInput): string {
-  return resolveSelectedRepository(input) ?? input.workspacePath;
+  const boundary = input.selectedPath && input.projectRoots?.find((root) => isWithinDirectory(root, input.selectedPath!));
+  const workspacePath = boundary || input.workspacePath;
+  return resolveSelectedRepository({ ...input, workspacePath }) ?? workspacePath;
 }

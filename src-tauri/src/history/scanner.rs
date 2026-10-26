@@ -443,6 +443,7 @@ fn prune_engine_subagent_sessions(
         )
         .map_err(|e| e.to_string())?;
         crate::db::session_auxiliary::set(&tx, engine, id, None).map_err(|e| e.to_string())?;
+        crate::session_sidebar::storage::delete_session(&tx, engine, id)?;
         super::prompt_cache::set(&tx, engine, id, None).map_err(|e| e.to_string())?;
         crate::engine::plan_review::delete_reviews_for_session(&tx, engine, id)?;
     }
@@ -505,6 +506,7 @@ fn prune_codex_sessions_outside_home(db: &crate::db::Db) -> Result<bool, String>
         )
         .map_err(|e| e.to_string())?;
         crate::db::session_auxiliary::set(&tx, "codex", id, None).map_err(|e| e.to_string())?;
+        crate::session_sidebar::storage::delete_session(&tx, "codex", id)?;
         super::prompt_cache::set(&tx, "codex", id, None).map_err(|e| e.to_string())?;
         crate::engine::plan_review::delete_reviews_for_session(&tx, "codex", id)?;
     }
@@ -570,7 +572,12 @@ fn upsert_rows(db: &crate::db::Db, rows: &[PreparedUpsert], tier1: Option<&Tier1
             &row.session_id,
             row.summary.auxiliary_kind.as_deref(),
         ).map_err(|e| e.to_string())?;
-        super::prompt_cache::set(&tx, row.engine, &row.session_id, row.summary.prompt_cache.as_ref()).map_err(|e| e.to_string())?;
+        // Cursor transcripts have no reliable request timestamps. Preserve the
+        // policy window recorded by a successful live run; file mtime must not
+        // renew it or an evidence-free scan erase it.
+        if row.engine != "cursor" || row.summary.prompt_cache.is_some() {
+            super::prompt_cache::set(&tx, row.engine, &row.session_id, row.summary.prompt_cache.as_ref()).map_err(|e| e.to_string())?;
+        }
     }
     if let Some(tier1) = tier1 {
         tx.execute(
@@ -710,6 +717,31 @@ pub fn spawn_scan(db: Arc<crate::db::Db>, sink: Arc<crate::event_sink::EventSink
 
 #[cfg(test)]
 pub(super) mod tests {
+
+    #[test]
+    fn cursor_prompt_cache_scan_preserves_live_evidence_without_mtime_renewal() -> Result<(), String> {
+        let home = scratch_dir("cursor-prompt-cache");
+        std::fs::create_dir_all(&home).unwrap();
+        let path = home.join("session.jsonl");
+        std::fs::write(&path, "{\"role\":\"user\",\"message\":{\"content\":\"hello\"}}\n{\"role\":\"assistant\",\"message\":{\"content\":\"response\"}}").unwrap();
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let candidate = Candidate { engine: "cursor", path: path.clone(), known_id: Some("cache".into()), known_workspace: Some("/ws".into()) };
+        let (stats, stale) = prefetch_stat_keys(&db, true)?;
+        let row = prepare_candidate(&candidate, stat_signature(&path).unwrap(), &stats, &stale, &["/ws".into()]).unwrap();
+        assert!(row.summary.prompt_cache.is_none());
+        upsert_rows(&db, &[row], None)?;
+        assert!(super::super::prompt_cache::load_all(&db.0.lock()).unwrap().is_empty());
+        let window = super::super::prompt_cache::CacheWindow {
+            ttl_seconds: 300, started_at: 1000, observed_at: 2000,
+            source: "cursor-policy".into(), reference: None,
+        };
+        super::super::prompt_cache::set(&db.0.lock(), "cursor", "cache", Some(&window)).unwrap();
+        let row = prepare_candidate(&candidate, stat_signature(&path).unwrap(), &stats, &stale, &["/ws".into()]).unwrap();
+        upsert_rows(&db, &[row], None)?;
+        assert_eq!(super::super::reader::list_sessions_from(&db)?[0].prompt_cache.as_ref(), Some(&window));
+        std::fs::remove_dir_all(home).unwrap();
+        Ok(())
+    }
 
     #[test]
     fn prompt_cache_backfills_unchanged_history_and_ignores_late_activity() -> Result<(), String> {
@@ -1218,6 +1250,49 @@ pub(super) mod tests {
         assert!(error.contains("no such table"), "{error}");
         drop(db);
         std::fs::remove_dir_all(&home).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    #[test]
+    fn session_sidebar_assignment_survives_real_scan_and_database_reopen() -> Result<(), String> {
+        let home = scratch_dir("scan-sidebar-placement");
+        let workspace = home.join("source");
+        let target = home.join("target");
+        let sessions = home.join(".codex/sessions/2026/10/24");
+        for directory in [&workspace, &target, &sessions] {
+            std::fs::create_dir_all(directory).map_err(|e| e.to_string())?;
+        }
+        let transcript = sessions.join("rollout-2026-10-24T10-00-00-sidebar-scan.jsonl");
+        let original = format!("{}\n{}\n",
+            serde_json::json!({"type":"session_meta","payload":{"id":"sidebar-scan","cwd":workspace}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Keep original history"}]}}));
+        std::fs::write(&transcript, &original).map_err(|e| e.to_string())?;
+        let _guard = HomeGuard::set(&home);
+        let database = home.join("app.db");
+        let db = crate::db::Db::open_at(&database).map_err(|e| e.to_string())?;
+        for (id, directory) in [("source", &workspace), ("target", &target)] {
+            db.0.lock().execute("INSERT INTO workspaces(id,path,name) VALUES(?1,?2,?1)",
+                rusqlite::params![id, directory.to_string_lossy()]).map_err(|e| e.to_string())?;
+        }
+        assert_eq!(scan_with(&db, || {})?.reparsed, 1);
+        crate::session_sidebar::assign(&db, "scan-placement".into(), vec![crate::session_sidebar::Assignment {
+            engine: "codex".into(), session_id: "sidebar-scan".into(),
+            expected_workspace_path: workspace.to_string_lossy().into_owned(),
+            expected_sidebar_workspace_path: None,
+            sidebar_workspace_path: Some(target.to_string_lossy().into_owned()),
+        }])?;
+        assert_eq!(std::fs::read_to_string(&transcript).map_err(|e| e.to_string())?, original);
+        // A real history change forces scanner upsert instead of the signature fast path.
+        std::fs::write(&transcript, format!("{original}\n")).map_err(|e| e.to_string())?;
+        assert_eq!(scan_with(&db, || {})?.reparsed, 1);
+        drop(db);
+        let db = crate::db::Db::open_at(&database).map_err(|e| e.to_string())?;
+        let listed = crate::history::reader::list_sessions_from(&db)?;
+        let row = listed.iter().find(|s| s.session_id == "sidebar-scan").ok_or("scanned session missing")?;
+        assert_eq!(row.sidebar_workspace_path.as_deref(), Some(target.to_string_lossy().as_ref()));
+        assert_eq!(crate::session_sidebar::path_key(&row.workspace_path), crate::session_sidebar::path_key(&workspace.to_string_lossy()));
+        drop(db);
+        std::fs::remove_dir_all(&home).ok();
         Ok(())
     }
 

@@ -7,6 +7,13 @@ import { crossSessionCostReview, requiresCrossSessionCostApproval } from "@/feat
 import { resolveSessionModel } from "@/features/chat/store/stream";
 import { cloneCheckpointValue, runtimeCheckpoint, type RuntimeCheckpoint, type RuntimeCheckpointParticipant } from "@/lib/runtime-checkpoint";
 import type { PluginStorageBackend } from "./context";
+import {
+  INBOX_GUIDANCE, MAX_INBOX_TEXT, MAX_INBOX_RESPONSE_BYTES, MAX_RELATED_MESSAGE_BYTES, acknowledgementCopy, callerCopy, envelopeCopy,
+  readOptionsCopy, renderInboxTurn, sameParticipant, targetParticipant, validCorrespondenceId, validMessageId,
+  type CorrespondenceEnvelope, type CorrespondenceReceipt, type InboxAcknowledgement, type InboxCaller,
+  type InboxClaim, type InboxMessage, type InboxParticipant, type InboxRead, type InboxReadOptions,
+  type InboxReadResult, type InboxSummary, type InboxWaitReason,
+} from "./chat-inbox";
 
 /** A request the user chose to send ahead of the target's own queued rows. */
 export interface HostChatDeliveryOptions { priority?: boolean }
@@ -89,7 +96,7 @@ function targetCopy(target: HostChatTarget): HostChatTarget {
     clientInstanceId: target.clientInstanceId, windowId: target.windowId };
 }
 function targetKey(target: HostChatTarget): string { return JSON.stringify(targetCopy(target)); }
-function copy(receipt: HostChatReceipt): HostChatReceipt { return { ...receipt, target: { ...receipt.target } }; }
+function copy(receipt: CorrespondenceReceipt): CorrespondenceReceipt { return { ...receipt, target: { ...receipt.target }, ...(receipt.mailbox ? { mailbox: { ...receipt.mailbox } } : {}) }; }
 function clip(text: string, limit: number): string {
   const prefix = text.slice(0, limit);
   // Do not end a bounded prefix in half of an emoji/non-BMP code point.
@@ -139,7 +146,7 @@ export async function desktopChatFacade(): Promise<HostChatFacade> {
           ? { ...stateMeta, promptCache: catalogMeta.promptCache } : stateMeta;
       if (!meta) return true;
       const review = crossSessionCostReview(meta, state, session.status);
-      return requiresCrossSessionCostApproval(review) || !review.cache;
+      return requiresCrossSessionCostApproval(review);
     },
     current() {
       const active = useChatStore.getState().active;
@@ -163,8 +170,9 @@ export async function desktopChatFacade(): Promise<HostChatFacade> {
   };
 }
 
-interface Entry { receipt: HostChatReceipt; prompt: string; fingerprint: string; lastSeq: number; priority?: true; costGuard?: true; costReviewedModel?: string | null }
-interface Ledger { version: 1; entries: Entry[] }
+interface Entry { receipt: CorrespondenceReceipt; prompt: string; fingerprint: string; lastSeq: number; priority?: true; costGuard?: true; costReviewedModel?: string | null;
+  envelope?: CorrespondenceEnvelope; claim?: InboxClaim; acknowledgement?: InboxAcknowledgement }
+interface Ledger { version: 1; entries: Entry[]; inboxReads?: InboxRead[] }
 interface BridgeCheckpoint {
   version: 1;
   pluginId: string;
@@ -174,6 +182,7 @@ interface BridgeCheckpoint {
   acknowledgedRuns: string[];
   sessionProvenRuns: string[];
   pendingTerminals: Array<[string, Partial<HostChatReceipt>]>;
+  endedInboxRuns?: string[];
   fenced: boolean;
 }
 type CheckpointCoordinator = Pick<typeof runtimeCheckpoint, "register" | "isPaused" | "assertAllowed">;
@@ -209,9 +218,38 @@ function ledgerEntries(value: unknown, identity?: HostChatIdentity): Entry[] {
     entry.receipt = { ...entry.receipt, target, text: entry.receipt.text === undefined ? undefined : clip(entry.receipt.text, MAX_TEXT),
       truncated: entry.receipt.truncated === true || (entry.receipt.text?.length ?? 0) > MAX_TEXT,
       error: entry.receipt.error === undefined ? undefined : clip(entry.receipt.error, 1024) };
+    if (entry.envelope) entry.envelope = envelopeCopy(entry.envelope);
+    const mailbox = entry.receipt.mailbox;
+    if (mailbox && (!entry.envelope?.relation || !["received", "retrieved", "handled", "deferred", "uncertain"].includes(mailbox.phase) ||
+      mailbox.relation !== entry.envelope.relation.type || mailbox.parentRequestId !== entry.envelope.relation.requestId || mailbox.kind !== entry.envelope.kind ||
+      (mailbox.waitReason !== undefined && !["target_busy", "permission", "cost_approval", "stopped", "parent_pending", "target_unavailable", "processing_unconfirmed"].includes(mailbox.waitReason)) ||
+      [mailbox.retrievedAt, mailbox.handledAt].some(at => at !== undefined && !Number.isFinite(at)) ||
+      (mailbox.impactReview !== undefined && (typeof mailbox.impactReview !== "string" || [...mailbox.impactReview].length > 8000)))) throw new Error("Invalid inbox receipt ledger");
+    if (entry.envelope?.relation && !mailbox) throw new Error("Missing inbox receipt ledger");
+    if (entry.claim && (typeof entry.claim.runId !== "string" || !entry.claim.runId || !validCorrespondenceId(entry.claim.readRequestId) ||
+      !["tool", "turn"].includes(entry.claim.mode) || !Number.isFinite(entry.claim.at) || typeof entry.claim.review !== "boolean" || !mailbox)) throw new Error("Invalid inbox claim ledger");
+    if (mailbox && ["retrieved", "handled", "deferred"].includes(mailbox.phase) && !entry.claim) throw new Error("Inbox receipt has no retrieval proof");
+    if (entry.acknowledgement) {
+      const ack = acknowledgementCopy(entry.acknowledgement, entry.acknowledgement.runId);
+      if (!entry.claim || ack.runId !== entry.claim.runId || ack.readRequestId !== entry.claim.readRequestId ||
+        (mailbox?.kind === "correction" && ack.outcome === "handled" && !ack.impactReview)) throw new Error("Invalid inbox acknowledgement ledger");
+    }
     return entry;
   });
 }
+function ledgerInboxReads(value: Ledger, entries: Map<string, Entry>): InboxRead[] {
+  const reads = value.inboxReads ?? [];
+  if (!Array.isArray(reads) || reads.length > MAX_REQUESTS) throw new Error("Invalid inbox read ledger");
+  const keys = new Set<string>();
+  return reads.map(read => {
+    const caller = callerCopy(read?.caller), key = JSON.stringify([caller, read.requestId]);
+    if (!validCorrespondenceId(read.requestId) || keys.has(key) || typeof read.fingerprint !== "string" || !Array.isArray(read.messageIds) || read.messageIds.length > 8 ||
+      new Set(read.messageIds).size !== read.messageIds.length || read.messageIds.some(id => !validMessageId(id) || !entries.get(id)?.receipt.mailbox || !sameParticipant(caller, targetParticipant(entries.get(id)!.receipt.target))) ||
+      (read.reviewIds !== undefined && (!Array.isArray(read.reviewIds) || read.reviewIds.some(id => !read.messageIds.includes(id))))) throw new Error("Invalid inbox read ledger");
+    keys.add(key); return structuredClone({ ...read, caller });
+  });
+}
+interface CorrespondenceCostOptions { requiresCostApproval?: boolean; costGuard?: boolean; reviewedModel?: string | null; checkCost?: () => Promise<boolean> | boolean }
 export interface HostChatBridgeDependencies {
   host?: () => Promise<HostChatFacade>;
   listen?: (callback: (events: EngineEventPayload[]) => void) => Promise<Disposer>;
@@ -236,6 +274,11 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
     approveCost(requestId: string, reviewedModel?: string | null): Promise<HostChatReceipt | null>;
     prioritize(requestId: string): Promise<HostChatReceipt | null>;
     cancel(requestId: string): Promise<HostChatReceipt | null>;
+    submitCorrespondence(request: HostChatSubmission, envelope: CorrespondenceEnvelope, cost?: CorrespondenceCostOptions): Promise<CorrespondenceReceipt>;
+    findCorrespondence(caller: InboxCaller, requestId: string): Promise<CorrespondenceReceipt | null>;
+    inboxStatus(caller: InboxCaller): Promise<InboxSummary>;
+    readMessages(caller: InboxCaller, options: InboxReadOptions): Promise<InboxReadResult>;
+    acknowledgeMessage(caller: InboxCaller, messageId: string, acknowledgement: Omit<InboxAcknowledgement, "runId">): Promise<CorrespondenceReceipt>;
   } {
   const now = deps.now ?? Date.now;
   const checkpoint = deps.checkpoint ?? runtimeCheckpoint;
@@ -243,6 +286,10 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
   const checkpointOwner = Symbol(participantId);
   let predecessorDrain: Promise<void> = Promise.resolve();
   const entries = new Map<string, Entry>();
+  const inboxReads = new Map<string, InboxRead>();
+  const endedInboxRuns = new Set<string>();
+  const inboxRunKey = (engine: string, sessionId: string, runId: string) => JSON.stringify([engine, sessionId, runId]);
+  const inboxRunEnded = (caller: InboxCaller) => endedInboxRuns.has(inboxRunKey(caller.engine, caller.sessionId, caller.runId));
   // Native events may finish before invoke resolves. Do not publish an
   // externally terminal receipt until the spawn ACK attests the frozen IDs.
   const acknowledgedRuns = new Set<string>();
@@ -277,7 +324,16 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
     chain = result.catch(() => undefined);
     return result;
   };
-  const visible = (receipt: HostChatReceipt) => copy({ ...receipt, status: pendingStarts.get(receipt.runId) ?? receipt.status });
+  const visible = (receipt: CorrespondenceReceipt) => {
+    const ack = entries.get(receipt.requestId)?.acknowledgement;
+    // A message receipt can be sealed while the native turn still owns other
+    // messages. Keep its execution status/output separate from that receipt.
+    return copy(ack && receipt.mailbox?.phase === ack.outcome ? { ...receipt,
+      status: ack.outcome === "handled" ? "completed" : "unknown", text: ack.response === undefined ? undefined : clip(ack.response, MAX_TEXT),
+      truncated: (ack.response?.length ?? 0) > MAX_TEXT,
+      error: ack.outcome === "handled" ? undefined : "The recipient deferred this message; it will not be automatically replayed",
+    } : { ...receipt, status: pendingStarts.get(receipt.runId) ?? receipt.status });
+  };
   const emit = (receipt: HostChatReceipt) => {
     if (disposed) return;
     for (const cb of [...listeners]) {
@@ -286,7 +342,7 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
   };
   const persist = () => {
     assertOwner();
-    return storage.set(pluginId, ledgerKey, structuredClone({ version: 1, entries: [...entries.values()] } satisfies Ledger));
+    return storage.set(pluginId, ledgerKey, structuredClone({ version: 1, entries: [...entries.values()], inboxReads: [...inboxReads.values()] } satisfies Ledger));
   };
   const clearTerminal = (entry: Entry) => {
     if (!terminal.has(entry.receipt.status)) return;
@@ -301,6 +357,28 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
     if (check) return (await check()) === true;
     return (await host.requiresCostApproval?.(target)) === true;
   };
+  const ownsNativeRun = (entry: Entry) => !entry.claim || entry.claim.runId === entry.receipt.runId;
+  const stopReason = (entry: Entry): boolean => {
+    const parent = entry.envelope?.relation && entries.get(entry.envelope.relation.scopedId);
+    return host.wasInterrupted(entry.receipt.target) || !!(parent && parent.receipt.status === "failed" && /interrupted|cancelled/i.test(parent.receipt.error ?? ""));
+  };
+  function associatedForRun(entry: Entry): Entry[] {
+    if (!terminal.has(entry.receipt.status)) return [];
+    const changed: Entry[] = [];
+    for (const other of entries.values()) {
+      if (other.claim?.mode !== "turn" || other.claim.runId !== entry.receipt.runId || !other.receipt.mailbox ||
+        !sameParticipant(targetParticipant(other.receipt.target), targetParticipant(entry.receipt.target)) ||
+        ["handled", "deferred", "uncertain"].includes(other.receipt.mailbox.phase)) continue;
+      const completed = entry.receipt.status === "completed" && other.receipt.mailbox.kind !== "correction";
+      other.receipt = { ...other.receipt, status: completed ? "completed" : "unknown", updatedAt: now(),
+        ...(completed ? { text: entry.receipt.text, truncated: entry.receipt.truncated, error: undefined } : { error: other.receipt.mailbox.kind === "correction" && entry.receipt.status === "completed"
+          ? "Correction was delivered but its impact review was not acknowledged; reconcile before continuing"
+          : "Associated message delivery may have started; reconcile the original identity before any retry" }),
+        mailbox: { ...other.receipt.mailbox, phase: completed ? "handled" : "uncertain", waitReason: completed ? undefined : "processing_unconfirmed", ...(completed ? { handledAt: now() } : {}) } };
+      changed.push(other);
+    }
+    return changed;
+  }
   const shouldHoldForCost = async (entry: Entry): Promise<boolean> => {
     const { target, requestId } = entry.receipt;
     if (entry.costReviewedModel !== undefined && entry.costReviewedModel !== (host.model?.(target) ?? null)) {
@@ -309,16 +387,18 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
     if (!entry.costGuard) return false;
     return evaluateCostGuard(requestId, target);
   };
-  const change = async (entry: Entry, patch: Partial<HostChatReceipt>) => {
+  const change = async (entry: Entry, patch: Partial<CorrespondenceReceipt>, settleAssociated = true) => {
     if (disposed) return;
     entry.receipt = { ...entry.receipt, ...patch, updatedAt: now() };
+    const changed = new Set([entry, ...(settleAssociated ? associatedForRun(entry) : [])]);
     try { await persist(); }
     catch {
       fenced = true;
-      entry.receipt = { ...entry.receipt, status: "unknown", error: "Host chat ledger update failed; execution will not be replayed", updatedAt: now() };
+      for (const item of changed) item.receipt = { ...item.receipt, status: "unknown", error: "Host chat ledger update failed; execution will not be replayed", updatedAt: now(),
+        ...(item.receipt.mailbox ? { mailbox: { ...item.receipt.mailbox, phase: "uncertain", waitReason: "processing_unconfirmed" } } : {}) };
+      for (const item of associatedForRun(entry)) changed.add(item);
     }
-    clearTerminal(entry);
-    emit(entry.receipt);
+    for (const item of changed) { clearTerminal(item); emit(item.receipt); }
   };
   const ensure = () => init ??= (async () => {
     assertOwner();
@@ -329,6 +409,12 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
     }
     ledgerKey = hostChatLedgerKey(host.identity);
     const off = await (deps.listen ?? listenEngineEvents)((events) => {
+      // Record closure before queuing ledger work: a read may currently be
+      // awaiting initialization, a cost probe, or a durable write on that chain.
+      for (const event of events) if (["done", "error", "turn_complete"].includes(event.kind) && event.sessionId && Number.isInteger(event.seq)) {
+        endedInboxRuns.add(inboxRunKey(event.engine, event.sessionId, event.runId));
+        if (endedInboxRuns.size > 8192) endedInboxRuns.delete(endedInboxRuns.values().next().value!);
+      }
       void serial(async () => { await ensure(); if (!disposed) await onEvents(events); });
     });
     if (disposed) { off(); throw new Error("Host chat bridge has been disposed"); }
@@ -346,9 +432,11 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
       for (const entry of ledgerEntries(loaded)) {
         if (!terminal.has(entry.receipt.status)) {
           entry.receipt = { ...entry.receipt, status: "unknown", updatedAt: now(), error: "Restored nonterminal request has uncertain acceptance or execution; not replayed" };
+          if (entry.receipt.mailbox && !entry.acknowledgement) entry.receipt.mailbox = { ...entry.receipt.mailbox, phase: "uncertain", waitReason: "processing_unconfirmed" };
         }
         entries.set(entry.receipt.requestId, entry);
       }
+      for (const read of ledgerInboxReads(loaded, entries)) inboxReads.set(JSON.stringify([read.caller, read.requestId]), read);
     }
     if (restored) {
       for (const entry of entries.values()) {
@@ -356,6 +444,7 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
         if (completion && acknowledgedRuns.has(entry.receipt.runId) && sessionProvenRuns.has(entry.receipt.runId)) {
           entry.receipt = { ...entry.receipt, ...completion, updatedAt: now() };
           clearTerminal(entry);
+          for (const related of associatedForRun(entry)) clearTerminal(related);
         }
       }
     }
@@ -375,6 +464,132 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
     }
   }
 
+  function waitingReason(entry: Entry): InboxWaitReason | undefined {
+    if (!entry.receipt.mailbox || entry.receipt.mailbox.phase !== "received") return entry.receipt.mailbox?.phase === "handled" ? undefined : "processing_unconfirmed";
+    if (entry.receipt.status === "awaiting_cost_approval") return "cost_approval";
+    if (!entry.priority && stopReason(entry)) return "stopped";
+    const parent = entry.envelope?.relation && entries.get(entry.envelope.relation.scopedId);
+    if (entry.envelope?.relation?.type === "update" && parent && ["queued", "received", "awaiting_cost_approval"].includes(parent.receipt.status)) return "parent_pending";
+    const session = host.inspect(entry.receipt.target);
+    return !session ? "target_unavailable" : session.status === "awaiting_permission" ? "permission" : session.status === "busy" ? "target_busy" : undefined;
+  }
+  function inboxSummary(caller: InboxParticipant): InboxSummary {
+    let pending = 0, held = 0, needsReconciliation = 0;
+    for (const entry of entries.values()) {
+      const mailbox = entry.receipt.mailbox;
+      if (!mailbox || !sameParticipant(caller, targetParticipant(entry.receipt.target)) || mailbox.phase === "handled" || entry.receipt.status === "failed") continue;
+      if (mailbox.phase !== "received") { needsReconciliation++; continue; }
+      const reason = waitingReason(entry);
+      if (!reason || reason === "target_busy") pending++; else held++;
+    }
+    // Only current nonterminal dependencies form a wait cycle, not an ordinary
+    // historical exchange. This is metadata, never a claim or peer instruction.
+    const outgoing = [...entries.values()].filter(entry => entry.envelope && !terminal.has(entry.receipt.status) && sameParticipant(entry.envelope.sender, caller));
+    const waitingOnCaller = [...entries.values()].filter(entry => entry.envelope && !entry.envelope.relation &&
+      ["queued", "received"].includes(entry.receipt.status) && sameParticipant(caller, targetParticipant(entry.receipt.target)) &&
+      outgoing.some(sent => sameParticipant(targetParticipant(sent.receipt.target), entry.envelope!.sender)))
+      .slice(0, 8).map(entry => ({ messageId: entry.receipt.requestId, sender: { ...entry.envelope!.sender }, requestId: entry.envelope!.requestId }));
+    return { pending, held, needsReconciliation, ...(waitingOnCaller.length ? { waitingOnCaller } : {}),
+      ...(pending || needsReconciliation || waitingOnCaller.length ? { nextAction: pending
+        ? "Call read_messages with a new stable request_id to retrieve your associated inbox before waiting or finishing. This notice contains no message body and does not acknowledge processing."
+        : waitingOnCaller.length ? "The other assistant may be waiting on this chat while this chat waits on it. Do not spin indefinitely: use an explicit reply_to/update_of for related information, or finish the current turn so independent questions can proceed."
+          : "Previously retrieved messages need an explicit processing receipt. Inspect their original outcome; use read_messages with explicit message_ids for reconciliation, never blindly repeat actions." } : {}) };
+  }
+  function inboxMessage(entry: Entry, readRequestId: string, review: boolean): InboxMessage {
+    const envelope = entry.envelope!;
+    return { message_id: entry.receipt.requestId, request_id: envelope.requestId, sender: { ...envelope.sender },
+      relation: { type: envelope.relation!.type, request_id: envelope.relation!.requestId }, message_kind: envelope.kind ?? "information",
+      message: entry.prompt, read_request_id: readRequestId, needs_reconciliation: review, processing_state: entry.receipt.mailbox!.phase };
+  }
+  function claimMessage(entry: Entry, runId: string, readRequestId: string, mode: InboxClaim["mode"], review = false) {
+    entry.claim = { runId, readRequestId, mode, at: now(), review };
+    delete entry.acknowledgement;
+    entry.receipt = { ...entry.receipt, status: "executing", updatedAt: now(), error: undefined,
+      mailbox: { ...entry.receipt.mailbox!, phase: "retrieved", retrievedAt: now(), waitReason: "processing_unconfirmed" } };
+  }
+  function turnPrompt(entry: Entry, messages: InboxMessage[]) {
+    const base = entry.receipt.mailbox ? "Handle the following associated messages in the existing conversation. Continue from established context; do not replay or restart the original request." : entry.prompt;
+    return renderInboxTurn(base, entry.envelope, messages);
+  }
+  async function readMessages(rawCaller: InboxCaller, rawOptions: InboxReadOptions): Promise<InboxReadResult> {
+    const caller = callerCopy(rawCaller), options = readOptionsCopy(rawOptions);
+    await ensure();
+    return serial(async () => {
+      assertOwner(); checkpoint.assertAllowed();
+      if (fenced) throw new Error("Host chat ledger is fenced after an ambiguous storage failure");
+      const key = JSON.stringify([caller, options.requestId]), fingerprint = JSON.stringify([options.limit, options.messageIds ?? null]);
+      const previous = inboxReads.get(key);
+      if (previous) {
+        if (previous.fingerprint !== fingerprint) throw new Error("Inbox read request_id already belongs to a different selection");
+        return { read_request_id: options.requestId, messages: previous.messageIds.map(id => inboxMessage(entries.get(id)!, options.requestId, previous.reviewIds?.includes(id) === true)), inbox: inboxSummary(caller), instructions: INBOX_GUIDANCE };
+      }
+      if (inboxReads.size >= MAX_REQUESTS) throw new Error("Inbox retrieval ledger capacity reached");
+      const explicit = options.messageIds !== undefined;
+      const candidates = inboxRunEnded(caller) ? [] : explicit ? options.messageIds!.map(id => {
+        const entry = entries.get(id);
+        if (!entry?.receipt.mailbox || !sameParticipant(caller, targetParticipant(entry.receipt.target))) throw new Error("Message does not belong to the caller's inbox");
+        if (entry.receipt.mailbox.phase === "retrieved" && entry.claim?.runId !== caller.runId) throw new Error("Message belongs to another active retrieval; reconcile after that turn settles");
+        return entry;
+      }) : [...entries.values()].filter(entry => entry.receipt.mailbox?.phase === "received" && sameParticipant(caller, targetParticipant(entry.receipt.target)));
+      const selected: Entry[] = [], reviewIds: string[] = []; let size = 0;
+      for (const entry of candidates) {
+        if (selected.length >= options.limit) break;
+        if (entry.receipt.status === "failed" || entry.receipt.mailbox!.phase === "handled") continue;
+        const reason = waitingReason(entry);
+        const session = host.inspect(entry.receipt.target);
+        if (!session || session.status === "awaiting_permission" || entry.receipt.status === "awaiting_cost_approval" || reason === "permission" || reason === "target_unavailable" ||
+          (!explicit && reason && reason !== "target_busy")) continue;
+        if (await shouldHoldForCost(entry)) { await change(entry, { status: "awaiting_cost_approval", mailbox: { ...entry.receipt.mailbox!, waitReason: "cost_approval" } }); continue; }
+        assertOwner(); checkpoint.assertAllowed();
+        if (fenced) throw new Error("Inbox delivery is fenced");
+        // The cost probe may yield. Recheck target state before exposing bytes.
+        const latest = waitingReason(entry);
+        const currentSession = host.inspect(entry.receipt.target);
+        if (!currentSession || currentSession.status === "awaiting_permission" || latest === "permission" || latest === "target_unavailable" || (!explicit && latest && latest !== "target_busy")) continue;
+        const prospective = [...selected, entry].map(item => inboxMessage(item, options.requestId, true));
+        if (size + entry.prompt.length > MAX_INBOX_TEXT || new TextEncoder().encode(JSON.stringify(prospective)).length > MAX_INBOX_RESPONSE_BYTES) break;
+        size += entry.prompt.length;
+        if (entry.receipt.mailbox!.phase !== "received" || (explicit && stopReason(entry))) reviewIds.push(entry.receipt.requestId);
+        selected.push(entry);
+      }
+      if (inboxRunEnded(caller)) { selected.length = 0; reviewIds.length = 0; }
+      const read: InboxRead = { caller, requestId: options.requestId, fingerprint, messageIds: selected.map(entry => entry.receipt.requestId), reviewIds };
+      for (const entry of selected) claimMessage(entry, caller.runId, options.requestId, "tool", reviewIds.includes(entry.receipt.requestId));
+      inboxReads.set(key, read);
+      try { await persist(); }
+      catch { fenced = true; for (const entry of selected) { entry.receipt = { ...entry.receipt, status: "unknown", mailbox: { ...entry.receipt.mailbox!, phase: "uncertain", waitReason: "processing_unconfirmed" }, error: "Inbox retrieval persistence is uncertain; no automatic retry" }; emit(entry.receipt); } throw new Error("Inbox retrieval could not be confirmed; preserve this read request_id and reconcile"); }
+      assertOwner();
+      for (const entry of selected) emit(entry.receipt);
+      return { read_request_id: options.requestId, messages: selected.map(entry => inboxMessage(entry, options.requestId, reviewIds.includes(entry.receipt.requestId))), inbox: inboxSummary(caller), instructions: INBOX_GUIDANCE };
+    });
+  }
+  async function acknowledgeMessage(rawCaller: InboxCaller, messageId: string, input: Omit<InboxAcknowledgement, "runId">): Promise<CorrespondenceReceipt> {
+    const caller = callerCopy(rawCaller), ack = acknowledgementCopy(input, caller.runId);
+    if (!validMessageId(messageId)) throw new Error("Invalid inbox message identity");
+    await ensure();
+    return serial(async () => {
+      assertOwner(); checkpoint.assertAllowed();
+      if (fenced) throw new Error("Inbox acknowledgement is fenced after an ambiguous storage failure");
+      const entry = entries.get(messageId);
+      if (!entry?.receipt.mailbox || !sameParticipant(caller, targetParticipant(entry.receipt.target)) || !entry.claim ||
+        entry.claim.runId !== caller.runId || entry.claim.readRequestId !== ack.readRequestId) throw new Error("Inbox acknowledgement does not match its authenticated retrieval");
+      if (entry.acknowledgement) {
+        if (JSON.stringify(entry.acknowledgement) !== JSON.stringify(ack)) throw new Error("Inbox acknowledgement already has a different outcome");
+        return visible(entry.receipt);
+      }
+      if (entry.receipt.mailbox.phase === "handled" || entry.receipt.status === "failed") throw new Error("Inbox message is already settled");
+      if (entry.receipt.mailbox.kind === "correction" && ack.outcome === "handled" && !ack.impactReview) throw new Error("A correction requires impact_review of completed and in-flight actions before acknowledgement");
+      entry.acknowledgement = ack;
+      const runningOwner = ownsNativeRun(entry) && !terminal.has(entry.receipt.status);
+      await change(entry, { ...(runningOwner ? {} : { status: ack.outcome === "handled" ? "completed" as const : "unknown" as const,
+        text: ack.response === undefined ? undefined : clip(ack.response, MAX_TEXT), truncated: (ack.response?.length ?? 0) > MAX_TEXT,
+        error: ack.outcome === "handled" ? undefined : "The recipient deferred this message; it will not be automatically replayed" }),
+        mailbox: { ...entry.receipt.mailbox, phase: ack.outcome, handledAt: ack.outcome === "handled" ? now() : undefined,
+          waitReason: ack.outcome === "handled" ? undefined : "processing_unconfirmed", impactReview: ack.impactReview } }, false);
+      return visible(entry.receipt);
+    });
+  }
+
   function kick() {
     if (disposed || fenced) return;
     if (checkpoint.isPaused()) { wakeRequested = true; return; }
@@ -391,6 +606,12 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
       for (const entry of ordered) {
         if (disposed || fenced || checkpoint.isPaused()) break;
         if (entry.receipt.status !== "queued" && entry.receipt.status !== "received") continue;
+        if (entry.receipt.mailbox) {
+          if (entry.receipt.mailbox.phase !== "received") continue;
+          const reason = waitingReason(entry);
+          if (entry.receipt.mailbox.waitReason !== reason) await change(entry, { mailbox: { ...entry.receipt.mailbox, waitReason: reason } });
+          if (reason === "stopped" || reason === "parent_pending") continue;
+        }
         const { target, runId } = entry.receipt;
         const key = targetKey(target);
         if (blockedTargets.has(key)) continue;
@@ -420,15 +641,43 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
           continue;
         }
         if (reservations.has(key)) continue;
+        const readRequestId = `turn-${runId}`;
+        const bundled: Entry[] = entry.receipt.mailbox ? [entry] : [];
+        // Updates still waiting when their original question starts join that
+        // prompt, on the same ledger chain as inbox retrieval.
+        if (entry.envelope) {
+          for (const update of entries.values()) {
+            const sameGroup = entry.envelope.relation
+              ? update.envelope?.relation?.type === entry.envelope.relation.type && update.envelope.relation.scopedId === entry.envelope.relation.scopedId
+              : update.envelope?.relation?.type === "update" && update.envelope.relation.scopedId === entry.receipt.requestId;
+            if (update === entry || bundled.length >= 8 || !sameGroup || (!update.priority && stopReason(update)) ||
+              update.receipt.mailbox?.phase !== "received" || !["queued", "received"].includes(update.receipt.status) ||
+              !sameParticipant(targetParticipant(update.receipt.target), targetParticipant(target))) continue;
+            if (await shouldHoldForCost(update)) { await change(update, { status: "awaiting_cost_approval", mailbox: { ...update.receipt.mailbox, waitReason: "cost_approval" } }); continue; }
+            const proposed = [...bundled, update].map(item => inboxMessage(item, readRequestId, false));
+            if (turnPrompt(entry, proposed).length > 131_072) continue;
+            bundled.push(update);
+          }
+        }
+        if (disposed || fenced || checkpoint.isPaused()) { wakeRequested = checkpoint.isPaused(); break; }
+        const beforeClaims = bundled.map(item => ({ item, receipt: copy(item.receipt), claim: item.claim, acknowledgement: item.acknowledgement }));
+        const restoreClaims = () => { for (const previous of beforeClaims) {
+          previous.item.receipt = previous.receipt; previous.item.claim = previous.claim; previous.item.acknowledgement = previous.acknowledgement;
+        } };
+        const initialStatus = entry.receipt.status;
+        for (const item of bundled) claimMessage(item, runId, readRequestId, "turn");
+        const prompt = turnPrompt(entry, bundled.map(item => inboxMessage(item, readRequestId, false)));
         reservations.add(key);
-        pendingStarts.set(runId, entry.receipt.status);
+        pendingStarts.set(runId, initialStatus);
         await change(entry, { status: "executing" });
         if (disposed || fenced) { reservations.delete(key); continue; }
+        for (const item of bundled) if (item !== entry) emit(item.receipt);
         // A prepare barrier can arrive during the durable pre-spawn write.
         // No native send happened yet, so restore its queued acceptance exactly.
         if (checkpoint.isPaused()) {
           const previous = pendingStarts.get(runId) ?? "queued";
           pendingStarts.delete(runId);
+          restoreClaims();
           await change(entry, { status: previous });
           reservations.delete(key);
           wakeRequested = true;
@@ -443,18 +692,21 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
         }
         if (entry.costReviewedModel !== undefined && entry.costReviewedModel !== (host.model?.(target) ?? null)) {
           pendingStarts.delete(runId);
+          restoreClaims();
           await change(entry, { status: "awaiting_cost_approval" });
           reservations.delete(key);
           continue;
         }
         if (beforeSend.status !== "idle") {
           pendingStarts.delete(runId);
+          restoreClaims();
           await change(entry, { status: "queued" });
           reservations.delete(key);
           continue;
         }
         if (await shouldHoldForCost(entry)) {
           pendingStarts.delete(runId);
+          restoreClaims();
           if (!disposed && !fenced && !checkpoint.isPaused()) {
             await change(entry, { status: "awaiting_cost_approval" });
           } else if (!disposed && !fenced && checkpoint.isPaused()) {
@@ -467,6 +719,7 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
         if (disposed || fenced || checkpoint.isPaused()) {
           const previous = pendingStarts.get(runId) ?? "queued";
           pendingStarts.delete(runId);
+          if (!fenced) restoreClaims();
           if (!disposed && !fenced) await change(entry, { status: previous });
           reservations.delete(key);
           if (checkpoint.isPaused()) wakeRequested = true;
@@ -480,12 +733,13 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
         }
         if (finalSend.status !== "idle") {
           pendingStarts.delete(runId);
+          restoreClaims();
           await change(entry, { status: "queued" });
           reservations.delete(key);
           continue;
         }
         inFlightStarts.add(runId);
-        void host.send(target, entry.prompt, runId, delivery).then((result) => serial(async () => {
+        void host.send(target, prompt, runId, delivery).then((result) => serial(async () => {
           if (disposed || terminal.has(entry.receipt.status)) return;
           if (result.runId !== runId || (result.sessionId !== null && result.sessionId !== target.nativeSessionId)) {
             await change(entry, { status: "unknown", error: `Native send ACK identity mismatch: ${clip(JSON.stringify({ actualRunId: result.runId, actualSessionId: result.sessionId }), 768)}` });
@@ -501,7 +755,7 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
         }), (error: unknown) => serial(async () => {
           if (disposed || terminal.has(entry.receipt.status)) return;
           const busyBeforeStart = error instanceof HostChatBusyError && pendingStarts.has(runId);
-          if (busyBeforeStart) pendingStarts.delete(runId);
+          if (busyBeforeStart) { pendingStarts.delete(runId); restoreClaims(); }
           await change(entry, busyBeforeStart ? { status: "queued" } :
             { status: "unknown", error: "Native send failed without a conclusive execution acknowledgement; not replayed" });
         })).finally(() => { inFlightStarts.delete(runId); reservations.delete(key); kick(); });
@@ -514,7 +768,7 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
 
   async function onEvents(events: EngineEventPayload[]) {
     const changed = new Set<Entry>();
-    const update = (entry: Entry, patch: Partial<HostChatReceipt>) => {
+    const update = (entry: Entry, patch: Partial<CorrespondenceReceipt>) => {
       entry.receipt = { ...entry.receipt, ...patch, updatedAt: now() };
       changed.add(entry);
     };
@@ -528,8 +782,16 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
       else pendingTerminals.set(entry.receipt.runId, result);
     };
     for (const event of events) {
+      if (event.kind === "done" || event.kind === "error" || event.kind === "turn_complete") {
+        for (const message of entries.values()) {
+          if (message.claim?.mode !== "tool" || message.claim.runId !== event.runId || message.receipt.mailbox?.phase !== "retrieved" ||
+            event.engine !== message.receipt.target.engine || event.sessionId !== message.receipt.target.nativeSessionId) continue;
+          update(message, { status: "unknown", error: "The receiving turn ended without an explicit processing receipt; do not automatically replay the message",
+            mailbox: { ...message.receipt.mailbox, phase: "uncertain", waitReason: "processing_unconfirmed" } });
+        }
+      }
       const entry = [...entries.values()].find((e) => e.receipt.runId === event.runId);
-      if (!entry || terminal.has(entry.receipt.status) ||
+      if (!entry || !ownsNativeRun(entry) || terminal.has(entry.receipt.status) ||
         (entry.receipt.status !== "executing" && entry.receipt.status !== "awaiting_permission") ||
         event.engine !== entry.receipt.target.engine ||
         !Number.isInteger(event.seq) || event.seq <= entry.lastSeq) continue;
@@ -582,10 +844,12 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
     }
     // One durable write per native batch, not one IPC write per text chunk.
     if (changed.size) {
+      for (const entry of changed) for (const related of associatedForRun(entry)) changed.add(related);
       try { await persist(); }
       catch {
         fenced = true;
-        for (const entry of changed) entry.receipt = { ...entry.receipt, status: "unknown", updatedAt: now(), error: "Host chat ledger update failed; execution will not be replayed" };
+        for (const entry of changed) entry.receipt = { ...entry.receipt, status: "unknown", updatedAt: now(), error: "Host chat ledger update failed; execution will not be replayed",
+          ...(entry.receipt.mailbox ? { mailbox: { ...entry.receipt.mailbox, phase: "uncertain", waitReason: "processing_unconfirmed" } } : {}) };
       }
       for (const entry of changed) { clearTerminal(entry); emit(entry.receipt); }
     }
@@ -594,9 +858,9 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
 
   function captureCheckpoint(): BridgeCheckpoint {
     return cloneCheckpointValue({ version: 1, pluginId, identity: identityCopy(host?.identity ?? restoredIdentity),
-      ledger: { version: 1, entries: [...entries.values()] }, pendingStarts: [...pendingStarts],
+      ledger: { version: 1, entries: [...entries.values()], inboxReads: [...inboxReads.values()] }, pendingStarts: [...pendingStarts],
       acknowledgedRuns: [...acknowledgedRuns], sessionProvenRuns: [...sessionProvenRuns],
-      pendingTerminals: [...pendingTerminals], fenced } satisfies BridgeCheckpoint);
+      pendingTerminals: [...pendingTerminals], endedInboxRuns: [...endedInboxRuns], fenced } satisfies BridgeCheckpoint);
   }
 
   function restoreCheckpoint(value: unknown) {
@@ -610,7 +874,10 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
       throw new Error("Host chat checkpoint belongs to another desktop document");
     }
     const nextEntries = ledgerEntries(snapshot.ledger, identity);
-    const activeRuns = new Set(nextEntries.filter((entry) => ["executing", "awaiting_permission"].includes(entry.receipt.status)).map((entry) => entry.receipt.runId));
+    const nextInboxReads = ledgerInboxReads(snapshot.ledger, new Map(nextEntries.map(entry => [entry.receipt.requestId, entry])));
+    const nextEnded = snapshot.endedInboxRuns ?? [];
+    if (!Array.isArray(nextEnded) || nextEnded.length > 8192 || nextEnded.some(key => typeof key !== "string" || key.length > 16384)) throw new Error("Invalid inbox run checkpoint");
+    const activeRuns = new Set(nextEntries.filter((entry) => ownsNativeRun(entry) && ["executing", "awaiting_permission"].includes(entry.receipt.status)).map((entry) => entry.receipt.runId));
     const runSet = (values: string[]) => {
       if (values.length > MAX_REQUESTS || values.some((run) => typeof run !== "string" || !activeRuns.has(run)) || new Set(values).size !== values.length) {
         throw new Error("Invalid host chat checkpoint run proof");
@@ -637,12 +904,14 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
       nextTerminals.set(pair[0], patch);
     }
     if (snapshot.pendingStarts.length > MAX_REQUESTS || snapshot.pendingTerminals.length > MAX_REQUESTS ||
-      nextEntries.some((entry) => ["executing", "awaiting_permission"].includes(entry.receipt.status) && !nextAcknowledged.has(entry.receipt.runId))) {
+      nextEntries.some((entry) => ownsNativeRun(entry) && ["executing", "awaiting_permission"].includes(entry.receipt.status) && !nextAcknowledged.has(entry.receipt.runId))) {
       throw new Error("Host chat checkpoint contains an unpublished native start");
     }
     // Install synchronously. ensure() must not later replace this cut with a KV
     // ledger load that treats all active receipts as crash uncertainty.
     entries.clear(); nextEntries.forEach((entry) => entries.set(entry.receipt.requestId, entry));
+    inboxReads.clear(); for (const read of nextInboxReads) inboxReads.set(JSON.stringify([read.caller, read.requestId]), read);
+    endedInboxRuns.clear(); for (const key of nextEnded) endedInboxRuns.add(key);
     pendingStarts.clear(); nextStarts.forEach((status, run) => pendingStarts.set(run, status));
     acknowledgedRuns.clear(); nextAcknowledged.forEach((run) => acknowledgedRuns.add(run));
     sessionProvenRuns.clear(); nextProven.forEach((run) => sessionProvenRuns.add(run));
@@ -697,12 +966,16 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
     costGuard = false,
     reviewedModel?: string | null,
     checkCost?: () => Promise<boolean> | boolean,
-  ): Promise<HostChatReceipt> {
+    rawEnvelope?: CorrespondenceEnvelope,
+  ): Promise<CorrespondenceReceipt> {
     if (!validRequestId(request?.requestId) || typeof request.prompt !== "string" || !request.prompt.trim() || request.prompt.length > 131_072) throw new Error("Invalid host chat requestId or prompt");
     const target = targetCopy(request.target);
     const requestId = request.requestId;
     const prompt = request.prompt;
     const fingerprint = JSON.stringify([target, prompt]);
+    const envelope = rawEnvelope ? envelopeCopy(rawEnvelope) : undefined;
+    if (envelope && sameParticipant(envelope.sender, targetParticipant(target))) throw new Error("Cannot send correspondence to the sender's own session");
+    if (envelope?.relation && (!validMessageId(requestId) || new TextEncoder().encode(JSON.stringify(prompt)).length > MAX_RELATED_MESSAGE_BYTES)) throw new Error("Associated message is too large; split it into smaller updates with the same original request reference");
     await ensure();
     return serial(async () => {
       if (disposed) throw new Error("Host chat bridge has been disposed");
@@ -710,6 +983,9 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
       const previous = entries.get(requestId);
       if (previous) {
         if (previous.fingerprint !== fingerprint) throw new Error("Host chat requestId already belongs to a different target or prompt");
+        if (envelope && previous.envelope && (!sameParticipant(envelope.sender, previous.envelope.sender) || previous.envelope.requestId !== envelope.requestId ||
+          previous.envelope.kind !== envelope.kind || previous.envelope.relation?.type !== envelope.relation?.type || previous.envelope.relation?.requestId !== envelope.relation?.requestId)) throw new Error("Correspondence requestId already belongs to a different relation or sender");
+        if (envelope?.relation && !previous.envelope) throw new Error("An independent request cannot become an associated message");
         return visible(previous.receipt);
       }
       checkpoint.assertAllowed();
@@ -717,6 +993,18 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
       const initialSession = host.inspect(target);
       if (!initialSession) throw new Error("Exact host chat target is unavailable (open, loaded native timeline required)");
       if (entries.size >= MAX_REQUESTS) throw new Error("Host chat request ledger capacity reached");
+      if (envelope?.relation) {
+        const relation = envelope.relation;
+        const matches = [...entries.values()].filter(candidate => !candidate.envelope?.relation &&
+          (candidate.receipt.requestId === relation.scopedId || (candidate.envelope?.requestId === relation.requestId &&
+            sameParticipant(candidate.envelope.sender, relation.type === "update" ? envelope.sender : targetParticipant(target)))) &&
+          sameParticipant(targetParticipant(candidate.receipt.target), relation.type === "update" ? targetParticipant(target) : envelope.sender));
+        if (matches.length !== 1) throw new Error("Related original request is unavailable, ambiguous or belongs to different participants");
+        const parent = matches[0];
+        if (parent.envelope && (parent.envelope.requestId !== relation.requestId ||
+          !sameParticipant(parent.envelope.sender, relation.type === "update" ? envelope.sender : targetParticipant(target)))) throw new Error("Related request sender does not match");
+        relation.scopedId = parent.receipt.requestId;
+      }
       if (costGuard && checkCost) costGuards.set(requestId, checkCost);
       const initialModel = host.model?.(target) ?? null;
       const costReviewedModel = costGuard ? reviewedModel === undefined ? initialModel : reviewedModel : undefined;
@@ -737,6 +1025,12 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
       const at = now();
       const entry: Entry = { prompt, fingerprint, lastSeq: -1, ...(costGuard ? { costGuard: true, costReviewedModel } : {}), receipt: { requestId, target,
         runId: deps.runId?.() ?? `run-${newId()}`, status: needsApproval ? "awaiting_cost_approval" : session.status === "idle" ? "received" : "queued", acceptedAt: at, updatedAt: at } };
+      if (envelope) entry.envelope = envelope;
+      if (envelope?.relation) entry.receipt.mailbox = { phase: "received", relation: envelope.relation.type, parentRequestId: envelope.relation.requestId,
+        kind: envelope.kind ?? "information", waitReason: needsApproval ? "cost_approval" : session.status === "awaiting_permission" ? "permission" : session.status === "busy" ? "target_busy" : undefined };
+      if (turnPrompt(entry, entry.receipt.mailbox ? [inboxMessage(entry, `turn-${entry.receipt.runId}`, false)] : []).length > 131_072) {
+        costGuards.delete(requestId); throw new Error("Attributed correspondence exceeds the delivery budget; split the message before sending");
+      }
       entries.set(requestId, entry);
       try { await persist(); }
       catch { entries.delete(requestId); costGuards.delete(requestId); fenced = true; throw new Error("Host chat acceptance could not be persisted; no native send was started"); }
@@ -748,6 +1042,18 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
 
   return {
     ready,
+    submitCorrespondence: (request, envelope, cost = {}) => submit(request, cost.requiresCostApproval, cost.costGuard, cost.reviewedModel, cost.checkCost, envelope),
+    async findCorrespondence(rawCaller, requestId) {
+      const caller = callerCopy(rawCaller); await ensure();
+      return serial(async () => {
+        const found = [...entries.values()].filter(entry => entry.envelope?.requestId === requestId && sameParticipant(entry.envelope.sender, caller));
+        if (found.length > 1) throw new Error("Correspondence identity is ambiguous; reconcile existing receipts before retrying");
+        return found.length ? visible(found[0].receipt) : null;
+      });
+    },
+    async inboxStatus(rawCaller) { const caller = callerCopy(rawCaller); await ensure(); return serial(async () => { assertOwner(); return inboxSummary(caller); }); },
+    readMessages,
+    acknowledgeMessage,
     submitForCostApproval: (request) => submit(request, true),
     async submitWithCostGuard(request, reviewedModel, requiresCostApproval) {
       if (reviewedModel !== undefined && reviewedModel !== null && typeof reviewedModel !== "string") {
@@ -788,6 +1094,8 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
         if (entry.priority) return;
         if (fenced) throw new Error("Host chat ledger is fenced after an ambiguous storage failure");
         entry.priority = true;
+        const parent = entry.envelope?.relation?.type === "update" ? entries.get(entry.envelope.relation.scopedId) : undefined;
+        if (parent && ["queued", "received"].includes(parent.receipt.status)) parent.priority = true;
         await change(entry, {});
       });
       kick();

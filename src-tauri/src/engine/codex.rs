@@ -10,6 +10,20 @@ use serde_json::Value;
 /// `codex exec` answers every question itself.
 pub struct CodexEngine;
 
+/// Apply after trusted child admission and all channel overrides, before spawn.
+/// A child must not inherit Fast from the app, CLI config, or a resumed thread.
+/// Keep the request in sync so thread/start and thread/resume restate the tier.
+pub(super) fn apply_child_service_tier(
+    command: &mut tokio::process::Command,
+    req: &mut SendRequest,
+    run_id: &str,
+) {
+    if crate::leader::is_managed_child(run_id) {
+        req.service_tier = Some("default".into());
+        command.arg("-c").arg("service_tier=\"default\"");
+    }
+}
+
 /// TOML basic-string literal for a `-c key=<value>` override. codex parses
 /// the value as TOML, so a Windows path's backslashes would otherwise read
 /// as escape sequences.
@@ -308,8 +322,8 @@ impl Engine for CodexEngine {
         // and by apply_channel; see apply_computer_use.
         apply_computer_use(&mut cmd, req)?;
         apply_host_chat(&mut cmd, host_chat_server)?;
-        // Fast mode is Codex's service_tier=priority; the driver's thread/start
-        // carries model and sandbox, but not the tier.
+        // Fast mode is Codex's service_tier=priority. Set the process default;
+        // the driver also restates explicit tiers when starting/resuming threads.
         if let Some(tier) = req.service_tier.as_deref() {
             if !matches!(tier, "default" | "priority") {
                 return Err("Invalid Codex service tier".to_string());
@@ -643,7 +657,10 @@ async fn run_help_probe(bin: &str) -> Option<String> {
     cmd.kill_on_drop(true);
     #[cfg(windows)]
     super::hide_console(&mut cmd);
-    let output = tokio::time::timeout(std::time::Duration::from_secs(8), cmd.output())
+    let child = cmd.spawn().ok()?;
+    #[cfg(windows)]
+    let _job = super::job::assign_kill_on_close(&child);
+    let output = tokio::time::timeout(std::time::Duration::from_secs(8), child.wait_with_output())
         .await
         .ok()?
         .ok()?;

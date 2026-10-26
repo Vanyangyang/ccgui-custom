@@ -1,3 +1,4 @@
+import { matchesHostTaskSelection } from "./host-task-selection";
 import { ipc } from "@/lib/ipc";
 import { cursorLaunchModel, cursorRememberedModel } from "@/components/application/ai-chat/cursor-models";
 import { engineSupportsCompact } from "@/components/application/ai-chat/app-commands";
@@ -12,6 +13,7 @@ import {
   sessionKey,
   type ActiveSession,
 } from "./persistence";
+import { isBackgroundDraftAvailable } from "./tabs";
 import {
   EMPTY_SESSION,
   adoptedDraftKeys,
@@ -38,6 +40,7 @@ import { latestMessageUsage, mergeUsage, parseUsage } from "../usage";
 import { crossSessionCostReview, requiresQueueDrainCostApproval, useSessionSendCostGuardStore } from "../cross-session-cost";
 import { settleThroughput } from "../throughput";
 import { persistClaudeUltracode } from "./claude-ultracode";
+import { resolveClaudeHaikuAssist } from "../claude-haiku-assist";
 import { beginRuntimeOperation, guardRuntimeActions, isRuntimeSubmissionPaused } from "@/lib/runtime-checkpoint";
 import {
   dropRunUsage,
@@ -226,7 +229,10 @@ export function createMessagingActions(
     }
     const key = sessionKey(tab.engine, null, tab.workspacePath);
     const draft = get().bySession[key];
-    if (draft?.loading || draft?.streaming || draft?.draftLaunching) return;
+    if (draft?.loading || draft?.streaming || draft?.draftLaunching) {
+      if (options?.requestedRunId) throw new HostChatBusyError();
+      return;
+    }
     const draftLaunch = { id: newId(), invoked: false };
     patchSession(set, key, { draftLaunching: draftLaunch.id, interrupted: false });
     try {
@@ -254,11 +260,32 @@ export function createMessagingActions(
       const state = get();
       const key = sessionKey(tab.engine, tab.sessionId, tab.workspacePath);
       const session = state.bySession[key];
+      if (options.hostNewChat) {
+        // A first task turn targets exactly one open pending chat; an adopted,
+        // closed, focused or user-edited draft is a pre-spawn refusal, never a
+        // send elsewhere or an overwrite of the user's draft.
+        if (
+          tab.sessionId !== null ||
+          !draftLaunch ||
+          session?.draftLaunching !== draftLaunch.id ||
+          !isBackgroundDraftAvailable(state, tab.engine, tab.workspacePath, options.hostLaunch, {
+            requireOpenTab: true,
+            allowDraftLaunchingId: draftLaunch.id,
+          })
+        ) {
+          throw new HostChatBusyError();
+        }
+        return;
+      }
       if (!state.initialized || !tab.sessionId || !session || session.loading || state.archivedSessionKeys[key] ||
         !state.openTabs.some((t) => t.engine === tab.engine && t.sessionId === tab.sessionId && t.workspacePath === tab.workspacePath)) {
-        throw new Error("Exact host chat target is no longer reachable");
+        throw new HostChatBusyError("Exact host chat target is no longer reachable");
       }
-      if (session.streaming || session.queue.length || hasOpenCard(session)) {
+      const current = state.openTabs.find((t) => t.engine === tab.engine && t.sessionId === tab.sessionId && t.workspacePath === tab.workspacePath)!;
+      if (options.hostLaunch && !matchesHostTaskSelection(current, session, options.hostLaunch)) {
+        throw new HostChatBusyError("Host task session selection changed before delivery");
+      }
+      if ((session.streaming && !(live && options.hostContinuation)) || session.queue.length || hasOpenCard(session)) {
         throw new HostChatBusyError();
       }
     };
@@ -295,6 +322,7 @@ export function createMessagingActions(
         // A Stop during this await cancels the prepared delivery even if the
         // run's final done already cleared its per-run parking flags.
         if (preparation?.stopped) {
+          if (options?.hostContinuation) throw new HostChatBusyError("Host continuation stopped during preparation");
           patchSession(set, preparation.key, { followUpAt: null });
           const putBack = tab.engine === "codex" ? requeueCodexInput : requeueFirst;
           putBack(preparation.key, live!.item ?? {
@@ -310,12 +338,23 @@ export function createMessagingActions(
         });
       }
     }
+    if (options?.requestedRunId) {
+      await options.hostBeforeSend?.();
+      assertHostIdle();
+      tab = get().openTabs.find((t) => t.engine === tab.engine && t.sessionId === tab.sessionId && t.workspacePath === tab.workspacePath)!;
+    }
     const engine = tab.engine;
     const key = sessionKey(engine, tab.sessionId, tab.workspacePath);
     // Closing or retargeting during agent resolution cancels this first launch.
     if (tab.sessionId === null && !get().openTabs.some((t) =>
-      t.engine === engine && t.sessionId === null && t.workspacePath === tab.workspacePath)) return;
-    if (draftLaunch && (get().bySession[key]?.draftLaunching !== draftLaunch.id || get().bySession[key]?.interrupted)) return;
+      t.engine === engine && t.sessionId === null && t.workspacePath === tab.workspacePath)) {
+      if (options?.hostNewChat) throw new HostChatBusyError();
+      return;
+    }
+    if (draftLaunch && (get().bySession[key]?.draftLaunching !== draftLaunch.id || get().bySession[key]?.interrupted)) {
+      if (options?.hostNewChat) throw new HostChatBusyError();
+      return;
+    }
     // Computer use asks for the driver; engines without an MCP-mount path
     // would run the prompt text-only while the user believes the machine is
     // under agent control. Refuse loudly instead of downgrading silently.
@@ -328,8 +367,12 @@ export function createMessagingActions(
     // write instead of the session's history.
     // The session's own model, not the engine default: continuing a
     // conversation keeps running the model that conversation uses.
+    const engineDefaultModel =
+      options?.hostLaunch && "defaultModel" in options.hostLaunch
+        ? (options.hostLaunch.defaultModel || undefined)
+        : get().models[engine];
     const storedModel =
-      resolveSessionModel(tab, get().bySession[key], get().models[engine]) ||
+      resolveSessionModel(tab, get().bySession[key], engineDefaultModel) ||
       null;
     // 【cursor模型】会话记住基础 id；启动参数另写进 CLI 配置，不进会话记录。
     const model = engine === "cursor" ? cursorRememberedModel(storedModel) : storedModel;
@@ -348,14 +391,19 @@ export function createMessagingActions(
         rememberModelForRun(key, model);
       }
     }
+    const engineDefaultEffort =
+      options?.hostLaunch && "defaultEffort" in options.hostLaunch
+        ? ((options.hostLaunch.defaultEffort as typeof get extends () => infer S ? S extends { efforts: Record<string, infer E> } ? E : never : never) || undefined)
+        : get().efforts[engine];
     const effort =
-      resolveSessionEffort(tab, get().bySession[key], get().efforts[engine], get().models[engine]) ??
+      resolveSessionEffort(tab, get().bySession[key], engineDefaultEffort, engineDefaultModel) ??
       null;
     // Read the latest pending tab: resolving an agent block above can yield
     // while the user changes the starting switch.
-    const currentTab = get().openTabs.find((t) => sessionKey(t.engine, t.sessionId, t.workspacePath) === key) ?? tab;
+    const currentTab = get().openTabs.find((t) => sessionKey(t.engine, t.sessionId, t.workspacePath) === key &&
+      (!options?.hostContinuation || t.workspacePath === tab.workspacePath)) ?? tab;
     const claudeUltracode = resolveClaudeUltracode(currentTab, get().bySession[key], get().defaultClaudeUltracode);
-    const claudeHaikuAssist = engine === "claude" && currentTab.claudeHaikuAssist === true;
+    const claudeHaikuAssist = resolveClaudeHaikuAssist(currentTab);
     if (engine === "claude" && tab.sessionId) {
       void persistClaudeUltracode(set, claudeUltracode, tab.sessionId);
     }
@@ -375,7 +423,8 @@ export function createMessagingActions(
       resolveSessionProvider(
         tab,
         get().bySession[key],
-        get().providers[engine],
+        options?.hostLaunch && "defaultProvider" in options.hostLaunch
+          ? (options.hostLaunch.defaultProvider || undefined) : get().providers[engine],
       ) ?? null;
     if (provider) {
       if (tab.sessionId) {
@@ -399,6 +448,10 @@ export function createMessagingActions(
     }
     // Optimistic user message.
     const requestedRunId = options?.requestedRunId ?? `run-${newId()}`;
+    if (options?.hostContinuation) {
+      await options.hostContinuation.beforeDelivery("turn", requestedRunId);
+      assertHostIdle();
+    }
     // Built-in agent resolution above can yield: recheck immediately before
     // claiming this timeline so an external queued send cannot overlap a user.
     assertHostIdle();
@@ -443,6 +496,7 @@ export function createMessagingActions(
       },
     );
     // Refresh independently: a slow history read must not delay sending or Stop.
+    const hostUserRow = get().bySession[key]?.messages.at(-1);
     options?.onCommitted?.();
     void get().refreshSessionUsage(key);
     routeAndReconcileRun(set, requestedRunId, key);
@@ -460,6 +514,13 @@ export function createMessagingActions(
       : undefined;
     if (nativeLaunch) pendingNativeLaunches.set(requestedRunId, nativeLaunch);
     try {
+      if (options?.hostUserRow && hostUserRow?.role === "user") {
+        await options.hostUserRow({ runId: requestedRunId, seq: hostUserRow.seq, ts: hostUserRow.ts, text: hostUserRow.text, ...(hostUserRow.images ? { images: [...hostUserRow.images] } : {}) });
+        // Correlation persistence may yield to cancellation or an ownership fence.
+        await options.hostBeforeSend?.();
+        if (!get().openTabs.some(t => t.engine === tab.engine && t.sessionId === tab.sessionId && t.workspacePath === tab.workspacePath) ||
+          runRouting.get(requestedRunId) !== key || get().bySession[key]?.interrupted || get().bySession[key]?.queueParked) throw new HostChatBusyError("Exact host delivery was stopped during row persistence");
+      }
       if (draftLaunch) draftLaunch.invoked = true;
       const result = await ipc.sendMessage({
         runId: requestedRunId,
@@ -481,6 +542,7 @@ export function createMessagingActions(
         pendingNativeLaunches.delete(requestedRunId);
       }
       options?.onRunStarted?.(result);
+      options?.hostContinuation?.onReceived("turn", result.runId);
       // Older backends choose their own id. Retire the provisional route.
       if (result.runId !== requestedRunId) {
         runRouting.delete(requestedRunId);
@@ -893,6 +955,7 @@ export function createMessagingActions(
     images: string[],
     options?: SendOptions,
   ) {
+    if (options?.hostContinuation) throw new HostChatBusyError("Host continuation remains in its durable queue");
     const key = sessionKey(tab.engine, tab.sessionId, tab.workspacePath);
     enqueue(tab, text, images, options);
     if (get().bySession[key]?.queueParked) {
@@ -920,9 +983,14 @@ export function createMessagingActions(
     const current = get().bySession[key];
     const runId = current?.codexRunId;
     if (!current || !runId || codexSteerBlocker(get(), tab, current, options)) {
+      if (options?.hostContinuation) throw new HostChatBusyError();
       // The turn/settings may have changed while the selected agent resolved.
       if (get().bySession[key]) requeueCodexInput(key, item);
       return;
+    }
+    if (options?.hostContinuation) {
+      await options.hostContinuation.beforeDelivery("steer", runId);
+      if (get().bySession[key]?.codexRunId !== runId || codexSteerBlocker(get(), tab, get().bySession[key], options)) throw new HostChatBusyError();
     }
     // Fold all received text before input, but steering is not an item end:
     // subsequent deltas of the same native document must keep Markdown whole.
@@ -937,6 +1005,7 @@ export function createMessagingActions(
       images: images.length ? [...images] : undefined,
     }], { error: agentResolveError });
     const userSeq = get().bySession[key]?.messages.at(-1)?.seq;
+    const hostUserRow = get().bySession[key]?.messages.at(-1);
     const rollback = () => set((s) => {
       const session = s.bySession[key];
       return session ? { bySession: { ...s.bySession, [key]: {
@@ -944,15 +1013,23 @@ export function createMessagingActions(
       } } } : {};
     });
     try {
+      if (options?.hostUserRow && hostUserRow?.role === "user") await options.hostUserRow({ runId, seq: hostUserRow.seq, ts: hostUserRow.ts, text: hostUserRow.text, ...(hostUserRow.images ? { images: [...hostUserRow.images] } : {}) });
+      if (options?.hostUserRow && (get().bySession[key]?.codexRunId !== runId || codexSteerBlocker(get(), tab, get().bySession[key], options))) throw new HostChatBusyError("Exact host steer changed during row persistence");
       const accepted = await ipc.sendFollowUp({
         sessionId: runId, engine: tab.engine, workspacePath: tab.workspacePath,
         prompt, imagePaths: images.length ? images : null,
       });
       if (!accepted) {
         rollback();
+        if (options?.hostContinuation) throw new HostChatBusyError("Native turn did not accept the continuation");
         requeueCodexInput(key, item);
       }
+      if (accepted) options?.hostContinuation?.onReceived("steer", runId);
     } catch (error) {
+      if (options?.hostContinuation) {
+        if (!isDeliveryOutcomeUnknown(error)) rollback();
+        throw error;
+      }
       if (isDeliveryOutcomeUnknown(error)) {
         // An accepted steer cannot become a second queued instruction. Keep
         // the committed row and let actual native events settle the run.
@@ -986,6 +1063,7 @@ export function createMessagingActions(
     if (!cur || !runId || (live.origin === "queue" && cur.queueParked) ||
       liveFollowUpBlocker(get(), tab, cur, { computerUse: options?.computerUse === true })) {
       patchSession(set, key, { followUpAt: null });
+      if (options?.hostContinuation) throw new HostChatBusyError();
       if (live.origin === "queue" && live.item) {
         requeueFirst(key, live.item);
         // The run may have ended during the preparation: its final done drained
@@ -998,6 +1076,10 @@ export function createMessagingActions(
         await sendPrompt(tab, typedPrompt, images, options);
       }
       return;
+    }
+    if (options?.hostContinuation) {
+      await options.hostContinuation.beforeDelivery("live", runId);
+      if (get().bySession[key]?.nativeTaskRunId !== runId || liveFollowUpBlocker(get(), tab, get().bySession[key], options)) throw new HostChatBusyError();
     }
     const claimedAt = Date.now();
     const before = {
@@ -1034,6 +1116,7 @@ export function createMessagingActions(
       },
     );
     const userSeq = get().bySession[key]?.messages.at(-1)?.seq;
+    const hostUserRow = get().bySession[key]?.messages.at(-1);
     if (agentResolveError) patchSession(set, key, { error: agentResolveError });
     // Take the optimistic state back. What the CLI itself reported since (it
     // clears followUpAt) is newer than the snapshot and stays.
@@ -1066,6 +1149,9 @@ export function createMessagingActions(
       });
     let delivered: boolean;
     try {
+      if (options?.hostUserRow && hostUserRow?.role === "user") await options.hostUserRow({ runId, seq: hostUserRow.seq, ts: hostUserRow.ts, text: hostUserRow.text, ...(hostUserRow.images ? { images: [...hostUserRow.images] } : {}) });
+      if (options?.hostUserRow && (get().bySession[key]?.nativeTaskRunId !== runId || get().bySession[key]?.queueParked ||
+        liveFollowUpBlocker(get(), tab, get().bySession[key], { activity: "running" }))) throw new HostChatBusyError("Exact host live input changed during row persistence");
       delivered = await ipc.sendFollowUp({
         sessionId: runId,
         engine: tab.engine,
@@ -1074,6 +1160,10 @@ export function createMessagingActions(
         imagePaths: images.length ? images : null,
       });
     } catch (error) {
+      if (options?.hostContinuation) {
+        if (!isDeliveryOutcomeUnknown(error)) rollback();
+        throw error;
+      }
       if (isDeliveryOutcomeUnknown(error)) {
         // A lost ACK is not permission to launch this prompt again. Retain the
         // optimistic row/activity and park later work without requeueing it.
@@ -1101,6 +1191,7 @@ export function createMessagingActions(
       // closed): nothing took it, so it is an ordinary send now. The row it
       // would have shown twice is taken back first.
       rollback();
+      if (options?.hostContinuation) throw new HostChatBusyError("Native process did not accept the continuation");
       const item = live.item ?? { id: newId(), text: typedPrompt, images, queuedAt: Date.now() };
       if (get().bySession[key]?.interrupted || get().bySession[key]?.queueParked) {
         // Stop may have interrupted the reply while the write was pending.
@@ -1122,6 +1213,7 @@ export function createMessagingActions(
       }
       await sendPrompt(tab, prompt, images, options);
     }
+    if (delivered) options?.hostContinuation?.onReceived("live", runId);
   }
 
   /** Native Esc never escalates to a process kill. Keep routing and partial
@@ -1495,7 +1587,10 @@ export function createMessagingActions(
      *  with background tasks running takes it at once (as the native CLI
      *  does); anything else queues, as before. */
     sendWhileBusy: async (text, images, options, target) => {
-      const tab = resolveLiveSessionTab(target === undefined ? get().active : target, get().openTabs);
+      const tab = options?.hostContinuation
+        ? get().openTabs.find(t => target && t.engine === target.engine && t.sessionId === target.sessionId && t.workspacePath === target.workspacePath)
+        : resolveLiveSessionTab(target === undefined ? get().active : target, get().openTabs);
+      if (options?.hostContinuation && !tab) throw new HostChatBusyError("Exact host conversation is no longer open");
       if (!tab || (!text.trim() && images.length === 0)) return;
       const key = sessionKey(tab.engine, tab.sessionId, tab.workspacePath);
       const session = get().bySession[key];

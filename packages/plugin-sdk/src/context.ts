@@ -2,6 +2,9 @@ import type { ComponentType } from "react";
 import type * as React from "react";
 import type { Disposer } from "./manifest";
 import type { ComposerSlotId, SessionMenuTarget } from "./registry";
+import type { PluginDetachedSurfaceDefinition } from "./detached-surface";
+import type { HostConversationsApi, ConversationViewComponent, HostImagesApi } from "./conversations";
+import type { HostMemoryExtractionApi } from "./memory-extraction";
 
 /**
  * PluginContext（plan §5.2）：插件唯一能力门面。宿主 runtime/context.ts
@@ -98,6 +101,10 @@ export interface HostChatActivationEvent {
 }
 
 export interface PluginContext {
+  /** Persistent read-only native discussions; requires host:chat. */
+  conversations: HostConversationsApi & { View: ConversationViewComponent };
+  /** Durable host-managed plugin image attachments; requires host:chat or host:tasks (0.3.23). */
+  images: HostImagesApi;
   pluginId: string;
   version: string;
   /** Shared host React instance: external bundles can't resolve bare
@@ -106,6 +113,27 @@ export interface PluginContext {
    *  ctx.react 容器（双段挂载模式，import-map 共享是 P0-3 后续）。 */
   react: typeof React;
   ui: {
+    /** Opt in this plugin's center tabs and selected side panel to safe
+     * self-update closure (permission ui:center-tab, SDK 0.3.18).
+     * The host first returns floating views through their normal input/return
+     * guard, then calls prepare. Freeze new UI actions, drain accepted local
+     * work and durably save drafts before resolving; never re-submit analysis.
+     * A rejection or abort keeps unsaved views open. Check signal before and
+     * after awaits. resume is called on cancellation/failure, including when
+     * prepare did not finish, and must idempotently release the UI freeze.
+     * The plugin remains loaded. Remembered views are restored after maintenance
+     * ends; closing a view explicitly prevents its automatic restoration.
+     * Loaded handlers also prepare when their views are already closed, so
+     * background work settles before native handoff. Support that state too.
+     * Since SDK 0.3.28, plugin-owned exec services can enter this preparation
+     * before they stop. Drain accepted work, gracefully stop those services,
+     * then call plugin_exec_kill({ onlyExited: true }) to clear their native ownership. Native
+     * admission still blocks on any remaining service or one-shot exec.
+     * Only one handler may be registered per plugin. Overlay pages are excluded. */
+    registerUpdateCloseHandler(def: {
+      prepare(signal: AbortSignal): Promise<void>;
+      resume(): void;
+    }): Disposer;
     registerConversationMode(def: {
       key?: string;
       label: () => string;
@@ -172,7 +200,8 @@ export interface PluginContext {
       run: () => void;
     }): Disposer;
     /** Sidebar session right-click menu row (permission `ui:session-menu`,
-     *  0.3.5 起)。`run` 收到打开菜单的会话 `{ engine, sessionId }`。 */
+     *  0.3.5 起)。`run` 收到打开菜单的会话 `{ engine, sessionId, workspacePath? }`；
+     *  SDK 0.3.22 提供已知的原目录，未知时不得用当前聊天目录代填。 */
     registerSessionMenuItem(def: {
       key?: string;
       label: () => string;
@@ -224,6 +253,8 @@ export interface PluginContext {
       icon?: ComponentType<{ className?: string }>;
       component: ComponentType;
       order?: number;
+      /** Renderer-only native pop-out; also requires ui:detached-window. */
+      detached?: PluginDetachedSurfaceDefinition;
     }): Disposer;
     /** Open (or focus) one of this plugin's registered center tabs
      *  (permission `ui:center-tab`, 0.3.12). Throws when the tab was never
@@ -270,6 +301,12 @@ export interface PluginContext {
    *  TOFU 而非严格 pinning。 */
   workspaces: {
     add(path: string, meta?: Record<string, unknown>): Promise<void>;
+    /** Publish/update this plugin's project view (host:workspace, 0.3.19).
+     * Use an existing project UUID as sourceKey; retries update the same host
+     * projection. Members must be covered by registered local workspaces.
+     * Does not register workspaces, grant access, change cwd or move memory.
+     * The host retains the projection after plugin unload; the user can remove it. */
+    publishProject(sourceKey: string, definition: import("./workspace-projects").WorkspaceProjectDefinition): Promise<import("./workspace-projects").PublishedWorkspaceProject>;
   };
   /** 会话打开 + 外部会话源(权限 `host:session`;selectSession 0.3.3 起,
    *  registerSource 0.3.4 起)。registerSource:登记异步会话源,宿主在会话
@@ -327,6 +364,56 @@ export interface PluginContext {
     /** This plugin's receipts only; automatically disposed on unload. */
     onEvent(callback: (receipt: HostChatReceipt) => void): Disposer;
   };
+  /** Goal routing and task delivery into real GUI chats (permission
+   * `host:tasks`, desktop only, 0.3.20). The host reuses a slot's saved chat
+   * or creates a background chat in a registered local workspace, with the
+   * user's own model and permission settings; it never changes an existing
+   * chat's cwd. Acceptance is persisted before resolving. A request that may
+   * have started is never replayed: after a restart it becomes `unknown`.
+   * Declared write paths order conflicting requests (unknown = whole
+   * workspace); they are not an OS sandbox. See ./tasks.ts. */
+  tasks: {
+    /** Attach only this plugin's initial owned task request to its proven native coordinator (0.3.24). */
+    conversation(requestId: string): Promise<import("./task-conversations").HostTaskConversationSnapshot>;
+    /** Durable exact-session input CAS; received means native accepted, never applied. */
+    sendMessage(request: import("./task-conversations").HostTaskMessageRequest): Promise<import("./task-conversations").HostTaskMessageReceipt>;
+    messageReceipt(conversationRequestId: string, requestId: string): Promise<import("./task-conversations").HostTaskMessageReceipt | null>;
+    cancelMessage(conversationRequestId: string, requestId: string): Promise<import("./task-conversations").HostTaskMessageReceipt | null>;
+    /** Cancels pending inputs and requests stop of the exact coordinator and its real managed descendants. */
+    stopConversation(requestId: string): Promise<import("./task-conversations").HostTaskConversationSnapshot>;
+    conversationAction(requestId: string, action: import("./task-conversations").HostTaskConversationAction): Promise<import("./task-conversations").HostTaskConversationSnapshot | void>;
+    onConversationEvent(callback: (snapshot: import("./task-conversations").HostTaskConversationSnapshot) => void): Disposer;
+    /** Engines (with the user's defaults), registered workspaces and project organization. No credentials or settings. */
+    catalog(options?: { includeModels?: boolean }): Promise<import("./tasks").HostTaskCatalog>;
+    /** Saved chats of exactly one registered local workspace, newest first, paged (≤100). Metadata only. */
+    history(query: import("./tasks").HostTaskHistoryQuery): Promise<import("./tasks").HostTaskHistoryPage>;
+    /** Bounded user/assistant text of one saved chat page for indexes and handoffs; never a whole history. */
+    excerpt(query: import("./tasks").HostTaskExcerptQuery): Promise<import("./tasks").HostTaskExcerpt>;
+    /** Isolated, tool-less routing call. Rejects with Error whose `code` is a HostTaskPlanErrorCode. */
+    plan(request: import("./tasks").HostTaskPlanRequest): Promise<import("./tasks").HostTaskPlan>;
+    /** This plugin's plan record (running/ready/needs_clarification/failed/cancelled). */
+    getPlan(requestId: string): Promise<import("./tasks").HostTaskPlanRecord | null>;
+    /** Stops a running planner call; true when one was running. */
+    cancelPlan(requestId: string): Promise<boolean>;
+    /** Durable acceptance before resolving; delivery continues in the background. */
+    submit(request: import("./tasks").HostTaskSubmission): Promise<import("./tasks").HostTaskReceipt>;
+    /** This plugin's receipt; null for an unknown id, never permission to resubmit under a new id. */
+    receipt(requestId: string): Promise<import("./tasks").HostTaskReceipt | null>;
+    /** This plugin's receipts in acceptance order. */
+    list(query?: { projectId?: string; slotKey?: string; taskId?: string }): Promise<import("./tasks").HostTaskReceipt[]>;
+    /** Queued requests are withdrawn; a running turn of this request is interrupted. */
+    cancel(requestId: string): Promise<import("./tasks").HostTaskReceipt | null>;
+    /** Focus the request's conversation (user-initiated). */
+    open(requestId: string): Promise<void>;
+    /** Prune large assistant output from a settled receipt while retaining its non-replayable tombstone and identity. */
+    forget(requestId: string): Promise<boolean>;
+    /** Current chat per logical slot; moves only on native session evidence. */
+    slots(projectId?: string): Promise<import("./tasks").HostTaskSlot[]>;
+    /** This plugin's receipts only; disposed on unload. */
+    onEvent(callback: (receipt: import("./tasks").HostTaskReceipt) => void): Disposer;
+  };
+  /** Fixed project-scoped background extraction; desktop owner, host:memory. */
+  memoryExtraction: HostMemoryExtractionApi;
   /** Agent 轮次（权限 `agent`，0.3.13 起）：经宿主引擎管线拉起 agent
    *  进程——渠道注入、进程注册与聊天发送同构。事件走独立的
    *  `agent://<pluginId>` 总线话题（ctx.events.on 订阅；payload 为引擎
@@ -394,8 +481,10 @@ export interface PluginContext {
    *    PATH 注入语义同 `plugin_exec_run`。
    *    lifecycle 缺省 "detached"（用户级服务，活过插件）；"plugin" =
    *    附属进程，宿主跟踪，插件禁用/卸载时自动 kill。
-   *  - `plugin_exec_kill` `{}` → `{ killed: number }`：kill 本插件全部
-   *    lifecycle="plugin" 子进程（配置变更改名重启用；需任意 exec: 授权）。
+   *  - `plugin_exec_kill` `{ onlyExited?: boolean }` → `{ killed: number }`：
+   *    缺省 kill 本插件全部 lifecycle="plugin" 子进程。SDK 0.3.28 起
+   *    onlyExited=true 仅清退已确认退出的本插件登记，最多等待 2 秒；仍活跃或
+   *    退出状态不可确认则 reject，不强杀，killed 为清退数。需任意 exec: 授权。
    *  - `plugin_agent_start` / `plugin_agent_interrupt`（0.3.13 起）：
    *    与 `ctx.agent` 同一能力（需 `agent` 授权）——引擎管线由宿主接管，
    *    run id 属主前缀在 Rust 侧强制。
@@ -406,6 +495,11 @@ export interface PluginContext {
     invoke<T>(command: string, args?: Record<string, unknown>): Promise<T>;
   };
   host: {
+    /** Wait until restored runtime ownership permits plugin I/O (SDK 0.3.18).
+     * Resolves immediately during ordinary operation. Register UI/chat owners
+     * synchronously in activate; await this only before starting background I/O.
+     * An optional signal cancels the wait when the plugin unloads. */
+    whenReady(signal?: AbortSignal): Promise<void>;
     appVersion: string;
     /** 宿主实现的 SDK 契约版本（= 本包 version），供插件运行时自检。 */
     sdkVersion: string;

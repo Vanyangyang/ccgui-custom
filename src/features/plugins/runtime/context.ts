@@ -1,6 +1,7 @@
 import * as React from "react";
 import i18n from "@/lib/i18n";
 import { isWeb } from "@/lib/transport";
+import { runtimeCheckpoint, whenRuntimeSubmissionResumed } from "@/lib/runtime-checkpoint";
 import {
   SDK_VERSION,
   addMenuRegistry,
@@ -36,6 +37,15 @@ import { registerSessionSource } from "./session-source";
 import { usePluginTabsStore } from "./center-tabs";
 import { runAsPlugin } from "./hardening";
 import { createHostChatBridge } from "./chat-bridge";
+import { createHostConversationBridge, HOST_CONVERSATIONS_KEY_PREFIX } from "./conversation-bridge";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { createHostTaskBridge, HOST_TASKS_KEY_PREFIX } from "./task-bridge";
+import { createMemoryExtractionBridge } from "./memory-extraction-bridge";
+import { createDetachedSurfaceOwner, type DetachedSurfaceOwner } from "../windows/owner";
+import { assertPluginViewsCanOpen, registerPluginDetachedOwner, registerPluginUpdateCloseHandler } from "./update-close";
+import { copyJson, type DetachedLabels } from "../windows/protocol";
+import { DetachedCenterTabSurface } from "../windows/CenterTabSurface";
+import { ConversationSurface } from "./ConversationSurface";
 
 /** Storage transport the context talks to; the loader binds the IPC-backed
  *  implementation, tests bind fakes. */
@@ -121,10 +131,11 @@ function tokenBlock(selector: string, tokens: Record<string, string> | undefined
 export function createPluginContext(
   manifest: PluginManifest,
   backend: PluginContextBackend,
-  hostInfo: { appVersion: string },
+  hostInfo: { appVersion: string; detachedBundle?: () => { code: string; css: string; rendererExports: Set<string> } | undefined },
 ): PluginHandle {
   const disposers: Disposer[] = [];
   const id = manifest.id;
+  const detachedOwners = new Map<string, DetachedSurfaceOwner>();
 
   /** Missing-permission failures throw: a plugin probing beyond its manifest
    *  is a bug the developer should see, not a silent no-op. Unknown
@@ -140,6 +151,17 @@ export function createPluginContext(
   };
 
   let chatBridge: ReturnType<typeof createHostChatBridge> | undefined;
+  let conversationBridge: ReturnType<typeof createHostConversationBridge> | undefined;
+  const conversations = () => {
+    if (isWeb || (typeof window !== "undefined" && Boolean((window as { __TAURI_INTERNALS__?: { metadata?: unknown } }).__TAURI_INTERNALS__?.metadata) && getCurrentWindow().label.startsWith("plugin-window-"))) {
+      throw new Error("host conversations are available only in the desktop owner");
+    }
+    if (!conversationBridge) {
+      conversationBridge = createHostConversationBridge(id, backend);
+      track(conversationBridge.dispose);
+    }
+    return conversationBridge;
+  };
   const chat = () => {
     if (isWeb) throw new Error("host:chat is available only in the desktop host");
     if (!chatBridge) {
@@ -147,6 +169,43 @@ export function createPluginContext(
       track(chatBridge.dispose);
     }
     return chatBridge;
+  };
+  let taskBridge: ReturnType<typeof createHostTaskBridge> | undefined;
+  const tasks = () => {
+    if (isWeb) throw new Error("host:tasks is available only in the desktop host");
+    if (!taskBridge) {
+      taskBridge = createHostTaskBridge(id, backend, {
+        invoke: (command, args) => backend.bridgeInvoke(command, args),
+        loadClaims: () => backend.bridgeInvoke("plugin_task_pending_claims", { pluginId: id }),
+      });
+      track(taskBridge.dispose);
+    }
+    return taskBridge;
+  };
+  let memoryExtractionBridge: ReturnType<typeof createMemoryExtractionBridge> | undefined;
+  const memoryExtraction = () => {
+    if (isWeb || (typeof window !== "undefined" && Boolean((window as { __TAURI_INTERNALS__?: { metadata?: unknown } }).__TAURI_INTERNALS__?.metadata) && getCurrentWindow().label !== "main")) {
+      throw new Error("host:memory is available only in the desktop owner");
+    }
+    if (!memoryExtractionBridge) {
+      memoryExtractionBridge = createMemoryExtractionBridge(id, {
+        invoke: (command, args) => backend.bridgeInvoke(command, args),
+        conversation: async threadId => { requirePermission("host:chat"); return conversations().inspect(threadId); },
+        coordination: async requestId => { requirePermission("host:tasks"); return tasks().conversation(requestId); },
+        paused: runtimeCheckpoint.isPaused,
+      });
+      track(memoryExtractionBridge.dispose);
+    }
+    return memoryExtractionBridge;
+  };
+  /** The task ledger shares this plugin's KV; its keys are host-owned. */
+  const assertPluginStorageKey = (key: string) => {
+    if (typeof key === "string" && key.startsWith(HOST_CONVERSATIONS_KEY_PREFIX)) {
+      throw new Error("Conversation storage keys are reserved for the host");
+    }
+    if (typeof key === "string" && key.startsWith(HOST_TASKS_KEY_PREFIX)) {
+      throw new Error(`[plugins] "${id}" storage key prefix ${HOST_TASKS_KEY_PREFIX} is reserved for the host`);
+    }
   };
 
   const ctx: PluginContext = {
@@ -307,26 +366,116 @@ export function createPluginContext(
       },
       registerCenterTab(def) {
         requirePermission("ui:center-tab");
-        return track(
-          centerTabRegistry.register({
-            id: scopedPluginId(id, def.key),
+        const tabId = scopedPluginId(id, def.key);
+        let component = def.component;
+        let restore: (() => void) | undefined;
+        let disposeOwner: Disposer | undefined;
+        if (def.detached) {
+          requirePermission("ui:detached-window");
+          if (!isWeb) {
+            const assets = hostInfo.detachedBundle?.();
+            if (!assets || !assets.rendererExports.has(def.detached.rendererExport)) {
+              throw new Error(`[plugins] "${id}" registered an unavailable detached renderer`);
+            }
+            const definition = def.detached;
+            if (definition.defaultPresentation !== undefined && !["docked", "detached"].includes(definition.defaultPresentation)) {
+              throw new Error("Invalid detached default presentation");
+            }
+            const labels: DetachedLabels = {
+              returnToMain: i18n.t("plugins.detached.returnToMain"),
+              ownerUnavailable: i18n.t("plugins.detached.ownerUnavailable"),
+              actionFailed: i18n.t("plugins.detached.actionFailed"),
+              loading: i18n.t("plugins.detached.loading"),
+            };
+            const owner = createDetachedSurfaceOwner({
+              assertCanOpen: () => assertPluginViewsCanOpen(id),
+              pluginId: id, tabId, title: def.title, rendererExport: definition.rendererExport,
+              defaultPresentation: definition.defaultPresentation,
+              assets: { code: assets.code, css: assets.css }, getSnapshot: () => copyJson(definition.getSnapshot()), subscribe: definition.subscribe,
+              dispatch: async (action) => {
+                const value = await definition.dispatch(action);
+                return value === undefined ? null : copyJson(value);
+              },
+              dark: () => document.documentElement.classList.contains("dark"), labels,
+              onReturn: (reason) => {
+                // The owner only invokes this for its live window generation.
+                if (!centerTabRegistry.get(tabId)) return;
+                if (reason === "closed") {
+                  usePluginTabsStore.getState().closeTab(tabId, "presentation");
+                } else {
+                  dismissCenterSurfaces();
+                  usePluginTabsStore.getState().openTab(tabId, { reason: "presentation" });
+                }
+              },
+            });
+            const unregisterOwner = registerPluginDetachedOwner(id, owner, () => restore?.());
+            detachedOwners.set(tabId, owner);
+            const abort = new AbortController();
+            disposeOwner = () => { abort.abort(); if (detachedOwners.get(tabId) === owner) detachedOwners.delete(tabId); unregisterOwner(); owner.dispose(); };
+            restore = () => {
+              void whenRuntimeSubmissionResumed(abort.signal).then(() => owner.restore()).then(mode => {
+                if (mode && !abort.signal.aborted && detachedOwners.get(tabId) === owner && centerTabRegistry.get(tabId)) {
+                  assertPluginViewsCanOpen(id);
+                  usePluginTabsStore.getState().openTab(tabId, { activate: false, reason: "presentation" });
+                }
+              }).catch(() => {
+                if (!abort.signal.aborted) console.warn("[plugins] detached presentation could not be restored", { pluginId: id, tabId });
+              });
+            };
+            const Component = def.component;
+            component = () => React.createElement(DetachedCenterTabSurface, { owner, component: Component });
+          }
+        }
+        let unregister: Disposer;
+        try {
+          unregister = centerTabRegistry.register({
+            id: tabId,
             title: def.title,
             icon: def.icon,
-            component: def.component,
+            component,
             order: def.order,
-          }),
-        );
+          });
+        } catch (error) { disposeOwner?.(); throw error; }
+        let registered = true;
+        const dispose = track(() => { if (!registered) return; registered = false; unregister(); disposeOwner?.(); });
+        restore?.();
+        return dispose;
       },
       openCenterTab(key) {
         requirePermission("ui:center-tab");
+        assertPluginViewsCanOpen(id);
         const tabId = scopedPluginId(id, key);
         if (!centerTabRegistry.get(tabId)) {
           throw new Error(`[plugins] "${id}" opened unregistered center tab ${tabId}`);
+        }
+        const owner = detachedOwners.get(tabId);
+        if (owner) {
+          void owner.present().then(mode => {
+            if (detachedOwners.get(tabId) !== owner || !centerTabRegistry.get(tabId)) return;
+            assertPluginViewsCanOpen(id);
+            if (mode === "docked") dismissCenterSurfaces();
+            usePluginTabsStore.getState().openTab(tabId, { activate: mode === "docked", reason: "presentation" });
+          }).catch(() => {
+            if (detachedOwners.get(tabId) !== owner || !centerTabRegistry.get(tabId)) return;
+            try { assertPluginViewsCanOpen(id); } catch { return; }
+            // The owner's status renders the native open failure and retry action.
+            dismissCenterSurfaces();
+            usePluginTabsStore.getState().openTab(tabId, { reason: "presentation" });
+          });
+          return;
         }
         // 插件页签置前：其他中心面（浏览器/文件/插件中心/工作台/差异）让位；
         // 否则经由插件侧栏入口打开时，页签开了、画面还停在原地。
         dismissCenterSurfaces();
         usePluginTabsStore.getState().openTab(tabId);
+      },
+      registerUpdateCloseHandler(handler) {
+        requirePermission("ui:center-tab");
+        if (!handler || typeof handler.prepare !== "function" || typeof handler.resume !== "function") throw new Error("Invalid update close handler");
+        return track(registerPluginUpdateCloseHandler(id, {
+          prepare: (signal) => runAsPlugin(() => handler.prepare(signal)),
+          resume: () => runAsPlugin(() => handler.resume()),
+        }));
       },
     },
     theme: {
@@ -358,10 +507,12 @@ export function createPluginContext(
       },
       async set(key, value) {
         requirePermission("storage");
+        assertPluginStorageKey(key);
         await backend.set(id, key, value);
       },
       async delete(key) {
         requirePermission("storage");
+        assertPluginStorageKey(key);
         await backend.delete(id, key);
       },
     },
@@ -383,6 +534,19 @@ export function createPluginContext(
       },
     },
     workspaces: {
+      async publishProject(sourceKey, definition) {
+        requirePermission("host:workspace");
+        // The source identity is bound to this plugin, never supplied by it.
+        const result = await backend.bridgeInvoke("plugin_publish_workspace_project", {
+          pluginId: id,
+          sourceKey,
+          input: { name: definition.name, defaultPath: definition.defaultPath, members: definition.members },
+        });
+        if (!result || typeof result !== "object" || !("id" in result) || typeof result.id !== "string") {
+          throw new Error("Invalid project publication response");
+        }
+        return { id: result.id };
+      },
       add(path, meta) {
         requirePermission("host:workspace");
         // meta 带 wsl 键 = 远程工作区(会话流量经 ssh 导向插件指定主机),
@@ -438,6 +602,89 @@ export function createPluginContext(
         );
       },
     },
+    conversations: {
+      View: ConversationSurface,
+      async catalog() { requirePermission("host:chat"); return conversations().catalog(); },
+      async open(request) { requirePermission("host:chat"); return conversations().open(request); },
+      async inspect(threadId) { requirePermission("host:chat"); return conversations().inspect(threadId); },
+      async send(request) { requirePermission("host:chat"); return conversations().send(request); },
+      async stop(threadId) { requirePermission("host:chat"); return conversations().stop(threadId); },
+      async openFile(threadId, path) { requirePermission("host:chat"); return conversations().openFile(threadId, path); },
+      onEvent(callback) {
+        requirePermission("host:chat");
+        return track(conversations().onEvent((snapshot) => runAsPlugin(() => callback(snapshot))));
+      },
+    },
+    images: {
+      async importImage(request) {
+        if (manifest.permissions.includes("host:tasks") && !manifest.permissions.includes("host:chat")) {
+          requirePermission("host:tasks");
+        } else {
+          requirePermission("host:chat");
+        }
+        if (isWeb || (typeof window !== "undefined" && Boolean((window as { __TAURI_INTERNALS__?: { metadata?: unknown } }).__TAURI_INTERNALS__?.metadata) && getCurrentWindow().label.startsWith("plugin-window-"))) {
+          throw new Error("host images on PluginContext are available only in the desktop owner");
+        }
+        if (!request || typeof request !== "object") {
+          throw new Error("Invalid image import request");
+        }
+        const dataBase64 = typeof request.dataBase64 === "string" ? request.dataBase64.trim() : "";
+        const mimeType = typeof request.mimeType === "string" ? request.mimeType.trim() : "";
+        const name = request.name === undefined ? undefined : typeof request.name === "string" ? request.name : "";
+        if (!dataBase64 || !mimeType || (request.name !== undefined && typeof request.name !== "string")) {
+          throw new Error("Invalid image import arguments");
+        }
+        const result = await backend.bridgeInvoke("plugin_image_import", {
+          pluginId: id,
+          dataBase64,
+          mimeType,
+          ...(name !== undefined ? { name } : {}),
+        });
+        if (
+          !result ||
+          typeof result !== "object" ||
+          typeof (result as { id?: unknown }).id !== "string" ||
+          typeof (result as { name?: unknown }).name !== "string" ||
+          typeof (result as { mimeType?: unknown }).mimeType !== "string" ||
+          typeof (result as { size?: unknown }).size !== "number"
+        ) {
+          throw new Error("Invalid plugin image attachment response");
+        }
+        return {
+          id: (result as { id: string }).id,
+          name: (result as { name: string }).name,
+          mimeType: (result as { mimeType: "image/png" | "image/jpeg" | "image/webp" | "image/gif" }).mimeType,
+          size: (result as { size: number }).size,
+        };
+      },
+      async readPreview(imageId) {
+        if (manifest.permissions.includes("host:tasks") && !manifest.permissions.includes("host:chat")) {
+          requirePermission("host:tasks");
+        } else {
+          requirePermission("host:chat");
+        }
+        if (isWeb || (typeof window !== "undefined" && Boolean((window as { __TAURI_INTERNALS__?: { metadata?: unknown } }).__TAURI_INTERNALS__?.metadata) && getCurrentWindow().label.startsWith("plugin-window-"))) {
+          throw new Error("host images on PluginContext are available only in the desktop owner");
+        }
+        const normalizedId = typeof imageId === "string" ? imageId.trim() : "";
+        if (!normalizedId) {
+          throw new Error("Invalid plugin image id");
+        }
+        const result = await backend.bridgeInvoke("plugin_image_preview", {
+          pluginId: id,
+          imageId: normalizedId,
+        });
+        if (
+          !result ||
+          typeof result !== "object" ||
+          typeof (result as { dataUrl?: unknown }).dataUrl !== "string" ||
+          !(result as { dataUrl: string }).dataUrl.startsWith("data:image/")
+        ) {
+          throw new Error("Invalid plugin image preview response");
+        }
+        return { dataUrl: (result as { dataUrl: string }).dataUrl };
+      },
+    },
     chat: {
       async identity() { requirePermission("host:chat"); return chat().identity(); },
       async current() { requirePermission("host:chat"); return chat().current(); },
@@ -448,6 +695,42 @@ export function createPluginContext(
         requirePermission("host:chat");
         return track(chat().onEvent((receipt) => runAsPlugin(() => callback(receipt))));
       },
+    },
+    tasks: {
+      async conversation(id) { requirePermission("host:tasks"); return tasks().conversation(id); },
+      async sendMessage(request) { requirePermission("host:tasks"); return tasks().sendMessage(request); },
+      async messageReceipt(id, requestId) { requirePermission("host:tasks"); return tasks().messageReceipt(id, requestId); },
+      async cancelMessage(id, requestId) { requirePermission("host:tasks"); return tasks().cancelMessage(id, requestId); },
+      async stopConversation(id) { requirePermission("host:tasks"); return tasks().stopConversation(id); },
+      async conversationAction(id, action) { requirePermission("host:tasks"); return tasks().conversationAction(id, action); },
+      onConversationEvent(callback) {
+        requirePermission("host:tasks");
+        return track(tasks().onConversationEvent(snapshot => runAsPlugin(() => callback(snapshot))));
+      },
+      async catalog(options) { requirePermission("host:tasks"); return tasks().catalog(options); },
+      async history(query) { requirePermission("host:tasks"); return tasks().history(query); },
+      async excerpt(query) { requirePermission("host:tasks"); return tasks().excerpt(query); },
+      async plan(request) { requirePermission("host:tasks"); return tasks().plan(request); },
+      async getPlan(requestId) { requirePermission("host:tasks"); return tasks().getPlan(requestId); },
+      async cancelPlan(requestId) { requirePermission("host:tasks"); return tasks().cancelPlan(requestId); },
+      async submit(request) { requirePermission("host:tasks"); return tasks().submit(request); },
+      async receipt(requestId) { requirePermission("host:tasks"); return tasks().receipt(requestId); },
+      async list(query) { requirePermission("host:tasks"); return tasks().list(query); },
+      async cancel(requestId) { requirePermission("host:tasks"); return tasks().cancel(requestId); },
+      async open(requestId) { requirePermission("host:tasks"); return tasks().open(requestId); },
+      async forget(requestId) { requirePermission("host:tasks"); return tasks().forget(requestId); },
+      async slots(projectId) { requirePermission("host:tasks"); return tasks().slots(projectId); },
+      onEvent(callback) {
+        requirePermission("host:tasks");
+        return track(tasks().onEvent((receipt) => runAsPlugin(() => callback(receipt))));
+      },
+    },
+    memoryExtraction: {
+      async status() { requirePermission("host:memory"); return memoryExtraction().status(); },
+      async checkpoint(request) { requirePermission("host:memory"); return memoryExtraction().checkpoint(request); },
+      async prepare(request) { requirePermission("host:memory"); return memoryExtraction().prepare(request); },
+      async extract(request) { requirePermission("host:memory"); return memoryExtraction().extract(request); },
+      async cancel(requestId) { requirePermission("host:memory"); return memoryExtraction().cancel(requestId); },
     },
     agent: {
       async catalog(workspacePath) {
@@ -529,6 +812,7 @@ export function createPluginContext(
       },
     },
     host: {
+      whenReady: whenRuntimeSubmissionResumed,
       appVersion: hostInfo.appVersion,
       sdkVersion: SDK_VERSION,
       isWeb,

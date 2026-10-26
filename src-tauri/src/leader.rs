@@ -26,8 +26,12 @@ static MANAGER: OnceLock<Arc<LeaderManager>> = OnceLock::new();
 mod archive;
 mod branch_delete;
 mod cost_approval;
+mod delegation;
+mod delegation_storage;
 mod model_policy;
+mod worker_handoff;
 pub use cost_approval::TaskCostApproval;
+pub use delegation::TaskDelegation;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -43,6 +47,10 @@ pub struct LeaderBranch {
     pub id: String,
     pub parent_engine: String,
     pub parent_session_id: String,
+    /// Exact native parent source. Legacy records used the child cwd for both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_workspace_path: Option<String>,
+    /// Child execution cwd; never rewrite this when resuming an existing chat.
     pub workspace_path: String,
     pub engine: String,
     pub session_id: Option<String>,
@@ -62,6 +70,8 @@ pub struct LeaderBranch {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_approval: Option<TaskCostApproval>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<TaskDelegation>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -96,6 +106,10 @@ pub struct Caller {
 #[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SpawnArgs {
+    /// Optional registered local execution workspace. Cross-workspace targets must be
+    /// available development members of the parent's registered project. Omit to inherit cwd.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_path: Option<String>,
     /// Idempotency key you choose (1-128 characters). Reuse it only to retry this exact call.
     pub request_id: String,
     /// "claude", "codex", "agy" or "cursor".
@@ -214,6 +228,9 @@ fn trim_tool_field(value: &mut Value, field: &str, chars: usize) -> bool {
 fn tool_branch(branch: &LeaderBranch, budget: usize) -> Result<Value, String> {
     let mut value = encoded(branch)?;
     trim_tool_field(&mut value, "task", 512);
+    if let Some(delegation) = value.get_mut("delegation") {
+        trim_tool_field(delegation, "task", 512);
+    }
     while serde_json::to_vec(&value).map_err(|e| e.to_string())?.len() > budget {
         let largest = [
             "result",
@@ -232,11 +249,17 @@ fn tool_branch(branch: &LeaderBranch, budget: usize) -> Result<Value, String> {
                 .map(|text| (field, text.len(), text.chars().count()))
         })
         .filter(|(_, _, chars)| *chars > 0)
-        .max_by_key(|(_, bytes, _)| *bytes);
-        let Some((field, _, chars)) = largest else {
+        .map(|(field, bytes, chars)| (false, field, bytes, chars))
+        .chain(["result", "task", "error"].into_iter().filter_map(|field| {
+            value.get("delegation")?.get(field)?.as_str()
+                .filter(|text| !text.is_empty()).map(|text| (true, field, text.len(), text.chars().count()))
+        }))
+        .max_by_key(|(_, _, bytes, _)| *bytes);
+        let Some((nested, field, _, chars)) = largest else {
             return Err("Leader identity metadata exceeds the tool response budget".into());
         };
-        trim_tool_field(&mut value, field, chars / 2);
+        if nested { trim_tool_field(&mut value["delegation"], field, chars / 2); }
+        else { trim_tool_field(&mut value, field, chars / 2); }
     }
     Ok(value)
 }
@@ -249,6 +272,9 @@ pub fn validate_arguments(method: &str, arguments: Value) -> Result<Value, Strin
             text_limit(&a.request_id, "request_id", 128)?;
             text_limit(&a.title, "title", 256)?;
             text_limit(&a.task, "task", MAX_INPUT_CHARS)?;
+            if let Some(path) = &a.workspace_path {
+                text_limit(path, "workspace_path", 4096)?;
+            }
             for (name, value) in [("model", &a.model), ("effort", &a.effort)] {
                 if let Some(value) = value {
                     text_limit(value, name, 256)?;
@@ -311,6 +337,10 @@ struct Request {
     state: String,
     response: Option<Value>,
     error: Option<String>,
+    #[serde(skip)]
+    projection: Option<delegation_storage::Projection>,
+    #[serde(skip)]
+    projection_invalid: bool,
 }
 
 // serde_json uses preserve_order in this crate. Object order must not change
@@ -350,7 +380,8 @@ impl Request {
     }
 }
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Output {
     /// Uncommitted streamed assistant text; a following assistant snapshot
     /// replaces this segment instead of appending the same text twice.
@@ -385,6 +416,7 @@ fn erase_branch_content(record: &mut BranchRecord) {
     record.branch.result_truncated = false;
     record.branch.error = None;
     record.branch.cost_approval = None;
+    record.branch.delegation = None;
     record.output = Output::default();
     record.questions.clear();
     record.plans.clear();
@@ -404,6 +436,8 @@ fn erase_reclaimed_request(
     request.erase_arguments()?;
     request.state = "reclaimed".into();
     request.error = None;
+    request.projection = None;
+    request.projection_invalid = false;
     request.response = Some(reclaimed_response(&request.request_id, branch)?);
     Ok(())
 }
@@ -433,9 +467,12 @@ struct Run {
     launch_pending: bool,
     retired: bool,
     last_seq: HashMap<String, u64>,
+    // A live process can serve several turns. Terminal events settle only
+    // their exact event run id, so late tails cannot mutate a later turn.
+    settled_turns: HashSet<String>,
 }
 
-/// Native-only continuation of an already admitted ordinary worker. This is
+/// Native-only continuation of an already admitted worker. This is
 /// carried by the existing authenticated host-chat checkpoint, never by tool
 /// arguments or an independently discovered worker manifest.
 #[derive(Clone, Serialize, Deserialize)]
@@ -451,9 +488,15 @@ pub(crate) struct WorkerTaskRegistration {
     root_saved_baseline: Option<HashSet<String>>,
     root_foreign_claims: Option<HashSet<String>>,
     verified_new_root: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    managed: Option<worker_handoff::ManagedWorkerRegistration>,
 }
 
 impl WorkerTaskRegistration {
+    pub(crate) fn managed_branch_id(&self) -> Option<&str> {
+        self.managed.as_ref().map(|managed| managed.branch_id())
+    }
+
     pub(crate) fn matches_origin(&self, run_id: &str, engine: &str, workspace: &str, session: Option<&str>) -> bool {
         self.run_id == run_id && self.engine == engine
             && same_workspace(&self.workspace_path, workspace)
@@ -468,6 +511,9 @@ struct Inner {
     branches: HashMap<String, BranchRecord>,
     requests: HashMap<RequestKey, Request>,
     runs: HashMap<String, Run>,
+    // Only startup tombstones may be revived by an authenticated worker
+    // checkpoint. finish_run in this process never grants recovery authority.
+    worker_recovery_runs: HashSet<String>,
     // Successful native first-root binding is exact-workspace provenance for
     // the history scan gap. It is bounded, memory-only, and never reconstructed
     // from durable role flags on restart; worker checkpoints carry their proof.
@@ -548,7 +594,13 @@ fn key(parent: &LeaderIdentity) -> IdentityKey {
 fn belongs(branch: &LeaderBranch, parent: &LeaderIdentity) -> bool {
     branch.parent_engine == parent.engine
         && branch.parent_session_id == parent.session_id
-        && same_workspace(&branch.workspace_path, &parent.workspace_path)
+        && same_workspace(branch.parent_workspace(), &parent.workspace_path)
+}
+
+impl LeaderBranch {
+    fn parent_workspace(&self) -> &str {
+        self.parent_workspace_path.as_deref().unwrap_or(&self.workspace_path)
+    }
 }
 
 fn refresh_parents(inner: &mut Inner) {
@@ -556,7 +608,7 @@ fn refresh_parents(inner: &mut Inner) {
         .filter(|record| record.branch.state != "reclaimed")
         .map(|record| {
             let b = &record.branch;
-            let parent = identity(&b.parent_engine, &b.parent_session_id, &b.workspace_path);
+            let parent = identity(&b.parent_engine, &b.parent_session_id, b.parent_workspace());
             (key(&parent), parent)
         }).collect();
     inner.disabled.clear();
@@ -604,16 +656,18 @@ fn write_role(conn: &mut rusqlite::Connection, parent: &LeaderIdentity, enabled:
 /// A branch view's readiness for `task_wait`, and what has to change for it
 /// to count as news: its run, state or attention flag.
 fn wait_mark(view: &Value) -> (bool, Value) {
+    let task = view.get("delegation").filter(|value| value.is_object()).unwrap_or(view);
     let ready = view.get("needsAttention") == Some(&Value::Bool(true))
-        || view
+        || task
             .get("state")
             .and_then(Value::as_str)
             .is_some_and(terminal);
     (
         ready,
         json!([
-            view.get("runId"),
-            view.get("state"),
+            task.get("requestId"),
+            task.get("runId"),
+            task.get("state"),
             view.get("needsAttention")
         ]),
     )
@@ -693,10 +747,11 @@ pub(crate) fn schema_contract_descriptor() -> Value {
         session_id: String::new(),
         workspace_path: String::new(),
     };
-    let branch = LeaderBranch {
+    let mut branch = LeaderBranch {
         id: String::new(),
         parent_engine: String::new(),
         parent_session_id: String::new(),
+        parent_workspace_path: Some(String::new()),
         workspace_path: String::new(),
         engine: String::new(),
         session_id: Some(String::new()),
@@ -730,7 +785,9 @@ pub(crate) fn schema_contract_descriptor() -> Value {
             }),
             model: Some(String::new()),
         }),
+        delegation: None,
     };
+    branch.delegation = Some(TaskDelegation::new("", &branch, 0));
     let request = Request {
         parent: identity.clone(),
         request_id: String::new(),
@@ -741,6 +798,8 @@ pub(crate) fn schema_contract_descriptor() -> Value {
         state: String::new(),
         response: Some(Value::Null),
         error: Some(String::new()),
+        projection: None,
+        projection_invalid: false,
     };
     let archived_group = LeaderArchivedGroup {
         root: identity.clone(),
@@ -751,7 +810,7 @@ pub(crate) fn schema_contract_descriptor() -> Value {
         deletion_started: false,
     };
     json!({
-        "branchRecord": branch,
+        "branchRecord": delegation_storage::branch_value(&branch).expect("schema branch encoding"),
         "requestRecord": request,
         "requestStates": [
             "starting",
@@ -782,15 +841,24 @@ pub(crate) fn schema_contract_descriptor() -> Value {
 pub fn initialize_worker_fixture_schema(db:&Db) -> Result<(),String> { ensure_schema(db) }
 
 fn write_branch(conn: &rusqlite::Connection, record: &BranchRecord) -> Result<(), String> {
+    if conn.is_autocommit() {
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        write_branch_in_transaction(&tx, record)?;
+        return tx.commit().map_err(|e| e.to_string());
+    }
+    write_branch_in_transaction(conn, record)
+}
+
+fn write_branch_in_transaction(conn: &rusqlite::Connection, record: &BranchRecord) -> Result<(), String> {
     let b = &record.branch;
-    let serialized = serde_json::to_string(b).map_err(|e| e.to_string())?;
+    let serialized = delegation_storage::branch_value(b)?.to_string();
     conn.execute(
         "INSERT INTO leader_branches(id,parent_engine,parent_session_id,workspace_path,engine,session_id,state,record_json,permission)
          VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(id) DO UPDATE SET
          session_id=excluded.session_id,state=excluded.state,record_json=excluded.record_json,permission=excluded.permission",
         params![b.id,b.parent_engine,b.parent_session_id,b.workspace_path,b.engine,b.session_id,b.state,serialized,record.permission]
     ).map_err(|e| e.to_string())?;
-    Ok(())
+    delegation_storage::persist(conn, b)
 }
 
 fn write_request(conn: &rusqlite::Connection, request: &Request) -> Result<(), String> {
@@ -799,12 +867,25 @@ fn write_request(conn: &rusqlite::Connection, request: &Request) -> Result<(), S
          VALUES(?1,?2,?3,?4,?5) ON CONFLICT(parent_engine,parent_session_id,workspace_path,request_id)
          DO UPDATE SET record_json=excluded.record_json",
         params![request.parent.engine,request.parent.session_id,request.parent.workspace_path,
-            request.request_id,serde_json::to_string(request).map_err(|e| e.to_string())?]
+            request.request_id,delegation_storage::encode_preserving(conn, request)?]
     ).map_err(|e| e.to_string())?;
     Ok(())
 }
 
 impl LeaderManager {
+    fn spawn_workspace(&self, parent: &LeaderIdentity, target: Option<&str>) -> Result<String, String> {
+        let Some(target) = target.filter(|target| !same_workspace(target, &parent.workspace_path)) else {
+            // Preserve the original exact cwd and all legacy same-workspace behavior.
+            return Ok(parent.workspace_path.clone());
+        };
+        let archived = crate::settings::read_settings()?.archived_workspaces;
+        let conn = self.db.0.lock();
+        validate_workspace_registration(&conn, &parent.workspace_path, &archived, true)?;
+        validate_workspace_registration(&conn, target, &archived, true)?;
+        crate::workspace_projects::authorize_task_target(&conn, &parent.workspace_path, target, same_workspace)?;
+        Ok(target.to_owned())
+    }
+
     fn new(
         db: Arc<Db>,
         processes: Arc<crate::engine::ProcessRegistry>,
@@ -848,13 +929,9 @@ impl LeaderManager {
                     b.state.as_str(),
                     "starting" | "running" | "waiting" | "reclaiming"
                 );
-                if uncertain {
-                    b.state = "unknown".into();
-                    b.error = Some("Application restarted; the previous run's outcome is unknown. Inspect before sending again.".into());
-                    b.updated_at = clock();
-                }
                 b.expired = clock() >= b.deadline_at;
                 if let Some(run_id) = &b.run_id {
+                    inner.worker_recovery_runs.insert(run_id.clone());
                     inner.runs.insert(
                         run_id.clone(),
                         Run {
@@ -871,7 +948,7 @@ impl LeaderManager {
                             isolated_resume_session: None,
                             launch_pending: false,
                             retired: true,
-                            last_seq: HashMap::new(),
+                            last_seq: HashMap::new(), settled_turns: HashSet::new(),
                         },
                     );
                 }
@@ -891,7 +968,8 @@ impl LeaderManager {
                         || record.branch.effort.is_some()
                         || !record.branch.result.is_empty()
                         || record.branch.result_truncated
-                        || record.branch.error.is_some();
+                        || record.branch.error.is_some()
+                        || record.branch.delegation.is_some();
                     erase_branch_content(&mut record);
                 }
                 inner.branches.insert(record.branch.id.clone(), record);
@@ -907,8 +985,7 @@ impl LeaderManager {
             drop(stmt);
             let mut migrated_requests = Vec::new();
             for raw in rows {
-                let mut request: Request = serde_json::from_str(&raw)
-                    .map_err(|e| format!("invalid Leader request record: {e}"))?;
+                let mut request = delegation_storage::decode_request(&raw)?;
                 let mut changed =
                     request.arguments_fingerprint.is_none() || !request.arguments.is_null();
                 // Migrate only durable receipts. Old public method names are
@@ -943,6 +1020,20 @@ impl LeaderManager {
                 inner
                     .requests
                     .insert((key(&request.parent), request.request_id.clone()), request);
+            }
+            delegation_storage::hydrate(&mut inner, clock())?;
+            delegation::migrate(&mut inner, clock());
+            for record in inner.branches.values_mut() {
+                if record.branch.delegation.as_ref().is_some_and(|d| matches!(d.state.as_str(), "starting" | "running" | "waiting" | "reclaiming")) {
+                    delegation::cold_restart(&mut record.branch, clock());
+                    record.dirty = true;
+                }
+                if matches!(record.branch.state.as_str(), "starting" | "running" | "waiting" | "reclaiming") {
+                    record.branch.state = "unknown".into();
+                    record.branch.error = Some("Application restarted; the previous run's outcome is unknown. Inspect before sending again.".into());
+                    record.branch.updated_at = clock();
+                    record.dirty = true;
+                }
             }
             // Publish no manager until every legacy argument and reclaimed
             // record has been scrubbed durably. A storage failure rolls the
@@ -979,6 +1070,7 @@ impl LeaderManager {
     }
 
     fn save(&self, record: &mut BranchRecord) -> Result<(), String> {
+        delegation::sync(&mut record.branch);
         write_branch(&self.db.0.lock(), record)?;
         record.dirty = false;
         Ok(())
@@ -1000,6 +1092,7 @@ impl LeaderManager {
                     changed = true;
                 }
                 if record.dirty {
+                    delegation::sync(&mut record.branch);
                     write_branch(&conn, record)?;
                     record.dirty = false;
                     changed = true;
@@ -1156,7 +1249,7 @@ impl LeaderManager {
         if let Some(response) = &request.response {
             let mut response = response.clone();
             if let Some(record) = inner.branches.get(&request.branch_id) {
-                response["branch"] = tool_branch(&record.branch, MAX_TOOL_RESPONSE_BYTES - 8192)?;
+                response["branch"] = delegation::response_branch(request, &record.branch)?;
             }
             return Ok(Some(response));
         }
@@ -1169,7 +1262,7 @@ impl LeaderManager {
         let branch = inner
             .branches
             .get(&request.branch_id)
-            .map(|r| tool_branch(&r.branch, MAX_TOOL_RESPONSE_BYTES - 8192))
+            .map(|r| delegation::response_branch(request, &r.branch))
             .transpose()?;
         Ok(Some(
             json!({"requestId":request_id,"requestState":request.state,"branch":branch,
@@ -1206,11 +1299,13 @@ impl LeaderManager {
         let id = uuid::Uuid::new_v4().to_string();
         let run_id = uuid::Uuid::new_v4().to_string();
         let now = (self.clock)();
-        let branch = LeaderBranch {
+        let workspace = self.spawn_workspace(parent, args.workspace_path.as_deref())?;
+        let mut branch = LeaderBranch {
             id: id.clone(),
             parent_engine: parent.engine.clone(),
             parent_session_id: parent.session_id.clone(),
-            workspace_path: parent.workspace_path.clone(),
+            parent_workspace_path: (workspace != parent.workspace_path).then(|| parent.workspace_path.clone()),
+            workspace_path: workspace.clone(),
             engine: args.engine.clone(),
             session_id: None,
             title: args.title.clone(),
@@ -1228,7 +1323,9 @@ impl LeaderManager {
             result_truncated: false,
             error: None,
             cost_approval: None,
+            delegation: None,
         };
+        delegation::begin(&mut branch, &args.request_id);
         let record = BranchRecord {
             branch,
             permission: permission.into(),
@@ -1248,18 +1345,20 @@ impl LeaderManager {
             state: "starting".into(),
             response: None,
             error: None,
+            projection: None,
+            projection_invalid: false,
         };
         let mut conn = self.db.0.lock();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
-        write_branch(&tx, &record)?;
         write_request(&tx, &request)?;
+        write_branch(&tx, &record)?;
         tx.commit().map_err(|e| e.to_string())?;
         inner.runs.insert(
             run_id.clone(),
             Run {
                 engine: args.engine.clone(),
                 session_id: None,
-                workspace_path: parent.workspace_path.clone(),
+                workspace_path: workspace,
                 permission: permission.into(),
                 branch_id: Some(id.clone()),
                 leader_eligible: true,
@@ -1270,7 +1369,7 @@ impl LeaderManager {
                 isolated_resume_session: None,
                 launch_pending: true,
                 retired: false,
-                last_seq: HashMap::new(),
+                last_seq: HashMap::new(), settled_turns: HashSet::new(),
             },
         );
         inner.branches.insert(id.clone(), record);
@@ -1279,6 +1378,31 @@ impl LeaderManager {
             .requests
             .insert((key(parent), args.request_id.clone()), request);
         Ok(Reservation::Start((id, run_id)))
+    }
+
+    fn sendable_child<'a>(
+        &self,
+        inner: &'a Inner,
+        parent: &LeaderIdentity,
+        branch_id: &str,
+    ) -> Result<&'a BranchRecord, String> {
+        let previous = self.child(inner, parent, branch_id)?;
+        if fenced(&previous.branch.state)
+            || previous.stopping
+            || self.active(inner, &previous.branch)
+            || previous.branch.cost_approval.is_some()
+            || previous.branch.state == "awaiting_cost_approval"
+        {
+            return Err(
+                "Child is still running or being reclaimed; wait or stop it before sending".into(),
+            );
+        }
+        if previous.branch.session_id.is_none() {
+            return Err(
+                "Child has no native session identity; inspect it in task management".into(),
+            );
+        }
+        Ok(previous)
     }
 
     fn reserve_send(
@@ -1296,28 +1420,46 @@ impl LeaderManager {
         {
             return Ok(Reservation::Replay(response));
         }
-        let previous = self.child(&inner, parent, &args.branch_id)?;
-        if fenced(&previous.branch.state)
-            || previous.stopping
-            || self.active(&inner, &previous.branch)
-            || previous.branch.cost_approval.is_some()
-            || previous.branch.state == "awaiting_cost_approval"
-        {
-            return Err(
-                "Child is still running or being reclaimed; wait or stop it before sending".into(),
-            );
-        }
-        if previous.branch.session_id.is_none() {
-            return Err(
-                "Child has no native session identity; inspect it in task management".into(),
-            );
-        }
+        let previous = self.sendable_child(&inner, parent, &args.branch_id)?;
         let cache = self.send_cache(&previous.branch)?;
-        if cost_approval::requires_approval(cache.as_ref(), (self.clock)()) {
-            let response = self.hold_send(&mut inner, parent, permission, args, &arguments, cache)?;
+        if !crate::history::prompt_cache::cache_time_limit_disabled(
+            &previous.branch.engine,
+            previous.branch.model.as_deref(),
+        ) && cost_approval::requires_approval(cache.as_ref(), (self.clock)())
+        {
+            // History can be large. Release the ledger lock while reading it,
+            // then revalidate cancellation, competing sends and the identity.
+            let sampled = previous.branch.clone();
             drop(inner);
-            self.emit();
-            return Ok(Reservation::Replay(response));
+            let small_context = self.read_small_context(&sampled)?;
+            inner = self.inner.lock();
+            self.authorize(&inner, caller)?;
+            if let Some(response) =
+                self.replay(&inner, parent, &args.request_id, "task_send", &arguments)?
+            {
+                return Ok(Reservation::Replay(response));
+            }
+            let current = &self.sendable_child(&inner, parent, &args.branch_id)?.branch;
+            let unchanged = current.engine == sampled.engine
+                && current.session_id == sampled.session_id
+                && current.workspace_path == sampled.workspace_path
+                && current.model == sampled.model
+                && current.run_id == sampled.run_id
+                && current.updated_at == sampled.updated_at;
+            let small = match small_context.as_ref().filter(|_| unchanged) {
+                Some(evidence) => self.small_context_still_matches(current, evidence)?,
+                None => false,
+            };
+            let cache = self.send_cache(current)?;
+            if !small && !crate::history::prompt_cache::cache_time_limit_disabled(
+                &current.engine, current.model.as_deref(),
+            ) && cost_approval::requires_approval(cache.as_ref(), (self.clock)()) {
+                let response =
+                    self.hold_send(&mut inner, parent, permission, args, &arguments, cache)?;
+                drop(inner);
+                self.emit();
+                return Ok(Reservation::Replay(response));
+            }
         }
         self.start_send(&mut inner, parent, permission, args, arguments)
     }
@@ -1331,6 +1473,8 @@ impl LeaderManager {
         arguments: Value,
     ) -> Result<Reservation<(LeaderBranch, String)>, String> {
         let previous = self.child(inner, parent, &args.branch_id)?;
+        self.spawn_workspace(parent, Some(&previous.branch.workspace_path))?;
+        let frozen = delegation::freeze_request(inner, &previous.branch, &args.request_id)?;
         let run_id = uuid::Uuid::new_v4().to_string();
         let mut record = BranchRecord {
             branch: previous.branch.clone(),
@@ -1350,6 +1494,7 @@ impl LeaderManager {
         record.branch.result.clear();
         record.branch.result_truncated = false;
         record.branch.error = None;
+        delegation::begin(&mut record.branch, &args.request_id);
         let request = Request {
             parent: parent.clone(),
             request_id: args.request_id.clone(),
@@ -1360,11 +1505,14 @@ impl LeaderManager {
             state: "starting".into(),
             response: None,
             error: None,
+            projection: None,
+            projection_invalid: false,
         };
         let mut conn = self.db.0.lock();
         let tx = conn.transaction().map_err(|e| e.to_string())?;
-        write_branch(&tx, &record)?;
+        if let Some(request) = &frozen { write_request(&tx, request)?; }
         write_request(&tx, &request)?;
+        write_branch(&tx, &record)?;
         tx.commit().map_err(|e| e.to_string())?;
         let branch = record.branch.clone();
         inner.runs.insert(
@@ -1383,13 +1531,16 @@ impl LeaderManager {
                 isolated_resume_session: None,
                 launch_pending: true,
                 retired: false,
-                last_seq: HashMap::new(),
+                last_seq: HashMap::new(), settled_turns: HashSet::new(),
             },
         );
         if let Some(session) = branch.session_id.as_deref() {
             record_pending_root_foreign_claim(inner, &run_id, &branch.engine, session);
         }
         inner.branches.insert(branch.id.clone(), record);
+        if let Some(request) = frozen {
+            inner.requests.insert((key(&request.parent), request.request_id.clone()), request);
+        }
         inner
             .requests
             .insert((key(parent), args.request_id.clone()), request);
@@ -1475,14 +1626,15 @@ impl LeaderManager {
                     }
                 }
                 request.state = "acknowledged".into();
+                delegation::sync(&mut record.branch);
                 request.response = Some(
-                    json!({"requestId":request_id,"requestState":"acknowledged","branch":tool_branch(&record.branch,MAX_TOOL_RESPONSE_BYTES-8192)?}),
+                    json!({"requestId":request_id,"requestState":"acknowledged","branch":delegation::response_branch(&request, &record.branch)?}),
                 );
                 let response = request.response.clone().unwrap_or(Value::Null);
                 let mut conn = self.db.0.lock();
                 let tx = conn.transaction().map_err(|e| e.to_string())?;
-                write_branch(&tx, record)?;
                 write_request(&tx, &request)?;
+                write_branch(&tx, record)?;
                 tx.commit().map_err(|e| e.to_string())?;
                 record.dirty = false;
                 inner.requests.insert(request_key, request);
@@ -1509,10 +1661,11 @@ impl LeaderManager {
                 }
                 request.state = "failed".into();
                 request.error = Some(error.clone());
+                delegation::sync(&mut record.branch);
                 let mut conn = self.db.0.lock();
                 let tx = conn.transaction().map_err(|e| e.to_string())?;
-                write_branch(&tx, record)?;
                 write_request(&tx, &request)?;
+                write_branch(&tx, record)?;
                 tx.commit().map_err(|e| e.to_string())?;
                 record.dirty = false;
                 inner.requests.insert(request_key, request);
@@ -1626,25 +1779,29 @@ pub fn shutdown() {
 }
 
 fn validate_workspace(db: &Db, workspace: &str) -> Result<(), String> {
-    let conn = db.0.lock();
+    validate_workspace_registration(&db.0.lock(), workspace,
+        &crate::settings::read_settings()?.archived_workspaces, false)
+}
+
+fn validate_workspace_registration(
+    conn: &rusqlite::Connection, workspace: &str, archived: &[String], strict_local: bool,
+) -> Result<(), String> {
     let mut stmt = conn.prepare("SELECT id,path,meta FROM workspaces").map_err(|e| e.to_string())?;
     let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?)))
         .map_err(|e| e.to_string())?.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
     drop(stmt);
     let matches: Vec<_> = rows.into_iter().filter(|(_, path, _)| same_workspace(path, workspace)).collect();
     if matches.is_empty() { return Err("Workspace is not a registered local workspace".into()); }
-    let archived = crate::settings::read_settings()?.archived_workspaces;
     for (id, _, meta) in matches {
         if archived.contains(&id) { return Err("Workspace is archived".into()); }
         if let Some(raw) = meta {
             let meta: Value =
                 serde_json::from_str(&raw).map_err(|_| "Workspace metadata is invalid")?;
-            if meta.get("wsl").is_some() {
+            if meta.get("wsl").is_some() || (strict_local && meta.get("remote").is_some()) {
                 return Err("Child tasks do not support WSL or remote workspaces".into());
             }
         }
     }
-    drop(conn);
     if !std::path::Path::new(workspace).is_dir() {
         return Err("Local workspace directory is unavailable".into());
     }
@@ -1695,9 +1852,12 @@ fn require_main(window: &tauri::WebviewWindow) -> Result<(), String> {
     Ok(())
 }
 
+mod parent_messages;
+pub(crate) use parent_messages::validate_parent_message;
+
 fn role(child: bool) -> String {
     let description = if child {
-        "Work within the assigned managed task. Return a self-contained report of results, verification and uncertainty to your parent. Questions and approvals wait for the human in this chat."
+        "Work within the assigned managed task. Write progress and your self-contained final report of results, verification and uncertainty in normal assistant output: the host captures it for your parent's task_list/task_wait. Do not call send_message to report progress or completion to your parent, and do not wait for a reply to a report. task_send is parent-to-child only. Only an actual question requiring a parent reply may use send_message with intent=\"question\", subject to the existing human authorization and cost approval rules; it may queue while the parent is busy. Human approvals remain in this chat."
     } else {
         "Collaboration is available for this task without a separate mode. You retain responsibility for decisions, integration and acceptance. Delegate within the user's task when useful and verify deliverables before reporting completion."
     };
@@ -1709,6 +1869,8 @@ pub(crate) fn unscoped_task_instructions() -> String { role(false) }
 pub(crate) fn owned_task_instructions() -> String {
     format!("This chat owns managed child tasks and must retain its CC GUI task controls.\n\n{}", role(false))
 }
+
+pub(crate) fn managed_child_instructions() -> String { role(true) }
 
 pub(crate) fn run_owns_tasks(run_id: &str) -> bool {
     MANAGER.get().is_some_and(|manager| {
@@ -1729,16 +1891,9 @@ pub(crate) fn validate_worker_session(
     session_id: Option<&str>,
 ) -> Result<(), String> {
     if !matches!(engine, "claude" | "codex" | "agy" | "cursor") { return Ok(()); }
+    validate_host_worker_session(db, engine, session_id)?;
     let conn = db.0.lock();
-    for sql in [
-        "SELECT engine,session_id,workspace_path,enabled FROM leader_roles LIMIT 0",
-        "SELECT id,parent_engine,parent_session_id,workspace_path,engine,session_id,state,record_json,permission FROM leader_branches LIMIT 0",
-        "SELECT engine,session_id,workspace_path,root_engine,root_session_id,root_workspace_path FROM leader_archived_members LIMIT 0",
-    ] {
-        conn.prepare(sql).map_err(|_| "Detached worker requires the host's initialized compatible Leader schema".to_string())?;
-    }
     if let Some(session) = session_id {
-        archive::ensure_not_archived(&conn, engine, session)?;
         let managed: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM leader_branches WHERE engine=?1 AND session_id=?2)",
             params![engine, session], |row| row.get(0),
@@ -1746,6 +1901,33 @@ pub(crate) fn validate_worker_session(
         if managed { return Err("Detached worker does not support managed Leader chats".into()); }
     }
     Ok(())
+}
+
+pub(crate) fn validate_host_worker_session(
+    db: &Db, engine: &str, session_id: Option<&str>,
+) -> Result<(), String> {
+    worker_handoff::validate_host_worker_session(db, engine, session_id)
+}
+
+#[cfg(test)]
+fn validate_detached_worker_session(
+    db: &Db, run_id: &str, engine: &str, session_id: Option<&str>,
+    workspace_path: &str, managed_branch_id: Option<&str>,
+) -> Result<(), String> {
+    detached_worker_presentation(
+        db, run_id, engine, session_id, workspace_path, managed_branch_id,
+    ).map(|_| ())
+}
+
+/// Validate the native launch reservation and freeze its presentation metadata
+/// before the detached worker writes any immutable journal events.
+pub(crate) fn detached_worker_presentation(
+    db: &Db, run_id: &str, engine: &str, session_id: Option<&str>,
+    workspace_path: &str, managed_branch_id: Option<&str>,
+) -> Result<Option<Value>, String> {
+    worker_handoff::detached_worker_presentation(
+        db, run_id, engine, session_id, workspace_path, managed_branch_id,
+    )
 }
 
 #[cfg(test)]
@@ -1806,11 +1988,10 @@ pub(crate) fn prepare_worker_run(
     db: &Db, run_id: &str, engine: &str, session_id: Option<&str>,
     workspace_path: &str, permission: Option<&str>,
 ) -> Result<(), String> {
-    validate_worker_session(db, engine, session_id)?;
-    if is_managed_child(run_id) {
-        return Err("Managed child launches require the task coordinator's native path".into());
-    }
-    let Some(manager) = MANAGER.get() else { return Ok(()); };
+    validate_host_worker_session(db, engine, session_id)?;
+    let Some(manager) = MANAGER.get() else {
+        return validate_worker_session(db, engine, session_id);
+    };
     let entry = manager.processes.get(run_id).ok_or("Worker has no trusted run reservation")?;
     if entry.pid != 0 || entry.child.is_some() || entry.killed.load(std::sync::atomic::Ordering::SeqCst) {
         return Err("Worker does not own an active new run reservation".into());
@@ -1820,85 +2001,22 @@ pub(crate) fn prepare_worker_run(
     Ok(())
 }
 
-pub(crate) fn capture_worker_registration(run_id: &str) -> Option<WorkerTaskRegistration> {
-    MANAGER.get()?.capture_worker_registration(run_id)
+pub(crate) fn capture_worker_registration(run_id: &str) -> Result<Option<WorkerTaskRegistration>, String> {
+    match MANAGER.get() {
+        Some(manager) => manager.try_capture_worker_registration(run_id),
+        None => Ok(None),
+    }
 }
 
 pub(crate) fn restore_worker_registration(registration: &WorkerTaskRegistration) -> Result<(), String> {
     manager()?.restore_worker_registration(registration)
 }
 
-impl LeaderManager {
-    fn capture_worker_registration(&self, run_id: &str) -> Option<WorkerTaskRegistration> {
-        let inner = self.inner.lock();
-        let run = inner.runs.get(run_id)?;
-        if run.retired || !run.leader_eligible || run.branch_id.is_some() { return None; }
-        let entry = self.processes.get(run_id)?;
-        if entry.killed.load(std::sync::atomic::Ordering::SeqCst) { return None; }
-        Some(WorkerTaskRegistration {
-            run_id: run_id.into(), engine: run.engine.clone(), session_id: run.session_id.clone(),
-            workspace_path: run.workspace_path.clone(), permission: run.permission.clone(),
-            root_on_start: run.root_on_start, root_identity_bound: run.root_identity_bound,
-            root_saved_baseline: run.root_saved_baseline.as_deref().cloned(),
-            root_foreign_claims: run.root_foreign_claims.clone(),
-            verified_new_root: run.session_id.as_deref().is_some_and(|session|
-                inner.verified_new_roots.contains_key(&key(&identity(&run.engine, session, &run.workspace_path)))),
-        })
-    }
-
-    fn restore_worker_registration(&self, saved: &WorkerTaskRegistration) -> Result<(), String> {
-        supported(&saved.engine)?;
-        text_limit(&saved.run_id, "worker run_id", 128)?;
-        text_limit(&saved.workspace_path, "worker workspace", 4096)?;
-        if let Some(session) = &saved.session_id { text_limit(session, "worker session_id", 256)?; }
-        if !matches!(saved.permission.as_str(), "auto" | "manual" | "plan" | "bypass")
-            || saved.root_on_start != saved.session_id.is_none()
-            || saved.root_identity_bound != saved.session_id.is_some()
-            || saved.root_on_start != saved.root_saved_baseline.is_some()
-            || saved.root_on_start != saved.root_foreign_claims.is_some()
-            || (saved.verified_new_root && saved.session_id.is_none()) {
-            return Err("Invalid worker task registration".into());
-        }
-        validate_worker_session(&self.db, &saved.engine, saved.session_id.as_deref())?;
-        let entry = self.processes.get(&saved.run_id).ok_or("Recovered worker has no live routing proxy")?;
-        if entry.run_id != saved.run_id || entry.pid == 0 || entry.killed.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err("Recovered worker routing proxy is not active".into());
-        }
-        let mut inner = self.inner.lock();
-        if inner.shutdown { return Err("Task coordinator is shutting down".into()); }
-        if let Some(run) = inner.runs.get(&saved.run_id) {
-            if run.retired || !run.leader_eligible || run.branch_id.is_some()
-                || run.engine != saved.engine || run.session_id != saved.session_id
-                || !same_workspace(&run.workspace_path, &saved.workspace_path) || run.permission != saved.permission {
-                return Err("Recovered worker conflicts with an existing task registration".into());
-            }
-            return Ok(());
-        }
-        if let Some(session) = &saved.session_id {
-            archive::ensure_available(&inner, &saved.engine, session, None)?;
-            self.ensure_no_isolated_run(&inner, &saved.engine, session)?;
-            if saved.verified_new_root {
-                inner.verified_new_roots.insert(key(&identity(&saved.engine, session, &saved.workspace_path)), (self.clock)());
-            }
-        }
-        inner.runs.insert(saved.run_id.clone(), Run {
-            engine: saved.engine.clone(), session_id: saved.session_id.clone(),
-            workspace_path: saved.workspace_path.clone(), permission: saved.permission.clone(),
-            branch_id: None, leader_eligible: true, root_on_start: saved.root_on_start,
-            root_identity_bound: saved.root_identity_bound,
-            root_saved_baseline: saved.root_saved_baseline.clone().map(Arc::new),
-            root_foreign_claims: saved.root_foreign_claims.clone(), isolated_resume_session: None,
-            launch_pending: false, retired: false, last_seq: HashMap::new(),
-        });
-        Ok(())
-    }
-}
-
 /// Whether an admitted run belongs to a managed child chat, launched by its
 /// parent or sent from the child's own tab. A run's branch never changes
 /// after `prepare_run`.
 pub fn is_managed_child(run_id: &str) -> bool {
-    MANAGER.get().is_some_and(|manager| {
+    crate::host_chat::worker_is_managed_child(run_id) || MANAGER.get().is_some_and(|manager| {
         manager
             .inner
             .lock()
@@ -1906,6 +2024,34 @@ pub fn is_managed_child(run_id: &str) -> bool {
             .get(run_id)
             .is_some_and(|run| run.branch_id.is_some())
     })
+}
+
+/// Delivery may happen after the producing process or host has restarted.
+/// Use the durable child identity, never titles or whether a chat owns tasks.
+pub(crate) fn is_managed_child_session(
+    db: &Db,
+    engine: &str,
+    session_id: &str,
+    workspace_path: &str,
+) -> Result<bool, String> {
+    let conn = db.0.lock();
+    let mut query = conn.prepare(
+        "SELECT workspace_path FROM leader_branches WHERE engine=?1 AND session_id=?2",
+    ).map_err(|error| error.to_string())?;
+    let rows = query.query_map(params![engine, session_id], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?;
+    for row in rows {
+        if same_workspace(&row.map_err(|error| error.to_string())?, workspace_path) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// A managed worker must finish its native identity handshake before a host
+/// switch; otherwise history scanning can race the first ownership binding.
+pub(crate) fn managed_worker_is_starting(run_id: &str) -> bool {
+    MANAGER.get().is_some_and(|manager| manager.managed_worker_is_starting(run_id))
 }
 
 /// Presentation capability only. Tool dispatch still verifies the active caller.
@@ -2089,7 +2235,7 @@ impl LeaderManager {
                 isolated_resume_session: session_id.map(str::to_string),
                 launch_pending: true,
                 retired: false,
-                last_seq: HashMap::new(),
+                last_seq: HashMap::new(), settled_turns: HashSet::new(),
             },
         );
         if let Some(session) = session_id {
@@ -2152,7 +2298,7 @@ impl LeaderManager {
             root_on_start: true, root_identity_bound: false,
             root_saved_baseline: Some(Arc::new(baseline)),
             root_foreign_claims: Some(foreign_claims), isolated_resume_session: None,
-            launch_pending: true, retired: false, last_seq: HashMap::new(),
+            launch_pending: true, retired: false, last_seq: HashMap::new(), settled_turns: HashSet::new(),
         });
         if inner.runs.len() > 2048 {
             inner.runs.retain(|_, run| !run.retired || run.branch_id.is_some());
@@ -2231,6 +2377,9 @@ impl LeaderManager {
             {
                 return Err("Managed run identity does not match its branch".into());
             }
+            self.spawn_workspace(&identity(&record.branch.parent_engine,
+                &record.branch.parent_session_id, record.branch.parent_workspace()),
+                Some(&record.branch.workspace_path))?;
             if fenced(&record.branch.state) || record.stopping {
                 return Err("This branch is being retired or has been reclaimed".into());
             }
@@ -2298,7 +2447,7 @@ impl LeaderManager {
                 isolated_resume_session: None,
                 launch_pending: true,
                 retired: false,
-                last_seq: HashMap::new(),
+                last_seq: HashMap::new(), settled_turns: HashSet::new(),
             },
         );
         if let Some(session) = session_id {
@@ -2310,6 +2459,7 @@ impl LeaderManager {
                 .get_mut(&id)
                 .ok_or("Managed branch is missing")?;
             if record.branch.run_id.as_deref() != Some(run_id) {
+                delegation::transfer_pending(&mut record.branch, run_id);
                 record.branch.run_id = Some(run_id.into());
                 record.branch.result.clear();
                 record.branch.result_truncated = false;
@@ -2775,6 +2925,8 @@ impl LeaderManager {
             }
             entry.run_id
         };
+        let interrupted = data.get("interrupted").and_then(Value::as_bool) == Some(true)
+            || self.processes.get(&base).is_some_and(|entry| entry.killed.load(std::sync::atomic::Ordering::SeqCst));
         let Some(run) = inner.runs.get(&base) else {
             return;
         };
@@ -2783,6 +2935,11 @@ impl LeaderManager {
         }
         let branch_id = run.branch_id.clone();
         let retired = run.retired;
+        let settled_turn = run.settled_turns.contains(&run_id);
+        let first_session = kind == "session" && session.is_some()
+            && (run.session_id.is_none() || branch_id.as_ref().is_some_and(|id| {
+                inner.branches.get(id).is_some_and(|record| record.branch.session_id.is_none())
+            }));
         if let Some(id) = &branch_id {
             let Some(record) = inner.branches.get(id) else {
                 return;
@@ -2805,7 +2962,7 @@ impl LeaderManager {
             if let Err(error) = self.check_binding(&inner, &base, &engine, session) {
                 if let Some(id) = &branch_id {
                     event["leader"]["identityRejected"] = Value::Bool(true);
-                    if let Some(record) = inner.branches.get_mut(id) {
+                    if let Some(record) = inner.branches.get_mut(id).filter(|_| !settled_turn) {
                         record.branch.state = "failed".into();
                         record.branch.error = Some(error);
                         record.branch.updated_at = now;
@@ -2817,6 +2974,11 @@ impl LeaderManager {
                 self.emit();
                 return;
             }
+        }
+        // Preserve envelope and identity checks above. A first session id may
+        // still arrive after completion; it can bind identity, never reopen it.
+        if settled_turn && !first_session {
+            return;
         }
         let Some(run) = inner.runs.get_mut(&base) else {
             return;
@@ -2830,6 +2992,9 @@ impl LeaderManager {
         run.launch_pending = false;
         if let Some(session) = &session {
             run.session_id = Some(session.clone());
+        }
+        if branch_id.is_none() && matches!(kind.as_str(), "done" | "error") {
+            run.settled_turns.insert(run_id.clone());
         }
         if let Some(session) = session.as_deref() {
             record_pending_root_foreign_claim(&mut inner, &base, &engine, session);
@@ -2852,6 +3017,18 @@ impl LeaderManager {
                 }
                 lifecycle = true;
             }
+        }
+        if settled_turn {
+            if lifecycle {
+                record.branch.updated_at = now;
+                record.dirty = true;
+                let _ = self.save(record);
+            }
+            drop(inner);
+            if lifecycle {
+                self.emit();
+            }
+            return;
         }
         let previous = record.branch.state.clone();
         // Continuation ids identify genuinely new turns on a still-live Claude
@@ -2957,10 +3134,16 @@ impl LeaderManager {
                     .and_then(Value::as_str)
                     .map(str::to_string);
             }
+            "turn_complete" if can_progress && interrupted => {
+                // A reply-only interrupt need not retire Claude's live process
+                // or its background tasks, but this delegated reply has ended.
+                delegation::interrupted_turn(&mut record.branch, now);
+                lifecycle = true;
+            }
             "done" if can_progress => {
                 record.output.stream_start = None;
                 record.output.active_tool = None;
-                record.branch.state = if record.stopping {
+                record.branch.state = if record.stopping || interrupted {
                     "stopped"
                 } else if !record.questions.is_empty() || !record.plans.is_empty() {
                     "waiting"
@@ -2973,7 +3156,7 @@ impl LeaderManager {
             "error" if can_progress => {
                 record.output.stream_start = None;
                 record.output.active_tool = None;
-                record.branch.state = if record.stopping { "stopped" } else { "failed" }.into();
+                record.branch.state = if record.stopping || interrupted { "stopped" } else { "failed" }.into();
                 record.branch.error = data.as_str().map(str::to_string).or_else(|| {
                     data.get("message")
                         .and_then(Value::as_str)
@@ -2993,10 +3176,18 @@ impl LeaderManager {
         record.branch.last_activity_at = now;
         record.branch.updated_at = now;
         record.branch.expired = now >= record.branch.deadline_at;
+        delegation::sync(&mut record.branch);
         record.dirty = true;
         lifecycle |= previous != record.branch.state || kind == "session";
         if lifecycle {
             let _ = self.save(record);
+        }
+        // A done emitted while approvals remain pending is still waiting, not
+        // a terminal turn: same-turn approval settlement must keep working.
+        if matches!(kind.as_str(), "done" | "error") && terminal(&record.branch.state) {
+            if let Some(run) = inner.runs.get_mut(&base) {
+                run.settled_turns.insert(run_id);
+            }
         }
         drop(inner);
         if lifecycle {
@@ -3006,6 +3197,7 @@ impl LeaderManager {
 
     fn finish(&self, run_id: &str) {
         let mut inner = self.inner.lock();
+        inner.worker_recovery_runs.remove(run_id);
         inner.pending_bindings.remove(run_id);
         let Some(run) = inner.runs.get_mut(run_id) else {
             return;
@@ -3056,6 +3248,7 @@ pub async fn task_group_action(
     action: String,
 ) -> Result<LeaderSnapshot, String> {
     require_main(&window)?;
+    let _task_action = crate::worker_host::task_action_guard().await?;
     group_action(&state.db, engine, session_id, workspace_path, action).await
 }
 
@@ -3086,6 +3279,7 @@ pub async fn task_resolve_cost_approval(
     reviewed_model: Option<String>,
 ) -> Result<LeaderSnapshot, String> {
     require_main(&window)?;
+    let _task_action = crate::worker_host::task_action_guard().await?;
     let manager = manager()?;
     let parent = identity(&parent_engine, &parent_session_id, &workspace_path);
     if let Some((branch, run_id, permission)) = manager.resolve_cost_approval(
@@ -3342,12 +3536,10 @@ impl LeaderManager {
                 let cache_window = r.branch.session_id.as_ref().and_then(|id| cache_windows.get(&format!("{}:{id}", r.branch.engine)));
                 let cache_warmth = cache_window.map_or("unknown", |w| w.heat(now));
                 view["processAlive"] = Value::Bool(alive);
+                let task_state = r.branch.delegation.as_ref().map_or(r.branch.state.as_str(), |d| d.state.as_str());
                 view["needsAttention"] = Value::Bool(
-                    r.branch.expired
-                        || r.branch.state == "waiting"
-                        || r.branch.state == "awaiting_cost_approval"
-                        || r.branch.state == "unknown"
-                        || r.branch.state == "failed",
+                    (r.branch.expired && !terminal(task_state))
+                        || matches!(task_state, "waiting" | "awaiting_cost_approval" | "unknown" | "failed"),
                 );
                 view["idleProgressAdvisory"] = Value::Bool(
                     alive
@@ -3437,16 +3629,24 @@ impl LeaderManager {
         }
     }
 
-    fn stop_runs(&self, ids: &[String]) {
+    async fn stop_runs(&self, ids: &[String]) -> Result<(), String> {
         let runs: Vec<_> = {
             let inner = self.inner.lock();
             ids.iter()
                 .filter_map(|id| inner.branches.get(id).and_then(|r| r.branch.run_id.clone()))
                 .collect()
         };
+        let mut failure = None;
         for run in runs {
-            self.processes.kill(&run);
+            match crate::worker_host::control(
+                &run, &format!("leader-stop-{run}"), crate::task_worker::Command::Interrupt,
+            ).await {
+                Some(Ok(_)) => {}
+                Some(Err(error)) => { failure.get_or_insert(error); }
+                None => { self.processes.kill(&run); }
+            }
         }
+        failure.map_or(Ok(()), Err)
     }
 
     async fn stop(&self, parent: &LeaderIdentity, id: &str) -> Result<LeaderBranch, String> {
@@ -3464,8 +3664,11 @@ impl LeaderManager {
             }
             inner.branches.get_mut(id).ok_or("Unknown branch")?.stopping = true;
         }
-        self.stop_runs(&[id.into()]);
-        if let Err(error) = self.wait_retired(&[id.into()]).await {
+        let retirement = match self.stop_runs(&[id.into()]).await {
+            Ok(()) => self.wait_retired(&[id.into()]).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = retirement {
             let mut inner = self.inner.lock();
             let record = inner.branches.get_mut(id).ok_or("Unknown branch")?;
             record.branch.state = "unknown".into();
@@ -3721,8 +3924,11 @@ impl LeaderManager {
         };
         self.emit();
         if !idle_only {
-            self.stop_runs(&ids);
-            if let Err(error) = self.wait_retired(&ids).await {
+            let retirement = match self.stop_runs(&ids).await {
+                Ok(()) => self.wait_retired(&ids).await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = retirement {
                 self.reclaim_failed(&ids, &error)?;
                 return Err(error);
             }
@@ -3784,6 +3990,7 @@ pub async fn task_branch_action(
     ttl_seconds: Option<u64>,
 ) -> Result<LeaderBranch, String> {
     require_main(&window)?;
+    let _task_action = crate::worker_host::task_action_guard().await?;
     branch_action(&state.db, parent_engine, parent_session_id, workspace_path, branch_id, action, ttl_seconds).await
 }
 
@@ -3888,10 +4095,12 @@ pub async fn dispatch(
                 }
             };
             manager.emit();
+            let workspace = manager.inner.lock().branches.get(&id)
+                .ok_or("Reserved child is missing")?.branch.workspace_path.clone();
             let result = crate::engine::send_message_inner(
                 state,
                 args.engine,
-                parent.workspace_path.clone(),
+                workspace,
                 None,
                 args.task,
                 None,
@@ -3910,19 +4119,17 @@ pub async fn dispatch(
         }
         "task_send" => {
             let args: SendArgs = decode(arguments.clone())?;
-            let (branch, run_id) = {
-                let inner = manager.inner.lock();
-                manager.authorize(&inner, &caller)?;
-                if let Some(response) =
-                    manager.replay(&inner, &parent, &args.request_id, method, &arguments)?
-                {
-                    return Ok(response);
-                }
-                drop(inner);
-                match manager.reserve_send(&caller, &parent, &permission, &args, arguments)? {
-                    Reservation::Replay(response) => return Ok(response),
-                    Reservation::Start(start) => start,
-                }
+            let reservation = tauri::async_runtime::spawn_blocking({
+                let manager = Arc::clone(&manager);
+                let caller = caller.clone();
+                let parent = parent.clone();
+                let permission = permission.clone();
+                let args = args.clone();
+                move || manager.reserve_send(&caller, &parent, &permission, &args, arguments)
+            }).await.map_err(|error| format!("Task continuation review failed: {error}"))??;
+            let (branch, run_id) = match reservation {
+                Reservation::Replay(response) => return Ok(response),
+                Reservation::Start(start) => start,
             };
             manager.emit();
             let result = crate::engine::send_message_inner(
@@ -4016,6 +4223,7 @@ pub async fn task_delete_branch(
     expected_branch_ids: Vec<String>,
 ) -> Result<LeaderSnapshot, String> {
     require_main(&window)?;
+    let _task_action = crate::worker_host::task_action_guard().await?;
     supported(&parent_engine)?;
     text_limit(&parent_session_id, "parent_session_id", 256)?;
     text_limit(&branch_id, "branch_id", 256)?;

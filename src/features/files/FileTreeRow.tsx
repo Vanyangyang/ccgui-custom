@@ -8,8 +8,10 @@ import { cx } from "@/utils/cx";
 import type { DirEntry, FileTreeColor, RepositorySummary } from "@/lib/ipc";
 import { getFileTreeIconSvg } from "./fileIcons";
 import { useFilesStore } from "./store";
+import type { FileProjectRoot } from "./project-roots";
 
 export interface VisibleNode extends DirEntry {
+  projectRoot?: FileProjectRoot;
   path: string;
   depth: number;
   expanded: boolean;

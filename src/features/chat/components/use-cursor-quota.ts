@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ipc, type CursorQuotaSnapshot } from "@/lib/ipc";
+import { quotaReadFailed } from "../subscription-quota";
 
 const EMPTY: CursorQuotaSnapshot = { status: "unavailable", errorCode: "not_loaded" };
 
@@ -31,7 +32,7 @@ export function useCursorQuota(engine: string) {
             setState({ engine, snapshot, loading: false });
           }
         } catch {
-          if (current()) setState({ engine, snapshot: { ...EMPTY, errorCode: "read_failed" }, loading: false });
+          if (current()) setState(previous => ({ engine, snapshot: quotaReadFailed(previous.snapshot, EMPTY), loading: false }));
         } finally {
           pending = undefined;
           if (current()) setState(previous => ({ ...previous, loading: false }));

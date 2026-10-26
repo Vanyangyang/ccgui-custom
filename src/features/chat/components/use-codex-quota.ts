@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ipc, type CodexQuotaSnapshot } from "@/lib/ipc";
 import { listenCodexQuotaChanged, listenTransportConnected } from "@/lib/events";
-import { QUOTA_MAX_AGE, QUOTA_STALE_AGE, isNativeSubscriptionProvider, validSubscriptionQuotaSnapshot } from "../subscription-quota";
+import { QUOTA_STALE_AGE, isNativeSubscriptionProvider, quotaReadFailed, validSubscriptionQuotaSnapshot } from "../subscription-quota";
 
 const EMPTY: CodexQuotaSnapshot = { status: "unavailable", windows: {}, errorCode: "not_loaded" };
 
@@ -45,9 +45,7 @@ export function useCodexQuota(engine: string, providerId: string | undefined, wo
           setState({ route, snapshot, loading: true });
         }
       } catch {
-        // A transport failure cannot confirm that the account still matches.
-        // Native validated stale replies may retain values; an IPC rejection may not.
-        if (current()) setState({ route, snapshot: { ...EMPTY, errorCode: "read_failed" }, loading: true });
+        if (current()) setState(previous => ({ route, snapshot: quotaReadFailed(previous.snapshot, EMPTY), loading: true }));
       } finally {
         inFlight = false;
         if (current()) {
@@ -86,9 +84,9 @@ export function useCodexQuota(engine: string, providerId: string | undefined, wo
   }, [route, engine, providerId, workspacePath, enabled]);
 
   const snapshot = enabled && state.route === route ? validSubscriptionQuotaSnapshot(state.snapshot, now) : undefined;
-  // Expire reset windows and freshness exactly between minute cache reads.
+  // Update stale/reset labels exactly between minute cache reads.
   const deadlines = snapshot?.collectedAt && Number.isFinite(snapshot.collectedAt) && snapshot.collectedAt <= now
-    ? [snapshot.collectedAt + QUOTA_STALE_AGE, snapshot.collectedAt + QUOTA_MAX_AGE,
+    ? [snapshot.collectedAt + QUOTA_STALE_AGE,
       ...Object.values(snapshot.windows).map(window => window?.resetsAt ?? 0)].filter(time => time > now)
     : [];
   const nextDeadline = deadlines.length ? Math.min(...deadlines) : undefined;

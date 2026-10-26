@@ -17,6 +17,7 @@ import {
 } from "@ccgui/plugin-sdk";
 import { pluginBus } from "./events";
 import { setActiveComposerDraft } from "./composer-draft";
+import { whenRuntimeSubmissionResumed } from "@/lib/runtime-checkpoint";
 import type { PluginManifest } from "@ccgui/plugin-sdk";
 // composer.setDraft 的 store 落点由 composer-draft.test.ts 单独覆盖；
 // 这里只验证权限门与委派，不拉入 chat store 依赖链。
@@ -44,6 +45,30 @@ function manifest(permissions: string[]): PluginManifest {
 }
 
 describe("createPluginContext", () => {
+  it("gates project publication and binds the source to the publishing plugin", async () => {
+    const backend = fakeStorage();
+    const definition = { name: "Game", defaultPath: "/game", members: [{ id: "game", path: "/game", label: "Game", role: "development" as const }] };
+    const denied = createPluginContext(manifest([]), backend, { appVersion: "1" });
+    await expect(denied.ctx.workspaces.publishProject("stable-project", definition)).rejects.toThrow(/host:workspace/);
+    expect(backend.bridgeInvoke).not.toHaveBeenCalled();
+    backend.bridgeInvoke.mockResolvedValueOnce({ id: "host-projection", sourceKey: "stable-project" });
+    const allowed = createPluginContext(manifest(["host:workspace"]), backend, { appVersion: "1" });
+    await expect(allowed.ctx.workspaces.publishProject("stable-project", definition)).resolves.toEqual({ id: "host-projection" });
+    expect(backend.bridgeInvoke).toHaveBeenLastCalledWith("plugin_publish_workspace_project", {
+      pluginId: "test-plugin", sourceKey: "stable-project", input: definition,
+    });
+    backend.bridgeInvoke.mockRejectedValueOnce(new Error("member outside registered workspaces"));
+    await expect(allowed.ctx.workspaces.publishProject("stable-project", definition)).rejects.toThrow(/outside registered/);
+  });
+  it("exposes abortable host readiness without permissions or native IPC", async () => {
+    const backend = fakeStorage();
+    const { ctx } = createPluginContext(manifest([]), backend, { appVersion: "1" });
+    expect(ctx.host.whenReady).toBe(whenRuntimeSubmissionResumed);
+    await expect(ctx.host.whenReady()).resolves.toBeUndefined();
+    const controller = new AbortController(); controller.abort(new Error("unloaded"));
+    await expect(ctx.host.whenReady(controller.signal)).rejects.toThrow("unloaded");
+    expect(backend.bridgeInvoke).not.toHaveBeenCalled();
+  });
   it("gates every existing-host-chat operation and refuses desktop impersonation on web", async () => {
     const backend = fakeStorage();
     const denied = createPluginContext(manifest([]), backend, { appVersion: "1" });
@@ -53,11 +78,23 @@ describe("createPluginContext", () => {
     await expect(denied.ctx.chat.inspect({} as never)).rejects.toThrow(/host:chat/);
     await expect(denied.ctx.chat.submit({} as never)).rejects.toThrow(/host:chat/);
     expect(() => denied.ctx.chat.onEvent(() => {})).toThrow(/host:chat/);
+    for (const call of [() => denied.ctx.conversations.catalog(), () => denied.ctx.conversations.open({} as never),
+      () => denied.ctx.conversations.inspect("one"), () => denied.ctx.conversations.send({} as never),
+      () => denied.ctx.conversations.stop("one"), () => denied.ctx.conversations.openFile("one", "file.ts")]) {
+      await expect(call()).rejects.toThrow(/host:chat/);
+    }
+    expect(() => denied.ctx.conversations.onEvent(() => {})).toThrow(/host:chat/);
     // jsdom has no __TAURI_INTERNALS__, so the host transport is Web.
     const web = createPluginContext(manifest(["host:chat"]), backend, { appVersion: "1" });
     await expect(web.ctx.chat.identity()).rejects.toThrow(/desktop/);
     await expect(web.ctx.chat.current()).rejects.toThrow(/desktop/);
     expect(() => web.ctx.chat.onEvent(() => {})).toThrow(/desktop/);
+    await expect(web.ctx.conversations.openFile("one", "file.ts")).rejects.toThrow(/desktop/);
+    await expect(web.ctx.conversations.open({} as never)).rejects.toThrow(/desktop/);
+    await expect(denied.ctx.images.importImage({ dataBase64: "AA==", mimeType: "image/png" })).rejects.toThrow(/host:chat/);
+    await expect(denied.ctx.images.readPreview("img1")).rejects.toThrow(/host:chat/);
+    await expect(web.ctx.images.importImage({ dataBase64: "AA==", mimeType: "image/png" })).rejects.toThrow(/desktop/);
+    await expect(web.ctx.images.readPreview("img1")).rejects.toThrow(/desktop/);
     expect(backend.data.size).toBe(0);
     expect(backend.bridgeInvoke).not.toHaveBeenCalled();
   });

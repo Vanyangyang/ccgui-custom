@@ -9,13 +9,14 @@ import Folders from "lucide-react/dist/esm/icons/folders";
 import FolderSymlink from "lucide-react/dist/esm/icons/folder-symlink";
 import History from "lucide-react/dist/esm/icons/history";
 import ListChecks from "lucide-react/dist/esm/icons/list-checks";
+import Plus from "lucide-react/dist/esm/icons/plus";
 import {
   WORKSPACE_DROP_TARGET_ATTR,
   WorkspaceSortableList,
 } from "@/components/application/ai-chat/workspace-sortable-list";
 import { ARCHIVED_SECTION_ID } from "@/components/application/ai-chat/use-sidebar-state";
 import { Input } from "@/components/base/input/input";
-import { RecentThreadList, RepoItem } from "@/components/application/ai-chat/repo-tree";
+import { RecentThreadList, RepoItem, SidebarDisclosure } from "@/components/application/ai-chat/repo-tree";
 import type { AiChatRepo, AiChatRepoSection, AiChatThread, ThreadAction } from "@/components/application/ai-chat/sidebar-types";
 import type { SidebarChatListMode } from "@/components/application/ai-chat/use-sidebar-state";
 import {
@@ -36,17 +37,23 @@ function GroupHeaderRow({
   name,
   collapsed,
   onToggle,
+  project,
+  onNewSession,
 }: {
   name: string;
   collapsed: boolean;
   onToggle: () => void;
+  project?: AiChatRepoSection["project"];
+  onNewSession?: (id: string) => void;
 }) {
+  const { t } = useTranslation();
   return (
+    <div className="group flex w-full items-center rounded-2lg hover:bg-background-secondary-hover">
     <button
       type="button"
       aria-expanded={!collapsed}
       onClick={onToggle}
-      className="flex w-full cursor-pointer items-center gap-1 rounded-2lg px-1 py-[5px] transition-colors duration-150 ease hover:bg-background-secondary-hover"
+      className={cx("flex min-w-0 flex-1 cursor-pointer items-center gap-1 rounded-2lg px-1 py-[5px] transition-colors duration-150 ease", project && "gap-2 p-2")}
     >
       <ChevronRight
         className={cx(
@@ -55,10 +62,17 @@ function GroupHeaderRow({
         )}
         aria-hidden
       />
-      <span className="min-w-0 flex-1 truncate text-left text-caption-1-medium text-text-tertiary">
+      <span className={cx("min-w-0 flex-1 truncate text-left", project ? "text-body-2-medium text-text-secondary" : "text-caption-1-medium text-text-tertiary")}>
         {name}
       </span>
     </button>
+    {project && onNewSession && <button type="button" disabled={!project.canLaunch}
+      aria-label={`${t("chat.newSession")} · ${name}`} title={project.canLaunch ? t("chat.newSession") : t("projects.unavailable")}
+      onClick={() => onNewSession(project.launchId)}
+      className="mr-2 flex size-6 shrink-0 items-center justify-center rounded-md text-foreground-icon-secondary opacity-0 transition-opacity group-hover:opacity-100 focus-visible:opacity-100 disabled:cursor-not-allowed disabled:opacity-30">
+      <Plus className="size-4" aria-hidden />
+    </button>}
+    </div>
   );
 }
 
@@ -230,7 +244,7 @@ export function WorkspaceSection({
   onThreadSelect?: (id: string) => void;
   onThreadAction?: (id: string, action: ThreadAction) => void;
   /** Right-click on a thread row (thread context menu). */
-  onThreadContextMenu?: (event: ReactMouseEvent<HTMLElement>, threadId: string) => void;
+  onThreadContextMenu?: (event: ReactMouseEvent<HTMLElement>, threadId: string, workspacePath?: string) => void;
   onAddWorkspace?: () => void;
   onRemoveWorkspace?: (id: string) => void;
   onNewSessionInWorkspace?: (id: string) => void;
@@ -260,6 +274,21 @@ export function WorkspaceSection({
   const { t } = useTranslation();
   const hasGroups = Boolean(sections?.some((section) => section.id !== null));
 
+  const renderProjectRepos = (projectRepos: AiChatRepo[]) => (
+    <div className="ml-3 flex min-w-0 flex-col gap-1 border-l border-border-button-default pl-1">
+      {projectRepos.map((repo) => <RepoItem key={repo.id ?? repo.label} repo={repo}
+        open={isRepoExpanded(repo)} onToggleOpen={() => onToggleRepo(repo)}
+        activeThreadId={activeThreadId} onThreadSelect={onThreadSelect} onThreadAction={onThreadAction}
+        onThreadContextMenu={onThreadContextMenu}
+        onNewSession={repo.unavailable ? undefined : onNewSessionInWorkspace}
+        onRemove={repo.directoryOnly ? undefined : onRemoveWorkspace}
+        onNewWorktree={repo.directoryOnly || repo.unavailable ? undefined : onNewWorktree}
+        onRepoContextMenu={repo.directoryOnly ? undefined : onRepoContextMenu}
+        isRepoExpanded={isRepoExpanded} onToggleRepo={onToggleRepo}
+        onContextMenu={onRepoContextMenu && repo.id && !repo.directoryOnly ? (event) => onRepoContextMenu(event, repo.id!) : undefined}
+      />)}
+    </div>
+  );
   const renderRepoList = (repos: AiChatRepo[], sectionId: string | null) =>
     repos.length > 0 && (
       <WorkspaceSortableList
@@ -276,7 +305,7 @@ export function WorkspaceSection({
                   (section) =>
                     section.id === sectionId
                       ? orderedIds
-                      : section.repos.map((repo) => repo.id),
+                      : section.repos.filter((repo) => !repo.directoryOnly).map((repo) => repo.id),
                 );
                 onReorderWorkspaces(all.filter((id): id is string => Boolean(id)));
               }
@@ -373,7 +402,15 @@ export function WorkspaceSection({
       {listMode !== "recent" && !hasGroups && renderRepoList(repos, null)}
       {listMode !== "recent" && hasGroups &&
         sections!.map((section) =>
-          section.id === null ? (
+          section.project ? (
+            <div key={section.id} data-workspace-project={section.id} className="flex min-w-0 flex-col gap-1">
+              <GroupHeaderRow name={section.name} collapsed={collapsedGroups.has(section.id!)}
+                onToggle={() => onToggleGroup?.(section.id!)} project={section.project} onNewSession={onNewSessionInWorkspace} />
+              <SidebarDisclosure expanded={!collapsedGroups.has(section.id!)}>
+                {renderProjectRepos(section.repos)}
+              </SidebarDisclosure>
+            </div>
+          ) : section.id === null ? (
             <div key="ungrouped" {...{ [WORKSPACE_DROP_TARGET_ATTR]: "" }} className={dropTargetClasses}>
               {renderRepoList(section.repos, null)}
             </div>

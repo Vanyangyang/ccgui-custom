@@ -89,13 +89,13 @@ describe("unreadableUsageKeys", () => {
     const coordinator = await import("@/lib/runtime-checkpoint");
     coordinator.initializeRuntimeCheckpoint(undefined, { requiredParticipants: ["chat"] });
     const { useChatStore: firstStore } = await import("../store");
-    const tab = { engine: "claude", sessionId: "bc89db18", workspacePath: "G:/VESPERIX" };
+    const tab = { engine: "claude", sessionId: "00000000-0000-4000-8000-000000000001", workspacePath: "G:/EXAMPLE" };
     firstStore.setState({
       initialized: true,
       openTabs: [tab],
       active: tab,
       bySession: {
-        "claude/bc89db18": {
+        "claude/00000000-0000-4000-8000-000000000001": {
           ...EMPTY_SESSION,
           activeModel: "<synthetic>",
           usage: { ...ZERO },
@@ -133,7 +133,7 @@ describe("unreadableUsageKeys", () => {
     const { useChatStore: restoredStore } = await import("../store");
 
     // Restore immediately strips <synthetic> model/usage from checkpointed rows.
-    const beforeResume = restoredStore.getState().bySession["claude/bc89db18"];
+    const beforeResume = restoredStore.getState().bySession["claude/00000000-0000-4000-8000-000000000001"];
     expect(beforeResume.activeModel).toBeNull();
     expect(beforeResume.messages[1].model).toBeUndefined();
     expect(beforeResume.messages[1].usage).toBeUndefined();
@@ -146,8 +146,8 @@ describe("unreadableUsageKeys", () => {
 
     nextCoord.resumeCommittedRuntimeCheckpoint();
     await vi.waitFor(() => {
-      expect(loadSessionPage).toHaveBeenCalledWith("claude", "bc89db18", 100);
-      expect(restoredStore.getState().bySession["claude/bc89db18"].usage).toMatchObject({
+      expect(loadSessionPage).toHaveBeenCalledWith("claude", "00000000-0000-4000-8000-000000000001", 100);
+      expect(restoredStore.getState().bySession["claude/00000000-0000-4000-8000-000000000001"].usage).toMatchObject({
         input_tokens: 2,
         cache_creation_input_tokens: 1_092,
         cache_read_input_tokens: 433_811,

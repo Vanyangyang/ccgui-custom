@@ -51,6 +51,8 @@ window.__TAURI_INTERNALS__ = {
     switch (cmd) {
       case "usage_summary":
         return structuredClone(state.rows);
+      case "usage_window_totals":
+        return [];
       case "usage_clear":
         state.rows = [];
         return null;

@@ -36,7 +36,7 @@ const key = (tab: typeof a | typeof draft) => sessionKey(tab.engine, tab.session
 const flush = async () => { for (let i = 0; i < 20; i++) await Promise.resolve(); };
 const deps = (): EngineEventDeps => ({ set: useChatStore.setState, get: useChatStore.getState, drainQueue: () => {}, markUnseenIfBackground: () => {}, upsertSessionMeta: () => {} });
 
-describe("optional Claude Haiku assistance", () => {
+describe("temporarily disabled Claude Haiku assistance", () => {
   beforeEach(async () => {
     await flush();
     vi.clearAllMocks();
@@ -47,20 +47,20 @@ describe("optional Claude Haiku assistance", () => {
     useChatStore.setState({ active: a, openTabs: [a, b], activeEngine: "claude", workspaces: [], sessions: [], archivedSessionKeys: {}, engines: [], models: { claude: "sonnet" }, efforts: { claude: "high" }, providers: {}, defaultClaudeUltracode: false, permission: "manual", bySession: {}, streamingByKey: {}, retryingByKey: {}, drafts: {}, unseen: {}, actionError: null });
   });
 
-  it.each([undefined, true, false])("sends choice %s without changing the main model, effort, permission or defaults", async (enabled) => {
+  it.each([undefined, true, false])("ignores legacy choice %s without changing the main model, effort, permission or defaults", async (enabled) => {
     if (enabled !== undefined) useChatStore.getState().setClaudeHaikuAssist(enabled);
     await useChatStore.getState().send("fake task", []);
-    expect(ipc.sendMessage).toHaveBeenCalledWith(expect.objectContaining({ sessionId: "a", claudeHaikuAssist: enabled === true, model: "opus", effort: "high", permission: "manual" }));
+    expect(ipc.sendMessage).toHaveBeenCalledWith(expect.objectContaining({ sessionId: "a", claudeHaikuAssist: false, model: "opus", effort: "high", permission: "manual" }));
     expect(useChatStore.getState()).toMatchObject({ models: { claude: "sonnet" }, efforts: { claude: "high" }, permission: "manual" });
     expect(ipc.updateAppSettings).not.toHaveBeenCalled();
   });
 
-  it("changes only the targeted pane and sends that background conversation's choice", async () => {
+  it("preserves targeted pane preferences while sending background conversations without assistance", async () => {
     useChatStore.getState().setClaudeHaikuAssist(true, b);
     expect(useChatStore.getState().active).toEqual(a);
     expect(readPersistedTabs()).toEqual([a, { ...b, claudeHaikuAssist: true }]);
     await useChatStore.getState().send("background", [], undefined, b);
-    expect(ipc.sendMessage).toHaveBeenLastCalledWith(expect.objectContaining({ sessionId: "b", claudeHaikuAssist: true, model: "opus" }));
+    expect(ipc.sendMessage).toHaveBeenLastCalledWith(expect.objectContaining({ sessionId: "b", claudeHaikuAssist: false, model: "opus" }));
     await useChatStore.getState().send("foreground", [], undefined, a);
     expect(ipc.sendMessage).toHaveBeenLastCalledWith(expect.objectContaining({ sessionId: "a", claudeHaikuAssist: false }));
   });
@@ -107,20 +107,23 @@ describe("optional Claude Haiku assistance", () => {
     await sending;
     expect(useChatStore.getState().active).toMatchObject({ sessionId: "a", claudeHaikuAssist: false });
     expect(readPersistedTabs()[0]).toMatchObject({ sessionId: "a", claudeHaikuAssist: false });
-    expect(useChatStore.getState().bySession[key(a)].liveLaunch?.claudeHaikuAssist).toBe(true);
+    expect(useChatStore.getState().bySession[key(a)].liveLaunch?.claudeHaikuAssist).toBe(false);
   });
 
-  it.each([false, true])("queues instead of reusing a live process after changing away from %s", (initial) => {
+  it.each([false, true])("only reuses an old live process if it launched without assistance (launched=%s)", (initial) => {
     const tab = { ...a, claudeHaikuAssist: initial };
     const state = useChatStore.getState();
     const session = { ...EMPTY_SESSION, streaming: true, nativeActivity: "waiting" as const, nativeTaskRunId: "run-a" };
-    const running = { ...session, liveLaunch: resolveLaunchSettings(state, tab, session) };
+    const running = { ...session, liveLaunch: { ...resolveLaunchSettings(state, tab, session), claudeHaikuAssist: initial } };
     runRouting.set("run-a", key(a));
-    expect(liveFollowUpBlocker(state, tab, running)).toBeNull();
-    expect(liveFollowUpBlocker(state, { ...tab, claudeHaikuAssist: !initial }, running)).toBe("settings-changed");
+    expect(resolveLaunchSettings(state, tab, running).claudeHaikuAssist).toBe(false);
+    for (const choice of [true, false]) {
+      expect(liveFollowUpBlocker(state, { ...tab, claudeHaikuAssist: choice }, running))
+        .toBe(initial ? "settings-changed" : null);
+    }
   });
 
-  it("reports capability refusal as an error and leaves the session switch available to turn off", async () => {
+  it("still localizes a legacy capability error and can retry without assistance", async () => {
     useChatStore.getState().setClaudeHaikuAssist(true);
     vi.mocked(ipc.sendMessage).mockRejectedValueOnce(new Error("CLAUDE_HAIKU_ASSIST_UNAVAILABLE: missing --agents"));
     await useChatStore.getState().send("fake task", []);

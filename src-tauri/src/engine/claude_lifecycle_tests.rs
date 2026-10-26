@@ -660,6 +660,7 @@ async fn exercise(mode: &str) -> Vec<Value> {
     let capture = Arc::new(Capture::default());
     let sink = EventSink::new(capture.clone());
     let ctx = RunContext {
+        request_started_at: None,
         core: TurnCore {
             sink: sink.clone(),
             registry: registry.clone(),

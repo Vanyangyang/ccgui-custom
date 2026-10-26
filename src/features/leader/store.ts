@@ -2,7 +2,7 @@ import { create } from "zustand";
 import { invoke, isWeb } from "@/lib/transport";
 import { errorText } from "@/lib/errors";
 import i18n from "@/lib/i18n";
-import { isDirectChild, leaderBranchSubtree, leaderGroupRoot, leaderGroupBranches, sameIdentity, type LeaderBranch, type LeaderIdentity, type LeaderSnapshot } from "./types";
+import { isDirectChild, leaderBranchSubtree, leaderGroupRoot, leaderGroupBranches, parentWorkspacePath, sameIdentity, type LeaderBranch, type LeaderIdentity, type LeaderSnapshot } from "./types";
 import { useChatStore, sessionKey } from "@/features/chat/store";
 import { ipc } from "@/lib/ipc";
 import { removeLeaderSessions } from "./session-cleanup";
@@ -68,7 +68,7 @@ export const useLeaderStore = create<LeaderStore>((set, get) => ({
             for (const candidate of s.snapshot.branches) {
               if (removed.has(candidate.id)) continue;
               if (s.snapshot.branches.some((parent) => removed.has(parent.id) && parent.sessionId &&
-                parent.engine === candidate.parentEngine && parent.sessionId === candidate.parentSessionId && sameLeaderWorkspace(parent.workspacePath, candidate.workspacePath))) {
+                parent.engine === candidate.parentEngine && parent.sessionId === candidate.parentSessionId && sameLeaderWorkspace(parent.workspacePath, parentWorkspacePath(candidate)))) {
                 removed.add(candidate.id); changed = true;
               }
             }

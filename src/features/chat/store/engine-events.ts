@@ -330,6 +330,9 @@ function onDelta(
   key: string,
   deps: EngineEventDeps,
 ) {
+  if (event.leader && typeof event.data === "string" && event.data) {
+    emitLeaderStreamDelta(event.leader.branchId, event.runId, event.data);
+  }
   resumeThroughput(event, key, deps);
   responseCompletedRuns.delete(event.runId);
   clearComposerPrediction(key, { resetTurn: true });
@@ -1826,6 +1829,9 @@ function adoptObservedRun(
 // Exported like runRouting so tests can reset it — reusing one runId across
 // tests would otherwise leak the previous test's terminal state.
 export const settledRuns = new Map<string, "done" | "error">();
+/** Per-run outcome evidence; the session's current error/Stop flags may belong
+ * to a later turn and must never settle an earlier background task. */
+export const settledRunOutcomes = new Map<string, { key: string; status: "completed" | "failed" | "cancelled" }>();
 const MAX_SETTLED_RUNS = 256;
 
 /** Only serializable bookkeeping crosses a renderer lifetime. Outstanding usage
@@ -1838,6 +1844,7 @@ export function captureEngineEventRuntime() {
     turnUsageTotals: [...turnUsageTotals], responseCompletedRuns: [...responseCompletedRuns],
     responseCompleteSeqs: [...responseCompleteSeqs], responseAssistantSeqs: [...responseAssistantSeqs],
     settledRuns: [...settledRuns],
+    settledRunOutcomes: [...settledRunOutcomes],
     pendingSessionOrigins: [...pendingSessionOrigins],
   };
 }
@@ -1865,6 +1872,7 @@ export function restoreEngineEventRuntime(snapshot: ReturnType<typeof captureEng
   restoreMap(responseCompleteSeqs, snapshot.responseCompleteSeqs);
   restoreMap(responseAssistantSeqs, snapshot.responseAssistantSeqs);
   restoreMap(settledRuns, snapshot.settledRuns);
+  restoreMap(settledRunOutcomes, snapshot.settledRunOutcomes ?? []);
   restoreMap(pendingSessionOrigins, (snapshot.pendingSessionOrigins ?? []).slice(-MAX_PENDING_SESSION_ORIGINS));
 }
 
@@ -1888,9 +1896,6 @@ function adoptLeaderSession(event: ChatEngineEvent, nativeId: string | null, dep
   }
   if (!deps.get().sessions.some((s) => s.engine === event.engine && s.sessionId === nativeId)) {
     deps.upsertSessionMeta(optimisticMeta(event.engine, nativeId, event.leader.workspacePath, event.leader.title));
-  }
-  if (event.kind === "delta" && typeof event.data === "string" && event.data) {
-    emitLeaderStreamDelta(event.leader.branchId, event.data);
   }
   routeAndReconcileRun(deps.set, event.runId, key);
 }
@@ -2017,9 +2022,16 @@ export function handleEngineEvents(
     if (event.kind === "done" || event.kind === "error") {
       pendingSessionOrigins.delete(event.runId);
       settledRuns.set(event.runId, event.kind);
+      const ownsCurrentTurn = session?.nativeTaskRunId === event.runId || session?.throughput?.runId === event.runId;
+      const endedInterrupted = event.kind === "done" && Boolean(
+        (event.data as TurnCompletePayload | null)?.interrupted ||
+        (ownsCurrentTurn && (session?.interrupted || session?.queueParked)),
+      );
+      settledRunOutcomes.set(event.runId, { key, status: event.kind === "error" ? "failed" : endedInterrupted ? "cancelled" : "completed" });
       if (settledRuns.size > MAX_SETTLED_RUNS) {
         settledRuns.delete(settledRuns.keys().next().value!);
       }
+      if (settledRunOutcomes.size > MAX_SETTLED_RUNS) settledRunOutcomes.delete(settledRunOutcomes.keys().next().value!);
       // Every turn funnels through here: drop the computer-use global
       // Esc-to-stop so a system-wide hotkey never outlives its run. Arming
       // is per computer-use send (messaging.ts); the call is idempotent.

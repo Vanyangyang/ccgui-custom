@@ -3,7 +3,8 @@
 
 use serde_json::{Map, Value};
 use std::path::Path;
-use std::time::Duration;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 const LAUNCH_SEPARATOR: char = '\u{1e}';
@@ -202,9 +203,7 @@ async fn read_result<R: AsyncRead + Unpin>(reader: &mut BufReader<R>, id: u64) -
     let mut line = String::new();
     loop {
         line.clear();
-        let read = tokio::time::timeout(Duration::from_secs(20), reader.read_line(&mut line))
-            .await
-            .map_err(|_| "Cursor model catalog timed out")?
+        let read = reader.read_line(&mut line).await
             .map_err(|_| "Cursor model catalog closed".to_string())?;
         if read == 0 {
             return Err("Cursor model catalog closed".into());
@@ -213,9 +212,11 @@ async fn read_result<R: AsyncRead + Unpin>(reader: &mut BufReader<R>, id: u64) -
         if value.get("id").and_then(Value::as_u64) != Some(id) {
             continue;
         }
-        if value.get("error").is_some() {
-            return Err(if id == 2 {
-                "Cursor authentication is unavailable".into()
+        if let Some(error) = value.get("error") {
+            // ACP authentication-required has a stable code. Do not initiate
+            // browser login while servicing a background model picker.
+            return Err(if error.get("code").and_then(Value::as_i64) == Some(-32000) {
+                "cursor_auth_required: Sign in to Cursor explicitly before refreshing models".into()
             } else {
                 "Cursor model catalog failed".into()
             });
@@ -224,12 +225,72 @@ async fn read_result<R: AsyncRead + Unpin>(reader: &mut BufReader<R>, id: u64) -
     }
 }
 
-async fn request_catalog(bin: &str) -> Result<Vec<CursorPickerModel>, String> {
-    let mut command = super::command_for_binary(bin);
-    command.arg("acp").stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).kill_on_drop(true);
+/// Own the whole launch, including cancellation while awaiting a reply.
+struct CatalogProcess {
+    child: Option<tokio::process::Child>,
+    pid: u32,
+    #[cfg(windows)]
+    job: Option<std::sync::Arc<super::job::KillOnCloseJob>>,
+}
+
+impl CatalogProcess {
+    fn stop_tree(&mut self) {
+        #[cfg(windows)]
+        if let Some(job) = self.job.take() {
+            drop(job);
+            return;
+        }
+        if self.pid != 0 {
+            super::kill_process_group(self.pid);
+        }
+    }
+
+    async fn finish(mut self) {
+        self.stop_tree();
+        self.pid = 0;
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+        }
+    }
+}
+
+impl Drop for CatalogProcess {
+    fn drop(&mut self) {
+        self.stop_tree();
+        if let Some(mut child) = self.child.take() {
+            let _ = child.start_kill();
+            // Cancellation cannot await, but the owning runtime can reap the
+            // direct child after the synchronous job/process-group sweep.
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+                });
+            }
+        }
+    }
+}
+
+async fn request_catalog_command(mut command: tokio::process::Command, budget: Duration) -> Result<Vec<CursorPickerModel>, String> {
+    command.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
     #[cfg(windows)]
     super::hide_console(&mut command);
-    let mut child = command.spawn().map_err(|_| "Cursor model catalog is unavailable".to_string())?;
+    let child = command.spawn().map_err(|_| "Cursor model catalog is unavailable".to_string())?;
+    let mut process = CatalogProcess {
+        pid: child.id().unwrap_or(0),
+        #[cfg(windows)]
+        job: super::job::assign_kill_on_close(&child),
+        child: Some(child),
+    };
+    #[cfg(windows)]
+    if process.job.is_none() {
+        process.finish().await;
+        return Err("Cursor model catalog process isolation is unavailable".into());
+    }
+    let result = tokio::time::timeout(budget, async {
+    let child = process.child.as_mut().ok_or("Cursor model catalog is unavailable")?;
     let mut stdin = child.stdin.take().ok_or("Cursor model catalog is unavailable")?;
     let stdout = child.stdout.take().ok_or("Cursor model catalog is unavailable")?;
     let mut reader = BufReader::new(stdout);
@@ -247,24 +308,63 @@ async fn request_catalog(bin: &str) -> Result<Vec<CursorPickerModel>, String> {
         read_result(reader, id).await
     }
     call(&mut stdin, &mut reader, 1, "initialize", Some(serde_json::json!({"protocolVersion": 1, "clientCapabilities": {}, "clientInfo": {"name": "ccgui", "version": "0"}}))).await?;
-    call(&mut stdin, &mut reader, 2, "authenticate", Some(serde_json::json!({"methodId": "cursor_login"}))).await?;
     let listed = call(&mut stdin, &mut reader, 3, "cursor/list_available_models", None).await?;
     drop(stdin);
-    drop(child);
     let models = parse_catalog_result(&listed);
     if models.is_empty() { Err("Cursor model catalog is empty".into()) } else { Ok(models) }
+    }).await.unwrap_or_else(|_| Err("Cursor model catalog timed out".into()));
+    process.finish().await;
+    result
+}
+
+type CatalogResult = Result<Vec<CursorPickerModel>, String>;
+struct CachedCatalog { bin: String, expires: Instant, result: CatalogResult }
+type CatalogCache = tokio::sync::Mutex<Option<CachedCatalog>>;
+
+async fn cached_catalog(cache: &CatalogCache, bin: &str, query: impl std::future::Future<Output = CatalogResult>) -> CatalogResult {
+    // Holding this bounded, single-entry lock through the probe gives all
+    // concurrent callers one answer without detached background login work.
+    let mut cache = cache.lock().await;
+    if let Some(entry) = cache.as_ref().filter(|entry| entry.bin == bin && Instant::now() < entry.expires) {
+        return entry.result.clone();
+    }
+    let result = query.await;
+    let ttl = if result.is_ok() { 60 } else { 10 };
+    *cache = Some(CachedCatalog { bin: bin.into(), expires: Instant::now() + Duration::from_secs(ttl), result: result.clone() });
+    result
 }
 
 pub async fn cursor_picker_catalog(bin: &str) -> Result<Vec<CursorPickerModel>, String> {
-    request_catalog(bin).await
+    static CACHE: OnceLock<CatalogCache> = OnceLock::new();
+    cached_catalog(CACHE.get_or_init(Default::default), bin, async {
+        let mut command = super::command_for_binary(bin);
+        command.arg("acp");
+        request_catalog_command(command, Duration::from_secs(20)).await
+    }).await
+}
+
+/// Shared admission for both picker and generic background model catalogs.
+pub(super) fn catalog_binary() -> Result<String, String> {
+    if !crate::development_profile::automatic_integrations_allowed() {
+        return Err("Cursor automatic model discovery is disabled in development profiles".into());
+    }
+    let config = crate::config::read_config()?;
+    if config.section("cursor").and_then(|section| section.current.as_deref()) == Some(crate::config::DISABLED_PROVIDER_ID) {
+        return Err("Cursor is disabled".into());
+    }
+    let settings = crate::settings::read_settings()?;
+    Ok(super::engine_bin(&settings, "cursor"))
 }
 
 #[tauri::command]
 pub async fn cursor_model_catalog() -> Result<Vec<CursorPickerModel>, String> {
-    let settings = crate::settings::read_settings().unwrap_or_default();
-    let bin = super::engine_bin(&settings, "cursor");
+    let bin = catalog_binary()?;
     cursor_picker_catalog(&bin).await
 }
+
+#[cfg(test)]
+#[path = "cursor_picker_process_tests.rs"]
+mod process_tests;
 
 #[cfg(test)]
 mod tests {

@@ -3,6 +3,7 @@ import { ipc, type Message } from "@/lib/ipc";
 import type { EngineEventPayload, TurnCompletePayload } from "@/lib/events";
 import { errorText } from "@/lib/errors";
 import i18n from "@/lib/i18n";
+import { isDeliveryOutcomeUnknown } from "@/lib/delivery-outcome";
 import type { ComposerPermission } from "@/components/application/ai-chat/permission-menu";
 import { parseUsage, type ParsedUsage } from "@/features/chat/usage";
 
@@ -269,6 +270,9 @@ export interface SidechatStore {
     effort?: string | null;
     providerId?: string | null;
     parentPermission?: ComposerPermission;
+    /** Host-owned read-only discussions must never replace a running turn. */
+    strictBusy?: boolean;
+    requestedRunId?: string;
   }) => Promise<void>;
 
   stopSidechat: (sessionKey: string) => Promise<void>;
@@ -742,10 +746,24 @@ export const useSidechatStore = create<SidechatStore>((set, get) => ({
     effort,
     providerId,
     parentPermission,
+    strictBusy,
+    requestedRunId,
   }) => {
     const trimmed = prompt.trim();
     if (!trimmed && images.length === 0) return;
     const current = get().sidechatBySession[sessionKey];
+    if (strictBusy && (sideOperations.has(sessionKey) || current?.streaming)) {
+      throw new Error("Sidechat is busy");
+    }
+    if (strictBusy && (parentSessionId !== null || parentPermission ||
+      (engine !== "claude" && engine !== "codex") ||
+      (current && (current.mode === "execute" || current.engine !== engine ||
+        current.workspacePath !== workspacePath || current.parentSessionId !== null)))) {
+      throw new Error("Invalid controlled read-only Sidechat identity");
+    }
+    if (requestedRunId && (!/^sidechat-[a-zA-Z0-9-]{1,128}$/.test(requestedRunId) || sideRunRouting.has(requestedRunId))) {
+      throw new Error("Invalid or occupied Sidechat run id");
+    }
     if (sideOperations.has(sessionKey)) return;
     const mode = current?.mode ?? "read-only";
     if (mode === "execute" && !parentPermission) {
@@ -785,7 +803,7 @@ export const useSidechatStore = create<SidechatStore>((set, get) => ({
       });
     }
 
-    const runId = `sidechat-${crypto.randomUUID()}`;
+    const runId = requestedRunId ?? `sidechat-${crypto.randomUUID()}`;
     const startedAt = Date.now();
     const latest = get().sidechatBySession[sessionKey] ?? current;
     const effectiveParentId = latest?.sideSessionId ? latest.parentSessionId : parentSessionId ?? latest?.parentSessionId ?? null;
@@ -873,6 +891,12 @@ export const useSidechatStore = create<SidechatStore>((set, get) => ({
       }
     } catch (err) {
       const resultKey = sideRunRouting.get(runId)?.sessionKey ?? sessionKey;
+      if (strictBusy && isDeliveryOutcomeUnknown(err)) {
+        // An uncertain transport result is not native settlement. Retain the
+        // exact routing so a late ACK / terminal event can still reconcile it.
+        showSideError(resultKey, err);
+        throw err;
+      }
       sideRunRouting.delete(runId);
       set((s) => {
         const cur = s.sidechatBySession[resultKey];

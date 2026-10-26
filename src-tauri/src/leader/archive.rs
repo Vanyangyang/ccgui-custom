@@ -75,6 +75,31 @@ fn write_members(conn: &Connection, group: &LeaderArchivedGroup) -> Result<(), S
     Ok(())
 }
 
+/// A group may span workspaces, but every edge must retain its exact parent
+/// identity. Do not replace this with a project-membership or cwd-only check.
+fn validate_lineage(inner: &Inner, root: &LeaderIdentity, ids: &[String]) -> Result<(), String> {
+    let mut parents = vec![root.clone()];
+    let mut reached = HashSet::new();
+    let mut cursor = 0;
+    while cursor < parents.len() {
+        let parent = parents[cursor].clone();
+        cursor += 1;
+        for id in ids {
+            let branch = &inner.branches.get(id).ok_or("Leader group branch is missing")?.branch;
+            if !reached.contains(id) && belongs(branch, &parent) {
+                reached.insert(id.clone());
+                if let Some(session) = &branch.session_id {
+                    parents.push(identity(&branch.engine, session, &branch.workspace_path));
+                }
+            }
+        }
+    }
+    if reached.len() != ids.len() {
+        return Err("Leader group crosses workspace ownership or has invalid parent lineage".into());
+    }
+    Ok(())
+}
+
 pub(super) fn load_groups(conn: &Connection, inner: &mut Inner) -> Result<(), String> {
     let mut stmt = conn.prepare("SELECT root_engine,root_session_id,workspace_path,record_json,deleting FROM leader_archived_groups")
         .map_err(|e| e.to_string())?;
@@ -98,15 +123,24 @@ pub(super) fn load_groups(conn: &Connection, inner: &mut Inner) -> Result<(), St
         if key(&group.root) != key(&identity(&engine, &session, &workspace))
             || !group.members.contains(&group.root)
             || group
-                .members
-                .iter()
-                .any(|member| !same_workspace(&member.workspace_path, &group.root.workspace_path))
-            || group
                 .branch_ids
                 .iter()
                 .any(|id| !inner.branches.contains_key(id))
         {
             return Err("Archived Leader group ownership metadata is inconsistent".into());
+        }
+        validate_lineage(inner, &group.root, &group.branch_ids)?;
+        let mut expected = vec![group.root.clone()];
+        for id in &group.branch_ids {
+            let branch = &inner.branches[id].branch;
+            if let Some(session) = &branch.session_id {
+                expected.push(identity(&branch.engine, session, &branch.workspace_path));
+            }
+        }
+        if expected.len() != group.members.len()
+            || expected.iter().any(|member| !group.members.iter().any(|saved| key(saved) == key(member)))
+        {
+            return Err("Archived Leader group member workspace metadata is inconsistent".into());
         }
         write_members(conn, &group)?;
         group.deletion_started = deleting;
@@ -134,6 +168,7 @@ pub(super) fn session_meta(
           LEFT JOIN plugin_kv aux ON aux.plugin_id='{namespace}' AND aux.key=s.engine || ':' || s.session_id
           WHERE s.engine=?1 AND s.session_id=?2", namespace=crate::db::session_auxiliary::NAMESPACE),
         params![member.engine,member.session_id], |r| Ok(SessionMeta {
+            sidebar_workspace_path: None,
             prompt_cache: None,
             auxiliary_kind: crate::db::session_auxiliary::decode(r.get(15)?)?,
             engine: member.engine.clone(), session_id: member.session_id.clone(), workspace_path:r.get(0)?,
@@ -170,6 +205,7 @@ pub(super) fn session_meta(
     // A managed native identity can predate the history scan. Never invent an id.
     let branch = fallback.ok_or("Leader root is not a saved chat in this exact workspace")?;
     Ok(SessionMeta {
+        sidebar_workspace_path: None,
         prompt_cache: None,
         auxiliary_kind: None,
         engine: member.engine.clone(),
@@ -286,9 +322,6 @@ impl LeaderManager {
                 .get(id)
                 .ok_or("Leader group branch is missing")?
                 .branch;
-            if !same_workspace(&branch.workspace_path, &root.workspace_path) {
-                return Err("Leader group crosses workspace ownership".into());
-            }
             if let Some(session) = &branch.session_id {
                 if !seen.insert((branch.engine.clone(), session.clone())) {
                     return Err("Leader ledger contains duplicate native chat ownership".into());
@@ -296,6 +329,7 @@ impl LeaderManager {
                 members.push(identity(&branch.engine, session, &branch.workspace_path));
             }
         }
+        validate_lineage(inner, root, ids)?;
         let id_set: HashSet<_> = ids.iter().collect();
         if inner.branches.values().any(|record| {
             let branch = &record.branch;
@@ -313,7 +347,8 @@ impl LeaderManager {
             .leaders
             .keys()
             .chain(inner.disabled.iter())
-            .any(|(e, s, w)| seen.contains(&(e.clone(), s.clone())) && !same_workspace(w, &root.workspace_path))
+            .any(|(e, s, w)| members.iter().any(|member| member.engine == *e && member.session_id == *s
+                && !same_workspace(w, &member.workspace_path)))
         {
             return Err("Leader ledger contains a conflicting native identity or workspace".into());
         }

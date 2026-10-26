@@ -52,7 +52,7 @@ import { InlineAside } from "@/features/assistant-notices/InlineAside";
 import { chatHostVisible, subscribeChatHostPresence } from "@/features/assistant-notices/host-presence";
 import { useHandoffStore } from "../session-cleanup";
 import { usePromptCacheHeat } from "../use-prompt-cache";
-import { cacheWindowText, getPromptCacheHeatRatio, promptCacheForEngine } from "../prompt-cache";
+import { cacheWindowText, getPromptCacheHeatRatio, promptCacheForEngine, supportsPromptCacheExpiry } from "../prompt-cache";
 
 /** Path → trailing name (folder or file) for status-bar and chip labels.
  *  Both separators: workspace/attachment paths are native — backslashes on
@@ -389,8 +389,9 @@ function FooterStatusBar({
   );
   const enabledCache = promptCacheForEngine(active?.engine, activeMeta?.promptCache);
   const observedCacheHeat = usePromptCacheHeat(enabledCache);
-  const cacheHeat = active?.sessionId && active.engine !== "cursor" ? observedCacheHeat : undefined;
-  const cacheHeatRatio = active?.sessionId && active.engine !== "cursor"
+  const cacheHeat = active?.sessionId && supportsPromptCacheExpiry(active.engine) ? observedCacheHeat : undefined;
+  const cacheHeatRatio = active?.sessionId && active.engine === "codex" ? 1
+    : active?.sessionId && supportsPromptCacheExpiry(active.engine)
     ? getPromptCacheHeatRatio(enabledCache, activeMeta?.updatedAt, streaming)
     : undefined;
 
@@ -449,7 +450,8 @@ function FooterStatusBar({
         canCompact={canCompactSession}
         cacheHeat={cacheHeat}
         cacheHeatRatio={cacheHeatRatio}
-        cacheNote={cacheHeat ? cacheWindowText(t, enabledCache, cacheHeat) : undefined}
+        cacheNote={active?.sessionId && active.engine === "codex" ? t("chat.cachePermanent")
+          : cacheHeat ? cacheWindowText(t, enabledCache, cacheHeat) : undefined}
         onArchiveAndHandoff={active?.sessionId && activeMeta && !streaming && !enabledCache?.reference ? () => void handleArchiveAndHandoff() : undefined}
       />
     </div>

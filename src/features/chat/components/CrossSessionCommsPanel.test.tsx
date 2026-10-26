@@ -29,6 +29,9 @@ const renderRows = () => act(async () => root.render(<>
   <button data-testid="outside">Outside</button>
 </>));
 const close = () => click(details()!.querySelector<HTMLButtonElement>(`button[aria-label="${i18n.t("crossSession.closePanel")}"]`)!);
+const filter = (id: string) => details()!.querySelector<HTMLButtonElement>(`[data-testid="cross-session-filter-${id}"]`)!;
+const overview = () => node.querySelector<HTMLButtonElement>('[data-testid="sidebar-cross-session-btn"]')!;
+const renderOverview = () => act(async () => root.render(<CrossSessionCommsToggleButton />));
 
 function ActivitySummary({ side }: { side: "sender" | "target" }) {
   const activity = useCrossSessionThreadActivity(side === "sender" ? "codex/sender" : "claude/target", "/ws");
@@ -45,6 +48,116 @@ beforeEach(async () => {
 afterEach(async () => { await act(async () => root.unmount()); node.remove(); });
 
 describe("cross-session communication details", () => {
+  it.each(["retrieved", "deferred", "uncertain"] as const)("retains %s mailbox activity without opening or navigating automatically", async (phase) => {
+    await act(async () => root.render(<><ActivitySummary side="target" /><CrossSessionCommsToggleButton /><div data-side="target"><CrossSessionThreadIndicator threadId="claude/target" workspacePath="/ws" /></div></>));
+    const message = "约束 👩🏽‍💻\n```ts\nconst retained = true;\n```";
+    const impactReview = "模型报告：已检查现有改动，工具影响仍待确认。";
+    await act(async () => store.getState().upsertRecord(record({ status: "unknown", message, replyText: "取回回执", mailbox: { phase, relation: "update", parentRequestId: "parent", kind: "correction", waitReason: "processing_unconfirmed", impactReview } })));
+    expect(indicator("target")?.dataset.commStatus).toBe(phase);
+    expect(node.querySelector("output")?.textContent).toContain(i18n.t(`crossSession.mailboxPhase.${phase}`));
+    expect(details()).toBeNull(); expect(chat.selectSession).not.toHaveBeenCalled();
+    await click(overview());
+    expect(filter("active").getAttribute("aria-pressed")).toBe("true");
+    expect(details()?.textContent).toContain(i18n.t(`crossSession.mailboxPhase.${phase}`));
+    expect(details()?.textContent).toContain(i18n.t("crossSession.mailboxWait.processing_unconfirmed"));
+    const prompt = details()!.querySelector<HTMLElement>('[data-testid="cross-session-card-prompt"]')!;
+    expect(prompt.hidden).toBe(true);
+    await click(details()!.querySelector<HTMLElement>('[data-testid="cross-session-card-toggle"]')!);
+    expect(prompt.hidden).toBe(false); expect(prompt.textContent).toContain(message);
+    expect(details()?.querySelector('[data-testid="cross-session-card-reply"]')?.textContent).toContain("取回回执");
+    expect(details()?.querySelector('[data-testid="cross-session-impact-review"]')?.textContent).toContain(impactReview);
+    expect(chat.selectSession).not.toHaveBeenCalled();
+  });
+
+  it("labels handled mail as a report rather than verified business completion", async () => {
+    store.getState().upsertRecord(record({ status: "completed", mailbox: { phase: "handled", relation: "reply", parentRequestId: "parent", kind: "information" } }));
+    await renderOverview(); await click(overview());
+    expect(details()?.textContent).toContain(i18n.t("crossSession.mailboxPhase.handled"));
+    expect(node.querySelector('[data-testid="cross-session-count"]')).toBeNull();
+  });
+
+  it.each([
+    ["DELEGATION_LEGACY_UNKNOWN", "leader.delegationLegacyUnknown"],
+    ["DELEGATION_RESTART_UNKNOWN", "leader.delegationRestartUnknown"],
+  ])("localizes the %s assignment outcome without changing the stored evidence", async (code, key) => {
+    const error = `${code}: native explanation`;
+    store.getState().upsertRecord(record({ kind: "subtask", status: "unknown", error }));
+    await renderOverview();
+    await click(overview());
+    expect(details()?.querySelector('[role="alert"]')?.textContent).toBe(i18n.t(key));
+    expect(store.getState().records[0].error).toBe(error);
+  });
+
+  it("silently retains successful subtask results in history after active indicators disappear", async () => {
+    store.getState().upsertRecord(record({ kind: "subtask" }));
+    await act(async () => root.render(<>
+      <CrossSessionCommsToggleButton />
+      <div data-side="sender"><CrossSessionThreadIndicator threadId="codex/sender" workspacePath="/ws" /></div>
+      <div data-side="target"><CrossSessionThreadIndicator threadId="claude/target" workspacePath="/ws" /></div>
+    </>));
+    expect(indicator()).not.toBeNull();
+    expect(indicator("target")).not.toBeNull();
+    await click(node.querySelector<HTMLButtonElement>('[data-testid="sidebar-cross-session-btn"]')!);
+    expect(details()?.querySelectorAll('[data-testid="cross-session-comm-card"]')).toHaveLength(1);
+    await act(async () => store.getState().upsertRecord(record({ kind: "subtask", status: "completed", replyText: "真实子任务结果" })));
+    expect(filter("active").getAttribute("aria-pressed")).toBe("true");
+    expect(details()?.querySelectorAll('[data-testid="cross-session-comm-card"]')).toHaveLength(0);
+    expect(indicator()).toBeNull();
+    expect(indicator("target")).toBeNull();
+    expect(node.querySelector('[data-testid="cross-session-count"]')).toBeNull();
+    expect(store.getState().records[0].reviewedBy).toBeUndefined();
+    await click(filter("finished"));
+    expect(details()?.textContent).toContain("真实子任务结果");
+    expect(store.getState().records[0].status).toBe("completed");
+    await click(filter("all"));
+    expect(details()?.textContent).toContain("真实子任务结果");
+    await close();
+    expect(indicator()).toBeNull();
+    expect(indicator("target")).toBeNull();
+  });
+
+  it.each(["completed", "failed", "unknown"] as const)("retains unread %s history without counting it as sidebar activity", async (status) => {
+    store.getState().upsertRecord(record({ kind: "subtask", status }));
+    store.getState().upsertRecord(record({ scopedId: "consultation", kind: "consultation", status }));
+    await act(async () => root.render(<>
+      <CrossSessionCommsToggleButton />
+      <div data-side="sender"><CrossSessionThreadIndicator threadId="codex/sender" workspacePath="/ws" /></div>
+      <div data-side="target"><CrossSessionThreadIndicator threadId="claude/target" workspacePath="/ws" /></div>
+    </>));
+    expect(indicator()).toBeNull();
+    expect(indicator("target")).toBeNull();
+    expect(overview().dataset.commStatus).toBeUndefined();
+    expect(node.querySelector('[data-testid="cross-session-count"]')).toBeNull();
+    expect(store.getState().records.every((r) => r.reviewedBy === undefined)).toBe(true);
+    await click(overview());
+    expect(filter("finished").getAttribute("aria-pressed")).toBe("true");
+    expect(details()?.querySelectorAll('[data-testid="cross-session-comm-card"]')).toHaveLength(2);
+    expect(store.getState().records.every((r) => r.status === status)).toBe(true);
+  });
+
+  it("counts only live requests when unread history is mixed with activity", async () => {
+    for (let i = 0; i < 29; i++) {
+      store.getState().upsertRecord(record({ scopedId: `history-${i}`, kind: "subtask", status: "unknown" }));
+    }
+    const activeStatuses = ["preparing", "queued", "received", "executing", "awaiting_permission", "awaiting_cost_approval"] as const;
+    for (const status of activeStatuses) store.getState().upsertRecord(record({ scopedId: status, status }));
+    await act(async () => root.render(<>
+      <CrossSessionCommsToggleButton />
+      <div data-side="sender"><CrossSessionThreadIndicator threadId="codex/sender" workspacePath="/ws" /></div>
+      <div data-side="target"><CrossSessionThreadIndicator threadId="claude/target" workspacePath="/ws" /></div>
+    </>));
+    expect(Array.from(node.querySelectorAll('[data-testid="cross-session-count"]'), (n) => n.textContent)).toEqual(["6", "6", "6"]);
+    expect(overview().dataset.commStatus).toBe("awaiting_cost_approval");
+    await act(async () => {
+      for (const status of activeStatuses) store.getState().upsertRecord(record({ scopedId: status, status: "completed" }));
+    });
+    expect(node.querySelector('[data-testid="cross-session-count"]')).toBeNull();
+    expect(indicator()).toBeNull();
+    expect(indicator("target")).toBeNull();
+    expect(overview().dataset.commStatus).toBeUndefined();
+    expect(store.getState().records.some((r) => r.status === "unknown")).toBe(true);
+  });
+
   it("prioritizes cost approval and keeps it pending when details close", async () => {
     store.getState().upsertRecord(record({ status: "awaiting_cost_approval" }));
     store.getState().upsertRecord(record({ scopedId: "executing-2" }));
@@ -124,33 +237,45 @@ describe("cross-session communication details", () => {
     expect(indicator()).not.toBeNull();
   });
 
-  it("reviews terminal notifications independently and keeps the open anchor until dismissal", async () => {
-    store.getState().upsertRecord(record({ status: "completed", replyText: "已核对" }));
+  it("keeps an open anchor until dismissal after completion without showing a terminal activity badge", async () => {
+    store.getState().upsertRecord(record());
     await renderRows();
     await click(indicator()!);
+    await act(async () => store.getState().upsertRecord(record({ status: "completed", replyText: "已核对" })));
+    expect(indicator()).not.toBeNull();
+    expect(indicator()!.dataset.commStatus).toBeUndefined();
+    expect(indicator("target")).toBeNull();
+    await click(filter("finished"));
+    expect(filter("finished").getAttribute("aria-pressed")).toBe("true");
     expect(details()?.textContent).toContain("已核对");
     expect(indicator()).not.toBeNull();
     expect(isCrossSessionRecordUnread(store.getState().records[0], sender)).toBe(false);
     expect(isCrossSessionRecordUnread(store.getState().records[0], target)).toBe(true);
     await close();
     expect(indicator()).toBeNull();
-    expect(indicator("target")).not.toBeNull();
-    await click(indicator("target")!);
-    await close();
     expect(indicator("target")).toBeNull();
+    expect(store.getState().records[0].replyText).toBe("已核对");
   });
 
-  it("keeps details open when active work finishes and consumes only the visible participant's result", async () => {
+  it("removes finished work from active details without reviewing it until explicitly selected", async () => {
     store.getState().upsertRecord(record());
     await renderRows();
     await click(indicator()!);
+    expect(filter("active").getAttribute("aria-pressed")).toBe("true");
     await act(async () => store.getState().upsertRecord(record({ status: "completed", replyText: "最终结果" })));
+    expect(details()).not.toBeNull();
+    expect(filter("active").getAttribute("aria-pressed")).toBe("true");
+    expect(details()?.textContent).not.toContain("最终结果");
+    expect(details()?.querySelectorAll('[data-testid="cross-session-comm-card"]')).toHaveLength(0);
+    expect(isCrossSessionRecordUnread(store.getState().records[0], sender)).toBe(true);
+    await click(filter("finished"));
     expect(details()?.textContent).toContain("最终结果");
     expect(indicator()).not.toBeNull();
+    expect(isCrossSessionRecordUnread(store.getState().records[0], sender)).toBe(false);
     expect(isCrossSessionRecordUnread(store.getState().records[0], target)).toBe(true);
     await close();
     expect(indicator()).toBeNull();
-    expect(indicator("target")).not.toBeNull();
+    expect(indicator("target")).toBeNull();
   });
 
   it("reviews both sides in the overview and clears finished records while retaining active requests", async () => {
@@ -158,21 +283,82 @@ describe("cross-session communication details", () => {
     store.getState().upsertRecord(record({ scopedId: "active-2", status: "queued" }));
     await act(async () => root.render(<CrossSessionCommsToggleButton />));
     await click(node.querySelector<HTMLButtonElement>('[data-testid="sidebar-cross-session-btn"]')!);
+    expect(filter("active").getAttribute("aria-pressed")).toBe("true");
+    expect(document.querySelectorAll('[data-testid="cross-session-comm-card"]')).toHaveLength(1);
+    expect(isCrossSessionRecordUnread(store.getState().records.find((r) => r.scopedId === "message-1")!, sender)).toBe(true);
+    expect(isCrossSessionRecordUnread(store.getState().records.find((r) => r.scopedId === "message-1")!, target)).toBe(true);
+    await click(filter("finished"));
     const completed = store.getState().records.find((r) => r.scopedId === "message-1")!;
     expect(isCrossSessionRecordUnread(completed, sender)).toBe(false);
     expect(isCrossSessionRecordUnread(completed, target)).toBe(false);
+    await click(filter("all"));
     await click(document.querySelector<HTMLButtonElement>('[data-testid="cross-session-clear-btn"]')!);
     expect(store.getState().records.map((r) => r.scopedId)).toEqual(["active-2"]);
     expect(document.querySelectorAll('[data-testid="cross-session-comm-card"]')).toHaveLength(1);
     expect(details()).not.toBeNull();
   });
 
+  it("opens an idle overview on finished records and keeps history visible on reopening", async () => {
+    store.getState().upsertRecord(record({ status: "completed", replyText: "历史结果" }));
+    await act(async () => root.render(<CrossSessionCommsToggleButton />));
+    const overview = node.querySelector<HTMLButtonElement>('[data-testid="sidebar-cross-session-btn"]')!;
+    expect(overview.querySelector('[data-testid="cross-session-count"]')).toBeNull();
+    await click(overview);
+    expect(filter("finished").getAttribute("aria-pressed")).toBe("true");
+    expect(details()?.textContent).toContain("历史结果");
+    expect(details()?.querySelector('[data-testid="cross-session-filter-empty"]')).toBeNull();
+    expect(isCrossSessionRecordUnread(store.getState().records[0], sender)).toBe(false);
+    expect(isCrossSessionRecordUnread(store.getState().records[0], target)).toBe(false);
+    expect(overview.querySelector('[data-testid="cross-session-count"]')).toBeNull();
+    await close();
+    await click(overview);
+    expect(filter("finished").getAttribute("aria-pressed")).toBe("true");
+    expect(details()?.textContent).toContain("历史结果");
+    await close();
+    await act(async () => store.getState().upsertRecord(record({ scopedId: "new-active", status: "queued" })));
+    await click(overview);
+    expect(filter("active").getAttribute("aria-pressed")).toBe("true");
+    expect(details()?.querySelector('[data-testid="cross-session-comm-card"]')?.getAttribute("data-comm-status")).toBe("queued");
+  });
+
+  it("reviews unknown subtask history from the overview without changing its outcome", async () => {
+    const error = "DELEGATION_LEGACY_UNKNOWN: original assignment outcome unavailable";
+    store.getState().upsertRecord(record({ kind: "subtask", status: "unknown", error }));
+    await act(async () => root.render(<>
+      <CrossSessionCommsToggleButton />
+      <div data-side="sender"><CrossSessionThreadIndicator threadId="codex/sender" workspacePath="/ws" /></div>
+      <div data-side="target"><CrossSessionThreadIndicator threadId="claude/target" workspacePath="/ws" /></div>
+    </>));
+    expect(indicator()).toBeNull();
+    expect(indicator("target")).toBeNull();
+    await click(node.querySelector<HTMLButtonElement>('[data-testid="sidebar-cross-session-btn"]')!);
+    expect(filter("finished").getAttribute("aria-pressed")).toBe("true");
+    expect(details()?.querySelector('[role="alert"]')?.textContent).toBe(i18n.t("leader.delegationLegacyUnknown"));
+    expect(indicator()).toBeNull();
+    expect(indicator("target")).toBeNull();
+    expect(node.querySelector('[data-testid="cross-session-count"]')).toBeNull();
+    expect(store.getState().records[0]).toMatchObject({ status: "unknown", error });
+  });
+
+  it("opens mixed participant activity on active and leaves hidden terminal results unread", async () => {
+    store.getState().upsertRecord(record({ status: "failed", error: "历史错误" }));
+    store.getState().upsertRecord(record({ scopedId: "active-2" }));
+    await renderRows();
+    await click(indicator()!);
+    expect(filter("active").getAttribute("aria-pressed")).toBe("true");
+    expect(details()?.textContent).not.toContain("历史错误");
+    expect(isCrossSessionRecordUnread(store.getState().records.find((r) => r.scopedId === "message-1")!, sender)).toBe(true);
+    await click(filter("finished"));
+    expect(details()?.textContent).toContain("历史错误");
+    expect(isCrossSessionRecordUnread(store.getState().records.find((r) => r.scopedId === "message-1")!, sender)).toBe(false);
+  });
+
   it("retains long Chinese and emoji text verbatim, including whitespace and markdown", async () => {
     const message = "请核查👩🏽‍💻中文接口\n".repeat(100) + "```ts\nconst x = '✅';\n```";
     const replyText = "完整回复👨‍👩‍👧‍👦\n\n".repeat(100) + "| 中文 | 值 |\n| -- | -- |\n| 结果 | ✅ |";
     store.getState().upsertRecord(record({ message, replyText, status: "completed" }));
-    await renderRows();
-    await click(indicator()!);
+    await renderOverview();
+    await click(overview());
     expect(details()?.textContent).toContain(message);
     expect(details()?.textContent).toContain(replyText);
   });
@@ -257,6 +443,9 @@ describe("cross-session communication details", () => {
     expect(densityBtn.textContent).toBe(i18n.t("crossSession.compactMode"));
 
     const cards = () => Array.from(panel.querySelectorAll<HTMLElement>('[data-testid="cross-session-comm-card"]'));
+    expect(filter("active").getAttribute("aria-pressed")).toBe("true");
+    expect(cards()).toHaveLength(1);
+    await click(filter("all"));
     expect(cards()).toHaveLength(2);
     const subtaskCard = () => cards().find((c) => c.textContent?.includes("请独立审查目标设计文档"))!;
     const consultCard = () => cards().find((c) => c.textContent?.includes("短问题"))!;
@@ -294,7 +483,6 @@ describe("cross-session communication details", () => {
     expect(subtaskCard().dataset.expanded).toBe("false");
 
     // Category filter buttons
-    const filter = (id: string) => panel.querySelector<HTMLButtonElement>(`[data-testid="cross-session-filter-${id}"]`)!;
     expect(filter("all").getAttribute("aria-pressed")).toBe("true");
     await click(filter("active"));
     expect(filter("active").getAttribute("aria-pressed")).toBe("true");

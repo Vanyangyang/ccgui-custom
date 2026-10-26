@@ -3,9 +3,19 @@
 //! transaction; and the manifest+record merge into PluginInfo.
 
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use super::manifest::{manifest_path, validate_manifest, PluginManifest};
 use super::state::{mutate_record, read_state, write_state, PluginInfo, PluginRecord, STATE_LOCK};
+
+// Installers share deterministic staging/backup names. Serialize the whole
+// operation, not just the state write, including crash recovery and copying.
+static INSTALL_LOCK: LazyLock<parking_lot::Mutex<()>> =
+    LazyLock::new(|| parking_lot::Mutex::new(()));
+// Target directory and state mutations share this short critical section.
+// Always acquire it before STATE_LOCK; copying source files does not hold it.
+pub(crate) static LIFECYCLE_LOCK: LazyLock<parking_lot::Mutex<()>> =
+    LazyLock::new(|| parking_lot::Mutex::new(()));
 
 /// Hard per-file size cap, enforced both at install validation and on reads.
 // Local installs get a generous 16MB sanity cap: it exists to catch picking
@@ -218,14 +228,13 @@ pub(crate) fn artwork_data_url(plugins_dir: &Path, id: &str, rel: &str) -> Resul
     Ok(format!("data:{mime};base64,{encoded}"))
 }
 
-/// Install transaction (plan §4.4): copy into `.staging-<id>/` next to the
-/// target, validate there, then swap with rename and roll the backup back in
-/// on failure. Renames within one directory are atomic, so a crash leaves at
-/// worst a stale `.staging-`/`.backup-` dir, never a half-copied plugin —
-/// and the next install of the same id self-heals: if the target is missing
-/// while its `.backup-<id>` survives, the crash hit between the two swap
-/// renames, so the backup is renamed back before proceeding (see
-/// heal_crash_window).
+/// Copy into `.staging-<id>/`, validate the copied bundle, then swap it in.
+/// Keep the previous directory until the state write succeeds; ordinary
+/// state failures restore the directory and report any rollback failure.
+/// This is not a crash-atomic transaction across the directory and state
+/// file: interruption after a swap can leave new files with old state. The
+/// next install restores a stranded backup only when the target is absent
+/// (see heal_crash_window). Concurrent installers in this process serialize.
 ///
 /// `source_kind` is the record's origin tag ("local" directory pick,
 /// "marketplace" download, …) — the bits flow through the same transaction
@@ -237,6 +246,25 @@ pub(crate) fn install_from(
     source_kind: &str,
     on_progress: impl Fn(crate::event_sink::InstallProgress),
 ) -> Result<PluginInfo, String> {
+    install_from_checked(
+        plugins_dir,
+        state_path,
+        source,
+        source_kind,
+        None,
+        on_progress,
+    )
+}
+
+pub(crate) fn install_from_checked(
+    plugins_dir: &Path,
+    state_path: &Path,
+    source: &Path,
+    source_kind: &str,
+    expected: Option<(&str, &str)>,
+    on_progress: impl Fn(crate::event_sink::InstallProgress),
+) -> Result<PluginInfo, String> {
+    let _install_guard = INSTALL_LOCK.lock();
     if !source.is_dir() {
         return Err(format!("{}: not a directory", source.display()));
     }
@@ -247,13 +275,24 @@ pub(crate) fn install_from(
     // bad bundle must never touch the plugins directory.
     let manifest = validate_manifest(source, &files)?;
     let id = manifest.id.clone();
+    if let Some((expected_id, expected_version)) = expected {
+        if manifest.id != expected_id || manifest.version != expected_version {
+            return Err(format!(
+                "plugin identity mismatch: expected {expected_id}@{expected_version}, found {}@{}",
+                manifest.id, manifest.version
+            ));
+        }
+    }
 
     std::fs::create_dir_all(plugins_dir)
         .map_err(|e| format!("mkdir {}: {e}", plugins_dir.display()))?;
     let staging = plugins_dir.join(format!(".staging-{id}"));
     let backup = plugins_dir.join(format!(".backup-{id}"));
     let target = plugins_dir.join(&id);
-    heal_crash_window(&staging, &backup, &target)?;
+    {
+        let _lifecycle_guard = LIFECYCLE_LOCK.lock();
+        heal_crash_window(&staging, &backup, &target)?;
+    }
 
     // Step 1: fresh staging copy. Same-fs temp means the later rename is atomic.
     // Self-throttled byte progress (~50 events per run, mirroring the history
@@ -283,16 +322,33 @@ pub(crate) fn install_from(
         let _ = remove_dir_if_exists(&staging);
         return Err(error);
     }
-    if total > 0 {
-        on_progress(crate::event_sink::InstallProgress {
-            done: copied,
-            total,
-            finished: true,
+    // Source files may change while copying. Validate what will actually be
+    // installed, including fresh sizes, and never switch the selected id.
+    let staged_manifest = collect_files(&staging)
+        .and_then(|files| validate_manifest(&staging, &files))
+        .and_then(|staged| {
+            if staged.id != manifest.id
+                || staged.version != manifest.version
+                || staged.permissions != manifest.permissions
+            {
+                Err("plugin identity, version, or permissions changed during install".into())
+            } else {
+                Ok(staged)
+            }
         });
-    }
+    let manifest = match staged_manifest {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            return Err(match remove_dir_if_exists(&staging) {
+                Ok(()) => error,
+                Err(cleanup) => format!("{error}; staging cleanup failed: {cleanup}"),
+            });
+        }
+    };
 
     // Step 2: swap. Existing install moves aside first so any failure before
     // the final rename can put it back untouched.
+    let lifecycle_guard = LIFECYCLE_LOCK.lock();
     let had_previous = target.exists();
     if had_previous {
         if let Err(error) = std::fs::rename(&target, &backup)
@@ -303,21 +359,26 @@ pub(crate) fn install_from(
         }
     }
     if let Err(e) = std::fs::rename(&staging, &target) {
+        let mut error = format!("rename {}: {e}", staging.display());
         if had_previous {
-            let _ = std::fs::rename(&backup, &target);
+            if let Err(rollback) = std::fs::rename(&backup, &target) {
+                error.push_str(&format!(
+                    "; rollback failed restoring {}: {rollback}",
+                    target.display()
+                ));
+            }
         }
-        let _ = remove_dir_if_exists(&staging);
-        return Err(format!("rename {}: {e}", staging.display()));
-    }
-    if had_previous {
-        remove_dir_if_exists(&backup)?;
+        if let Err(cleanup) = remove_dir_if_exists(&staging) {
+            error.push_str(&format!("; staging cleanup failed: {cleanup}"));
+        }
+        return Err(error);
     }
 
     // Step 3: record. A reinstall keeps the original enabled flag and install
     // time; quarantine state and the stored error always reset on fresh bits.
-    // STATE_LOCK covers this read→mutate→write only — the copy phase above
-    // runs lock-free.
-    let record = {
+    // STATE_LOCK covers this read→mutate→write only — copying holds the
+    // installer lock but does not block target lifecycle changes until the swap.
+    let record = (|| -> Result<PluginRecord, String> {
         let _guard = STATE_LOCK.lock();
         let mut state = read_state(state_path)?;
         let record = mutate_record(&mut state, &id, source_kind, |record| {
@@ -331,10 +392,40 @@ pub(crate) fn install_from(
         // outlive the reinstall and purge the still-in-use KV rows.
         state.kv_tombstones.remove(&id);
         write_state(state_path, &state)?;
-        record
+        Ok(record)
+    })();
+    let record = match record {
+        Ok(record) => record,
+        Err(error) => {
+            let rollback = remove_dir_if_exists(&target).and_then(|()| {
+                if had_previous {
+                    std::fs::rename(&backup, &target)
+                        .map_err(|e| format!("restore {}: {e}", target.display()))?;
+                }
+                Ok(())
+            });
+            return Err(match rollback {
+                Ok(()) => format!("{error}; plugin directory rolled back"),
+                Err(rollback) => format!("{error}; rollback failed: {rollback}"),
+            });
+        }
     };
+    let installed = info_for(plugins_dir, &id, &record);
+    drop(lifecycle_guard);
+    if had_previous {
+        if let Err(error) = remove_dir_if_exists(&backup) {
+            // Files and state are already committed. Returning failure here
+            // would skip runtime retirement and misreport the installed version.
+            eprintln!("[plugins] {id}: installed; backup cleanup deferred: {error}");
+        }
+    }
+    on_progress(crate::event_sink::InstallProgress {
+        done: copied,
+        total,
+        finished: true,
+    });
 
-    Ok(info_for(plugins_dir, &id, &record))
+    Ok(installed)
 }
 
 #[cfg(test)]
@@ -431,6 +522,156 @@ mod tests {
         // Rollback: no target, no staging, no state record.
         assert!(!plugins_dir.exists() || std::fs::read_dir(&plugins_dir).unwrap().next().is_none());
         assert!(read_state(&state_path).unwrap().plugins.is_empty());
+    }
+
+    #[test]
+    fn checked_install_rejects_unexpected_identity_before_touching_destination() {
+        let scratch = Scratch::new();
+        let source = scratch.path("source");
+        write_plugin(&source, &valid_manifest("cool-plugin"));
+        for expected in [("other-plugin", "1.2.3"), ("cool-plugin", "9.0.0")] {
+            let error = install_from_checked(
+                &scratch.path("plugins"),
+                &scratch.path("state.json"),
+                &source,
+                "local",
+                Some(expected),
+                |_| panic!("unexpected progress"),
+            )
+            .unwrap_err();
+            assert!(error.contains("identity mismatch"), "{error}");
+            assert!(!scratch.path("plugins").exists());
+        }
+    }
+
+    #[test]
+    fn copied_bundle_is_revalidated_and_identity_changes_are_rejected() {
+        for changed in [
+            r#"{"id":"other-plugin","name":"Test","version":"1.2.3","tier":"declarative"}"#,
+            r#"{"id":"cool-plugin","name":"Test","version":"2.0.0","tier":"declarative"}"#,
+            r#"{"id":"cool-plugin","name":"Test","version":"1.2.3","tier":"declarative","permissions":["events"]}"#,
+            r#"{"id":"cool-plugin","name":"Test","version":"1.2.3","tier":"invalid"}"#,
+        ] {
+            let scratch = Scratch::new();
+            let source = scratch.path("source");
+            let plugins = scratch.path("plugins");
+            write_plugin(&source, &valid_manifest("cool-plugin"));
+            let error = install_from(
+                &plugins,
+                &scratch.path("state.json"),
+                &source,
+                "local",
+                |p| {
+                    assert!(!p.finished, "rejected install must not report completion");
+                    if p.done == 0 {
+                        std::fs::write(source.join("manifest.json"), changed).unwrap();
+                    }
+                },
+            )
+            .unwrap_err();
+            assert!(
+                error.contains("changed during install") || error.contains("invalid tier"),
+                "{error}"
+            );
+            assert!(!plugins.join("cool-plugin").exists());
+            assert!(!plugins.join(".staging-cool-plugin").exists());
+        }
+    }
+
+    #[test]
+    fn failed_state_write_restores_previous_bundle_and_record() {
+        let scratch = Scratch::new();
+        let source = scratch.path("source");
+        let plugins = scratch.path("plugins");
+        let state_path = scratch.path("state.json");
+        write_plugin(&source, &valid_manifest("cool-plugin"));
+        install_from(&plugins, &state_path, &source, "local", |_| {}).unwrap();
+        update_record(&state_path, "cool-plugin", |r| {
+            r.enabled = false;
+            r.installed_at = 42;
+        })
+        .unwrap();
+        let original_state = std::fs::read(&state_path).unwrap();
+        let original_manifest = std::fs::read(plugins.join("cool-plugin/manifest.json")).unwrap();
+        write_plugin(
+            &source,
+            r#"{"id":"cool-plugin","name":"Test","version":"2.0.0","tier":"declarative"}"#,
+        );
+        // atomic_write cannot write its temp file over a directory, on Windows
+        // or Unix, even when the tests run with elevated privileges.
+        std::fs::create_dir(state_path.with_extension("tmp")).unwrap();
+        let error = install_from(&plugins, &state_path, &source, "local", |p| {
+            assert!(!p.finished);
+        })
+        .unwrap_err();
+        assert!(error.contains("rolled back"), "{error}");
+        assert_eq!(std::fs::read(&state_path).unwrap(), original_state);
+        assert_eq!(
+            std::fs::read(plugins.join("cool-plugin/manifest.json")).unwrap(),
+            original_manifest
+        );
+        assert!(!plugins.join(".backup-cool-plugin").exists());
+        assert!(!plugins.join(".staging-cool-plugin").exists());
+    }
+
+    #[test]
+    fn failed_state_read_removes_new_install() {
+        let scratch = Scratch::new();
+        let source = scratch.path("source");
+        let plugins = scratch.path("plugins");
+        let state_path = scratch.path("state.json");
+        write_plugin(&source, &valid_manifest("cool-plugin"));
+        std::fs::write(&state_path, "invalid json").unwrap();
+        let error = install_from(&plugins, &state_path, &source, "local", |p| {
+            assert!(!p.finished)
+        })
+        .unwrap_err();
+        assert!(error.contains("rolled back"), "{error}");
+        assert!(!plugins.join("cool-plugin").exists());
+        assert_eq!(std::fs::read_to_string(state_path).unwrap(), "invalid json");
+    }
+
+    #[test]
+    fn concurrent_installs_serialize_and_finish_only_after_state_commit() {
+        let scratch = Scratch::new();
+        let plugins = scratch.path("plugins");
+        let state_path = scratch.path("state.json");
+        let barrier = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            for version in 1..=4 {
+                let source = scratch.path(&format!("source-{version}"));
+                write_plugin(
+                    &source,
+                    &format!(
+                        r#"{{"id":"cool-plugin","name":"Test","version":"{version}.0.0","tier":"declarative"}}"#
+                    ),
+                );
+                let (plugins, state_path, barrier) = (&plugins, &state_path, &barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    let info = install_from(plugins, state_path, &source, "local", |p| {
+                        assert!(INSTALL_LOCK.try_lock().is_none());
+                        if p.finished {
+                            assert_eq!(
+                                read_state(state_path).unwrap().plugins["cool-plugin"].version,
+                                format!("{version}.0.0")
+                            );
+                            assert!(!plugins.join(".backup-cool-plugin").exists());
+                        }
+                    })
+                    .unwrap();
+                    assert_eq!(info.version, format!("{version}.0.0"));
+                });
+            }
+        });
+        let state = read_state(&state_path).unwrap();
+        let record = &state.plugins["cool-plugin"];
+        assert_eq!(
+            info_for(&plugins, "cool-plugin", record).version,
+            record.version
+        );
+        assert!(!plugins.join(".staging-cool-plugin").exists());
+        assert!(!plugins.join(".backup-cool-plugin").exists());
     }
 
     #[test]

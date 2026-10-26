@@ -190,7 +190,7 @@ export function useComposerPickers({
       const el = editableRef.current;
       if (!el || !workspacePath) return;
       setMention(null);
-      const token = mentionToken(joinPath(workspacePath, entry.rel)) + " ";
+      const token = mentionToken(joinPath(entry.root ?? workspacePath, entry.rel)) + " ";
       const caret = getCaretOffset(el);
       const text = extractText(el);
       // Recompute the trigger at select time — the caret may have moved

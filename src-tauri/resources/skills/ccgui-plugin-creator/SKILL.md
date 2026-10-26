@@ -101,6 +101,8 @@ export default function activate(ctx) {
 3. **迭代**：改完文件重新走一次「从本地目录安装」——它会**热重载**新代码（同一 id 覆盖），不需要重启应用，也别新建插件目录。
 4. **卸载/回滚**：插件页卸载即可；插件数据保留 30 天。
 
+用户已授权安装或维护、且宿主 `ccgui` MCP 提供插件工具时，可直接使用正式入口：先 `get_plugin_status({ id, sourcePath })` 核对安装目录、候选版本与新增权限，再 `install_plugin({ path, expectedId, expectedVersion })` 覆盖同一 ID；只刷新已安装代码用 `reload_plugin({ id, expectedVersion })`。两者保留启用状态。`committed` 只证明原生安装/重载操作完成，必须同时核对 `activation: "active"` 和 `runtime.loadedVersion` 才能报告新代码已加载；禁用插件仍保持禁用。支持保存回调的目标先保存并关闭，未支持的活动视图会阻塞，不能强制丢弃草稿。结果不确定时用 `get_plugin_status` 查询原目标，不盲目重复安装。旧宿主没有这些工具时继续使用上面的插件中心入口，不直接改写插件目录或状态文件。
+
 ## 6. 硬性约束（写错了宿主会拒绝或崩溃）
 
 - `id` 必须匹配 `^[a-z0-9][a-z0-9-]{1,63}$`；`version` 必须匹配 `^\d+\.\d+\.\d+$`；`tier` 只能是 `declarative` 或 `js`。
