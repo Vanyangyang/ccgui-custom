@@ -77,7 +77,7 @@ describe("Leader sidebar tree", () => {
       { id: "claude/child", engine: "claude", label: "child conversation", time: "child-age", promptCache: coldCache },
       { id: "codex/grandchild", engine: "codex", label: "grandchild conversation", time: "grandchild-age", promptCache: { ...hotCache, ttlSeconds: 1800, source: "openai-policy" } },
       { id: "agy/unknown", engine: "agy", label: "unknown conversation", time: "unknown-age" },
-      { id: "cursor/cursor", engine: "cursor", label: "cursor conversation", time: "cursor-age", promptCache: hotCache },
+      { id: "cursor/cursor", engine: "cursor", label: "cursor conversation", time: "cursor-age", promptCache: { ...hotCache, ttlSeconds: 300, source: "cursor-policy" } },
     ];
     const grouped = groupLeaderThreads(threads, native, "/branches");
     await act(async () => root.render(<AiChatSidebar
@@ -98,7 +98,10 @@ describe("Leader sidebar tree", () => {
     expect(row("grandchild conversation").textContent).toContain("leader.state.running");
     expect(chip("unknown conversation")?.dataset.cacheHeat).toBe("unknown");
     expect(row("unknown conversation").textContent).toContain("leader.state.failed");
-    expect(chip("cursor conversation")).toBeNull();
+    const cursorChip = chip("cursor conversation");
+    expect(cursorChip?.dataset.cacheHeat).toBe("hot");
+    expect(cursorChip?.textContent).toBe("cursor-age");
+    expect(row("cursor conversation").querySelector('[data-cache-heat-ratio="0.8"]')).not.toBeNull();
     expect(row("cursor conversation").textContent).toContain("cursor-age");
     expect(row("cursor conversation").textContent).toContain("leader.state.stopped");
     expect(chip("task-pending")).toBeNull();
@@ -203,7 +206,10 @@ describe("Leader sidebar tree", () => {
     expect(grouped).toHaveLength(1);
     expect(grouped[0].children?.[0].children?.[0].id).toBe("claude/grandchild");
     expect(paginateThreads(grouped, 1, 0).visibleThreads[0].children).toHaveLength(1);
-    const flat = rows(); expect(groupLeaderThreads(flat, snapshot(), "/other")).toBe(flat);
+    const flat = rows();
+    // Managed children stay with their root's workspace and must not appear
+    // again as ordinary rows in an unrelated workspace.
+    expect(groupLeaderThreads(flat, snapshot(), "/other")).toEqual([flat[0]]);
     expect(paginateThreads(flat, 1, 0).hiddenCount).toBe(2);
   });
   it("reconstitutes a missing parent and keeps pending branches unopenable", () => {
