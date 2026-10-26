@@ -2,13 +2,12 @@
  * Antigravity (agy)「BYOK 挂载识别与额度概览」区块 — 模仿 pi/omp 供应商认证与自定义模型挂载体验：
  *
  * 1. 赠金余额与账户额度 (agyByokBalance)：
- *    - 提供 Google Cloud 赠金与账单控制台入口；没有实时账单数据时不展示固定余额。
+ *    - 引导用户登录自己的 Google 账号并选择结算账号；未连接或无真实数据时不展示固定余额。
  *    - 展示 Antigravity 原生 `/credits` 与 `/usage` 实时额度摘要，支持遵循 UI 规范的转圈→对号刷新反馈。
  * 2. BYOK 挂载识别与模型接入 (agyByokMount)：
  *    - 自动识别本机 Vertex AI 接入配置与本机密钥文件状态（仅展示路径提示与状态点，绝不读取或回显真实密钥）。
- *    - 支持一键将 Vertex / BYOK 模型挂载到 AGY 聊天模型选择器，并可在「沿用 API 命名」（如 `gemini-4-argon`）
- *      与「自定义显示名称」（如 `Gemini 4 Argon (Vertex)`，底层仍向 `agy --model` 传递真实 API 模型 ID）之间切换。
- *    - 支持可选同步生成/更新「供应商渠道」中的 Vertex BYOK 渠道条目。
+ *    - 支持一键将 Vertex / BYOK 模型挂载到 AGY 聊天模型选择器，并可在「沿用 API 命名」与「自定义显示名称」之间切换。
+ *    - 仅在真实 metadata 存在且输入的 model 匹配时才允许自动同步生成供应商渠道。
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -35,9 +34,11 @@ import {
 import { openExternal } from "@/lib/platform";
 import { cx } from "@/utils/cx";
 import {
-  AGY_VERTEX_GUARDRAIL,
-  AGY_VERTEX_LINKS,
   agyVertexEndpoint,
+  DEFAULT_VERTEX_MODEL,
+  getAgyVertexBillingOverviewUrl,
+  getAgyVertexCreditsUrl,
+  useAgyVertexConfig,
   useAgyVertexCredits,
 } from "./agy-vertex-guardrail";
 import { Badge } from "./CliChannelRow";
@@ -66,37 +67,54 @@ export function AgyByokSection({ cli }: { cli: CliConfigState }) {
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [officialFiles, setOfficialFiles] = useState<OfficialConfigFile[]>([]);
   const [quota, setQuota] = useState<AgyQuotaSnapshot | null>(null);
-  const { credits: vertexCredits, sync: syncVertexCredits } = useAgyVertexCredits();
+  const {
+    credits: vertexCredits,
+    sync: syncVertexCredits,
+    syncing: vertexSyncing,
+  } = useAgyVertexCredits();
+  const { config: vertexConfig } = useAgyVertexConfig();
   const [loadError, setLoadError] = useState<string | null>(null);
 
   // Inline mount / naming editor state
   const [editorOpen, setEditorOpen] = useState(false);
   const [namingMode, setNamingMode] = useState<NamingMode>("custom_alias");
-  const [draftModelId, setDraftModelId] = useState<string>(AGY_VERTEX_GUARDRAIL.model);
+  const [draftModelId, setDraftModelId] = useState<string>(
+    vertexConfig.model || DEFAULT_VERTEX_MODEL,
+  );
   const [draftAlias, setDraftAlias] = useState<string>(DEFAULT_VERTEX_ALIAS);
   const [syncChannel, setSyncChannel] = useState<boolean>(true);
   const [saving, setSaving] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
 
-  const loadState = useCallback(async (forceQuota = false) => {
-    try {
-      const [appSettings, files, quotaSnap] = await Promise.all([
-        ipc.getAppSettings(),
-        ipc.officialConfigRead("agy").catch(() => [] as OfficialConfigFile[]),
-        ipc.agyQuotaRead({ force: forceQuota, cacheOnly: !forceQuota }).catch(() => null),
-      ]);
-      if (!mounted.current) return false;
-      setSettings(appSettings);
-      setOfficialFiles(files);
-      setQuota(quotaSnap?.status === "ready" ? quotaSnap : null);
-      const failed = forceQuota && quotaSnap?.status !== "ready";
-      setLoadError(failed ? t("settings.agyByokRefreshFailed") : null);
-      return !failed;
-    } catch (e) {
-      if (mounted.current) setLoadError(String(e));
-      return false;
+  // 当配置加载更新且当前未编辑时，同步 draftModelId
+  useEffect(() => {
+    if (!editorOpen) {
+      setDraftModelId(vertexConfig.model || DEFAULT_VERTEX_MODEL);
     }
-  }, [t]);
+  }, [editorOpen, vertexConfig.model]);
+
+  const loadState = useCallback(
+    async (forceQuota = false) => {
+      try {
+        const [appSettings, files, quotaSnap] = await Promise.all([
+          ipc.getAppSettings(),
+          ipc.officialConfigRead("agy").catch(() => [] as OfficialConfigFile[]),
+          ipc.agyQuotaRead({ force: forceQuota, cacheOnly: !forceQuota }).catch(() => null),
+        ]);
+        if (!mounted.current) return false;
+        setSettings(appSettings);
+        setOfficialFiles(files);
+        setQuota(quotaSnap?.status === "ready" ? quotaSnap : null);
+        const failed = forceQuota && quotaSnap?.status !== "ready";
+        setLoadError(failed ? t("settings.agyByokRefreshFailed") : null);
+        return !failed;
+      } catch (e) {
+        if (mounted.current) setLoadError(String(e));
+        return false;
+      }
+    },
+    [t],
+  );
 
   useEffect(() => {
     void loadState(false);
@@ -118,11 +136,12 @@ export function AgyByokSection({ cli }: { cli: CliConfigState }) {
     [settings],
   );
 
-  const isVertexMounted = customModels.includes(AGY_VERTEX_GUARDRAIL.model);
-  const vertexMountedAlias = customLabels[AGY_VERTEX_GUARDRAIL.model]?.trim() ?? "";
+  const activeModel = vertexConfig.model || DEFAULT_VERTEX_MODEL;
+  const isVertexMounted = customModels.includes(activeModel);
+  const vertexMountedAlias = customLabels[activeModel]?.trim() ?? "";
   const hasVertexChannel = useMemo(
-    () => cli.entries.some((e) => e.id === VERTEX_CHANNEL_ID || e.model === AGY_VERTEX_GUARDRAIL.model),
-    [cli.entries],
+    () => cli.entries.some((e) => e.id === VERTEX_CHANNEL_ID || e.model === activeModel),
+    [cli.entries, activeModel],
   );
 
   const openEditorForModel = useCallback(
@@ -132,19 +151,17 @@ export function AgyByokSection({ cli }: { cli: CliConfigState }) {
       if (existingAlias && existingAlias !== modelId) {
         setNamingMode("custom_alias");
         setDraftAlias(existingAlias);
-      } else if (modelId === AGY_VERTEX_GUARDRAIL.model && !customModels.includes(modelId)) {
+      } else if (modelId === activeModel && !customModels.includes(modelId)) {
         setNamingMode("custom_alias");
         setDraftAlias(DEFAULT_VERTEX_ALIAS);
       } else {
         setNamingMode("keep_api");
-        setDraftAlias(
-          modelId === AGY_VERTEX_GUARDRAIL.model ? DEFAULT_VERTEX_ALIAS : "",
-        );
+        setDraftAlias(modelId === activeModel ? DEFAULT_VERTEX_ALIAS : "");
       }
       setActionError(null);
       setEditorOpen(true);
     },
-    [customLabels, customModels],
+    [activeModel, customLabels, customModels],
   );
 
   const toggleEditor = useCallback(() => {
@@ -153,8 +170,8 @@ export function AgyByokSection({ cli }: { cli: CliConfigState }) {
       setActionError(null);
       return;
     }
-    openEditorForModel(AGY_VERTEX_GUARDRAIL.model);
-  }, [editorOpen, openEditorForModel]);
+    openEditorForModel(activeModel);
+  }, [activeModel, editorOpen, openEditorForModel]);
 
   const saveMount = useCallback(
     async (opts?: {
@@ -171,7 +188,26 @@ export function AgyByokSection({ cli }: { cli: CliConfigState }) {
       const mode = opts?.mode ?? namingMode;
       const rawAlias = (opts?.alias ?? draftAlias).trim();
       const effectiveAlias = mode === "custom_alias" && rawAlias ? rawAlias : "";
-      const shouldSyncChannel = opts?.createChannel ?? syncChannel;
+      const canSyncChannel = Boolean(vertexConfig.configured && vertexConfig.projectId);
+      const shouldSyncChannel =
+        opts?.createChannel != null ? opts.createChannel : (syncChannel && canSyncChannel);
+
+      // 需求：未配置 API 时同步 Vertex 渠道不可用并说明先配置自己的项目与 API 密钥。
+      // 自动建渠道必须使用真实本机 metadata 并校验输入 model 匹配该配置，不能为任意新别名建错误目标。
+      if (opts?.createChannel && !canSyncChannel) {
+        setActionError(t("settings.agyByokErrorNoConfig"));
+        return;
+      }
+      if (shouldSyncChannel) {
+        if (!vertexConfig.configured || !vertexConfig.projectId) {
+          setActionError(t("settings.agyByokErrorNoConfig"));
+          return;
+        }
+        if (targetId !== vertexConfig.model) {
+          setActionError(t("settings.agyByokErrorModelMismatch"));
+          return;
+        }
+      }
 
       setSaving(true);
       setActionError(null);
@@ -202,14 +238,19 @@ export function AgyByokSection({ cli }: { cli: CliConfigState }) {
         };
         await ipc.updateAppSettings(nextSettings);
 
-        if (shouldSyncChannel) {
+        if (shouldSyncChannel && vertexConfig.projectId) {
+          const endpoint = agyVertexEndpoint(
+            vertexConfig.projectId,
+            vertexConfig.location,
+            targetId,
+          );
           const channelName =
-            effectiveAlias || `${AGY_VERTEX_GUARDRAIL.projectName} (${targetId})`;
+            effectiveAlias || `${vertexConfig.projectId} (${targetId})`;
           await cli.mutate(() =>
             ipc.upsertProvider("agy", VERTEX_CHANNEL_ID, {
               name: channelName,
-              remark: `${AGY_VERTEX_GUARDRAIL.projectId} · ~/${AGY_VERTEX_GUARDRAIL.keyFileHint}`,
-              baseUrl: agyVertexEndpoint(),
+              remark: `${vertexConfig.projectId} · ~/${vertexConfig.keyFileHint}`,
+              baseUrl: endpoint || "",
               apiKey: "",
               model: targetId,
             }),
@@ -226,7 +267,7 @@ export function AgyByokSection({ cli }: { cli: CliConfigState }) {
         if (mounted.current) setSaving(false);
       }
     },
-    [cli, draftAlias, draftModelId, namingMode, syncChannel, t],
+    [cli, draftAlias, draftModelId, namingMode, syncChannel, t, vertexConfig],
   );
 
   const handleUnmount = useCallback(
@@ -272,6 +313,12 @@ export function AgyByokSection({ cli }: { cli: CliConfigState }) {
       ? Math.max(0, Math.min(100, Math.round(100 - geminiWindow.fiveHour.usedPercentage)))
       : null;
 
+  const creditsUrl = getAgyVertexCreditsUrl(vertexCredits.billingAccountId);
+  const billingOverviewUrl = getAgyVertexBillingOverviewUrl(vertexCredits.billingAccountId);
+
+  const hasCreditsData =
+    vertexCredits.freeTrialCredit != null || vertexCredits.gdpMonthlyCredit != null;
+
   return (
     <div className="flex w-full flex-col gap-6" data-testid="agy-byok-section">
       {/* ── 1. 赠金余额与账户额度 ── */}
@@ -280,9 +327,11 @@ export function AgyByokSection({ cli }: { cli: CliConfigState }) {
           <SettingsSectionLabel anchor="agyByokBalance">
             {t("settings.agyByokBalanceTitle")}
             <span className="ml-2 text-body-2-regular font-normal text-text-tertiary">
-              {t("settings.agyByokBalanceHint", {
-                account: AGY_VERTEX_GUARDRAIL.billingAccountId,
-              })}
+              {vertexCredits.billingAccountId
+                ? t("settings.agyByokBalanceHint", {
+                    account: vertexCredits.billingAccountId,
+                  })
+                : t("settings.agyByokNotConnected")}
             </span>
           </SettingsSectionLabel>
           <div className="flex shrink-0 flex-wrap items-center gap-2">
@@ -290,11 +339,14 @@ export function AgyByokSection({ cli }: { cli: CliConfigState }) {
               type="button"
               aria-label={t("settings.agyByokRefresh")}
               title={t("settings.agyByokRefresh")}
-              disabled={refreshFeedback.feedback === "running"}
+              disabled={refreshFeedback.feedback === "running" || vertexSyncing}
               onClick={() => {
                 let failed = false;
                 void refreshFeedback.start(
-                  async () => { void syncVertexCredits(); failed = !(await loadState(true)); },
+                  async () => {
+                    void syncVertexCredits();
+                    failed = !(await loadState(true));
+                  },
                   () => failed,
                 );
               }}
@@ -306,11 +358,11 @@ export function AgyByokSection({ cli }: { cli: CliConfigState }) {
                 spin
                 iconClassName="size-3.5"
               />
-              {t("settings.agyByokRefresh")}
+              {vertexSyncing ? t("settings.agyVertexSyncing") : t("settings.agyByokRefresh")}
             </button>
             <button
               type="button"
-              onClick={() => void openExternal(AGY_VERTEX_LINKS.credits)}
+              onClick={() => void openExternal(creditsUrl)}
               className="flex items-center gap-1 rounded-lg border border-border-button-default px-2.5 py-1 text-body-2-medium text-text-primary hover:bg-background-secondary-hover"
             >
               <ExternalLink className="size-3.5 text-foreground-icon-secondary" aria-hidden />
@@ -318,7 +370,7 @@ export function AgyByokSection({ cli }: { cli: CliConfigState }) {
             </button>
             <button
               type="button"
-              onClick={() => void openExternal(AGY_VERTEX_LINKS.billingOverview)}
+              onClick={() => void openExternal(billingOverviewUrl)}
               className="flex items-center gap-1 rounded-lg border border-border-button-default px-2.5 py-1 text-body-2-medium text-text-primary hover:bg-background-secondary-hover"
             >
               <ExternalLink className="size-3.5 text-foreground-icon-secondary" aria-hidden />
@@ -339,23 +391,50 @@ export function AgyByokSection({ cli }: { cli: CliConfigState }) {
                 <Badge>{t("settings.agyByokBillingCurrency")}</Badge>
               </div>
               <code className="w-fit truncate rounded border border-dashed border-border-button-default px-1 py-px text-[11px] text-text-tertiary">
-                {AGY_VERTEX_GUARDRAIL.projectName} · {AGY_VERTEX_GUARDRAIL.projectId}
+                {vertexConfig.projectId || t("settings.agyVertexNoProject")}
               </code>
             </div>
             <div className="flex flex-wrap items-center justify-end gap-1.5">
-              <span className="rounded bg-background-tertiary px-2 py-0.5 font-mono text-body-2-medium text-notification-success-foreground">
-                {t("settings.agyByokFreeTrialBadge", {
-                  amount: `${vertexCredits.freeTrialCredit} / ${vertexCredits.freeTrialOriginalCredit} (${vertexCredits.freeTrialRemainingPercent}%)`,
-                })}
-              </span>
-              <span className="rounded bg-background-tertiary px-2 py-0.5 font-mono text-body-2-medium text-text-primary">
-                {t("settings.agyByokGdpBadge", {
-                  amount: `${vertexCredits.gdpMonthlyCredit} (${vertexCredits.gdpMonthlyRemainingPercent}%)`,
-                })}
-              </span>
-              <span className="rounded border border-border-button-default px-1.5 py-0.5 text-[11px] text-text-secondary">
-                {t("settings.agyByokCapBadge")}
-              </span>
+              {hasCreditsData ? (
+                <>
+                  {vertexCredits.freeTrialCredit && (
+                    <span className="rounded bg-background-tertiary px-2 py-0.5 font-mono text-body-2-medium text-notification-success-foreground">
+                      {t("settings.agyByokFreeTrialBadge", {
+                        amount: `${vertexCredits.freeTrialCredit}${
+                          vertexCredits.freeTrialOriginalCredit
+                            ? ` / ${vertexCredits.freeTrialOriginalCredit}`
+                            : ""
+                        }${
+                          vertexCredits.freeTrialRemainingPercent != null
+                            ? ` (${vertexCredits.freeTrialRemainingPercent}%)`
+                            : ""
+                        }`,
+                      })}
+                    </span>
+                  )}
+                  {vertexCredits.gdpMonthlyCredit && (
+                    <span className="rounded bg-background-tertiary px-2 py-0.5 font-mono text-body-2-medium text-text-primary">
+                      {t("settings.agyByokGdpBadge", {
+                        amount: `${vertexCredits.gdpMonthlyCredit}${
+                          vertexCredits.gdpMonthlyRemainingPercent != null
+                            ? ` (${vertexCredits.gdpMonthlyRemainingPercent}%)`
+                            : ""
+                        }`,
+                      })}
+                    </span>
+                  )}
+                </>
+              ) : (
+                <span className="rounded bg-background-tertiary px-2 py-0.5 text-body-2-regular text-text-tertiary">
+                  {vertexCredits.errorCode && vertexCredits.errorCode !== "not_connected"
+                    ? vertexCredits.errorCode === "sync_cancelled"
+                      ? t("settings.agyVertexErrorCancelled")
+                      : vertexCredits.errorCode === "permission_denied"
+                        ? t("settings.agyVertexErrorPermissionDenied")
+                        : vertexCredits.errorCode
+                    : t("settings.agyVertexNotSynced")}
+                </span>
+              )}
             </div>
           </div>
 
@@ -387,7 +466,9 @@ export function AgyByokSection({ cli }: { cli: CliConfigState }) {
             )}
           </div>
         </SettingsCard>
-        <p className="px-1 text-caption-1-regular text-text-tertiary">{t("settings.agyVertexBillingSourceNote")}</p>
+        <p className="px-1 text-caption-1-regular text-text-tertiary">
+          {t("settings.agyVertexStepsGuide")} · {t("settings.agyVertexBillingSourceNote")}
+        </p>
       </div>
 
       {/* ── 2. BYOK 挂载识别与模型接入 ── */}
@@ -397,7 +478,7 @@ export function AgyByokSection({ cli }: { cli: CliConfigState }) {
             {t("settings.agyByokMountTitle")}
             <span className="ml-2 text-body-2-regular font-normal text-text-tertiary">
               {t("settings.agyByokMountHint", {
-                path: `~/${AGY_VERTEX_GUARDRAIL.keyFileHint}`,
+                path: `~/${vertexConfig.keyFileHint}`,
               })}
             </span>
           </SettingsSectionLabel>
@@ -432,8 +513,8 @@ export function AgyByokSection({ cli }: { cli: CliConfigState }) {
                 <div className="flex flex-wrap items-center gap-1.5">
                   <p className="truncate text-body-regular text-text-primary">
                     {t("settings.agyByokVertexRowTitle", {
-                      project: AGY_VERTEX_GUARDRAIL.projectName,
-                      model: vertexMountedAlias || AGY_VERTEX_GUARDRAIL.model,
+                      project: vertexConfig.projectId || t("settings.agyVertexNoProject"),
+                      model: vertexMountedAlias || activeModel,
                     })}
                   </p>
                   {isVertexMounted && (
@@ -449,10 +530,10 @@ export function AgyByokSection({ cli }: { cli: CliConfigState }) {
                 </div>
                 <div className="flex flex-wrap items-center gap-1.5">
                   <code className="w-fit truncate rounded border border-dashed border-border-button-default px-1 py-px text-[11px] text-text-tertiary">
-                    {AGY_VERTEX_GUARDRAIL.model}
+                    {activeModel}
                   </code>
                   <code className="w-fit truncate rounded border border-dashed border-border-button-default px-1 py-px text-[11px] text-text-tertiary">
-                    ~/{AGY_VERTEX_GUARDRAIL.keyFileHint}
+                    ~/{vertexConfig.keyFileHint}
                   </code>
                 </div>
               </div>
@@ -464,14 +545,16 @@ export function AgyByokSection({ cli }: { cli: CliConfigState }) {
                   : t("settings.agyByokDetectedReady")}
               </span>
 
-              <span
-                className="flex size-5 shrink-0 items-center justify-center text-notification-success-foreground"
-                role="img"
-                aria-label={t("settings.agyByokKeyDetected")}
-                title={t("settings.agyByokKeyDetected")}
-              >
-                <KeyRound className="size-3.5" aria-hidden />
-              </span>
+              {vertexConfig.configured ? (
+                <span
+                  className="flex size-5 shrink-0 items-center justify-center text-notification-success-foreground"
+                  role="img"
+                  aria-label={t("settings.agyByokKeyDetected")}
+                  title={t("settings.agyByokKeyDetected")}
+                >
+                  <KeyRound className="size-3.5" aria-hidden />
+                </span>
+              ) : null}
 
               {!isVertexMounted ? (
                 <button
@@ -479,10 +562,10 @@ export function AgyByokSection({ cli }: { cli: CliConfigState }) {
                   disabled={saving}
                   onClick={() =>
                     void saveMount({
-                      modelId: AGY_VERTEX_GUARDRAIL.model,
+                      modelId: activeModel,
                       mode: "custom_alias",
                       alias: DEFAULT_VERTEX_ALIAS,
-                      createChannel: true,
+                      createChannel: Boolean(vertexConfig.configured && vertexConfig.projectId),
                     })
                   }
                   className="shrink-0 rounded-lg bg-accent-500 px-2.5 py-1 text-body-2-medium text-white hover:opacity-90 disabled:opacity-50"
@@ -494,9 +577,9 @@ export function AgyByokSection({ cli }: { cli: CliConfigState }) {
               <button
                 type="button"
                 className={TEXT_BTN}
-                onClick={() => openEditorForModel(AGY_VERTEX_GUARDRAIL.model)}
+                onClick={() => openEditorForModel(activeModel)}
               >
-                {editorOpen && draftModelId === AGY_VERTEX_GUARDRAIL.model
+                {editorOpen && draftModelId === activeModel
                   ? t("settings.piAuthCollapse")
                   : t("settings.agyByokConfigureNaming")}
               </button>
@@ -506,7 +589,7 @@ export function AgyByokSection({ cli }: { cli: CliConfigState }) {
                   type="button"
                   disabled={saving}
                   className={cx(TEXT_BTN, "hover:text-text-error-primary")}
-                  onClick={() => void handleUnmount(AGY_VERTEX_GUARDRAIL.model)}
+                  onClick={() => void handleUnmount(activeModel)}
                 >
                   {t("settings.agyByokUnmount")}
                 </button>
@@ -520,7 +603,7 @@ export function AgyByokSection({ cli }: { cli: CliConfigState }) {
                   {t("settings.agyByokEditorTitle")}
                 </p>
 
-                {/* Naming Mode Selector: 沿用 API 命名 vs 自定义显示名称 */}
+                {/* Naming Mode Selector */}
                 <div className="mb-3 flex flex-wrap items-center gap-2">
                   <span className="text-body-2-regular text-text-secondary">
                     {t("settings.agyByokNamingModeLabel")}
@@ -543,7 +626,7 @@ export function AgyByokSection({ cli }: { cli: CliConfigState }) {
                     aria-pressed={namingMode === "custom_alias"}
                     onClick={() => {
                       setNamingMode("custom_alias");
-                      if (!draftAlias.trim() && draftModelId === AGY_VERTEX_GUARDRAIL.model) {
+                      if (!draftAlias.trim() && draftModelId === activeModel) {
                         setDraftAlias(DEFAULT_VERTEX_ALIAS);
                       }
                     }}
@@ -571,7 +654,7 @@ export function AgyByokSection({ cli }: { cli: CliConfigState }) {
                       type="text"
                       value={draftModelId}
                       onChange={(e) => setDraftModelId(e.target.value)}
-                      placeholder={AGY_VERTEX_GUARDRAIL.model}
+                      placeholder={activeModel}
                       className="h-9 w-full rounded-lg bg-background-tertiary px-2.5 font-mono text-body-2-regular text-text-primary outline-none placeholder:text-text-tertiary"
                     />
                   </div>
@@ -595,7 +678,7 @@ export function AgyByokSection({ cli }: { cli: CliConfigState }) {
                       placeholder={
                         namingMode === "keep_api"
                           ? t("settings.agyByokDisplayNameKeepPlaceholder", {
-                              model: draftModelId.trim() || AGY_VERTEX_GUARDRAIL.model,
+                              model: draftModelId.trim() || activeModel,
                             })
                           : t("settings.agyByokDisplayNamePlaceholder")
                       }
@@ -604,19 +687,32 @@ export function AgyByokSection({ cli }: { cli: CliConfigState }) {
                   </div>
                 </div>
 
-                <label className="mt-2.5 flex cursor-pointer items-center gap-2 text-body-2-regular text-text-secondary">
+                <label
+                  className={cx(
+                    "mt-2.5 flex items-center gap-2 text-body-2-regular text-text-secondary",
+                    !vertexConfig.configured || !vertexConfig.projectId
+                      ? "cursor-not-allowed opacity-50"
+                      : "cursor-pointer",
+                  )}
+                >
                   <input
                     type="checkbox"
-                    checked={syncChannel}
+                    checked={syncChannel && Boolean(vertexConfig.configured && vertexConfig.projectId)}
+                    disabled={!vertexConfig.configured || !vertexConfig.projectId}
                     onChange={(e) => setSyncChannel(e.target.checked)}
                     className="size-3.5 rounded border-border-button-default"
                   />
                   <span>{t("settings.agyByokSyncChannelLabel")}</span>
                 </label>
+                {!vertexConfig.configured || !vertexConfig.projectId ? (
+                  <p className="mt-1 text-caption-1-regular text-text-tertiary">
+                    {t("settings.agyByokSyncChannelDisabledHint")}
+                  </p>
+                ) : null}
 
                 <p className="mt-1.5 text-body-2-regular text-text-tertiary">
                   {t("settings.agyByokEditorHint", {
-                    model: draftModelId.trim() || AGY_VERTEX_GUARDRAIL.model,
+                    model: draftModelId.trim() || activeModel,
                   })}
                 </p>
 
@@ -654,7 +750,7 @@ export function AgyByokSection({ cli }: { cli: CliConfigState }) {
 
           {/* Other mounted custom models in customModels.agy */}
           {customModels
-            .filter((m) => m !== AGY_VERTEX_GUARDRAIL.model)
+            .filter((m) => m !== activeModel)
             .map((modelId) => {
               const alias = customLabels[modelId]?.trim() ?? "";
               return (
@@ -707,7 +803,7 @@ export function AgyByokSection({ cli }: { cli: CliConfigState }) {
           <div className="flex flex-wrap items-center gap-2 py-2 pr-2.5 text-[11px] text-text-tertiary">
             <code className="min-w-0 truncate">{officialPath}</code>
             <span className="shrink-0">·</span>
-            <code className="min-w-0 truncate">~/{AGY_VERTEX_GUARDRAIL.keyFileHint}</code>
+            <code className="min-w-0 truncate">~/{vertexConfig.keyFileHint}</code>
             <span className="shrink-0">·</span>
             <span className="min-w-0 truncate">{t("settings.agyByokFooterHint")}</span>
           </div>

@@ -46,6 +46,9 @@ const APP_DIR_NAME: &str = "antigravity-cli-vertex";
 const KEY_FILE: &str = "vertex-gemini-4-argon.txt";
 const DEFAULT_MODEL: &str = "gemini-4-argon";
 const VERTEX_HOST: &str = "aiplatform.googleapis.com";
+/// Appended to route failures: Vertex is an optional, user-owned project; the
+/// Antigravity subscription stays usable without it.
+const NATIVE_HINT: &str = " To use your own Antigravity quota instead, select the default Antigravity channel and a native model (e.g. gemini-4-argon-high). To use Vertex, point ~/.gemini/vertex-gemini-4-argon.txt at your own Google Cloud project with project=, location=, model= and api_key= lines.";
 /// Request bodies carry the whole conversation (and inline images).
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 
@@ -114,11 +117,16 @@ pub(crate) fn load_target() -> Result<VertexTarget, String> {
     let path = key_file_path();
     let text = std::fs::read_to_string(&path).map_err(|e| {
         format!(
-            "Vertex route needs the key file ~/.gemini/{KEY_FILE} ({}): {e}",
+            "Vertex route needs the key file ~/.gemini/{KEY_FILE} ({}): {e}.{NATIVE_HINT}",
             path.display()
         )
     })?;
     parse_target(&text)
+}
+
+/// Settings may display connection metadata, never the API key or key-file contents.
+pub(crate) fn target_metadata() -> Option<(String, String, String)> {
+    load_target().ok().map(|target| (target.project, target.location, target.model))
 }
 
 fn normalize_effort(effort: &str) -> &'static str {
@@ -248,7 +256,7 @@ fn validate_channel_target(provider: Option<&Value>, target: &VertexTarget) -> R
         || segments.get(2).copied() != Some(target.project.as_str())
         || segments.get(4).copied() != Some(target.location.as_str())
         || model != Some(target.model.as_str()) {
-        return Err("Vertex channel project, location and model must match the local key file; refusing a different billing target".into());
+        return Err(format!("Vertex channel project, location and model must match the local key file; refusing a different billing target. Re-save the Vertex mount in Settings to rebuild this channel from your own key file.{NATIVE_HINT}"));
     }
     Ok(())
 }

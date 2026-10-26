@@ -954,7 +954,12 @@ pub(super) async fn dispatch(
         }
         "agy_vertex_credits_read" => {
             let a: QuotaArgs = parse_args(&raw)?;
+            // Cached reads are passive; force opens a login window and replaces local data.
+            authorize_vertex_credits_context(&app.state::<crate::AppState>().db, a.force, context)?;
             ser(crate::agy_vertex_credits::agy_vertex_credits_read(app.clone(), a.force).await)
+        }
+        "agy_vertex_config_read" => {
+            ser(Ok::<_, String>(crate::agy_vertex_credits::agy_vertex_config_read()))
         }
         "throughput_stats_read" => {
             let a: ThroughputStatsArgs = parse_args(&raw)?;
@@ -1779,7 +1784,7 @@ fn collaboration_write_required(command: &str) -> Option<bool> {
         | "plugin_read_file" | "plugin_storage_get"
         | "cli_version_status" | "cli_update_plan" | "cli_update_snapshot"
         | "dsh_host_status" | "pi_family_auth_list" | "pi_family_models_config_read"
-        | "claude_quota_read" | "codex_quota_read" | "codex_context_window_read" | "agy_quota_read" | "agy_vertex_credits_read" | "throughput_stats_read" | "git_worktree_list" | "git_worktree_creation_snapshot"
+        | "claude_quota_read" | "codex_quota_read" | "codex_context_window_read" | "agy_quota_read" | "agy_vertex_credits_read" | "agy_vertex_config_read" | "throughput_stats_read" | "git_worktree_list" | "git_worktree_creation_snapshot"
         | "git_branch_merged" | "git_resolve_pr" | "remote_control_active" => Some(false),
         "runtime_worker_start" | "runtime_worker_control" | "runtime_worker_plan_review"
         | "save_workspace_project" | "assign_session_sidebar_workspaces" | "remove_workspace_project" | "plugin_publish_workspace_project" | "revoke_image_preview_grant"
@@ -1804,6 +1809,14 @@ fn authorize_collaboration_context(db: &crate::db::Db, command: &str, context: &
     // Revocation and socket lifetime apply even to pre-existing commands.
     // Additional origin requirements cover the collaboration write surface.
     let write = collaboration_write_required(command).unwrap_or(false);
+    authorize_request_context(db, write, context)
+}
+
+fn authorize_vertex_credits_context(db: &crate::db::Db, force: Option<bool>, context: &super::RequestContext) -> Result<(), String> {
+    authorize_request_context(db, force.unwrap_or(false), context)
+}
+
+fn authorize_request_context(db: &crate::db::Db, write: bool, context: &super::RequestContext) -> Result<(), String> {
     let authorized = if context.device.is_empty() {
         context.live.load(std::sync::atomic::Ordering::SeqCst) && (!write || context.origin_allowed)
     } else {
@@ -1815,6 +1828,30 @@ fn authorize_collaboration_context(db: &crate::db::Db, command: &str, context: &
 #[cfg(test)]
 mod follow_up_args_tests {
     use super::*;
+
+    #[test]
+    fn vertex_login_requires_write_origin_but_cached_reads_remain_passive() {
+        let db = crate::db::Db::open_at(std::path::Path::new(":memory:")).unwrap();
+        for device in ["", "vertex-device"] {
+            if !device.is_empty() {
+                db.web_device_touch(device, "test browser", 1).unwrap();
+                db.web_device_approve(device, 2).unwrap();
+            }
+            let foreign = super::super::RequestContext::from_handshake(&db, device.into(), false);
+            assert!(authorize_vertex_credits_context(&db, None, &foreign).is_ok());
+            assert!(authorize_vertex_credits_context(&db, Some(false), &foreign).is_ok());
+            assert!(authorize_vertex_credits_context(&db, Some(true), &foreign).is_err());
+            let local = super::super::RequestContext::from_handshake(&db, device.into(), true);
+            assert!(authorize_vertex_credits_context(&db, Some(true), &local).is_ok());
+            local.live.store(false, std::sync::atomic::Ordering::SeqCst);
+            assert!(authorize_vertex_credits_context(&db, Some(false), &local).is_err());
+            assert!(authorize_vertex_credits_context(&db, Some(true), &local).is_err());
+            if !device.is_empty() {
+                db.web_device_revoke(device).unwrap();
+                assert!(authorize_vertex_credits_context(&db, Some(false), &foreign).is_err());
+            }
+        }
+    }
 
     #[test]
     fn sidechat_wire_permission_preserves_old_requests_and_explicit_modes() {
@@ -1870,7 +1907,7 @@ mod follow_up_args_tests {
             ("dsh_host_status", false), ("dsh_host_start", true), ("dsh_host_stop", true),
             ("pi_family_auth_list", false), ("pi_family_models_config_read", false),
             ("pi_family_auth_set_api_key", true), ("pi_family_auth_delete_credential", true), ("pi_family_models_config_write", true),
-            ("claude_quota_read", false), ("codex_quota_read", false), ("codex_context_window_read", false), ("codex_context_window_write", true), ("agy_quota_read", false), ("agy_vertex_credits_read", false), ("throughput_stats_read", false), ("git_worktree_list", false), ("git_worktree_creation_snapshot", false),
+            ("claude_quota_read", false), ("codex_quota_read", false), ("codex_context_window_read", false), ("codex_context_window_write", true), ("agy_quota_read", false), ("agy_vertex_credits_read", false), ("agy_vertex_config_read", false), ("throughput_stats_read", false), ("git_worktree_list", false), ("git_worktree_creation_snapshot", false),
             ("git_branch_merged", false), ("git_resolve_pr", false), ("git_worktree_create", true),
             ("git_worktree_create_cancel", true), ("git_worktree_remove", true),
             ("plugin_install_from_path", true), ("plugin_install_from_marketplace", true),

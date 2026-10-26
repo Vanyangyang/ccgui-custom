@@ -1,84 +1,144 @@
-/** 【Vertex 防护】Antigravity 设置详情使用的本机接入事实。
- *  只放项目、模型和调用地址，不放 API 密钥。密钥留在本机文件里。 */
+/**
+ * 【Vertex 防护与 BYOK 接入】
+ * 引导用户连接自己的 Google Cloud 结算账号并读取本机 Vertex 接入元信息。
+ * 绝不硬编码任何个人账号、项目或固定余额。
+ */
 import { useCallback, useEffect, useState } from "react";
 import { listenAgyVertexCreditsChanged } from "@/lib/events";
-import { ipc, type AgyVertexCreditsSnapshot } from "@/lib/ipc";
+import {
+  ipc,
+  type AgyVertexConfigSnapshot,
+  type AgyVertexCreditsSnapshot,
+} from "@/lib/ipc";
 
-export const AGY_VERTEX_GUARDRAIL = {
-  projectId: "project-1141a96f-5ab2-42b3-a5d",
-  projectName: "My First Project",
-  billingAccountId: "01E559-FC92E9-D4E9E7",
-  freeTrialCredit: "$348.01",
-  freeTrialOriginalCredit: "$383.45",
-  freeTrialRemainingPercent: 91,
-  gdpMonthlyCredit: "$51.13",
-  gdpMonthlyRemainingPercent: 100,
-  location: "global",
-  model: "gemini-4-argon",
-  monthlyCapUsd: null,
-  requestsPerMinute: null,
-  /** 相对用户主目录，避免把某台机器的绝对路径写进界面。 */
-  keyFileHint: ".gemini/vertex-gemini-4-argon.txt",
-} as const;
+export const DEFAULT_VERTEX_MODEL = "gemini-4-argon";
+export const DEFAULT_KEY_FILE_HINT = ".gemini/vertex-gemini-4-argon.txt";
+export const DEFAULT_LOCATION = "global";
 
-const DEFAULT_CREDITS_SNAPSHOT: AgyVertexCreditsSnapshot = {
-  freeTrialCredit: AGY_VERTEX_GUARDRAIL.freeTrialCredit,
-  freeTrialOriginalCredit: AGY_VERTEX_GUARDRAIL.freeTrialOriginalCredit,
-  freeTrialRemainingPercent: AGY_VERTEX_GUARDRAIL.freeTrialRemainingPercent,
-  gdpMonthlyCredit: AGY_VERTEX_GUARDRAIL.gdpMonthlyCredit,
-  gdpMonthlyRemainingPercent: AGY_VERTEX_GUARDRAIL.gdpMonthlyRemainingPercent,
+export const DEFAULT_CREDITS_SNAPSHOT: AgyVertexCreditsSnapshot = {
+  billingAccountId: null,
+  freeTrialCredit: null,
+  freeTrialOriginalCredit: null,
+  freeTrialRemainingPercent: null,
+  gdpMonthlyCredit: null,
+  gdpMonthlyRemainingPercent: null,
+  collectedAt: undefined,
+  errorCode: "not_connected",
+};
+
+export const DEFAULT_CONFIG_SNAPSHOT: AgyVertexConfigSnapshot = {
+  configured: false,
+  projectId: null,
+  location: DEFAULT_LOCATION,
+  model: DEFAULT_VERTEX_MODEL,
+  keyFileHint: DEFAULT_KEY_FILE_HINT,
 };
 
 let currentCreditsSnapshot: AgyVertexCreditsSnapshot = DEFAULT_CREDITS_SNAPSHOT;
 let currentSyncing = false;
 let activeSyncPromise: Promise<AgyVertexCreditsSnapshot> | null = null;
+let syncSequence = 0;
 const subscribers = new Set<() => void>();
 
 function notifySubscribers() {
   for (const listener of subscribers) listener();
 }
 
-function applyCreditsSnapshot(next: AgyVertexCreditsSnapshot | null | undefined) {
-  if (!next || typeof next.freeTrialCredit !== "string") return;
-  currentCreditsSnapshot = {
-    freeTrialCredit: next.freeTrialCredit || DEFAULT_CREDITS_SNAPSHOT.freeTrialCredit,
-    freeTrialOriginalCredit:
-      next.freeTrialOriginalCredit || DEFAULT_CREDITS_SNAPSHOT.freeTrialOriginalCredit,
-    freeTrialRemainingPercent:
-      typeof next.freeTrialRemainingPercent === "number" &&
-      Number.isFinite(next.freeTrialRemainingPercent)
-        ? Math.max(0, Math.min(100, Math.round(next.freeTrialRemainingPercent)))
-        : DEFAULT_CREDITS_SNAPSHOT.freeTrialRemainingPercent,
-    gdpMonthlyCredit: next.gdpMonthlyCredit || DEFAULT_CREDITS_SNAPSHOT.gdpMonthlyCredit,
-    gdpMonthlyRemainingPercent:
-      typeof next.gdpMonthlyRemainingPercent === "number" &&
-      Number.isFinite(next.gdpMonthlyRemainingPercent)
-        ? Math.max(0, Math.min(100, Math.round(next.gdpMonthlyRemainingPercent)))
-        : DEFAULT_CREDITS_SNAPSHOT.gdpMonthlyRemainingPercent,
-    collectedAt: next.collectedAt,
-    errorCode: next.errorCode,
-  };
+export function getAgyVertexCreditsSnapshot(): AgyVertexCreditsSnapshot {
+  return currentCreditsSnapshot;
+}
+
+/**
+ * 校验并更新赠金快照。
+ * 取消、无权限或错误时不保留旧余额，清空为 null。
+ */
+export function applyCreditsSnapshot(next: AgyVertexCreditsSnapshot | null | undefined) {
+  if (!next) return;
+
+  const hasError = Boolean(next.errorCode && next.errorCode !== "ok");
+  const hasCredits =
+    typeof next.freeTrialCredit === "string" || typeof next.gdpMonthlyCredit === "string";
+
+  if (hasError || !hasCredits) {
+    currentCreditsSnapshot = {
+      billingAccountId: next.billingAccountId ?? null,
+      freeTrialCredit: null,
+      freeTrialOriginalCredit: null,
+      freeTrialRemainingPercent: null,
+      gdpMonthlyCredit: null,
+      gdpMonthlyRemainingPercent: null,
+      collectedAt: next.collectedAt,
+      errorCode: next.errorCode || (hasCredits ? undefined : "not_connected"),
+    };
+  } else {
+    currentCreditsSnapshot = {
+      billingAccountId: next.billingAccountId ?? null,
+      freeTrialCredit: next.freeTrialCredit ?? null,
+      freeTrialOriginalCredit: next.freeTrialOriginalCredit ?? null,
+      freeTrialRemainingPercent:
+        typeof next.freeTrialRemainingPercent === "number" &&
+        Number.isFinite(next.freeTrialRemainingPercent)
+          ? Math.max(0, Math.min(100, Math.round(next.freeTrialRemainingPercent)))
+          : null,
+      gdpMonthlyCredit: next.gdpMonthlyCredit ?? null,
+      gdpMonthlyRemainingPercent:
+        typeof next.gdpMonthlyRemainingPercent === "number" &&
+        Number.isFinite(next.gdpMonthlyRemainingPercent)
+          ? Math.max(0, Math.min(100, Math.round(next.gdpMonthlyRemainingPercent)))
+          : null,
+      collectedAt: next.collectedAt,
+      errorCode: undefined,
+    };
+  }
   notifySubscribers();
 }
 
-export async function syncAgyVertexCredits(): Promise<AgyVertexCreditsSnapshot> {
+/**
+ * 同步 Google Cloud 赠金（打开网页登录 / 选择结算账号，自动抓取 Credits）。
+ * 开始前先清除旧余额；请求中防重复；慢旧请求不会覆盖新结果。
+ */
+export function syncAgyVertexCredits(): Promise<AgyVertexCreditsSnapshot> {
   if (typeof ipc?.agyVertexCreditsRead !== "function") {
-    return currentCreditsSnapshot;
+    return Promise.resolve(currentCreditsSnapshot);
   }
   if (activeSyncPromise) return activeSyncPromise;
+
   currentSyncing = true;
+  const seq = ++syncSequence;
+
+  // 开始时清除旧余额
+  currentCreditsSnapshot = {
+    ...DEFAULT_CREDITS_SNAPSHOT,
+    billingAccountId: currentCreditsSnapshot.billingAccountId,
+    errorCode: undefined,
+  };
   notifySubscribers();
+
   activeSyncPromise = (async () => {
     try {
       const next = await ipc.agyVertexCreditsRead({ force: true });
-      applyCreditsSnapshot(next);
+      if (seq === syncSequence) {
+        applyCreditsSnapshot(next);
+      }
       return currentCreditsSnapshot;
-    } catch {
+    } catch (err) {
+      if (seq === syncSequence) {
+        // Tauri rejects with the backend's string code, e.g. vertex_sync_in_progress.
+        const code = typeof err === "string" ? err : err instanceof Error ? err.message : "";
+        currentCreditsSnapshot = {
+          ...DEFAULT_CREDITS_SNAPSHOT,
+          billingAccountId: null,
+          errorCode: code.trim() || "sync_failed",
+        };
+        notifySubscribers();
+      }
       return currentCreditsSnapshot;
     } finally {
-      activeSyncPromise = null;
-      currentSyncing = false;
-      notifySubscribers();
+      if (seq === syncSequence) {
+        activeSyncPromise = null;
+        currentSyncing = false;
+        notifySubscribers();
+      }
     }
   })();
   return activeSyncPromise;
@@ -94,26 +154,25 @@ export function useAgyVertexCredits() {
     let disposed = false;
     let unlisten: (() => void) | undefined;
 
-    if (typeof ipc?.agyVertexCreditsRead === "function") {
+    // A passive read started before (or during) a sync may resolve after it and
+    // carry the previous account's balance; the sync's own result wins.
+    const readCached = () => {
+      if (typeof ipc?.agyVertexCreditsRead !== "function") return;
+      const seq = syncSequence;
       void ipc
         .agyVertexCreditsRead({ force: false })
         .then((snap) => {
-          if (!disposed) applyCreditsSnapshot(snap);
+          if (!disposed && snap && seq === syncSequence && !currentSyncing) {
+            applyCreditsSnapshot(snap);
+          }
         })
         .catch(() => {});
-    }
+    };
+
+    readCached();
 
     if (typeof listenAgyVertexCreditsChanged === "function") {
-      void listenAgyVertexCreditsChanged(() => {
-        if (typeof ipc?.agyVertexCreditsRead === "function") {
-          void ipc
-            .agyVertexCreditsRead({ force: false })
-            .then((snap) => {
-              if (!disposed) applyCreditsSnapshot(snap);
-            })
-            .catch(() => {});
-        }
-      })
+      void listenAgyVertexCreditsChanged(readCached)
         .then((stop) => {
           if (disposed) stop();
           else unlisten = stop;
@@ -137,33 +196,191 @@ export function useAgyVertexCredits() {
   };
 }
 
-export function agyVertexEndpoint(): string {
-  const guardrail = AGY_VERTEX_GUARDRAIL;
-  return `https://aiplatform.googleapis.com/v1/projects/${guardrail.projectId}/locations/${guardrail.location}/publishers/google/models/${guardrail.model}:generateContent`;
+/* ───────────────────── 本机 Vertex 配置元信息 ───────────────────── */
+
+let currentConfigSnapshot: AgyVertexConfigSnapshot = DEFAULT_CONFIG_SNAPSHOT;
+let configLoaded = false;
+let activeConfigPromise: Promise<AgyVertexConfigSnapshot> | null = null;
+const configSubscribers = new Set<() => void>();
+
+function notifyConfigSubscribers() {
+  for (const listener of configSubscribers) listener();
 }
 
-export function agyVertexStreamEndpoint(): string {
-  const guardrail = AGY_VERTEX_GUARDRAIL;
-  return `https://aiplatform.googleapis.com/v1/projects/${guardrail.projectId}/locations/${guardrail.location}/publishers/google/models/${guardrail.model}:streamGenerateContent?alt=sse`;
+export function applyConfigSnapshot(conf: AgyVertexConfigSnapshot | null | undefined) {
+  if (!conf || typeof conf !== "object") {
+    currentConfigSnapshot = DEFAULT_CONFIG_SNAPSHOT;
+  } else {
+    currentConfigSnapshot = {
+      configured: Boolean(conf.configured),
+      projectId: conf.projectId ? String(conf.projectId).trim() : null,
+      location: conf.location?.trim() || DEFAULT_LOCATION,
+      model: conf.model?.trim() || DEFAULT_VERTEX_MODEL,
+      keyFileHint: conf.keyFileHint?.trim() || DEFAULT_KEY_FILE_HINT,
+      errorCode: conf.errorCode,
+    };
+  }
+  configLoaded = true;
+  notifyConfigSubscribers();
 }
 
-export function agyVertexSampleCommand(): string {
-  const endpoint = agyVertexEndpoint();
-  const keyPath = AGY_VERTEX_GUARDRAIL.keyFileHint;
+export function fetchAgyVertexConfig(): Promise<AgyVertexConfigSnapshot> {
+  if (typeof ipc?.agyVertexConfigRead !== "function") {
+    return Promise.resolve(currentConfigSnapshot);
+  }
+  if (activeConfigPromise) return activeConfigPromise;
+
+  activeConfigPromise = (async () => {
+    try {
+      const conf = await ipc.agyVertexConfigRead();
+      applyConfigSnapshot(conf);
+    } catch {
+      currentConfigSnapshot = {
+        ...DEFAULT_CONFIG_SNAPSHOT,
+        errorCode: "config_read_failed",
+      };
+      configLoaded = true;
+      notifyConfigSubscribers();
+    } finally {
+      activeConfigPromise = null;
+    }
+    return currentConfigSnapshot;
+  })();
+  return activeConfigPromise;
+}
+
+export function useAgyVertexConfig() {
+  const [, setTick] = useState(0);
+
+  useEffect(() => {
+    const onUpdate = () => setTick((n) => n + 1);
+    configSubscribers.add(onUpdate);
+
+    if (!configLoaded && !activeConfigPromise) {
+      void fetchAgyVertexConfig();
+    }
+
+    return () => {
+      configSubscribers.delete(onUpdate);
+    };
+  }, []);
+
+  const reload = useCallback(() => fetchAgyVertexConfig(), []);
+
+  return {
+    config: currentConfigSnapshot,
+    reload,
+  };
+}
+
+/* ───────────────────── 动态链接与 Endpoint ───────────────────── */
+
+const GOOGLE_BILLING_BASE = "https://console.cloud.google.com/billing";
+
+/**
+ * 结算账号赠金明细外链。
+ * 若 billingAccountId 存在，跳转到该账号赠金明细；未连接时使用通用控制台链接。
+ * 绝不硬编码 authuser=0 或固定账号。
+ */
+export function getAgyVertexCreditsUrl(billingAccountId?: string | null): string {
+  const account = billingAccountId?.trim();
+  if (account) {
+    return `${GOOGLE_BILLING_BASE}/${encodeURIComponent(account)}/credits/all`;
+  }
+  return GOOGLE_BILLING_BASE;
+}
+
+/**
+ * 结算总览外链。
+ */
+export function getAgyVertexBillingOverviewUrl(billingAccountId?: string | null): string {
+  const account = billingAccountId?.trim();
+  if (account) {
+    return `${GOOGLE_BILLING_BASE}/${encodeURIComponent(account)}/overview`;
+  }
+  return GOOGLE_BILLING_BASE;
+}
+
+export type VertexProjectLinkType =
+  | "credentials"
+  | "studio"
+  | "budgets"
+  | "quotas"
+  | "policies";
+
+/**
+ * 项目控制台外链。只有真实 projectId 存在时才拼接 ?project= 参数。
+ */
+export function getAgyVertexProjectUrl(
+  type: VertexProjectLinkType,
+  projectId?: string | null,
+): string {
+  const pid = projectId?.trim();
+  const query = pid ? `?project=${encodeURIComponent(pid)}` : "";
+
+  switch (type) {
+    case "credentials":
+      return `https://console.cloud.google.com/apis/credentials${query}`;
+    case "studio":
+      return pid
+        ? `https://console.cloud.google.com/vertex-ai/studio${query}`
+        : "https://console.cloud.google.com/vertex-ai";
+    case "budgets":
+      return `https://console.cloud.google.com/billing/budgets${query}`;
+    case "quotas":
+      return `https://console.cloud.google.com/iam-admin/quotas${query}`;
+    case "policies":
+      return `https://console.cloud.google.com/iam-admin/orgpolicies/list${query}`;
+  }
+}
+
+/**
+ * 单次调用地址。未配置 projectId 时返回 null。
+ */
+export function agyVertexEndpoint(
+  projectId?: string | null,
+  location?: string | null,
+  model?: string | null,
+): string | null {
+  const pid = projectId?.trim();
+  if (!pid) return null;
+  const loc = location?.trim() || DEFAULT_LOCATION;
+  const m = model?.trim() || DEFAULT_VERTEX_MODEL;
+  return `https://aiplatform.googleapis.com/v1/projects/${encodeURIComponent(pid)}/locations/${encodeURIComponent(loc)}/publishers/google/models/${encodeURIComponent(m)}:generateContent`;
+}
+
+/**
+ * 流式调用地址。未配置 projectId 时返回 null。
+ */
+export function agyVertexStreamEndpoint(
+  projectId?: string | null,
+  location?: string | null,
+  model?: string | null,
+): string | null {
+  const pid = projectId?.trim();
+  if (!pid) return null;
+  const loc = location?.trim() || DEFAULT_LOCATION;
+  const m = model?.trim() || DEFAULT_VERTEX_MODEL;
+  return `https://aiplatform.googleapis.com/v1/projects/${encodeURIComponent(pid)}/locations/${encodeURIComponent(loc)}/publishers/google/models/${encodeURIComponent(m)}:streamGenerateContent?alt=sse`;
+}
+
+/**
+ * 示例 curl 测试命令。未配置 projectId 时返回 null。
+ */
+export function agyVertexSampleCommand(
+  projectId?: string | null,
+  location?: string | null,
+  model?: string | null,
+  keyFileHint?: string | null,
+): string | null {
+  const endpoint = agyVertexEndpoint(projectId, location, model);
+  if (!endpoint) return null;
+  const keyPath = keyFileHint?.trim() || DEFAULT_KEY_FILE_HINT;
   return [
     `curl -X POST "${endpoint}" \\`,
     `  -H "Content-Type: application/json" \\`,
-    `  -H "x-goog-api-key: $(cat ~/${keyPath})" \\`,
+    // The key file holds project=/location=/model=/api_key= lines; send only the key.
+    `  -H "x-goog-api-key: $(sed -n 's/^api_key=//p' ~/${keyPath})" \\`,
     `  -d '{"contents":[{"role":"user","parts":[{"text":"Hello"}]}]}'`,
   ].join("\n");
 }
-
-export const AGY_VERTEX_LINKS = {
-  credits: `https://console.cloud.google.com/billing/${AGY_VERTEX_GUARDRAIL.billingAccountId}/credits/all?authuser=0&organizationId=0`,
-  billingOverview: `https://console.cloud.google.com/billing/${AGY_VERTEX_GUARDRAIL.billingAccountId}/overview?authuser=0&organizationId=0`,
-  apiCredentials: `https://console.cloud.google.com/apis/credentials?project=${AGY_VERTEX_GUARDRAIL.projectId}`,
-  vertexStudio: `https://console.cloud.google.com/vertex-ai/studio?project=${AGY_VERTEX_GUARDRAIL.projectId}`,
-  budgets: `https://console.cloud.google.com/billing/budgets?project=${AGY_VERTEX_GUARDRAIL.projectId}`,
-  quotas: `https://console.cloud.google.com/iam-admin/quotas?project=${AGY_VERTEX_GUARDRAIL.projectId}`,
-  orgPolicies: `https://console.cloud.google.com/iam-admin/orgpolicies/list?project=${AGY_VERTEX_GUARDRAIL.projectId}`,
-} as const;

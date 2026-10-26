@@ -1,12 +1,7 @@
-//! Automatic Google Cloud Billing promotional credits DOM scraper via Tauri WebView.
-//!
-//! Google Cloud Billing does not expose a REST API for promotional credits
-//! (Free Trial / GDP monthly credits) to API keys. When the user triggers a
-//! refresh, this module opens the official Google Cloud Billing Credits page
-//! in a Tauri `WebviewWindow` sharing the app's persistent WebView profile,
-//! extracts the rendered credit rows from the DOM via `initialization_script`
-//! + `on_document_title_changed`, persists the snapshot under `app_home()`,
-//! and broadcasts `agy-vertex-credits://changed`.
+//! User-initiated Google Cloud Billing connection. No bundled account or balance.
+//! A visible dedicated WebView lets the user sign in and choose their account.
+//! Only credit rows from that account's official Credits page are saved locally.
+//! This login does not grant Vertex API access; API calls use the user's local key.
 
 use crate::event_sink::Emit;
 use serde::{Deserialize, Serialize};
@@ -20,26 +15,21 @@ use std::{
 };
 use tauri::{AppHandle, Manager, Url, WebviewUrl, WindowEvent};
 
-pub const BILLING_CREDITS_URL: &str =
-    "https://console.cloud.google.com/billing/01E559-FC92E9-D4E9E7/credits/all?authuser=0&organizationId=0";
+pub const BILLING_ACCOUNTS_URL: &str = "https://console.cloud.google.com/billing";
 const WINDOW_LABEL: &str = "agy-vertex-credits-sync";
 const TITLE_PREFIX: &str = "__CCGUI_VERTEX_CREDITS__:";
-const CACHE_FILE: &str = "agy-vertex-credits.json";
-
-pub const DEFAULT_FREE_TRIAL_CREDIT: &str = "$348.01";
-pub const DEFAULT_FREE_TRIAL_ORIGINAL_CREDIT: &str = "$383.45";
-pub const DEFAULT_FREE_TRIAL_REMAINING_PERCENT: u8 = 91;
-pub const DEFAULT_GDP_MONTHLY_CREDIT: &str = "$51.13";
-pub const DEFAULT_GDP_MONTHLY_REMAINING_PERCENT: u8 = 100;
+// Do not read legacy, accountless snapshots or import another WebView's cookies.
+const CACHE_FILE: &str = "agy-vertex-credits-v2.json";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AgyVertexCreditsSnapshot {
-    pub free_trial_credit: String,
-    pub free_trial_original_credit: String,
-    pub free_trial_remaining_percent: u8,
-    pub gdp_monthly_credit: String,
-    pub gdp_monthly_remaining_percent: u8,
+    pub billing_account_id: Option<String>,
+    pub free_trial_credit: Option<String>,
+    pub free_trial_original_credit: Option<String>,
+    pub free_trial_remaining_percent: Option<u8>,
+    pub gdp_monthly_credit: Option<String>,
+    pub gdp_monthly_remaining_percent: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub collected_at: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -49,14 +39,46 @@ pub struct AgyVertexCreditsSnapshot {
 impl Default for AgyVertexCreditsSnapshot {
     fn default() -> Self {
         Self {
-            free_trial_credit: DEFAULT_FREE_TRIAL_CREDIT.to_owned(),
-            free_trial_original_credit: DEFAULT_FREE_TRIAL_ORIGINAL_CREDIT.to_owned(),
-            free_trial_remaining_percent: DEFAULT_FREE_TRIAL_REMAINING_PERCENT,
-            gdp_monthly_credit: DEFAULT_GDP_MONTHLY_CREDIT.to_owned(),
-            gdp_monthly_remaining_percent: DEFAULT_GDP_MONTHLY_REMAINING_PERCENT,
+            billing_account_id: None,
+            free_trial_credit: None,
+            free_trial_original_credit: None,
+            free_trial_remaining_percent: None,
+            gdp_monthly_credit: None,
+            gdp_monthly_remaining_percent: None,
             collected_at: None,
-            error_code: None,
+            error_code: Some("not_connected".into()),
         }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgyVertexConfigSnapshot {
+    pub configured: bool,
+    pub project_id: Option<String>,
+    pub location: String,
+    pub model: String,
+    pub key_file_hint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+}
+
+#[tauri::command]
+pub fn agy_vertex_config_read() -> AgyVertexConfigSnapshot {
+    let metadata = crate::engine::agy_vertex::target_metadata();
+    let configured = metadata.is_some();
+    let (project, location, model) = metadata.map(|(p, l, m)| (Some(p), l, m)).unwrap_or((
+        None,
+        "global".into(),
+        "gemini-4-argon".into(),
+    ));
+    AgyVertexConfigSnapshot {
+        configured,
+        project_id: project,
+        location,
+        model,
+        key_file_hint: ".gemini/vertex-gemini-4-argon.txt".into(),
+        error_code: (!configured).then(|| "vertex_config_missing_or_invalid".into()),
     }
 }
 
@@ -64,6 +86,7 @@ impl Default for AgyVertexCreditsSnapshot {
 #[serde(rename_all = "camelCase")]
 pub struct ScrapedCreditsPayload {
     pub status: String,
+    pub billing_account_id: Option<String>,
     pub free_trial_credit: Option<String>,
     pub free_trial_original_credit: Option<String>,
     pub free_trial_remaining_percent: Option<u8>,
@@ -74,156 +97,126 @@ pub struct ScrapedCreditsPayload {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ScrapeSignal {
     LoginRequired,
+    PermissionDenied,
+    NoCredits,
     Scraped(ScrapedCreditsPayload),
 }
 
 const SCRAPE_SCRIPT: &str = r#"
 (() => {
-  if (window !== window.top) return;
-  const PREFIX = "__CCGUI_VERTEX_CREDITS__:";
-  const send = (payload) => {
-    try {
-      document.title = PREFIX + JSON.stringify(payload);
-    } catch (_) {}
-  };
-
-  const host = (location.hostname || "").toLowerCase();
-  const path = location.pathname || "";
-  if (
-    host === "accounts.google.com" ||
-    host.endsWith(".accounts.google.com") ||
-    path.startsWith("/signin") ||
-    path.startsWith("/ServiceLogin")
-  ) {
+  if (window !== window.top || location.protocol !== "https:") return;
+  const send = (payload) => { document.title = "__CCGUI_VERTEX_CREDITS__:" + JSON.stringify(payload); };
+  if (location.hostname === "accounts.google.com") {
     send({ status: "login_required" });
     return;
   }
-
-  if (host !== "console.cloud.google.com") return;
-
-  try {
-    Object.defineProperty(Document.prototype, "visibilityState", {
-      get: () => "visible",
-      configurable: true,
-    });
-    Object.defineProperty(Document.prototype, "hidden", {
-      get: () => false,
-      configurable: true,
-    });
-    window.requestAnimationFrame = (cb) =>
-      window.setTimeout(() => cb(performance.now()), 16);
-  } catch (_) {}
-
+  if (location.hostname !== "console.cloud.google.com") return;
+  const accountFromPath = () => {
+    const match = location.pathname.match(/^\/billing\/([A-Fa-f0-9]{6}-[A-Fa-f0-9]{6}-[A-Fa-f0-9]{6})(?:\/|$)/);
+    return match ? match[1] : null;
+  };
+  const isCreditsPage = () => /^\/billing\/[^/]+\/credits(?:\/|$)/.test(location.pathname);
   const CURRENCY_RE = /(?:(?:US|SG|CA|AU|HK|NT|NZ|S)?\$|(?:SGD|USD|EUR|GBP|JPY|CNY)\s*)\s*\d[\d,]*(?:\.\d{1,2})?/gi;
   const PCT_RE = /(\d{1,3}(?:\.\d+)?)\s*%/;
-
-  const normalizeCurrency = (raw) => {
-    const num = String(raw).replace(/^[^\d]+/, "").trim();
-    return num ? "$" + num : String(raw).trim();
-  };
-
   const parseNumber = (raw) => {
-    const val = parseFloat(String(raw).replace(/[^0-9.]/g, ""));
-    return Number.isFinite(val) ? val : null;
+    const value = parseFloat(String(raw).replace(/[^0-9.]/g, ""));
+    return Number.isFinite(value) ? value : null;
   };
-
   const collectRows = (root, out = []) => {
     if (!root || !root.querySelectorAll) return out;
-    const rows = root.querySelectorAll("tbody tr, [role='row'], cfc-table-row, mat-row");
-    for (const r of rows) out.push(r);
-    const all = root.querySelectorAll("*");
-    for (const el of all) {
-      if (el.shadowRoot) collectRows(el.shadowRoot, out);
+    for (const row of root.querySelectorAll("tbody tr, [role='row'], cfc-table-row, mat-row")) out.push(row);
+    for (const element of root.querySelectorAll("*")) {
+      if (element.shadowRoot) collectRows(element.shadowRoot, out);
     }
     return out;
   };
-
   const scan = () => {
-    const rows = collectRows(document);
     const found = {};
-    let matchedAny = false;
-
-    for (const row of rows) {
+    for (const row of collectRows(document)) {
       if (row.querySelector && row.querySelector("th, [role='columnheader']")) continue;
-      const text = String(row.innerText || row.textContent || "")
-        .replace(/\s+/g, " ")
-        .trim();
-      if (!text) continue;
-      const rawAmounts = text.match(CURRENCY_RE);
-      if (!rawAmounts || rawAmounts.length === 0) continue;
-      const amounts = rawAmounts.map(normalizeCurrency);
-
+      const text = String(row.innerText || row.textContent || "").replace(/\s+/g, " ").trim();
+      const amounts = text.match(CURRENCY_RE);
+      if (!amounts) continue;
       const pctMatch = text.match(PCT_RE);
       let pct = pctMatch ? Math.round(parseFloat(pctMatch[1])) : null;
       if (pct === null && amounts.length >= 2) {
-        const rem = parseNumber(amounts[0]);
-        const orig = parseNumber(amounts[1]);
-        if (rem !== null && orig && orig > 0) {
-          pct = Math.max(0, Math.min(100, Math.round((rem / orig) * 100)));
-        }
+        const remaining = parseNumber(amounts[0]);
+        const original = parseNumber(amounts[1]);
+        if (remaining !== null && original > 0) pct = Math.round(remaining / original * 100);
       }
-      if (pct !== null) {
-        pct = Math.max(0, Math.min(100, pct));
-      }
-
-      const isFreeTrial = /free\s*trial|freetrial|免费试用|试用赠金/i.test(text);
-      const isGdp =
-        !isFreeTrial &&
-        /\bgdp\b|developer\s*program|开发者|月度|genai|google\s*developer/i.test(text);
-
-      if (isFreeTrial && !found.freeTrialCredit) {
-        found.freeTrialCredit = amounts[0];
-        if (amounts[1]) found.freeTrialOriginalCredit = amounts[1];
+      if (pct !== null) pct = Math.max(0, Math.min(100, pct));
+      const freeTrial = /free\s*trial|freetrial|免费试用|试用赠金/i.test(text);
+      const monthly = !freeTrial && /\bgdp\b|developer\s*program|开发者|月度|genai|google\s*developer/i.test(text);
+      if (freeTrial && !found.freeTrialCredit) {
+        found.freeTrialCredit = amounts[0].trim();
+        if (amounts[1]) found.freeTrialOriginalCredit = amounts[1].trim();
         if (pct !== null) found.freeTrialRemainingPercent = pct;
-        matchedAny = true;
-      } else if (isGdp && !found.gdpMonthlyCredit) {
-        found.gdpMonthlyCredit = amounts[0];
+      } else if (monthly && !found.gdpMonthlyCredit) {
+        found.gdpMonthlyCredit = amounts[0].trim();
         if (pct !== null) found.gdpMonthlyRemainingPercent = pct;
-        matchedAny = true;
       }
     }
-
-    return matchedAny ? found : null;
+    return Object.keys(found).length ? found : null;
   };
-
   let settled = false;
   let settleTimer = null;
-
+  let currentAccount = null;
+  let accountChangedAt = 0;
   const check = () => {
-    if (settled) return;
-    const h = (location.hostname || "").toLowerCase();
-    if (h === "accounts.google.com" || h.endsWith(".accounts.google.com")) {
-      send({ status: "login_required" });
+    if (settled || location.hostname !== "console.cloud.google.com") return;
+    const account = accountFromPath();
+    if (!account) return;
+    const text = String(document.body?.innerText || "");
+    if (/billing\.accounts\.get[\s\S]{0,80}(?:missing|缺少)|you (?:need additional access|do not have permission)|您需要额外访问权限|你需要额外访问权限|您需要拥有.*更多权限/i.test(text)) {
+      settled = true;
+      send({ status: "permission_denied", billingAccountId: account });
       return;
     }
+    // Preserve Google's current account selection; never force authuser=0.
+    if (!isCreditsPage()) {
+      const target = new URL("/billing/" + account + "/credits/all", location.origin);
+      const authuser = new URL(location.href).searchParams.get("authuser");
+      if (authuser !== null) target.searchParams.set("authuser", authuser);
+      location.replace(target.href);
+      return;
+    }
+    if (account !== currentAccount) {
+      currentAccount = account;
+      accountChangedAt = Date.now();
+      if (settleTimer) clearTimeout(settleTimer);
+      settleTimer = null;
+    }
+    if (Date.now() - accountChangedAt < 1000 || document.querySelector('[role="progressbar"]')) return;
     const result = scan();
     if (result && !settleTimer) {
-      settleTimer = window.setTimeout(() => {
-        if (settled) return;
-        const finalResult = scan() || result;
+      settleTimer = setTimeout(() => {
+        settleTimer = null;
+        if (settled || currentAccount !== accountFromPath() || !isCreditsPage()) return;
+        const latest = scan();
+        if (!latest) return;
         settled = true;
-        send({ status: "ok", ...finalResult });
-      }, 350);
+        send({ status: "ok", billingAccountId: currentAccount, ...latest });
+      }, 700);
+    } else if (!result && /no (?:promotional )?credits (?:found|available)|暂无赠金|没有可用赠金/i.test(text)) {
+      settled = true;
+      send({ status: "no_credits", billingAccountId: account });
     }
   };
-
-  const interval = window.setInterval(check, 300);
-  window.addEventListener("DOMContentLoaded", () => {
-    check();
-    try {
-      const obs = new MutationObserver(check);
-      obs.observe(document.documentElement, { childList: true, subtree: true });
-    } catch (_) {}
-  });
+  const interval = setInterval(check, 300);
+  window.addEventListener("DOMContentLoaded", check);
   window.addEventListener("load", check);
-  window.setTimeout(() => window.clearInterval(interval), 180000);
+  window.addEventListener("pagehide", () => {
+    clearInterval(interval);
+    if (settleTimer) clearTimeout(settleTimer);
+  });
+  setTimeout(() => clearInterval(interval), 300000);
+  check();
 })();
 "#;
 
 static CACHE: LazyLock<Mutex<Option<AgyVertexCreditsSnapshot>>> =
     LazyLock::new(|| Mutex::new(None));
-static SYNC_LOCK: LazyLock<tokio::sync::Mutex<()>> =
-    LazyLock::new(|| tokio::sync::Mutex::new(()));
+static SYNC_LOCK: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 fn now_seconds() -> u64 {
     SystemTime::now()
@@ -236,268 +229,170 @@ fn cache_path() -> PathBuf {
     crate::paths::app_home().join(CACHE_FILE)
 }
 
-fn valid_currency(value: &str) -> bool {
-    let trimmed = value.trim();
-    !trimmed.is_empty()
-        && trimmed.len() <= 32
-        && trimmed.bytes().any(|b| b.is_ascii_digit())
+fn valid_account(value: &str) -> bool {
+    value.len() == 20
+        && value.bytes().enumerate().all(|(i, b)| {
+            if i == 6 || i == 13 {
+                b == b'-'
+            } else {
+                b.is_ascii_hexdigit()
+            }
+        })
 }
 
-fn sanitize_snapshot(mut s: AgyVertexCreditsSnapshot) -> AgyVertexCreditsSnapshot {
-    let def = AgyVertexCreditsSnapshot::default();
-    if !valid_currency(&s.free_trial_credit) {
-        s.free_trial_credit = def.free_trial_credit;
+fn account_from_url(url: &Url, require_credits: bool) -> Option<&str> {
+    if url.scheme() != "https" || url.host_str() != Some("console.cloud.google.com") {
+        return None;
     }
-    if !valid_currency(&s.free_trial_original_credit) {
-        s.free_trial_original_credit = def.free_trial_original_credit;
+    let mut segments = url.path_segments()?;
+    if segments.next()? != "billing" {
+        return None;
     }
-    if s.free_trial_remaining_percent > 100 {
-        s.free_trial_remaining_percent = def.free_trial_remaining_percent;
+    let account = segments.next()?;
+    if !valid_account(account) || (require_credits && segments.next() != Some("credits")) {
+        return None;
     }
-    if !valid_currency(&s.gdp_monthly_credit) {
-        s.gdp_monthly_credit = def.gdp_monthly_credit;
+    Some(account)
+}
+
+fn valid_currency(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty()
+        && value.len() <= 32
+        && value.bytes().any(|b| b.is_ascii_digit())
+        && !value.contains(['<', '>', '\n', '\r'])
+}
+
+fn sanitize_snapshot(mut value: AgyVertexCreditsSnapshot) -> AgyVertexCreditsSnapshot {
+    if !value
+        .billing_account_id
+        .as_deref()
+        .is_some_and(valid_account)
+        || value.collected_at.is_none()
+        || value.error_code.is_some()
+    {
+        return AgyVertexCreditsSnapshot::default();
     }
-    if s.gdp_monthly_remaining_percent > 100 {
-        s.gdp_monthly_remaining_percent = def.gdp_monthly_remaining_percent;
+    for amount in [
+        &mut value.free_trial_credit,
+        &mut value.free_trial_original_credit,
+        &mut value.gdp_monthly_credit,
+    ] {
+        *amount = amount
+            .take()
+            .filter(|s| valid_currency(s))
+            .map(|s| s.trim().to_owned());
     }
-    s
+    value.free_trial_remaining_percent = value.free_trial_remaining_percent.filter(|n| *n <= 100);
+    value.gdp_monthly_remaining_percent = value.gdp_monthly_remaining_percent.filter(|n| *n <= 100);
+    value
 }
 
 pub fn load_from_path(path: &Path) -> AgyVertexCreditsSnapshot {
     std::fs::read_to_string(path)
         .ok()
-        .and_then(|raw| serde_json::from_str::<AgyVertexCreditsSnapshot>(&raw).ok())
+        .and_then(|raw| serde_json::from_str(&raw).ok())
         .map(sanitize_snapshot)
         .unwrap_or_default()
 }
 
-pub fn save_to_path(path: &Path, snapshot: &AgyVertexCreditsSnapshot) -> Result<(), String> {
+pub fn save_to_path(path: &Path, value: &AgyVertexCreditsSnapshot) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let json = serde_json::to_string_pretty(snapshot).map_err(|e| e.to_string())?;
-    std::fs::write(path, json).map_err(|e| e.to_string())
+    crate::settings::atomic_write(
+        path,
+        &serde_json::to_string_pretty(value).map_err(|e| e.to_string())?,
+    )
 }
 
-pub fn parse_title_signal(title: &str) -> Option<ScrapeSignal> {
-    let raw = title.strip_prefix(TITLE_PREFIX)?;
-    let payload: ScrapedCreditsPayload = serde_json::from_str(raw).ok()?;
+fn parse_title_signal(url: &Url, title: &str) -> Option<ScrapeSignal> {
+    if title.len() > 4096 {
+        return None;
+    }
+    let payload: ScrapedCreditsPayload =
+        serde_json::from_str(title.strip_prefix(TITLE_PREFIX)?).ok()?;
+    if payload.status == "login_required" {
+        return is_google_login_url(url).then_some(ScrapeSignal::LoginRequired);
+    }
+    let account = account_from_url(
+        url,
+        payload.status == "ok" || payload.status == "no_credits",
+    )?;
+    if payload.billing_account_id.as_deref()? != account {
+        return None;
+    }
     match payload.status.as_str() {
-        "login_required" => Some(ScrapeSignal::LoginRequired),
         "ok" => Some(ScrapeSignal::Scraped(payload)),
+        "permission_denied" => Some(ScrapeSignal::PermissionDenied),
+        "no_credits" => Some(ScrapeSignal::NoCredits),
         _ => None,
     }
 }
 
-pub fn merge_scraped_payload(
-    base: &AgyVertexCreditsSnapshot,
+fn snapshot_from_payload(
     payload: &ScrapedCreditsPayload,
     now: u64,
 ) -> Option<AgyVertexCreditsSnapshot> {
-    let mut next = base.clone();
-    let mut updated = false;
-
-    if let Some(ref credit) = payload.free_trial_credit {
-        if valid_currency(credit) {
-            next.free_trial_credit = credit.trim().to_owned();
-            updated = true;
-        }
-    }
-    if let Some(ref orig) = payload.free_trial_original_credit {
-        if valid_currency(orig) {
-            next.free_trial_original_credit = orig.trim().to_owned();
-            updated = true;
-        }
-    }
-    if let Some(pct) = payload.free_trial_remaining_percent {
-        if pct <= 100 {
-            next.free_trial_remaining_percent = pct;
-            updated = true;
-        }
-    }
-    if let Some(ref gdp) = payload.gdp_monthly_credit {
-        if valid_currency(gdp) {
-            next.gdp_monthly_credit = gdp.trim().to_owned();
-            updated = true;
-        }
-    }
-    if let Some(pct) = payload.gdp_monthly_remaining_percent {
-        if pct <= 100 {
-            next.gdp_monthly_remaining_percent = pct;
-            updated = true;
-        }
-    }
-
-    if !updated {
-        return None;
-    }
-    next.collected_at = Some(now);
-    next.error_code = None;
-    Some(sanitize_snapshot(next))
+    let account = payload
+        .billing_account_id
+        .as_deref()
+        .filter(|id| valid_account(id))?;
+    // Start empty: missing rows must never inherit another account's balance.
+    let value = sanitize_snapshot(AgyVertexCreditsSnapshot {
+        billing_account_id: Some(account.into()),
+        free_trial_credit: payload.free_trial_credit.clone(),
+        free_trial_original_credit: payload.free_trial_original_credit.clone(),
+        free_trial_remaining_percent: payload.free_trial_remaining_percent,
+        gdp_monthly_credit: payload.gdp_monthly_credit.clone(),
+        gdp_monthly_remaining_percent: payload.gdp_monthly_remaining_percent,
+        collected_at: Some(now),
+        error_code: None,
+    });
+    (value.free_trial_credit.is_some() || value.gdp_monthly_credit.is_some()).then_some(value)
 }
 
 fn read_cached() -> AgyVertexCreditsSnapshot {
-    let mut guard = CACHE.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(ref cached) = *guard {
-        return cached.clone();
-    }
-    let loaded = load_from_path(&cache_path());
-    *guard = Some(loaded.clone());
-    loaded
+    let mut cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    cache
+        .get_or_insert_with(|| load_from_path(&cache_path()))
+        .clone()
 }
 
-fn store_cached(app: &AppHandle, snapshot: &AgyVertexCreditsSnapshot) {
+fn store_cached(app: &AppHandle, snapshot: &AgyVertexCreditsSnapshot) -> Result<(), String> {
+    let persisted =
+        save_to_path(&cache_path(), snapshot).map_err(|_| "vertex_cache_write_failed".to_owned());
+    let snapshot = if persisted.is_ok() {
+        snapshot.clone()
+    } else {
+        failed("vertex_cache_write_failed")
+    };
     *CACHE.lock().unwrap_or_else(|p| p.into_inner()) = Some(snapshot.clone());
-    let _ = save_to_path(&cache_path(), snapshot);
     if let Some(state) = app.try_state::<crate::AppState>() {
-        if let Ok(json) = serde_json::to_string(snapshot) {
-            state.emitters.emit_json("agy-vertex-credits://changed", &json);
+        if let Ok(json) = serde_json::to_string(&snapshot) {
+            state
+                .emitters
+                .emit_json("agy-vertex-credits://changed", &json);
         }
     }
+    persisted
 }
 
 fn is_google_login_url(url: &Url) -> bool {
-    let Some(host) = url.host_str() else {
-        return false;
-    };
-    let host = host.to_ascii_lowercase();
-    host == "accounts.google.com"
-        || host.ends_with(".accounts.google.com")
-        || url.path().starts_with("/signin")
-        || url.path().starts_with("/ServiceLogin")
+    url.scheme() == "https" && url.host_str() == Some("accounts.google.com")
 }
 
 fn webview_data_dir() -> PathBuf {
     crate::development_profile::webview_dir()
-        .unwrap_or_else(|| crate::paths::app_home().join("agy-vertex-webview"))
+        .map(|directory| directory.join("vertex-billing-v2"))
+        .unwrap_or_else(|| crate::paths::app_home().join("agy-vertex-webview-v2"))
 }
 
-fn cookies_file_has_google_auth(cookies_path: &Path) -> bool {
-    let Ok(bytes) = std::fs::read(cookies_path) else {
-        return false;
-    };
-    let has_subslice = |needle: &[u8]| {
-        bytes
-            .windows(needle.len())
-            .any(|window| window == needle)
-    };
-    has_subslice(b"accounts.google.com") && has_subslice(b"console.cloud.google.com")
-}
-
-#[cfg(windows)]
-fn windows_unvirtualized_loopback_path(path: &Path) -> Option<PathBuf> {
-    let raw = path.to_str()?;
-    let bytes = raw.as_bytes();
-    if bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && (bytes[2] == b'\\' || bytes[2] == b'/')
-    {
-        let drive = (bytes[0] as char).to_ascii_lowercase();
-        let rest = &raw[3..];
-        Some(PathBuf::from(format!(r"\\127.0.0.1\{drive}$\{rest}")))
-    } else {
-        None
+fn failed(code: &str) -> AgyVertexCreditsSnapshot {
+    AgyVertexCreditsSnapshot {
+        error_code: Some(code.into()),
+        ..Default::default()
     }
-}
-
-pub fn seed_webview_profile_from_candidates(
-    target_data_dir: &Path,
-    candidate_eb_dirs: &[PathBuf],
-) -> bool {
-    let target_eb = target_data_dir.join("EBWebView");
-    let target_cookies = target_eb.join("Default").join("Network").join("Cookies");
-    if cookies_file_has_google_auth(&target_cookies) {
-        return false;
-    }
-
-    let best_source = candidate_eb_dirs
-        .iter()
-        .filter(|eb_dir| {
-            eb_dir.join("Local State").is_file()
-                && cookies_file_has_google_auth(
-                    &eb_dir.join("Default").join("Network").join("Cookies"),
-                )
-        })
-        .max_by_key(|eb_dir| {
-            eb_dir
-                .join("Default")
-                .join("Network")
-                .join("Cookies")
-                .metadata()
-                .map(|m| m.len())
-                .unwrap_or(0)
-        });
-
-    let Some(source_eb) = best_source else {
-        return false;
-    };
-
-    let target_default = target_eb.join("Default");
-    let target_network = target_default.join("Network");
-    if std::fs::create_dir_all(&target_network).is_err() {
-        return false;
-    }
-
-    if std::fs::copy(source_eb.join("Local State"), target_eb.join("Local State")).is_err() {
-        return false;
-    }
-    for pref in ["Preferences", "Secure Preferences"] {
-        let src = source_eb.join("Default").join(pref);
-        if src.is_file() {
-            let _ = std::fs::copy(&src, target_default.join(pref));
-        }
-    }
-    for net_file in [
-        "Cookies",
-        "Device Bound Sessions",
-        "TransportSecurity",
-        "Network Persistent State",
-        "NetworkDataMigrated",
-    ] {
-        let src = source_eb.join("Default").join("Network").join(net_file);
-        if src.is_file() {
-            let _ = std::fs::copy(&src, target_network.join(net_file));
-        }
-    }
-    true
-}
-
-fn ensure_webview_profile_seeded(app: &AppHandle, target_data_dir: &Path) {
-    if crate::development_profile::webview_dir().is_some() {
-        return;
-    }
-    let Ok(local_data_dir) = app.path().app_local_data_dir() else {
-        return;
-    };
-    let mut candidates = Vec::new();
-    #[cfg(windows)]
-    if let Some(loopback) = windows_unvirtualized_loopback_path(&local_data_dir.join("EBWebView")) {
-        candidates.push(loopback);
-    }
-    candidates.push(local_data_dir.join("EBWebView"));
-    #[cfg(windows)]
-    if let Some(local_appdata) = local_data_dir.parent() {
-        let packages_dir = local_appdata.join("Packages");
-        let app_folder_name = local_data_dir
-            .file_name()
-            .unwrap_or_default()
-            .to_os_string();
-        if let Ok(entries) = std::fs::read_dir(packages_dir) {
-            for entry in entries.flatten() {
-                let candidate = entry
-                    .path()
-                    .join("LocalCache")
-                    .join("Local")
-                    .join(&app_folder_name)
-                    .join("EBWebView");
-                if candidate.is_dir() {
-                    candidates.push(candidate);
-                }
-            }
-        }
-    }
-    let _ = seed_webview_profile_from_candidates(target_data_dir, &candidates);
 }
 
 async fn sync_via_webview(app: &AppHandle) -> AgyVertexCreditsSnapshot {
@@ -505,45 +400,36 @@ async fn sync_via_webview(app: &AppHandle) -> AgyVertexCreditsSnapshot {
         let _ = existing.close();
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
-
-    let parsed_url = match Url::parse(BILLING_CREDITS_URL) {
-        Ok(u) => u,
-        Err(_) => {
-            let mut s = read_cached();
-            s.error_code = Some("invalid_url".to_owned());
-            return s;
-        }
-    };
-
-    let data_dir = webview_data_dir();
-    ensure_webview_profile_seeded(app, &data_dir);
-
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ScrapeSignal>();
     let tx_title = tx.clone();
     let tx_nav = tx.clone();
-
     let mut builder = tauri::WebviewWindowBuilder::new(
         app,
         WINDOW_LABEL,
-        WebviewUrl::External(parsed_url),
+        WebviewUrl::External(Url::parse(BILLING_ACCOUNTS_URL).expect("static Google URL")),
     )
-    .title("Google Cloud 赠金同步")
+    .title("Google Cloud Billing — sign in and select your account")
     .inner_size(1040.0, 720.0)
     .center()
-    .visible(false)
+    .visible(true)
     .initialization_script(SCRAPE_SCRIPT)
     .on_navigation(move |url| {
         if is_google_login_url(url) {
             let _ = tx_nav.send(ScrapeSignal::LoginRequired);
         }
-        true
+        url.scheme() == "https"
+            && url
+                .host_str()
+                .is_some_and(|host| host == "google.com" || host.ends_with(".google.com"))
     })
-    .on_document_title_changed(move |_webview, title| {
-        if let Some(signal) = parse_title_signal(&title) {
-            let _ = tx_title.send(signal);
+    .on_document_title_changed(move |webview, title| {
+        if let Ok(url) = webview.url() {
+            if let Some(signal) = parse_title_signal(&url, &title) {
+                let _ = tx_title.send(signal);
+            }
         }
     });
-
+    let data_dir = webview_data_dir();
     #[cfg(not(target_os = "macos"))]
     {
         builder = builder.data_directory(data_dir);
@@ -554,16 +440,11 @@ async fn sync_via_webview(app: &AppHandle) -> AgyVertexCreditsSnapshot {
         let digest = Sha256::digest(data_dir.to_string_lossy().as_bytes());
         builder = builder.data_store_identifier(digest[..16].try_into().unwrap());
     }
-
     let window = match builder.build() {
         Ok(w) => w,
-        Err(_) => {
-            let mut s = read_cached();
-            s.error_code = Some("webview_create_failed".to_owned());
-            return s;
-        }
+        Err(_) => return failed("webview_create_failed"),
     };
-
+    let _ = window.set_focus();
     let destroyed = Arc::new(AtomicBool::new(false));
     let destroyed_flag = Arc::clone(&destroyed);
     window.on_window_event(move |event| {
@@ -571,72 +452,36 @@ async fn sync_via_webview(app: &AppHandle) -> AgyVertexCreditsSnapshot {
             destroyed_flag.store(true, Ordering::SeqCst);
         }
     });
-
-    let base = read_cached();
-    let mut shown_for_login = false;
-    let start = tokio::time::Instant::now();
-    let silent_reveal_deadline = start + Duration::from_secs(6);
-    let mut final_deadline = start + Duration::from_secs(25);
-
-    let outcome = loop {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+    let mut login_seen = false;
+    let result = loop {
         if destroyed.load(Ordering::SeqCst) {
-            let mut s = base.clone();
-            s.error_code = Some("sync_cancelled".to_owned());
-            break s;
+            break failed("sync_cancelled");
         }
-        let now = tokio::time::Instant::now();
-        if now >= final_deadline {
-            let mut s = base.clone();
-            s.error_code = Some(if shown_for_login {
-                "login_timeout".to_owned()
+        if tokio::time::Instant::now() >= deadline {
+            break failed(if login_seen {
+                "login_timeout"
             } else {
-                "scrape_timeout".to_owned()
+                "scrape_timeout"
             });
-            break s;
         }
-
-        if !shown_for_login && now >= silent_reveal_deadline {
-            // If hidden WebView2 throttling or an account chooser prevents silent
-            // table rendering within 6s, reveal the window so rendering/login can finish.
-            shown_for_login = true;
-            final_deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-            let _ = window.show();
-            let _ = window.set_focus();
-        }
-
         match tokio::time::timeout(Duration::from_millis(250), rx.recv()).await {
             Ok(Some(ScrapeSignal::LoginRequired)) => {
-                if !shown_for_login {
-                    shown_for_login = true;
-                    final_deadline = tokio::time::Instant::now() + Duration::from_secs(180);
-                    let _ = window.set_title("Google Cloud 赠金同步（请登录 Google 账号）");
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                }
+                login_seen = true;
             }
+            Ok(Some(ScrapeSignal::PermissionDenied)) => break failed("permission_denied"),
+            Ok(Some(ScrapeSignal::NoCredits)) => break failed("no_credits"),
             Ok(Some(ScrapeSignal::Scraped(payload))) => {
-                if let Some(merged) = merge_scraped_payload(&base, &payload, now_seconds()) {
-                    store_cached(app, &merged);
-                    break merged;
+                if let Some(snapshot) = snapshot_from_payload(&payload, now_seconds()) {
+                    break snapshot;
                 }
             }
-            Ok(None) => {
-                let mut s = base.clone();
-                s.error_code = Some("channel_closed".to_owned());
-                break s;
-            }
+            Ok(None) => break failed("channel_closed"),
             Err(_) => {}
         }
     };
-
-    if shown_for_login {
-        // Give Chromium NetworkService a moment to commit freshly issued auth cookies
-        // before tearing down the dedicated WebContext.
-        tokio::time::sleep(Duration::from_millis(350)).await;
-    }
     let _ = window.close();
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    outcome
+    result
 }
 
 #[tauri::command]
@@ -647,124 +492,158 @@ pub async fn agy_vertex_credits_read(
     if !force.unwrap_or(false) {
         return Ok(read_cached());
     }
-    let _guard = SYNC_LOCK.lock().await;
-    Ok(sync_via_webview(&app).await)
+    // Do not queue a second login window behind an already active connection flow.
+    let Ok(_guard) = SYNC_LOCK.try_lock() else {
+        return Err("vertex_sync_in_progress".into());
+    };
+    // If invalidation cannot be persisted, do not start an account switch.
+    store_cached(&app, &failed("syncing"))?;
+    let snapshot = sync_via_webview(&app).await;
+    store_cached(&app, &snapshot)?;
+    Ok(snapshot)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parses_title_signals_and_merges_scraped_free_trial_row() {
-        let login = parse_title_signal(
-            r#"__CCGUI_VERTEX_CREDITS__:{"status":"login_required"}"#,
-        );
-        assert_eq!(login, Some(ScrapeSignal::LoginRequired));
-
-        let scraped = parse_title_signal(
-            r#"__CCGUI_VERTEX_CREDITS__:{"status":"ok","freeTrialCredit":"$348.01","freeTrialOriginalCredit":"$383.45","freeTrialRemainingPercent":91}"#,
-        );
-        let Some(ScrapeSignal::Scraped(payload)) = scraped else {
-            panic!("expected scraped signal");
-        };
-
-        let base = AgyVertexCreditsSnapshot::default();
-        let merged = merge_scraped_payload(&base, &payload, 1_900_000_123).expect("merged");
-        assert_eq!(merged.free_trial_credit, "$348.01");
-        assert_eq!(merged.free_trial_original_credit, "$383.45");
-        assert_eq!(merged.free_trial_remaining_percent, 91);
-        assert_eq!(merged.gdp_monthly_credit, "$51.13");
-        assert_eq!(merged.gdp_monthly_remaining_percent, 100);
-        assert_eq!(merged.collected_at, Some(1_900_000_123));
-        assert_eq!(merged.error_code, None);
+    const ACCOUNT: &str = "ABCDEF-123456-789ABC";
+    fn credits_url(account: &str) -> Url {
+        Url::parse(&format!(
+            "https://console.cloud.google.com/billing/{account}/credits/all?authuser=2"
+        ))
+        .unwrap()
     }
-
     #[test]
-    fn persists_and_reloads_snapshot_round_trip() {
+    fn no_default_account_or_amount_and_accountless_cache_is_ignored() {
+        let empty = AgyVertexCreditsSnapshot::default();
+        assert!(empty.billing_account_id.is_none());
+        assert!(empty.free_trial_credit.is_none());
+        assert!(empty.gdp_monthly_credit.is_none());
+        let legacy: AgyVertexCreditsSnapshot = serde_json::from_str(r#"{"freeTrialCredit":"$100.00","freeTrialOriginalCredit":"$200.00","freeTrialRemainingPercent":50,"gdpMonthlyCredit":"$10.00","gdpMonthlyRemainingPercent":100,"collectedAt":123}"#).unwrap();
+        assert_eq!(sanitize_snapshot(legacy), empty);
+        assert_eq!(
+            BILLING_ACCOUNTS_URL,
+            "https://console.cloud.google.com/billing"
+        );
+        assert!(!SCRAPE_SCRIPT.contains("organizationId="));
+    }
+    #[test]
+    fn payload_is_bound_to_official_https_credits_page_and_exact_selected_account() {
+        let title = format!(
+            r#"{TITLE_PREFIX}{{"status":"ok","billingAccountId":"{ACCOUNT}","freeTrialCredit":"SG$100.00","freeTrialRemainingPercent":50}}"#
+        );
+        assert!(matches!(
+            parse_title_signal(&credits_url(ACCOUNT), &title),
+            Some(ScrapeSignal::Scraped(_))
+        ));
+        for wrong in [
+            format!("http://console.cloud.google.com/billing/{ACCOUNT}/credits/all"),
+            format!("https://console.cloud.google.com.evil.example/billing/{ACCOUNT}/credits/all"),
+            format!("https://accounts.google.com/billing/{ACCOUNT}/credits/all"),
+            format!("https://console.cloud.google.com/billing/{ACCOUNT}/overview"),
+            "https://console.cloud.google.com/billing/111111-222222-333333/credits/all".into(),
+        ] {
+            assert!(
+                parse_title_signal(&Url::parse(&wrong).unwrap(), &title).is_none(),
+                "{wrong}"
+            );
+        }
+        let accountless = format!(r#"{TITLE_PREFIX}{{"status":"ok","freeTrialCredit":"$100.00"}}"#);
+        assert!(parse_title_signal(&credits_url(ACCOUNT), &accountless).is_none());
+        assert!(parse_title_signal(&credits_url(ACCOUNT), &"x".repeat(5000)).is_none());
+    }
+    #[test]
+    fn login_and_permission_signals_are_origin_checked() {
+        let login = format!(r#"{TITLE_PREFIX}{{"status":"login_required"}}"#);
+        assert_eq!(
+            parse_title_signal(
+                &Url::parse("https://accounts.google.com/signin").unwrap(),
+                &login
+            ),
+            Some(ScrapeSignal::LoginRequired)
+        );
+        assert!(parse_title_signal(&credits_url(ACCOUNT), &login).is_none());
+        let denied = format!(
+            r#"{TITLE_PREFIX}{{"status":"permission_denied","billingAccountId":"{ACCOUNT}"}}"#
+        );
+        assert_eq!(
+            parse_title_signal(&credits_url(ACCOUNT), &denied),
+            Some(ScrapeSignal::PermissionDenied)
+        );
+        assert!(parse_title_signal(&Url::parse("https://example.com").unwrap(), &denied).is_none());
+    }
+    #[test]
+    fn missing_rows_never_inherit_values_and_actual_currency_is_preserved() {
+        let payload = ScrapedCreditsPayload {
+            status: "ok".into(),
+            billing_account_id: Some(ACCOUNT.into()),
+            free_trial_credit: Some(" SG$100.00 ".into()),
+            free_trial_remaining_percent: Some(50),
+            ..Default::default()
+        };
+        let value = snapshot_from_payload(&payload, 123).unwrap();
+        assert_eq!(value.free_trial_credit.as_deref(), Some("SG$100.00"));
+        assert_eq!(value.free_trial_original_credit, None);
+        assert_eq!(value.gdp_monthly_credit, None);
+        assert_eq!(value.gdp_monthly_remaining_percent, None);
+        assert_eq!(value.billing_account_id.as_deref(), Some(ACCOUNT));
+        assert_eq!(value.collected_at, Some(123));
+        assert!(snapshot_from_payload(
+            &ScrapedCreditsPayload {
+                billing_account_id: Some(ACCOUNT.into()),
+                ..Default::default()
+            },
+            123
+        )
+        .is_none());
+    }
+    #[test]
+    fn account_cache_round_trip_and_failed_sync_clears_it() {
         let path = std::env::temp_dir().join(format!(
             "ccgui-vertex-credits-{}.json",
             uuid::Uuid::new_v4()
         ));
-        let custom = AgyVertexCreditsSnapshot {
-            free_trial_credit: "$312.50".to_owned(),
-            free_trial_original_credit: "$383.45".to_owned(),
-            free_trial_remaining_percent: 81,
-            gdp_monthly_credit: "$40.00".to_owned(),
-            gdp_monthly_remaining_percent: 78,
-            collected_at: Some(1_900_000_500),
-            error_code: None,
+        let payload = ScrapedCreditsPayload {
+            status: "ok".into(),
+            billing_account_id: Some(ACCOUNT.into()),
+            gdp_monthly_credit: Some("EUR 20.00".into()),
+            ..Default::default()
         };
-        save_to_path(&path, &custom).unwrap();
-        let loaded = load_from_path(&path);
-        let _ = std::fs::remove_file(&path);
-        assert_eq!(loaded, custom);
+        let value = snapshot_from_payload(&payload, 123).unwrap();
+        save_to_path(&path, &value).unwrap();
+        assert_eq!(load_from_path(&path), value);
+        for code in [
+            "syncing",
+            "sync_cancelled",
+            "permission_denied",
+            "login_timeout",
+            "scrape_timeout",
+        ] {
+            let empty = failed(code);
+            assert!(empty.billing_account_id.is_none());
+            assert!(empty.free_trial_credit.is_none());
+            save_to_path(&path, &empty).unwrap();
+            assert_eq!(load_from_path(&path), AgyVertexCreditsSnapshot::default());
+        }
+        std::fs::remove_file(&path).unwrap();
     }
-
     #[test]
-    fn seeds_webview_profile_from_authenticated_candidate_and_preserves_existing() {
-        let root = std::env::temp_dir().join(format!(
-            "ccgui-vertex-webview-seed-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let empty_eb = root.join("virtualized").join("EBWebView");
-        std::fs::create_dir_all(empty_eb.join("Default").join("Network")).unwrap();
-        std::fs::write(empty_eb.join("Local State"), b"{\"os_crypt\":{\"encrypted_key\":\"empty\"}}").unwrap();
-        std::fs::write(
-            empty_eb.join("Default").join("Network").join("Cookies"),
-            b"sqlite-header-without-google",
-        )
-        .unwrap();
-
-        let authed_eb = root.join("real").join("EBWebView");
-        std::fs::create_dir_all(authed_eb.join("Default").join("Network")).unwrap();
-        std::fs::write(
-            authed_eb.join("Local State"),
-            b"{\"os_crypt\":{\"encrypted_key\":\"real-key\"}}",
-        )
-        .unwrap();
-        std::fs::write(
-            authed_eb.join("Default").join("Network").join("Cookies"),
-            b"sqlite-cookies-accounts.google.com-and-console.cloud.google.com-session",
-        )
-        .unwrap();
-        std::fs::write(
-            authed_eb
-                .join("Default")
-                .join("Network")
-                .join("Device Bound Sessions"),
-            b"dbsc-google-session",
-        )
-        .unwrap();
-
-        let target_dir = root.join("target-webview");
-        let candidates = vec![empty_eb, authed_eb];
-        assert!(seed_webview_profile_from_candidates(&target_dir, &candidates));
-
-        let seeded_key =
-            std::fs::read_to_string(target_dir.join("EBWebView").join("Local State")).unwrap();
-        assert!(seeded_key.contains("real-key"));
-        assert!(cookies_file_has_google_auth(
-            &target_dir
-                .join("EBWebView")
-                .join("Default")
-                .join("Network")
-                .join("Cookies")
-        ));
-        assert_eq!(
-            std::fs::read(
-                target_dir
-                    .join("EBWebView")
-                    .join("Default")
-                    .join("Network")
-                    .join("Device Bound Sessions")
-            )
-            .unwrap(),
-            b"dbsc-google-session"
-        );
-
-        // Second run is a no-op once target already has Google auth cookies.
-        assert!(!seed_webview_profile_from_candidates(&target_dir, &candidates));
-        let _ = std::fs::remove_dir_all(&root);
+    fn invalid_amounts_and_percentages_do_not_become_credits() {
+        let payload = ScrapedCreditsPayload {
+            status: "ok".into(),
+            billing_account_id: Some(ACCOUNT.into()),
+            free_trial_credit: Some("<script>100</script>".into()),
+            free_trial_remaining_percent: Some(255),
+            ..Default::default()
+        };
+        assert!(snapshot_from_payload(&payload, 123).is_none());
+        for id in [
+            "",
+            "project-example",
+            "ABCDEF-123456-789ABZ",
+            "ABCDEF-123456-789ABC/credits",
+        ] {
+            assert!(!valid_account(id));
+        }
     }
 }

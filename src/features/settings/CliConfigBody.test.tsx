@@ -2,6 +2,13 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+const SYNTHETIC_ACCOUNT = "ABCDEF-123456-789ABC";
+const SYNTHETIC_PROJECT = "project-example";
+// Shapes, not real values: tests must not republish any real account or project.
+const BILLING_ACCOUNT_RE = /\b[0-9A-F]{6}-[0-9A-F]{6}-[0-9A-F]{6}\b/i;
+const GENERATED_PROJECT_RE = /\bproject-[0-9a-f]{8}-[0-9a-f]{4}/i;
+const CURRENCY_AMOUNT_RE = /\$\d[\d,]*\.\d{2}/;
+
 vi.mock("@/lib/ipc", () => ({
   ipc: {
     // The bin-path / custom-models rows read AppSettings on mount.
@@ -24,9 +31,30 @@ vi.mock("@/lib/ipc", () => ({
         credits: { remaining: 500 },
       }),
     ),
+    agyVertexCreditsRead: vi.fn(() =>
+      Promise.resolve({
+        billingAccountId: null,
+        freeTrialCredit: null,
+        freeTrialOriginalCredit: null,
+        freeTrialRemainingPercent: null,
+        gdpMonthlyCredit: null,
+        gdpMonthlyRemainingPercent: null,
+        errorCode: "not_connected",
+      }),
+    ),
+    agyVertexConfigRead: vi.fn(() =>
+      Promise.resolve({
+        configured: false,
+        projectId: null,
+        location: "global",
+        model: "gemini-4-argon",
+        keyFileHint: ".gemini/vertex-gemini-4-argon.txt",
+      }),
+    ),
     upsertProvider: vi.fn(() => Promise.resolve()),
   },
 }));
+
 // The auth section owns its own ipc state; CliConfigBody only places it.
 vi.mock("./PiFamilyAuthSection", () => ({
   PiFamilyAuthSection: () => <div data-testid="pi-auth-section" />,
@@ -35,6 +63,12 @@ vi.mock("./PiFamilyAuthSection", () => ({
 import { CLI_DISPLAY_NAMES } from "@/components/foundations/icons/engine-brands";
 import i18n from "@/lib/i18n";
 import { ipc } from "@/lib/ipc";
+import {
+  applyConfigSnapshot,
+  applyCreditsSnapshot,
+  DEFAULT_CONFIG_SNAPSHOT,
+  DEFAULT_CREDITS_SNAPSHOT,
+} from "./agy-vertex-guardrail";
 import { CliConfigBody } from "./CliConfigBody";
 import type { CliConfigState } from "./useCliConfig";
 
@@ -65,7 +99,7 @@ function makeCli(over: Partial<CliConfigState> = {}): CliConfigState {
     officialEditing: false,
     setOfficialEditing: () => {},
     saveOfficialConfig: () => Promise.resolve(null),
-    mutate: vi.fn(),
+    mutate: vi.fn(async (fn: () => Promise<unknown>) => fn()),
     activate: () => {},
     saveProvider: () => {},
     confirmDelete: () => {},
@@ -110,16 +144,13 @@ describe("CliConfigBody disabled overlay", () => {
     const mask = overlay();
     expect(mask).not.toBeNull();
     const wrapper = mask!.parentElement!;
-    // The mask is absolutely positioned over the wrapper, not inside a card.
     expect(mask!.className).toContain("absolute");
     expect(mask!.className).toContain("inset-0");
 
-    // Everything below the enable switch is under the mask.
     expect(wrapper.textContent).toContain(i18n.t("settings.cliOfficial"));
     expect(wrapper.querySelector("[data-testid='pi-auth-section']")).not.toBeNull();
     expect(wrapper.textContent).toContain(i18n.t("settings.cliChannels"));
 
-    // The enable switch sits above the mask, still reachable.
     const enableTitle = i18n.t("settings.cliEnableTitle", { name: "PI CLI" });
     expect(wrapper.textContent).not.toContain(enableTitle);
     expect(container.textContent).toContain(enableTitle);
@@ -136,6 +167,12 @@ describe("CliEngineSettingsCard official edit entry", () => {
   let root: Root | null;
 
   beforeEach(() => {
+    applyCreditsSnapshot(DEFAULT_CREDITS_SNAPSHOT);
+    applyConfigSnapshot(DEFAULT_CONFIG_SNAPSHOT);
+    vi.mocked(ipc.agyVertexCreditsRead).mockResolvedValue(DEFAULT_CREDITS_SNAPSHOT);
+    vi.mocked(ipc.agyVertexConfigRead).mockResolvedValue(DEFAULT_CONFIG_SNAPSHOT);
+    vi.clearAllMocks();
+
     container = document.createElement("div");
     document.body.appendChild(container);
     root = null;
@@ -198,7 +235,7 @@ describe("CliEngineSettingsCard official edit entry", () => {
     );
   });
 
-  it("agy: Vertex guardrail row opens the detail and does not show a key", async () => {
+  it("agy: Vertex guardrail row opens detail with unconfigured notice, generic links, and no key", async () => {
     await render(makeCli({ engine: "agy" }));
     const title = i18n.t("settings.agyVertexTitle");
     expect(container.textContent).toContain(title);
@@ -207,13 +244,14 @@ describe("CliEngineSettingsCard official edit entry", () => {
     await act(async () => (row as HTMLElement).click());
     const page = document.body.textContent ?? "";
     expect(page).toContain("gemini-4-argon");
-    expect(page).toContain("project-1141a96f-5ab2-42b3-a5d");
-    expect(page).toContain("01E559-FC92E9-D4E9E7");
-    expect(page).toContain("$348.01 / $383.45 (91%)");
-    expect(page).toContain("$51.13 (100%)");
-    expect(page).toContain(":streamGenerateContent?alt=sse");
-    expect(page).toContain("curl -X POST");
-    expect(page).toContain(i18n.t("settings.agyVertexSpendBody"));
+    // 不包含任何硬编码个人项目、账号或固定余额
+    expect(page).not.toMatch(BILLING_ACCOUNT_RE);
+    expect(page).not.toMatch(GENERATED_PROJECT_RE);
+    expect(page).not.toMatch(CURRENCY_AMOUNT_RE);
+    // 未配置项目说明与未连接状态
+    expect(page).toContain(i18n.t("settings.agyVertexProjectUnconfigured"));
+    expect(page).toContain(i18n.t("settings.agyVertexNotConnected"));
+    expect(page).toContain(i18n.t("settings.agyVertexStepsGuide"));
     expect(page).not.toContain("AQ.");
     expect(page).not.toContain("AIza");
 
@@ -221,8 +259,47 @@ describe("CliEngineSettingsCard official edit entry", () => {
       `button[aria-label="${i18n.t("settings.agyVertexOpenCredits")}"]`,
     ) as HTMLButtonElement | null;
     expect(creditsBtn).toBeTruthy();
+    expect(creditsBtn?.title).toBe("https://console.cloud.google.com/billing");
+  });
+
+  it("agy: reflects local metadata and synced credits when configured", async () => {
+    const configData = {
+      configured: true,
+      projectId: SYNTHETIC_PROJECT,
+      location: "global",
+      model: "gemini-4-argon",
+      keyFileHint: ".gemini/vertex-gemini-4-argon.txt",
+    };
+    const creditsData = {
+      billingAccountId: SYNTHETIC_ACCOUNT,
+      freeTrialCredit: "$120.00",
+      freeTrialOriginalCredit: "$300.00",
+      freeTrialRemainingPercent: 40,
+      gdpMonthlyCredit: "$50.00",
+      gdpMonthlyRemainingPercent: 100,
+    };
+    vi.mocked(ipc.agyVertexConfigRead).mockResolvedValue(configData);
+    vi.mocked(ipc.agyVertexCreditsRead).mockResolvedValue(creditsData);
+    applyConfigSnapshot(configData);
+    applyCreditsSnapshot(creditsData);
+
+    await render(makeCli({ engine: "agy" }));
+    const row = container.querySelector("[data-setting-anchor='agyVertexGuardrail']");
+    expect(row).toBeTruthy();
+    await act(async () => (row as HTMLElement).click());
+    const page = document.body.textContent ?? "";
+
+    expect(page).toContain(SYNTHETIC_PROJECT);
+    expect(page).toContain(SYNTHETIC_ACCOUNT);
+    expect(page).toContain("$120.00 / $300.00 (40%)");
+    expect(page).toContain("$50.00 (100%)");
+    expect(page).toContain(`projects/${SYNTHETIC_PROJECT}`);
+
+    const creditsBtn = document.body.querySelector(
+      `button[aria-label="${i18n.t("settings.agyVertexOpenCredits")}"]`,
+    ) as HTMLButtonElement | null;
     expect(creditsBtn?.title).toBe(
-      "https://console.cloud.google.com/billing/01E559-FC92E9-D4E9E7/credits/all?authuser=0&organizationId=0",
+      `https://console.cloud.google.com/billing/${SYNTHETIC_ACCOUNT}/credits/all`,
     );
   });
 
@@ -237,14 +314,12 @@ describe("CliEngineSettingsCard official edit entry", () => {
     const section = container.querySelector("[data-testid='agy-byok-section']");
     expect(section).not.toBeNull();
     const text = section?.textContent ?? "";
-    expect(text).toContain("$348.01 / $383.45 (91%)");
-    expect(text).toContain("$51.13 (100%)");
     expect(text).toContain(i18n.t("settings.agyVertexBillingSourceNote"));
-    expect(text).toContain("01E559-FC92E9-D4E9E7");
     expect(text).toContain(".gemini/vertex-gemini-4-argon.txt");
     expect(text).toContain("500");
-    expect(text).not.toContain("AQ.");
-    expect(text).not.toContain("AIza");
+    // 初始未连接状态不展示旧维护者金额
+    expect(text).not.toMatch(CURRENCY_AMOUNT_RE);
+    expect(text).not.toMatch(BILLING_ACCOUNT_RE);
 
     // Click configure naming / mount button to open inline editor
     const configBtn = Array.from(section!.querySelectorAll("button")).find(
@@ -253,7 +328,6 @@ describe("CliEngineSettingsCard official edit entry", () => {
     expect(configBtn).toBeTruthy();
     await act(async () => configBtn!.click());
 
-    // Save with custom alias ("Gemini 4 Argon (Vertex)")
     const saveBtn = Array.from(section!.querySelectorAll("button")).find(
       (b) => b.textContent?.trim() === i18n.t("settings.agyByokSaveMount"),
     );
@@ -268,12 +342,98 @@ describe("CliEngineSettingsCard official edit entry", () => {
     );
   });
 
+  it("agy: prevents channel sync when metadata is missing", async () => {
+    await render(makeCli({ engine: "agy" }));
+    const section = container.querySelector("[data-testid='agy-byok-section']")!;
+    const configBtn = Array.from(section.querySelectorAll("button")).find(
+      (b) => b.textContent?.trim() === i18n.t("settings.agyByokConfigureNaming"),
+    )!;
+    await act(async () => configBtn.click());
+
+    const checkbox = section.querySelector<HTMLInputElement>("input[type='checkbox']")!;
+    expect(checkbox.disabled).toBe(true);
+
+    const saveBtn = Array.from(section.querySelectorAll("button")).find(
+      (b) => b.textContent?.trim() === i18n.t("settings.agyByokSaveMount"),
+    )!;
+    await act(async () => saveBtn.click());
+
+    // 仅保存模型，不调用 upsertProvider
+    expect(ipc.updateAppSettings).toHaveBeenCalled();
+    expect(ipc.upsertProvider).not.toHaveBeenCalled();
+  });
+
+  it("agy: channel sync validates model matching and generates correct provider entry", async () => {
+    const configData = {
+      configured: true,
+      projectId: SYNTHETIC_PROJECT,
+      location: "global",
+      model: "gemini-4-argon",
+      keyFileHint: ".gemini/vertex-gemini-4-argon.txt",
+    };
+    vi.mocked(ipc.agyVertexConfigRead).mockResolvedValue(configData);
+    applyConfigSnapshot(configData);
+
+    await render(makeCli({ engine: "agy" }));
+    const section = container.querySelector("[data-testid='agy-byok-section']")!;
+    const configBtn = Array.from(section.querySelectorAll("button")).find(
+      (b) => b.textContent?.trim() === i18n.t("settings.agyByokConfigureNaming"),
+    )!;
+    await act(async () => configBtn.click());
+
+    // 输入不匹配的模型 ID 进行测试
+    const modelInput = section.querySelector<HTMLInputElement>("#agy-byok-model-id")!;
+    await act(async () => {
+      const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+        window.HTMLInputElement.prototype,
+        "value",
+      )?.set;
+      nativeInputValueSetter?.call(modelInput, "mismatched-model");
+      modelInput.dispatchEvent(new Event("input", { bubbles: true }));
+      modelInput.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+
+    const saveBtn = Array.from(section.querySelectorAll("button")).find(
+      (b) => b.textContent?.trim() === i18n.t("settings.agyByokSaveMount"),
+    )!;
+    await act(async () => saveBtn.click());
+
+    // 匹配失败报错，不调用 upsertProvider
+    expect(section.textContent).toContain(i18n.t("settings.agyByokErrorModelMismatch"));
+    expect(ipc.upsertProvider).not.toHaveBeenCalled();
+
+    // 换回匹配的模型 ID
+    await act(async () => {
+      const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+        window.HTMLInputElement.prototype,
+        "value",
+      )?.set;
+      nativeInputValueSetter?.call(modelInput, "gemini-4-argon");
+      modelInput.dispatchEvent(new Event("input", { bubbles: true }));
+      modelInput.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    await act(async () => saveBtn.click());
+
+    // 成功同步渠道，带有真实 metadata
+    expect(ipc.upsertProvider).toHaveBeenCalledWith(
+      "agy",
+      "agy-vertex-byok",
+      expect.objectContaining({
+        baseUrl: expect.stringContaining(`projects/${SYNTHETIC_PROJECT}`),
+        remark: expect.stringContaining(SYNTHETIC_PROJECT),
+        model: "gemini-4-argon",
+      }),
+    );
+  });
+
   it("agy: a failed native refresh clears the old quota and reports failure", async () => {
     await render(makeCli({ engine: "agy" }));
     const section = container.querySelector("[data-testid='agy-byok-section']")!;
     expect(section.textContent).toContain("500");
     vi.mocked(ipc.agyQuotaRead).mockRejectedValueOnce(new Error("offline"));
-    const refresh = section.querySelector<HTMLButtonElement>(`button[aria-label="${i18n.t("settings.agyByokRefresh")}"]`)!;
+    const refresh = section.querySelector<HTMLButtonElement>(
+      `button[aria-label="${i18n.t("settings.agyByokRefresh")}"]`,
+    )!;
     await act(async () => refresh.click());
     expect(section.textContent).not.toContain("500");
     expect(section.textContent).toContain(i18n.t("settings.agyByokRefreshFailed"));

@@ -604,6 +604,7 @@ pub fn run() {
             codex_context_window::codex_context_window_write,
             agy_quota::agy_quota_read,
             agy_vertex_credits::agy_vertex_credits_read,
+            agy_vertex_credits::agy_vertex_config_read,
             cursor_quota::cursor_quota_read,
             throughput_stats::throughput_stats_read,
             config::upsert_provider,

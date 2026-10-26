@@ -57,12 +57,23 @@ export interface CursorQuotaSnapshot {
 }
 
 export interface AgyVertexCreditsSnapshot {
-  freeTrialCredit: string;
-  freeTrialOriginalCredit: string;
-  freeTrialRemainingPercent: number;
-  gdpMonthlyCredit: string;
-  gdpMonthlyRemainingPercent: number;
+  billingAccountId?: string | null;
+  freeTrialCredit: string | null;
+  freeTrialOriginalCredit: string | null;
+  freeTrialRemainingPercent: number | null;
+  gdpMonthlyCredit: string | null;
+  gdpMonthlyRemainingPercent: number | null;
   collectedAt?: number;
+  errorCode?: string;
+}
+
+/** Non-secret metadata from this user's own local Vertex configuration. */
+export interface AgyVertexConfigSnapshot {
+  configured: boolean;
+  projectId: string | null;
+  location: string;
+  model: string;
+  keyFileHint: string;
   errorCode?: string;
 }
 
@@ -1315,6 +1326,8 @@ export const ipc = {
     invoke<AgyQuotaSnapshot>("agy_quota_read", options),
   agyVertexCreditsRead: (options: { force?: boolean } = {}) =>
     invoke<AgyVertexCreditsSnapshot>("agy_vertex_credits_read", options),
+  agyVertexConfigRead: () =>
+    invoke<AgyVertexConfigSnapshot>("agy_vertex_config_read"),
   cursorQuotaRead: (options: { force?: boolean } = {}) =>
     invoke<CursorQuotaSnapshot>("cursor_quota_read", options),
   // config
