@@ -17,7 +17,7 @@ const sample = (): AgyQuotaSnapshot => ({ status: "ready", collectedAt: Date.now
   { id: "gemini_argon", windows: { fiveHour: { usedPercentage: 20 }, sevenDay: { usedPercentage: 35 } } },
 ] });
 
-describe("AGY quota control channel routing", () => {
+describe("combined AGY subscription and Vertex credits panel", () => {
   let root: Root, container: HTMLDivElement;
   beforeEach(async () => {
     vi.clearAllMocks();
@@ -36,39 +36,40 @@ describe("AGY quota control channel routing", () => {
     await act(async () => root.unmount());
     container.remove();
   });
-  async function render(engine = "agy", providerId?: string, workspacePath = "C:/project") {
-    await act(async () => root.render(<AgyQuotaControl engine={engine} providerId={providerId} workspacePath={workspacePath} model="gemini-4-argon-high" />));
+  async function render(engine = "agy", workspacePath = "C:/project") {
+    await act(async () => root.render(<AgyQuotaControl engine={engine} workspacePath={workspacePath} model="gemini-4-argon-high" />));
   }
   async function open() {
     await act(async () => container.querySelector("button")!.click());
     return document.querySelector('[role="dialog"]')!;
   }
 
-  it.each(["agy-vertex-byok", "other-custom-channel"])("keeps the entry and explicit Vertex sync for %s without reading native quota", async provider => {
-    await render("agy", provider);
-    expect(container.textContent).toBe(i18n.t("chat.agyQuotaAndCredits"));
-    expect(ipc.agyQuotaRead).not.toHaveBeenCalled();
+  it("queries the explicit local subscription and displays both balances in one dialog", async () => {
+    await render();
+    expect(container.textContent).toContain("80%");
+    expect(ipc.agyQuotaRead).toHaveBeenCalledWith({ cacheOnly: true, force: false, providerId: "__local_settings_json__", workspacePath: "C:/project" });
     expect(ipc.agyVertexCreditsRead).toHaveBeenCalledWith({ force: false });
     expect(ipc.agyVertexCreditsRead).not.toHaveBeenCalledWith({ force: true });
     const dialog = await open();
-    expect(dialog.textContent).toContain(i18n.t("chat.agyQuotaNativeChannelOnly"));
-    expect(dialog.textContent).not.toContain(i18n.t("chat.agyQuotaSource"));
+    expect(document.querySelectorAll('[role="dialog"]').length).toBe(1);
+    expect(dialog.textContent).toContain(i18n.t("chat.agyQuotaSource"));
+    expect(dialog.textContent).toContain("80%");
     const vertex = dialog.querySelector(`section[aria-label="${i18n.t("chat.agyVertexCredits")}"]`)!;
     expect(vertex).not.toBeNull();
-    expect(dialog.querySelectorAll("button").length).toBe(2);
+    expect(dialog.querySelectorAll("button").length).toBe(3);
     expect(ipc.agyVertexCreditsRead).not.toHaveBeenCalledWith({ force: true });
     await act(async () => vertex.querySelector("button")!.click());
     expect(ipc.agyVertexCreditsRead).toHaveBeenCalledWith({ force: true });
     await act(async () => window.dispatchEvent(new Event("focus")));
-    expect(ipc.agyQuotaRead).not.toHaveBeenCalled();
+    expect(ipc.agyQuotaRead).toHaveBeenLastCalledWith({ cacheOnly: false, force: false, providerId: "__local_settings_json__", workspacePath: "C:/project" });
   });
 
   it("keeps native bootstrap API reads and model percentages", async () => {
     vi.mocked(ipc.agyQuotaRead).mockResolvedValueOnce({ status: "unavailable", groups: [], errorCode: "not_loaded" });
     await render();
     expect(vi.mocked(ipc.agyQuotaRead).mock.calls.map(([options]) => options)).toEqual([
-      { cacheOnly: true, force: false, providerId: undefined, workspacePath: "C:/project" },
-      { cacheOnly: false, force: false, providerId: undefined, workspacePath: "C:/project" },
+      { cacheOnly: true, force: false, providerId: "__local_settings_json__", workspacePath: "C:/project" },
+      { cacheOnly: false, force: false, providerId: "__local_settings_json__", workspacePath: "C:/project" },
     ]);
     expect(container.textContent).toContain("80%");
     expect(container.textContent).toContain("65%");
@@ -78,14 +79,13 @@ describe("AGY quota control channel routing", () => {
     expect(ipc.agyVertexCreditsRead).not.toHaveBeenCalledWith({ force: true });
   });
 
-  it("removes native values and query access when switching to BYOK", async () => {
+  it("keeps both sections visible when subscription credentials are unavailable", async () => {
+    vi.mocked(ipc.agyQuotaRead).mockResolvedValue({ status: "unavailable", groups: [], errorCode: "auth_unavailable" });
     await render();
-    expect(container.textContent).toContain("80%");
-    vi.mocked(ipc.agyQuotaRead).mockClear();
-    await render("agy", "agy-vertex-byok");
-    await act(async () => window.dispatchEvent(new Event("focus")));
-    expect(container.textContent).toBe(i18n.t("chat.agyQuotaAndCredits"));
-    expect(ipc.agyQuotaRead).not.toHaveBeenCalled();
+    const dialog = await open();
+    expect(dialog.textContent).toContain(i18n.t("chat.agyQuotaSource"));
+    expect(dialog.textContent).toContain(i18n.t("chat.agyVertexCredits"));
+    expect(dialog.textContent).not.toContain("80%");
   });
 
   it("does not render or query quotas for another engine", async () => {
@@ -95,8 +95,8 @@ describe("AGY quota control channel routing", () => {
     expect(ipc.agyVertexCreditsRead).not.toHaveBeenCalled();
   });
   it("keeps the entry for remote AGY without relaxing native query routing", async () => {
-    await render("agy", undefined, "ssh://host/project");
-    expect(container.textContent).toBe(i18n.t("chat.agyQuotaAndCredits"));
+    await render("agy", "ssh://host/project");
+    expect(container.querySelector("button")).not.toBeNull();
     const dialog = await open();
     expect(dialog.textContent).toContain(i18n.t("chat.agyVertexCredits"));
     expect(ipc.agyQuotaRead).not.toHaveBeenCalled();

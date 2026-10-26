@@ -17,16 +17,18 @@ import { agyQuotaErrorKey, agyQuotaModelGroup, compactQuotaReset, quotaResetCoun
 import { QUOTA_CREDITS_MAX_AGE } from "../subscription-quota";
 import { useAgyQuota } from "./use-agy-quota";
 
-export function AgyQuotaControl({ engine, providerId, workspacePath, model }: {
-  engine: string; providerId?: string; workspacePath?: string; model?: string;
+export function AgyQuotaControl({ engine, workspacePath, model }: {
+  engine: string; workspacePath?: string; model?: string;
 }) {
-  const quota = useAgyQuota(engine, providerId, workspacePath);
+  // This panel shows the local AGY subscription alongside Vertex credits,
+  // regardless of the provider selected for model requests.
+  const quota = useAgyQuota(engine, "__local_settings_json__", workspacePath);
   if (engine !== "agy") return null;
-  return <AgyQuotaStatus model={model} snapshot={quota.snapshot} now={quota.now} loading={quota.loading} refresh={quota.refresh} nativeEnabled={quota.enabled} />;
+  return <AgyQuotaStatus model={model} snapshot={quota.snapshot} now={quota.now} loading={quota.loading} refresh={quota.refresh} />;
 }
 
-export function AgyQuotaStatus({ snapshot, model, loading, refresh, now = Date.now() / 1000, nativeEnabled = true }: {
-  snapshot?: AgyQuotaSnapshot; model?: string; loading: boolean; refresh: () => Promise<void>; now?: number; nativeEnabled?: boolean;
+export function AgyQuotaStatus({ snapshot, model, loading, refresh, now = Date.now() / 1000 }: {
+  snapshot?: AgyQuotaSnapshot; model?: string; loading: boolean; refresh: () => Promise<void>; now?: number;
 }) {
   const { t, i18n } = useTranslation();
   const [open, setOpen] = useState(false);
@@ -35,11 +37,11 @@ export function AgyQuotaStatus({ snapshot, model, loading, refresh, now = Date.n
   useDismissOnOutsidePress(open, () => setOpen(false), [triggerRef, popoverRef]);
   const allowOpenChange = useTriggerToggle(open, triggerRef);
   const { credits: vertexCredits, sync: syncVertexCredits, syncing: vertexSyncing } = useAgyVertexCredits();
-  const quota = nativeEnabled && snapshot ? validAgyQuotaSnapshot(snapshot, now) : undefined;
+  const quota = snapshot ? validAgyQuotaSnapshot(snapshot, now) : undefined;
   const activeId = agyQuotaModelGroup(model, quota?.groups);
   const active = quota?.groups.find(group => group.id === activeId);
   const percentage = (used: number | undefined) => used === undefined ? "—" : `${new Intl.NumberFormat(i18n.language, { maximumFractionDigits: 2 }).format(100 - used)}%`;
-  const summary = !nativeEnabled ? t("chat.agyQuotaAndCredits") : activeId ? t("chat.agyQuotaRemainingSummary", { fiveHour: percentage(active?.windows.fiveHour?.usedPercentage), sevenDay: percentage(active?.windows.sevenDay?.usedPercentage) }) : t("chat.agyQuotaViewUsage");
+  const summary = activeId ? t("chat.agyQuotaRemainingSummary", { fiveHour: percentage(active?.windows.fiveHour?.usedPercentage), sevenDay: percentage(active?.windows.sevenDay?.usedPercentage) }) : t("chat.agyQuotaViewUsage");
   const resets = (["fiveHour", "sevenDay"] as const).flatMap(name => {
     const at = active?.windows[name]?.resetsAt;
     const time = compactQuotaReset(at, name, i18n.language, now);
@@ -65,7 +67,6 @@ export function AgyQuotaStatus({ snapshot, model, loading, refresh, now = Date.n
       className="max-h-[calc(100dvh-2rem)] w-72 max-w-[calc(100vw-2rem)] origin-bottom-right overflow-y-auto rounded-xl border border-border-button-default bg-background-primary-default p-3 shadow-dropdown outline-none transition duration-150 ease-out data-[entering]:scale-95 data-[entering]:opacity-0 data-[exiting]:scale-95 data-[exiting]:opacity-0 motion-reduce:transition-none">
       <Dialog aria-label={t("chat.agyQuotaDetails")} className="flex flex-col gap-3 outline-none">
         <h3 className="text-body-2-medium text-text-secondary">{t("chat.agyQuotaPlan")}</h3>
-        {nativeEnabled ? <>
         {(["gemini", "gemini_argon", "third_party"] as const).filter(id => id !== "gemini_argon" || activeId === id || quota?.groups.some(group => group.id === id)).map(id => {
           const group = quota?.groups.find(value => value.id === id);
           const label = t(id === "gemini" ? "chat.agyQuotaGemini" : id === "gemini_argon" ? "chat.agyQuotaGeminiArgon" : "chat.agyQuotaThirdParty");
@@ -102,7 +103,6 @@ export function AgyQuotaStatus({ snapshot, model, loading, refresh, now = Date.n
           </Button>
         </div>
         <p className="text-caption-1-regular text-text-tertiary">{t("chat.agyQuotaManualWarning")}</p>
-        </> : <p className="text-caption-1-regular text-text-tertiary">{t("chat.agyQuotaNativeChannelOnly")}</p>}
         <section aria-label={t("chat.agyVertexCredits")} className="flex flex-col gap-2 border-t border-border-button-default pt-3">
           <div className="flex items-center justify-between gap-2">
             <h4 className="text-caption-1-medium text-text-secondary">{t("chat.agyVertexCredits")}</h4>

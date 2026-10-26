@@ -378,8 +378,6 @@ export const en: Messages = {
     agyReferenceWindowResetDone: "Cleared reference limit; restored default display.",
     agyReferenceWindowSaveFailed: "Could not save. Check local storage availability and try again.",
     agyQuotaPlan: "Antigravity usage",
-    agyQuotaAndCredits: "Quota & credits",
-    agyQuotaNativeChannelOnly: "Native subscription quotas are queried only on the local default Antigravity channel. View or sync Vertex credits separately below.",
     agyQuotaDetails: "Antigravity model quotas",
     agyQuotaViewUsage: "View AGY usage",
     agyQuotaRemainingSummary: "5h {{fiveHour}} · Week {{sevenDay}} remaining",

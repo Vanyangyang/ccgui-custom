@@ -375,8 +375,6 @@ export const zh = {
     agyReferenceWindowResetDone: "已清除参考上限，恢复默认显示。",
     agyReferenceWindowSaveFailed: "保存失败，请检查本地存储状态后重试。",
     agyQuotaPlan: "Antigravity 用量",
-    agyQuotaAndCredits: "额度与赠金",
-    agyQuotaNativeChannelOnly: "原生订阅额度仅在本机默认 Antigravity 渠道查询。Vertex 赠金可在下方单独查看和同步。",
     agyQuotaDetails: "Antigravity 模型额度",
     agyQuotaViewUsage: "查看 AGY 用量",
     agyQuotaRemainingSummary: "5 小时剩余 {{fiveHour}} · 本周剩余 {{sevenDay}}",
