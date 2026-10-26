@@ -6,6 +6,7 @@ import { QUOTA_STALE_AGE, isNativeSubscriptionProvider, quotaReadFailed } from "
 import { validAgyQuotaSnapshot } from "../agy-quota";
 
 const EMPTY: AgyQuotaSnapshot = { status: "unavailable", groups: [], errorCode: "not_loaded" };
+const READ_TIMEOUT_MS = 40_000;
 
 export function useAgyQuota(engine: string, providerId: string | undefined, workspacePath?: string) {
   const enabled = engine === "agy" && isNativeSubscriptionProvider(providerId) && !/^(wsl:|ssh:|\\\\wsl)/i.test(workspacePath ?? "");
@@ -16,62 +17,73 @@ export function useAgyQuota(engine: string, providerId: string | undefined, work
   const [state, setState] = useState({ route, snapshot: EMPTY, loading: false });
   const [now, setNow] = useState(() => Date.now() / 1000);
   useEffect(() => {
-    let disposed = false, subscribed = false, initial = true;
+    let disposed = false, subscribed = false;
     let generation = 0;
     let pending: Promise<void> | undefined;
     let pendingCacheOnly = true;
-    let queued: "cache" | "active" | undefined;
+    let pendingManual = false;
+    let queued: "cache" | "active" | "manual" | undefined;
     let unlisten: (() => void) | undefined;
     let configTimer: number | undefined;
+    let readTimer: number | undefined;
     const current = () => !disposed && currentRoute.current === route;
     const visible = () => document.visibilityState !== "hidden";
     setState({ route, snapshot: EMPTY, loading: false });
     if (!enabled) { request.current = undefined; return; }
-    const read = (cacheOnly = true): Promise<void> => {
+    // Only an explicit click may start a CLI probe. Lifecycle events read cache.
+    const read = (cacheOnly = true, manual = false): Promise<void> => {
       if (!current() || !subscribed || (!cacheOnly && !visible())) return Promise.resolve();
       if (pending) {
         // Native change events during a query require one subsequent cache read.
-        if (cacheOnly && queued !== "active") queued = "cache";
-        else if (!cacheOnly && pendingCacheOnly) queued = "active";
+        // A click during an automatic query still needs its own manual read.
+        if (manual && !pendingManual) queued = "manual";
+        else if (cacheOnly && !queued) queued = "cache";
+        else if (!cacheOnly && pendingCacheOnly && queued !== "manual") queued = "active";
         return pending;
       }
       const startedGeneration = generation;
       pendingCacheOnly = cacheOnly;
-      setState(previous => ({ ...previous, loading: true }));
+      pendingManual = manual;
+      if (manual) setState(previous => ({ ...previous, loading: true }));
       pending = (async () => {
-        let bootstrap = false;
         try {
-          const snapshot = await ipc.agyQuotaRead({ cacheOnly, force: !cacheOnly, providerId, workspacePath });
-          bootstrap = initial && cacheOnly && (snapshot.errorCode === "not_loaded" || snapshot.errorCode === "quota_expired");
-          initial = false;
+          const result = await Promise.race([
+            ipc.agyQuotaRead({ cacheOnly, force: manual, providerId, workspacePath }),
+            new Promise<never>((_, reject) => {
+              readTimer = window.setTimeout(() => reject(new Error("AGY quota read timed out")), READ_TIMEOUT_MS);
+            }),
+          ]);
+          const snapshot = result.errorCode === "not_loaded" || result.errorCode === "quota_expired"
+            ? { ...result, errorCode: "probe_requires_manual" } : result;
           if (current() && generation === startedGeneration) {
             setNow(Date.now() / 1000);
             setState({ route, snapshot, loading: false });
           }
         } catch {
-          initial = false;
           if (current() && generation === startedGeneration) setState(previous => ({ route, snapshot: quotaReadFailed(previous.snapshot, EMPTY), loading: false }));
         } finally {
+          window.clearTimeout(readTimer);
           pending = undefined;
           if (current()) {
             setState(previous => ({ ...previous, loading: false }));
             const next = queued; queued = undefined;
-            if (next === "active" || (bootstrap && generation === startedGeneration)) await read(false);
+            if (next === "manual") await read(false, true);
+            else if (next === "active") await read(true);
             else if (next === "cache") await read(true);
           }
         }
       })();
       return pending;
     };
-    request.current = { route, refresh: () => read(false) };
+    request.current = { route, refresh: () => read(false, true) };
     const cacheChanged = () => { if (current()) { setNow(Date.now() / 1000); void read(true); } };
-    const refreshVisible = () => { if (visible()) { setNow(Date.now() / 1000); void read(false); } };
+    const refreshVisible = () => { if (visible()) { setNow(Date.now() / 1000); void read(true); } };
     const configChanged = () => {
       generation++;
       setState({ route, snapshot: EMPTY, loading: false });
       window.clearTimeout(configTimer);
       configTimer = window.setTimeout(() => {
-        if (pending && visible()) queued = "active";
+        if (pending && visible()) { if (queued !== "manual") queued = "active"; }
         else refreshVisible();
       }, 250);
     };
@@ -82,10 +94,9 @@ export function useAgyQuota(engine: string, providerId: string | undefined, work
     window.addEventListener("focus", refreshVisible);
     document.addEventListener("visibilitychange", refreshVisible);
     window.addEventListener(CLI_CONFIG_CHANGED_EVENT, configChanged);
-    const timer = window.setInterval(refreshVisible, 60_000);
     return () => {
       disposed = true; unlisten?.();
-      window.clearInterval(timer); window.clearTimeout(configTimer);
+      window.clearTimeout(configTimer); window.clearTimeout(readTimer);
       window.removeEventListener("focus", refreshVisible);
       document.removeEventListener("visibilitychange", refreshVisible);
       window.removeEventListener(CLI_CONFIG_CHANGED_EVENT, configChanged);

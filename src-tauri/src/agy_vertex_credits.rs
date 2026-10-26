@@ -16,6 +16,9 @@ use std::{
 use tauri::{AppHandle, Manager, Url, WebviewUrl, WindowEvent};
 
 pub const BILLING_ACCOUNTS_URL: &str = "https://console.cloud.google.com/billing";
+/// "My projects" lists each project next to its billing account ID, so the
+/// project from the user's key file leads to the right account without a choice.
+pub const BILLING_PROJECTS_URL: &str = "https://console.cloud.google.com/billing/projects";
 const WINDOW_LABEL: &str = "agy-vertex-credits-sync";
 const TITLE_PREFIX: &str = "__CCGUI_VERTEX_CREDITS__:";
 // Do not read legacy, accountless snapshots or import another WebView's cookies.
@@ -106,8 +109,47 @@ const SCRAPE_SCRIPT: &str = r#"
 (() => {
   if (window !== window.top || location.protocol !== "https:") return;
   const send = (payload) => { document.title = "__CCGUI_VERTEX_CREDITS__:" + JSON.stringify(payload); };
+  // Project id from the user's own key file, or null; substituted by the host.
+  const wantedProject = __CCGUI_VERTEX_PROJECT__;
+  const zh = /^zh/i.test(String((typeof navigator !== "undefined" && navigator.language) || ""));
+  const msg = {
+    login: zh
+      ? "CCGUI：请登录开通 Vertex 的 Google 账号，登录后会自动查找结算账号。"
+      : "CCGUI: Sign in with the Google account that owns your Vertex project; the billing account is found automatically afterwards.",
+    find: (project) => zh
+      ? "CCGUI：正在「您的项目」中查找 " + project + "，找到后自动打开它的结算账号；也可点击该行的「结算账号」链接。列表里没有？在上方「选择一个组织」切换到项目所在组织（个人账号选「无组织」）。不要点「创建账号」。"
+      : "CCGUI: Looking for " + project + " under 'My projects'; its billing account opens automatically, or click the billing account link in that row. Not listed? Switch 'Select an organization' above to the project's organization (personal accounts: 'No organization'). Do not click 'Create account'.",
+    findAny: zh
+      ? "CCGUI：在「您的项目」中找到你调用 Vertex 的项目，点击该行的「结算账号」链接。列表为空就在上方「选择一个组织」切换（个人账号选「无组织」）。不要点「创建账号」。"
+      : "CCGUI: Under 'My projects', find the project you use for Vertex and click the billing account link in its row. Empty list? Switch 'Select an organization' above (personal accounts: 'No organization'). Do not click 'Create account'.",
+    unlinked: (project) => zh
+      ? "CCGUI：项目 " + project + " 还没有关联结算账号，请先在该行「操作」中关联结算账号。"
+      : "CCGUI: Project " + project + " has no billing account yet; link one from the Actions menu in its row first.",
+    setup: zh
+      ? "CCGUI：这是 Google 新建结算账号或补全资料的页面。已有结算账号请返回「结算账号管理 → 您的项目」；确实需要新建，请先在此完成设置。"
+      : "CCGUI: This is Google's create or complete-billing-profile page. If you already have a billing account, go back to 'Manage billing accounts → My projects'; if you need a new one, finish the setup here first.",
+    reading: zh
+      ? "CCGUI：正在读取该结算账号的赠金，完成后窗口会自动关闭。"
+      : "CCGUI: Reading this billing account's credits; the window closes when done.",
+  };
+  // Pointer-transparent status line; Google's page stays fully usable.
+  const hint = (message) => {
+    if (typeof document.createElement !== "function" || !document.body) return;
+    let box = document.getElementById("ccgui-vertex-hint");
+    if (!box) {
+      box = document.createElement("div");
+      box.id = "ccgui-vertex-hint";
+      box.setAttribute("role", "status");
+      box.style.cssText = "position:fixed;left:16px;right:16px;bottom:16px;z-index:2147483647;max-width:760px;margin:0 auto;padding:10px 14px;border-radius:10px;background:#1f2937;color:#fff;font:13px/1.5 system-ui,sans-serif;box-shadow:0 4px 16px rgba(0,0,0,.25);pointer-events:none";
+      document.body.appendChild(box);
+    }
+    if (box.textContent !== message) box.textContent = message;
+  };
   if (location.hostname === "accounts.google.com") {
     send({ status: "login_required" });
+    const showLogin = () => hint(msg.login);
+    showLogin();
+    window.addEventListener("DOMContentLoaded", showLogin);
     return;
   }
   if (location.hostname !== "console.cloud.google.com") return;
@@ -116,6 +158,11 @@ const SCRAPE_SCRIPT: &str = r#"
     return match ? match[1] : null;
   };
   const isCreditsPage = () => /^\/billing\/[^/]+\/credits(?:\/|$)/.test(location.pathname);
+  // Only an account's landing page is steered to Credits. Setup, payment and
+  // creation flows belong to the user; Google redirects them back otherwise.
+  const isLandingPage = () => /^\/billing\/[^/]+(?:\/overview)?\/?$/.test(location.pathname);
+  const isSetupPage = () => /^\/billing\/(?:create(?:\/|$)|[^/]+\/setupbillingprofile)/.test(location.pathname);
+  const ACCOUNT_RE = /\b([A-Fa-f0-9]{6}-[A-Fa-f0-9]{6}-[A-Fa-f0-9]{6})\b/;
   const CURRENCY_RE = /(?:(?:US|SG|CA|AU|HK|NT|NZ|S)?\$|(?:SGD|USD|EUR|GBP|JPY|CNY)\s*)\s*\d[\d,]*(?:\.\d{1,2})?/gi;
   const PCT_RE = /(\d{1,3}(?:\.\d+)?)\s*%/;
   const parseNumber = (raw) => {
@@ -158,28 +205,71 @@ const SCRAPE_SCRIPT: &str = r#"
     }
     return Object.keys(found).length ? found : null;
   };
+  // "My projects" lists each project with its billing account ID in the same row.
+  const linkedAccount = (project) => {
+    const token = new RegExp("(?:^|[^A-Za-z0-9._-])" + project.replace(/[.]/g, "\\.") + "(?:$|[^A-Za-z0-9._-])");
+    for (const row of collectRows(document)) {
+      const text = String(row.innerText || row.textContent || "").replace(/\s+/g, " ").trim();
+      if (!token.test(text)) continue;
+      const match = text.match(ACCOUNT_RE);
+      return { found: true, account: match ? match[1] : null };
+    }
+    return { found: false, account: null };
+  };
+  // Redirect once per account per window: if Google sends the user back (for
+  // example an account that still needs setup), do not fight its redirect.
+  const openCredits = (account) => {
+    const key = "__ccgui_vertex_credits_redirect:" + account;
+    let redirected = false;
+    try {
+      redirected = sessionStorage.getItem(key) === "1";
+      sessionStorage.setItem(key, "1");
+    } catch {}
+    if (redirected) return false;
+    // Preserve Google's current account and organization; never force authuser=0.
+    const current = new URL(location.href);
+    const target = new URL("/billing/" + account + "/credits/all", location.origin);
+    for (const name of ["authuser", "organizationId"]) {
+      const value = current.searchParams.get(name);
+      if (value !== null) target.searchParams.set(name, value);
+    }
+    location.replace(target.href);
+    return true;
+  };
   let settled = false;
   let settleTimer = null;
   let currentAccount = null;
   let accountChangedAt = 0;
   const check = () => {
     if (settled || location.hostname !== "console.cloud.google.com") return;
+    const find = wantedProject ? msg.find(wantedProject) : msg.findAny;
+    if (isSetupPage()) {
+      hint(msg.setup);
+      return;
+    }
     const account = accountFromPath();
-    if (!account) return;
+    if (!account) {
+      if (wantedProject && /^\/billing\/projects\/?$/.test(location.pathname)) {
+        const linked = linkedAccount(wantedProject);
+        if (linked.account && openCredits(linked.account)) return;
+        hint(linked.found && !linked.account ? msg.unlinked(wantedProject) : find);
+        return;
+      }
+      hint(find);
+      return;
+    }
     const text = String(document.body?.innerText || "");
     if (/billing\.accounts\.get[\s\S]{0,80}(?:missing|缺少)|you (?:need additional access|do not have permission)|您需要额外访问权限|你需要额外访问权限|您需要拥有.*更多权限/i.test(text)) {
       settled = true;
       send({ status: "permission_denied", billingAccountId: account });
       return;
     }
-    // Preserve Google's current account selection; never force authuser=0.
     if (!isCreditsPage()) {
-      const target = new URL("/billing/" + account + "/credits/all", location.origin);
-      const authuser = new URL(location.href).searchParams.get("authuser");
-      if (authuser !== null) target.searchParams.set("authuser", authuser);
-      location.replace(target.href);
+      if (isLandingPage() && openCredits(account)) return;
+      hint(find);
       return;
     }
+    hint(msg.reading);
     if (account !== currentAccount) {
       currentAccount = account;
       accountChangedAt = Date.now();
@@ -388,6 +478,13 @@ fn webview_data_dir() -> PathBuf {
         .unwrap_or_else(|| crate::paths::app_home().join("agy-vertex-webview-v2"))
 }
 
+/// Key-file project ids are already limited to `[A-Za-z0-9._-]`; JSON encoding
+/// keeps the substitution a plain string literal regardless.
+fn scrape_script(project: Option<&str>) -> String {
+    let literal = serde_json::to_string(&project).unwrap_or_else(|_| "null".into());
+    SCRAPE_SCRIPT.replace("__CCGUI_VERTEX_PROJECT__", &literal)
+}
+
 fn failed(code: &str) -> AgyVertexCreditsSnapshot {
     AgyVertexCreditsSnapshot {
         error_code: Some(code.into()),
@@ -406,13 +503,17 @@ async fn sync_via_webview(app: &AppHandle) -> AgyVertexCreditsSnapshot {
     let mut builder = tauri::WebviewWindowBuilder::new(
         app,
         WINDOW_LABEL,
-        WebviewUrl::External(Url::parse(BILLING_ACCOUNTS_URL).expect("static Google URL")),
+        WebviewUrl::External(Url::parse(BILLING_PROJECTS_URL).expect("static Google URL")),
     )
-    .title("Google Cloud Billing — sign in and select your account")
+    .title("Google Cloud Billing — CCGUI credits sync")
     .inner_size(1040.0, 720.0)
     .center()
     .visible(true)
-    .initialization_script(SCRAPE_SCRIPT)
+    .initialization_script(scrape_script(
+        crate::engine::agy_vertex::target_metadata()
+            .map(|(project, _, _)| project)
+            .as_deref(),
+    ))
     .on_navigation(move |url| {
         if is_google_login_url(url) {
             let _ = tx_nav.send(ScrapeSignal::LoginRequired);
@@ -526,6 +627,13 @@ mod tests {
             "https://console.cloud.google.com/billing"
         );
         assert!(!SCRAPE_SCRIPT.contains("organizationId="));
+        assert_eq!(
+            BILLING_PROJECTS_URL,
+            "https://console.cloud.google.com/billing/projects"
+        );
+        assert!(scrape_script(None).contains("const wantedProject = null;"));
+        assert!(scrape_script(Some("my-proj.1")).contains(r#"const wantedProject = "my-proj.1";"#));
+        assert!(!scrape_script(Some("p")).contains("__CCGUI_VERTEX_PROJECT__"));
     }
     #[test]
     fn payload_is_bound_to_official_https_credits_page_and_exact_selected_account() {

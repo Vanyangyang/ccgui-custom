@@ -31,16 +31,21 @@ describe("AGY quota lifecycle", () => {
   async function render(provider?: string, path?: string, engine?: string, strict = false) {
     await act(async () => root.render(strict ? <StrictMode><Probe provider={provider} path={path} engine={engine} /></StrictMode> : <Probe provider={provider} path={path} engine={engine} />));
   }
-  it("subscribes before bootstrap and starts only one active missing-cache query", async () => {
+  it("reads only cache on startup and remount, even when no sample exists", async () => {
     vi.mocked(ipc.agyQuotaRead).mockResolvedValue({ status: "unavailable", groups: [], errorCode: "not_loaded" });
     await render();
-    expect(vi.mocked(ipc.agyQuotaRead).mock.calls.map(([options]) => options?.cacheOnly)).toEqual([true, false]);
+    expect(controls.snapshot?.errorCode).toBe("probe_requires_manual");
+    expect(controls.loading).toBe(false);
     await act(async () => changed());
-    expect(vi.mocked(ipc.agyQuotaRead).mock.calls.map(([options]) => options?.cacheOnly)).toEqual([true, false, true]);
+    await render(undefined, "D:/other");
+    expect(vi.mocked(ipc.agyQuotaRead).mock.calls.map(([options]) => options?.cacheOnly)).toEqual([true, true, true]);
+    expect(vi.mocked(ipc.agyQuotaRead).mock.calls.every(([options]) => options?.force === false)).toBe(true);
   });
-  it("polls visible windows every minute and uses cache reads for native events", async () => {
+  it("never polls and uses only cache for focus, visibility and native events", async () => {
     await render();
     await act(async () => vi.advanceTimersByTimeAsync(60_000));
+    expect(ipc.agyQuotaRead).toHaveBeenCalledOnce();
+    await act(async () => controls.refresh());
     expect(ipc.agyQuotaRead).toHaveBeenLastCalledWith({ cacheOnly: false, force: true, providerId: undefined, workspacePath: "C:/project" });
     await act(async () => changed());
     expect(vi.mocked(ipc.agyQuotaRead).mock.lastCall?.[0]?.cacheOnly).toBe(true);
@@ -51,6 +56,7 @@ describe("AGY quota lifecycle", () => {
     Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
     await act(async () => document.dispatchEvent(new Event("visibilitychange")));
     expect(ipc.agyQuotaRead).toHaveBeenCalledTimes(count + 1);
+    expect(ipc.agyQuotaRead).toHaveBeenLastCalledWith({ cacheOnly: true, force: false, providerId: undefined, workspacePath: "C:/project" });
   });
   it("does not bootstrap hidden, remote, custom-provider or other-engine routes", async () => {
     Object.defineProperty(document, "visibilityState", { configurable: true, value: "hidden" });
@@ -80,6 +86,42 @@ describe("AGY quota lifecycle", () => {
     await act(async () => { pending.resolve(quota(55)); await Promise.all([first, second]); });
     expect(ipc.agyQuotaRead).toHaveBeenCalledTimes(3);
     expect(vi.mocked(ipc.agyQuotaRead).mock.lastCall?.[0]?.cacheOnly).toBe(true);
+  });
+  it("runs a manual check after an automatic query that was already in flight", async () => {
+    await render();
+    const pending = deferred<AgyQuotaSnapshot>();
+    vi.mocked(ipc.agyQuotaRead).mockReturnValueOnce(pending.promise);
+    let manual!: Promise<void>;
+    await act(async () => { window.dispatchEvent(new Event("focus")); manual = controls.refresh(); });
+    expect(vi.mocked(ipc.agyQuotaRead).mock.lastCall?.[0]?.force).toBe(false);
+    await act(async () => { pending.resolve(quota(30)); await manual; });
+    expect(vi.mocked(ipc.agyQuotaRead).mock.lastCall?.[0]).toMatchObject({ cacheOnly: false, force: true });
+  });
+  it("ends a hung IPC read, allows retry, and ignores the timed-out reply", async () => {
+    await render();
+    const hung = deferred<AgyQuotaSnapshot>();
+    vi.mocked(ipc.agyQuotaRead).mockReturnValueOnce(hung.promise);
+    let refresh!: Promise<void>;
+    await act(async () => { refresh = controls.refresh(); });
+    expect(controls.loading).toBe(true);
+    await act(async () => { await vi.advanceTimersByTimeAsync(40_000); await refresh; });
+    expect(controls.loading).toBe(false);
+    expect(controls.snapshot).toMatchObject({ status: "stale", errorCode: "read_failed" });
+    vi.mocked(ipc.agyQuotaRead).mockResolvedValueOnce(quota(45));
+    await act(async () => controls.refresh());
+    await act(async () => hung.resolve(quota(99)));
+    expect(container.textContent).toBe("45 ready");
+  });
+  it("does not show refreshing for cache reads and cleans a pending deadline on unmount", async () => {
+    const hung = deferred<AgyQuotaSnapshot>();
+    vi.mocked(ipc.agyQuotaRead).mockReturnValueOnce(hung.promise);
+    await render();
+    expect(controls.loading).toBe(false);
+    expect(vi.getTimerCount()).toBe(1);
+    await render("custom");
+    expect(vi.getTimerCount()).toBe(0);
+    await act(async () => hung.resolve(quota()));
+    expect(controls.snapshot).toBeUndefined();
   });
   it("clears config-invalid data, ignores its pending reply and debounces refresh", async () => {
     await render();

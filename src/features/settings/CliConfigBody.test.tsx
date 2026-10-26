@@ -260,6 +260,17 @@ describe("CliEngineSettingsCard official edit entry", () => {
     ) as HTMLButtonElement | null;
     expect(creditsBtn).toBeTruthy();
     expect(creditsBtn?.title).toBe("https://console.cloud.google.com/billing");
+
+    // Users without Google Cloud learn the Antigravity quota still works and how to start.
+    const noCloud = document.body.querySelector("[data-testid='agy-vertex-no-cloud']");
+    expect(noCloud?.textContent).toContain(i18n.t("settings.agyVertexNoCloudTitle"));
+    const freeTrialBtn = document.body.querySelector(
+      `button[aria-label="${i18n.t("settings.agyVertexOpenFreeTrial")}"]`,
+    ) as HTMLButtonElement | null;
+    expect(freeTrialBtn?.title).toBe("https://console.cloud.google.com/freetrial");
+    // The key file is key=value lines, not a bare key.
+    expect(page).toContain("api_key=");
+    expect(page).toContain("project=");
   });
 
   it("agy: reflects local metadata and synced credits when configured", async () => {
@@ -294,6 +305,7 @@ describe("CliEngineSettingsCard official edit entry", () => {
     expect(page).toContain("$120.00 / $300.00 (40%)");
     expect(page).toContain("$50.00 (100%)");
     expect(page).toContain(`projects/${SYNTHETIC_PROJECT}`);
+    expect(document.body.querySelector("[data-testid='agy-vertex-no-cloud']")).toBeNull();
 
     const creditsBtn = document.body.querySelector(
       `button[aria-label="${i18n.t("settings.agyVertexOpenCredits")}"]`,
@@ -432,10 +444,41 @@ describe("CliEngineSettingsCard official edit entry", () => {
     expect(section.textContent).toContain("500");
     vi.mocked(ipc.agyQuotaRead).mockRejectedValueOnce(new Error("offline"));
     const refresh = section.querySelector<HTMLButtonElement>(
-      `button[aria-label="${i18n.t("settings.agyByokRefresh")}"]`,
+      `button[aria-label="${i18n.t("chat.agyQuotaManualRefresh")}"]`,
     )!;
     await act(async () => refresh.click());
     expect(section.textContent).not.toContain("500");
     expect(section.textContent).toContain(i18n.t("settings.agyByokRefreshFailed"));
+  });
+  it("agy: syncing Vertex credits never starts a native quota probe", async () => {
+    await render(makeCli({ engine: "agy" }));
+    const section = container.querySelector("[data-testid='agy-byok-section']")!;
+    vi.mocked(ipc.agyQuotaRead).mockClear();
+    const refresh = section.querySelector<HTMLButtonElement>(
+      `button[aria-label="${i18n.t("settings.agyByokRefresh")}"]`,
+    )!;
+    await act(async () => refresh.click());
+    expect(ipc.agyQuotaRead).toHaveBeenCalledWith({ force: false, cacheOnly: true });
+    expect(vi.mocked(ipc.agyQuotaRead).mock.calls.every(([options]) => options?.force !== true)).toBe(true);
+    expect(section.textContent).toContain(i18n.t("chat.agyQuotaManualWarning"));
+  });
+  it("agy: a hung native refresh times out and cannot publish a late balance", async () => {
+    await render(makeCli({ engine: "agy" }));
+    const section = container.querySelector("[data-testid='agy-byok-section']")!;
+    let resolve!: (value: Awaited<ReturnType<typeof ipc.agyQuotaRead>>) => void;
+    vi.mocked(ipc.agyQuotaRead).mockReturnValueOnce(new Promise(done => { resolve = done; }));
+    vi.useFakeTimers();
+    try {
+      const refresh = section.querySelector<HTMLButtonElement>(`button[aria-label="${i18n.t("chat.agyQuotaManualRefresh")}"]`)!;
+      await act(async () => refresh.click());
+      expect(refresh.disabled).toBe(true);
+      await act(async () => vi.advanceTimersByTimeAsync(40_000));
+      expect(section.textContent).toContain(i18n.t("settings.agyByokRefreshFailed"));
+      // The shared feedback component finishes its current 600ms spin lap.
+      await act(async () => vi.advanceTimersByTimeAsync(600));
+      expect(refresh.disabled).toBe(false);
+      await act(async () => resolve({ status: "ready", groups: [], credits: { remaining: 98765 } }));
+      expect(section.textContent).not.toContain("98765");
+    } finally { vi.useRealTimers(); }
   });
 });

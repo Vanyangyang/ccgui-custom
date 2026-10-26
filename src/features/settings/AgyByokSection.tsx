@@ -57,10 +57,13 @@ type NamingMode = "keep_api" | "custom_alias";
 export function AgyByokSection({ cli }: { cli: CliConfigState }) {
   const { t } = useTranslation();
   const mounted = useRef(true);
+  const quotaTimers = useRef(new Set<number>());
   useEffect(() => {
     mounted.current = true;
     return () => {
       mounted.current = false;
+      quotaTimers.current.forEach(timer => window.clearTimeout(timer));
+      quotaTimers.current.clear();
     };
   }, []);
 
@@ -95,22 +98,37 @@ export function AgyByokSection({ cli }: { cli: CliConfigState }) {
 
   const loadState = useCallback(
     async (forceQuota = false) => {
+      let quotaTimer: number | undefined;
       try {
         const [appSettings, files, quotaSnap] = await Promise.all([
           ipc.getAppSettings(),
           ipc.officialConfigRead("agy").catch(() => [] as OfficialConfigFile[]),
-          ipc.agyQuotaRead({ force: forceQuota, cacheOnly: !forceQuota }).catch(() => null),
+          Promise.race([
+            ipc.agyQuotaRead({ force: forceQuota, cacheOnly: !forceQuota }).catch(() => null),
+            new Promise<null>(resolve => {
+              quotaTimer = window.setTimeout(() => resolve(null), 40_000);
+              quotaTimers.current.add(quotaTimer);
+            }),
+          ]),
         ]);
         if (!mounted.current) return false;
         setSettings(appSettings);
         setOfficialFiles(files);
         setQuota(quotaSnap?.status === "ready" ? quotaSnap : null);
         const failed = forceQuota && quotaSnap?.status !== "ready";
-        setLoadError(failed ? t("settings.agyByokRefreshFailed") : null);
+        const errorKey = quotaSnap?.errorCode === "slash_unexpanded" ? "chat.agyQuotaSlashUnexpanded"
+          : quotaSnap?.errorCode === "cli_version_unavailable" ? "chat.agyQuotaVersionUnavailable"
+          : quotaSnap?.errorCode === "probe_history_full" ? "chat.agyQuotaHistoryFull"
+          : quotaSnap?.errorCode === "probe_history_unavailable" ? "chat.agyQuotaHistoryUnavailable"
+          : "settings.agyByokRefreshFailed";
+        setLoadError(failed ? t(errorKey) : null);
         return !failed;
       } catch (e) {
         if (mounted.current) setLoadError(String(e));
         return false;
+      } finally {
+        window.clearTimeout(quotaTimer);
+        if (quotaTimer !== undefined) quotaTimers.current.delete(quotaTimer);
       }
     },
     [t],
@@ -126,6 +144,7 @@ export function AgyByokSection({ cli }: { cli: CliConfigState }) {
   }, [loadState]);
 
   const refreshFeedback = useActionFeedback({ spin: true });
+  const nativeQuotaFeedback = useActionFeedback({ spin: true });
 
   const customModels = useMemo(
     () => settings?.customModels?.agy ?? [],
@@ -345,7 +364,7 @@ export function AgyByokSection({ cli }: { cli: CliConfigState }) {
                 void refreshFeedback.start(
                   async () => {
                     void syncVertexCredits();
-                    failed = !(await loadState(true));
+                    failed = !(await loadState(false));
                   },
                   () => failed,
                 );
@@ -448,6 +467,7 @@ export function AgyByokSection({ cli }: { cli: CliConfigState }) {
               <code className="w-fit truncate rounded border border-dashed border-border-button-default px-1 py-px text-[11px] text-text-tertiary">
                 /credits · /usage
               </code>
+              <p className="text-caption-1-regular text-text-tertiary">{t("chat.agyQuotaManualWarning")}</p>
             </div>
             <span className="flex items-center gap-1.5 text-body-2-regular text-text-secondary">
               <StatusDot on={quota?.status === "ready"} />
@@ -464,6 +484,19 @@ export function AgyByokSection({ cli }: { cli: CliConfigState }) {
                 })}
               </code>
             )}
+            <button
+              type="button"
+              aria-label={t("chat.agyQuotaManualRefresh")}
+              disabled={nativeQuotaFeedback.feedback === "running"}
+              onClick={() => {
+                let failed = false;
+                void nativeQuotaFeedback.start(async () => { failed = !(await loadState(true)); }, () => failed);
+              }}
+              className="flex shrink-0 items-center gap-1.5 rounded-lg border border-border-button-default px-2.5 py-1 text-body-2-medium text-text-primary hover:bg-background-secondary-hover disabled:opacity-50"
+            >
+              <ActionFeedbackIcon icon={RefreshCw} feedback={nativeQuotaFeedback.feedback} spin iconClassName="size-3.5" />
+              {t("chat.agyQuotaManualRefresh")}
+            </button>
           </div>
         </SettingsCard>
         <p className="px-1 text-caption-1-regular text-text-tertiary">

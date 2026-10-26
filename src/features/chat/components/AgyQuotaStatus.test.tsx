@@ -70,6 +70,12 @@ describe("AGY remaining usage status", () => {
           agyQuotaUnavailable: "AGY usage unavailable",
           agyQuotaCooldown: "Refresh cooldown",
           agyQuotaQueryFailed: "Could not update AGY usage",
+          agyQuotaSlashUnexpanded: "This agy version does not run /usage in print mode",
+          agyQuotaProbeManual: "Click Update info once to check this agy version",
+          agyQuotaManualWarning: "Manual queries may spend tokens; automatic probing stays disabled",
+          agyQuotaVersionUnavailable: "Version check failed; probing blocked",
+          agyQuotaHistoryFull: "Probe history full; probing blocked",
+          agyQuotaHistoryUnavailable: "Probe history unavailable; probing blocked",
           agyQuotaCredits: "Antigravity credits",
           agyVertexCredits: "Vertex promotional credits",
           agyQuotaPromoTrial: "Free Trial",
@@ -158,6 +164,7 @@ describe("AGY remaining usage status", () => {
     expect(dialog.textContent).toContain("in 1h 1m");
     expect(dialog.textContent).toContain(new Date(NOW * 1000).toLocaleString("en"));
     expect(dialog.textContent).toContain("Native AGY /usage");
+    expect(dialog.textContent).toContain("Manual queries may spend tokens; automatic probing stays disabled");
     expect(dialog.textContent).not.toContain("Account");
     expect(refresh).not.toHaveBeenCalled();
     await act(async () => dialog.querySelector("button")!.click());
@@ -176,6 +183,17 @@ describe("AGY remaining usage status", () => {
     expect(dialog.textContent).toContain("Could not update AGY usage");
     await render({ ...quota(), status: "stale", errorCode: "refresh_cooldown" });
     expect(dialog.textContent).toContain("Refresh cooldown");
+    // Skipped probes explain why instead of a generic failure.
+    await render({ status: "unavailable", groups: [], errorCode: "slash_unexpanded" });
+    expect(dialog.textContent).toContain("This agy version does not run /usage in print mode");
+    await render({ status: "unavailable", groups: [], errorCode: "probe_requires_manual" });
+    expect(dialog.textContent).toContain("Click Update info once to check this agy version");
+    await render({ status: "unavailable", groups: [], errorCode: "cli_version_unavailable" });
+    expect(dialog.textContent).toContain("Version check failed; probing blocked");
+    await render({ status: "unavailable", groups: [], errorCode: "probe_history_full" });
+    expect(dialog.textContent).toContain("Probe history full; probing blocked");
+    await render({ status: "unavailable", groups: [], errorCode: "probe_history_unavailable" });
+    expect(dialog.textContent).toContain("Probe history unavailable; probing blocked");
     await render(quota(), "gemini-pro", false, NOW + 3600);
     expect(container.textContent).toContain("Stale");
     expect(dialog.textContent).toContain(new Date(NOW * 1000).toLocaleString("en"));

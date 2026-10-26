@@ -214,6 +214,27 @@ function AgyVertexGuardrailDialog({ onClose }: { onClose: () => void }) {
         {t("settings.agyVertexDialogIntro")}
       </p>
 
+      {/* 0. 尚未配置本机 Vertex 时：说明可忽略，或按步骤开通 */}
+      {!config.configured ? (
+        <section
+          data-testid="agy-vertex-no-cloud"
+          className="mt-4 flex flex-col gap-2 rounded-lg border border-border-button-default bg-background-secondary-default p-3"
+        >
+          <p className="text-body-2-medium text-text-primary">{t("settings.agyVertexNoCloudTitle")}</p>
+          <p className="text-body-2-regular text-text-secondary">{t("settings.agyVertexNoCloudBody")}</p>
+          <div className="flex flex-wrap items-center gap-2">
+            <ExternalLinkButton
+              label={t("settings.agyVertexOpenFreeTrial")}
+              url={getAgyVertexProjectUrl("freeTrial")}
+            />
+            <ExternalLinkButton
+              label={t("settings.agyVertexOpenVertexApi")}
+              url={getAgyVertexProjectUrl("vertexApi", config.projectId)}
+            />
+          </div>
+        </section>
+      ) : null}
+
       {/* 1. 剩余额度与赠金查询 */}
       <section className="mt-5 flex flex-col gap-2.5">
         <div className="flex flex-wrap items-center justify-between gap-2">

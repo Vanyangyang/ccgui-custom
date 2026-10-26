@@ -302,6 +302,8 @@ export function getAgyVertexBillingOverviewUrl(billingAccountId?: string | null)
 }
 
 export type VertexProjectLinkType =
+  | "freeTrial"
+  | "vertexApi"
   | "credentials"
   | "studio"
   | "budgets"
@@ -319,6 +321,10 @@ export function getAgyVertexProjectUrl(
   const query = pid ? `?project=${encodeURIComponent(pid)}` : "";
 
   switch (type) {
+    case "freeTrial":
+      return "https://console.cloud.google.com/freetrial";
+    case "vertexApi":
+      return `https://console.cloud.google.com/apis/library/aiplatform.googleapis.com${query}`;
     case "credentials":
       return `https://console.cloud.google.com/apis/credentials${query}`;
     case "studio":

@@ -38,7 +38,11 @@ export function AgyQuotaStatus({ snapshot, model, loading, refresh, now = Date.n
   });
   const stale = quota?.status === "stale";
   const error = quota?.errorCode;
-  const errorKey = error === "quota_expired" ? "chat.agyQuotaExpired" : error === "refresh_cooldown" ? "chat.agyQuotaCooldown" : error && /query_|read_failed|cli_unavailable/.test(error) ? "chat.agyQuotaQueryFailed" : "chat.agyQuotaUnavailable";
+  const errorKey = error === "quota_expired" ? "chat.agyQuotaExpired" : error === "refresh_cooldown" ? "chat.agyQuotaCooldown"
+    : error === "slash_unexpanded" ? "chat.agyQuotaSlashUnexpanded" : error === "probe_requires_manual" ? "chat.agyQuotaProbeManual"
+    : error === "cli_version_unavailable" ? "chat.agyQuotaVersionUnavailable" : error === "probe_history_full" ? "chat.agyQuotaHistoryFull"
+    : error === "probe_history_unavailable" ? "chat.agyQuotaHistoryUnavailable"
+    : error && /query_|read_failed|cli_unavailable/.test(error) ? "chat.agyQuotaQueryFailed" : "chat.agyQuotaUnavailable";
   const collectedAt = quota?.collectedAt;
   const validTime = quota?.status !== "unavailable" && collectedAt !== undefined && Number.isFinite(collectedAt) && collectedAt > 0 && collectedAt <= now && Number.isFinite(new Date(collectedAt * 1000).getTime());
 
@@ -90,6 +94,7 @@ export function AgyQuotaStatus({ snapshot, model, loading, refresh, now = Date.n
             {t(loading ? "chat.quotaRefreshing" : "chat.quotaRefresh")}
           </Button>
         </div>
+        <p className="text-caption-1-regular text-text-tertiary">{t("chat.agyQuotaManualWarning")}</p>
         <section aria-label={t("chat.agyVertexCredits")} className="flex flex-col gap-2 border-t border-border-button-default pt-3">
           <div className="flex items-center justify-between gap-2">
             <h4 className="text-caption-1-medium text-text-secondary">{t("chat.agyVertexCredits")}</h4>

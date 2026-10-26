@@ -408,7 +408,7 @@ async fn run_slash(binding: &Binding, slash: &str, timeout: &str) -> Result<Valu
     cmd.creation_flags(0x08000000);
     let mut child = cmd.spawn().map_err(|_| "cli_unavailable")?;
     #[cfg(windows)]
-    let _job = crate::engine::job::assign_kill_on_close(&child);
+    let _job = crate::engine::job::assign_kill_on_close(&child).ok_or("cli_unavailable")?;
     let stdout = child.stdout.take().ok_or("query_failed")?;
     let stderr = child.stderr.take().ok_or("query_failed")?;
     let (output, _, status) =
@@ -475,18 +475,191 @@ fn with_credits(mut snapshot: AgyQuotaSnapshot, stamp: &str) -> AgyQuotaSnapshot
     snapshot
 }
 
-async fn query(binding: &Binding) -> Result<Vec<AgyQuotaGroup>, &'static str> {
-    let usage = run_slash(binding, "/usage", "20s").await?;
+/// agy builds whose print mode sends `/usage` to the model before the slash
+/// command list has loaded (1.4.7: a ~37k input-token turn and no quota data).
+const KNOWN_UNEXPANDED: &[&str] = &["1.4.7"];
+const VERDICT_FILE: &str = "agy-quota-slash-verdicts.json";
+const MAX_VERDICTS: usize = 32;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SlashVerdict {
+    Expands,
+    NotExpanded,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Gate {
+    Run,
+    Skip(&'static str),
+}
+
+/// A print-mode probe of an unverified build may become a billed model turn,
+/// so only the user can start it; known or recorded failures never run again.
+fn gate(version: &str, recorded: Option<SlashVerdict>, manual: bool) -> Gate {
+    if !manual {
+        return Gate::Skip("probe_requires_manual");
+    }
+    let Some(base) = version_base(version) else {
+        return Gate::Skip("cli_version_unavailable");
+    };
+    if KNOWN_UNEXPANDED.contains(&base) || recorded == Some(SlashVerdict::NotExpanded) {
+        return Gate::Skip("slash_unexpanded");
+    }
+    Gate::Run
+}
+
+fn version_base(version: &str) -> Option<&str> {
+    let version = version.strip_prefix('v').unwrap_or(version);
+    let base = version.split(['-', '+']).next()?;
+    let parts: Vec<_> = base.split('.').collect();
+    (parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())))
+        .then_some(base)
+}
+
+/// An expanded slash command replies with `command`; a model turn does not.
+fn slash_verdict(value: &Value) -> Option<SlashVerdict> {
+    if value.get("conversation_id").is_some() || value.get("response").is_some() {
+        Some(SlashVerdict::NotExpanded)
+    } else if value.get("command").is_some() {
+        Some(SlashVerdict::Expands)
+    } else {
+        None
+    }
+}
+
+struct VerdictStore {
+    path: PathBuf,
+    key: String,
+}
+static VERDICT_LOCK: Mutex<()> = Mutex::new(());
+// A failed write must not let another request repeat a possibly billed probe.
+// Keep at most MAX_VERDICTS paths, then fail closed for the whole process.
+static FAILED_HISTORY: Mutex<(bool, Vec<PathBuf>)> = Mutex::new((false, Vec::new()));
+impl VerdictStore {
+    fn new(path: PathBuf, bin: &str, version: &str) -> Self {
+        Self { path, key: format!("{version}|{bin}") }
+    }
+    fn load_all(&self) -> Result<HashMap<String, SlashVerdict>, &'static str> {
+        let failed = FAILED_HISTORY.lock().unwrap_or_else(|p| p.into_inner());
+        if failed.0 || failed.1.contains(&self.path) { return Err("probe_history_unavailable"); }
+        drop(failed);
+        match std::fs::read_to_string(&self.path) {
+            Ok(raw) => serde_json::from_str(&raw).map_err(|_| "probe_history_unavailable"),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
+            Err(_) => Err("probe_history_unavailable"),
+        }
+    }
+    fn get(&self) -> Result<Option<SlashVerdict>, &'static str> {
+        Ok(self.load_all()?.get(&self.key).copied())
+    }
+    /// Persisted so a restart never repeats a probe that already cost a turn.
+    fn record(&self, verdict: SlashVerdict) -> Result<(), &'static str> {
+        let _lock = VERDICT_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut all = self.load_all()?;
+        if all.get(&self.key) == Some(&verdict) {
+            return Ok(());
+        }
+        if all.len() >= MAX_VERDICTS && !all.contains_key(&self.key) {
+            return Err("probe_history_full");
+        }
+        all.insert(self.key.clone(), verdict);
+        let persisted = (|| {
+            if let Some(parent) = self.path.parent() {
+                std::fs::create_dir_all(parent).map_err(|_| "probe_history_unavailable")?;
+            }
+            let text = serde_json::to_string_pretty(&all).map_err(|_| "probe_history_unavailable")?;
+            crate::settings::atomic_write(&self.path, &text).map_err(|_| "probe_history_unavailable")
+        })();
+        if persisted.is_err() {
+            let mut failed = FAILED_HISTORY.lock().unwrap_or_else(|p| p.into_inner());
+            if failed.1.len() >= MAX_VERDICTS { failed.0 = true; }
+            else if !failed.1.contains(&self.path) { failed.1.push(self.path.clone()); }
+        }
+        persisted
+    }
+}
+
+static VERSIONS: LazyLock<Mutex<HashMap<String, (u64, u64, String)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// `agy --version` starts no language server and no model request.
+async fn cli_version(bin: &str) -> Option<String> {
+    let resolved = crate::engine::resolve::resolve_launchable_cli_binary(bin);
+    let bin = resolved.as_str();
+    let meta = std::fs::metadata(bin).ok()?;
+    let len = meta.len();
+    let mtime = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    if let Some((l, m, version)) = VERSIONS.lock().unwrap_or_else(|p| p.into_inner()).get(bin) {
+        if *l == len && *m == mtime {
+            return Some(version.clone());
+        }
+    }
+    let mut cmd = crate::engine::command_for_binary(bin);
+    crate::engine::agy::configure_background_command(&mut cmd);
+    cmd.arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000);
+    let mut child = cmd.spawn().ok()?;
+    #[cfg(windows)]
+    let _job = crate::engine::job::assign_kill_on_close(&child)?;
+    let stdout = child.stdout.take()?;
+    let (output, status) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::try_join!(read_bounded(stdout), async { child.wait().await.map_err(|_| "query_failed") })
+    }).await.ok()?.ok()?;
+    let version = String::from_utf8_lossy(&output).trim().to_owned();
+    if !status.success()
+        || version.is_empty()
+        || version.len() > 64
+        || !version.bytes().all(|b| b.is_ascii_graphic())
+        || version_base(&version).is_none()
+    {
+        return None;
+    }
+    let mut versions = VERSIONS.lock().unwrap_or_else(|p| p.into_inner());
+    if versions.len() >= MAX_BINDINGS && !versions.contains_key(bin) {
+        if let Some(key) = versions.keys().next().cloned() { versions.remove(&key); }
+    }
+    versions.insert(bin.to_owned(), (len, mtime, version.clone()));
+    Some(version)
+}
+
+async fn query(binding: &Binding, verdicts: &VerdictStore, version: &str, manual: bool) -> Result<Vec<AgyQuotaGroup>, &'static str> {
+    // This future is polled only after read_bound acquires the shared query lock.
+    if let Gate::Skip(code) = gate(version, verdicts.get()?, manual) { return Err(code); }
+    let all = verdicts.load_all()?;
+    if all.len() >= MAX_VERDICTS && !all.contains_key(&verdicts.key) {
+        return Err("probe_history_full");
+    }
+    let started = Instant::now();
+    let usage = tokio::time::timeout(Duration::from_secs(22), run_slash(binding, "/usage", "20s"))
+        .await.map_err(|_| "query_timeout")??;
+    match slash_verdict(&usage) {
+        Some(SlashVerdict::NotExpanded) => {
+            verdicts.record(SlashVerdict::NotExpanded)?;
+            return Err("slash_unexpanded");
+        }
+        _ => {}
+    }
     let groups = parse_usage(&usage, now_seconds())?;
+    verdicts.record(SlashVerdict::Expands)?;
     let credits = tokio::time::timeout(
-        Duration::from_secs(12),
+        Duration::from_secs(12).min(Duration::from_secs(24).saturating_sub(started.elapsed())),
         run_slash(binding, "/credits", "10s"),
     )
     .await
     .ok()
-    .and_then(Result::ok)
-    .and_then(|v| parse_credits(&v));
-    remember_credits(&binding.stamp, credits);
+    .and_then(Result::ok);
+    if credits.as_ref().and_then(slash_verdict) == Some(SlashVerdict::NotExpanded) {
+        remember_credits(&binding.stamp, None);
+        verdicts.record(SlashVerdict::NotExpanded)?;
+        return Err("slash_unexpanded");
+    }
+    remember_credits(&binding.stamp, credits.as_ref().and_then(parse_credits));
     Ok(groups)
 }
 
@@ -512,6 +685,22 @@ pub(crate) fn install_events(app: &tauri::AppHandle) {
     }));
 }
 impl AgyQuotaState {
+    async fn read_checked(
+        &self, binding: &Binding, manual: bool, cache_only: bool, verdict_path: PathBuf,
+        current: impl Fn() -> bool,
+    ) -> AgyQuotaSnapshot {
+        if cache_only { return self.cached(&binding.stamp, current); }
+        if !manual {
+            let mut snapshot = self.cached(&binding.stamp, current);
+            if snapshot.error_code != Some("auth_changed") {
+                snapshot.error_code = Some("probe_requires_manual");
+            }
+            return snapshot;
+        }
+        let version = cli_version(&binding.bin).await.unwrap_or_default();
+        let verdicts = VerdictStore::new(verdict_path, &binding.bin, &version);
+        self.read_bound(&binding.stamp, false, query(binding, &verdicts, &version, manual), current).await
+    }
     fn cached(&self, stamp: &str, current: impl Fn() -> bool) -> AgyQuotaSnapshot {
         if !current() {
             return AgyQuotaSnapshot::unavailable("auth_changed");
@@ -615,7 +804,8 @@ pub async fn agy_quota_read(
     cache_only: Option<bool>,
     workspace_path: Option<String>,
 ) -> Result<AgyQuotaSnapshot, String> {
-    let _ = force; // All callers share the minimum cooldown, including manual refresh.
+    // `force` marks a user-initiated refresh; all callers share the cooldown.
+    let manual = force.unwrap_or(false);
     let binding = match binding(
         provider_id.as_deref(),
         workspace_path.as_deref().map(Path::new),
@@ -624,12 +814,15 @@ pub async fn agy_quota_read(
         Err(code) => return Ok(AgyQuotaSnapshot::unavailable(code)),
     };
     let stamp = binding.stamp.clone();
+    let cache_only = cache_only.unwrap_or(false);
     let snapshot = tokio::time::timeout(
-        Duration::from_secs(29),
-        state.read_bound(
-            &binding.stamp,
-            cache_only.unwrap_or(false),
-            query(&binding),
+        // Include the five-second version preflight and the serialized query.
+        Duration::from_secs(35),
+        state.read_checked(
+            &binding,
+            manual,
+            cache_only,
+            crate::paths::app_home().join(VERDICT_FILE),
             || binding.current(),
         ),
     )
@@ -641,6 +834,171 @@ pub async fn agy_quota_read(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn affected_or_unverified_builds_never_probe_without_the_user() {
+        // Known affected build: skipped even for a manual refresh, so no turn is billed.
+        assert_eq!(gate("1.4.7", None, true), Gate::Skip("slash_unexpanded"));
+        assert_eq!(gate("v1.4.7-preview.1", Some(SlashVerdict::Expands), true), Gate::Skip("slash_unexpanded"));
+        assert_eq!(gate("unknown", Some(SlashVerdict::Expands), true), Gate::Skip("cli_version_unavailable"));
+        // A recorded failure survives restarts and blocks every later probe.
+        assert_eq!(gate("1.5.0", Some(SlashVerdict::NotExpanded), true), Gate::Skip("slash_unexpanded"));
+        // An unverified build is probed only on an explicit refresh.
+        assert_eq!(gate("1.5.0", None, false), Gate::Skip("probe_requires_manual"));
+        assert_eq!(gate("1.5.0", None, true), Gate::Run);
+        assert_eq!(gate("1.4.6", Some(SlashVerdict::Expands), false), Gate::Skip("probe_requires_manual"));
+    }
+
+    #[test]
+    fn model_turn_replies_are_told_apart_from_expanded_commands() {
+        let turn = serde_json::json!({"conversation_id":"c","status":"SUCCESS","response":"","usage":{"input_tokens":36767}});
+        let usage = serde_json::json!({"status":"SUCCESS","command":{"name":"usage","data":{"groups":[]}}});
+        assert_eq!(slash_verdict(&turn), Some(SlashVerdict::NotExpanded));
+        assert_eq!(slash_verdict(&usage), Some(SlashVerdict::Expands));
+        assert_eq!(slash_verdict(&serde_json::json!({"status":"ERROR"})), None);
+    }
+
+    #[test]
+    fn verdicts_persist_per_binary_and_version() {
+        let path = std::env::temp_dir().join(format!("ccgui-agy-verdicts-{}.json", uuid::Uuid::new_v4()));
+        let a = VerdictStore::new(path.clone(), "C:/agy.exe", "1.5.0");
+        let b = VerdictStore::new(path.clone(), "C:/agy.exe", "1.5.1");
+        assert_eq!(a.get().unwrap(), None);
+        a.record(SlashVerdict::NotExpanded).unwrap();
+        b.record(SlashVerdict::Expands).unwrap();
+        // A new store (as after a restart) reads the same verdicts back.
+        assert_eq!(VerdictStore::new(path.clone(), "C:/agy.exe", "1.5.0").get().unwrap(), Some(SlashVerdict::NotExpanded));
+        assert_eq!(VerdictStore::new(path.clone(), "C:/agy.exe", "1.5.1").get().unwrap(), Some(SlashVerdict::Expands));
+        assert_eq!(VerdictStore::new(path.clone(), "D:/other/agy.exe", "1.5.0").get().unwrap(), None);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn automatic_reads_never_spawn_even_after_success_or_restart() {
+        let fixture = crate::engine::agy::background_tests::Fixture::new("exit /b 99");
+        let binding = Binding { stamp: "auto".into(), bin: fixture.bin(), workspace: fixture.0.clone(), provider: None };
+        let path = fixture.0.join("verdicts.json");
+        let state = AgyQuotaState::default();
+        let first = state.read_checked(&binding, false, false, path.clone(), || true).await;
+        assert_eq!(first.error_code, Some("probe_requires_manual"));
+        VerdictStore::new(path.clone(), &binding.bin, "1.5.0").record(SlashVerdict::Expands).unwrap();
+        let cached = state.read_bound(&binding.stamp, false, async { Ok(groups()) }, || true).await;
+        let next = state.read_checked(&binding, false, false, path.clone(), || true).await;
+        assert_eq!(next.collected_at, cached.collected_at);
+        assert_eq!(next.groups.len(), cached.groups.len());
+        assert_eq!(next.error_code, Some("probe_requires_manual"));
+        let restarted = AgyQuotaState::default().read_checked(&binding, false, false, path, || true).await;
+        assert_eq!(restarted.error_code, Some("probe_requires_manual"));
+        assert!(!fixture.0.join("calls").exists(), "automatic reads must spawn no CLI process");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn unsafe_versions_never_reach_print() {
+        for body in ["echo unknown", "echo v1.4.7-preview.1", "exit /b 1"] {
+            let fixture = crate::engine::agy::background_tests::Fixture::new(body);
+            let binding = Binding { stamp: "version".into(), bin: fixture.bin(), workspace: fixture.0.clone(), provider: None };
+            let snapshot = AgyQuotaState::default().read_checked(&binding, true, false, fixture.0.join("verdicts.json"), || true).await;
+            assert!(matches!(snapshot.error_code, Some("cli_version_unavailable" | "slash_unexpanded")));
+            assert_eq!(fixture.calls(), ["--version"]);
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn corrupt_or_unreadable_history_fails_closed() {
+        for directory in [false, true] {
+            let fixture = crate::engine::agy::background_tests::Fixture::new("echo 1.5.0");
+            let path = fixture.0.join("verdicts.json");
+            if directory { std::fs::create_dir(&path).unwrap(); }
+            else { std::fs::write(&path, "broken json").unwrap(); }
+            let binding = Binding { stamp: "corrupt".into(), bin: fixture.bin(), workspace: fixture.0.clone(), provider: None };
+            let snapshot = AgyQuotaState::default().read_checked(&binding, true, false, path, || true).await;
+            assert_eq!(snapshot.error_code, Some("probe_history_unavailable"));
+            assert_eq!(fixture.calls(), ["--version"]);
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn failed_negative_write_latches_off_further_probes() {
+        let fixture = crate::engine::agy::background_tests::Fixture::new(
+            "if \"%1\"==\"--version\" (echo 1.5.0& exit /b 0)\r\necho {\"conversation_id\":\"model-turn\",\"response\":\"oops\"}",
+        );
+        let path = fixture.0.join("verdicts.json");
+        // atomic_write cannot write its temporary file over a directory.
+        std::fs::create_dir(path.with_extension("tmp")).unwrap();
+        let binding = Binding { stamp: "write-failure".into(), bin: fixture.bin(), workspace: fixture.0.clone(), provider: None };
+        let first = AgyQuotaState::default().read_checked(&binding, true, false, path.clone(), || true).await;
+        assert_eq!(first.error_code, Some("probe_history_unavailable"));
+        std::fs::remove_dir(path.with_extension("tmp")).unwrap();
+        let second = AgyQuotaState::default().read_checked(&binding, true, false, path, || true).await;
+        assert_eq!(second.error_code, Some("probe_history_unavailable"));
+        assert_eq!(fixture.calls().iter().filter(|s| s.contains("--print ")).count(), 1);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn full_history_preserves_failures_and_blocks_new_probes() {
+        let fixture = crate::engine::agy::background_tests::Fixture::new("echo 1.5.0");
+        let path = fixture.0.join("verdicts.json");
+        for i in 0..MAX_VERDICTS {
+            VerdictStore::new(path.clone(), &format!("old-{i}"), "1.5.0").record(SlashVerdict::NotExpanded).unwrap();
+        }
+        let binding = Binding { stamp: "full".into(), bin: fixture.bin(), workspace: fixture.0.clone(), provider: None };
+        let snapshot = AgyQuotaState::default().read_checked(&binding, true, false, path.clone(), || true).await;
+        assert_eq!(snapshot.error_code, Some("probe_history_full"));
+        assert_eq!(fixture.calls(), ["--version"]);
+        let store = VerdictStore::new(path, "old-0", "1.5.0");
+        assert_eq!(store.get().unwrap(), Some(SlashVerdict::NotExpanded));
+        assert_eq!(store.load_all().unwrap().len(), MAX_VERDICTS);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn queued_bindings_recheck_negative_verdict_before_print() {
+        let fixture = crate::engine::agy::background_tests::Fixture::new(
+            "if \"%1\"==\"--version\" (echo 1.5.0& exit /b 0)\r\necho {\"conversation_id\":\"model-turn\",\"status\":\"SUCCESS\",\"response\":\"oops\"}",
+        );
+        let first = Binding { stamp: "first".into(), bin: fixture.bin(), workspace: fixture.0.clone(), provider: None };
+        let second = Binding { stamp: "second".into(), bin: fixture.bin(), workspace: fixture.0.clone(), provider: None };
+        let path = fixture.0.join("verdicts.json");
+        let state = AgyQuotaState::default();
+        let (a, b) = tokio::join!(
+            state.read_checked(&first, true, false, path.clone(), || true),
+            state.read_checked(&second, true, false, path.clone(), || true),
+        );
+        assert_eq!(a.error_code, Some("slash_unexpanded"));
+        assert_eq!(b.error_code, Some("slash_unexpanded"));
+        assert_eq!(VerdictStore::new(path.clone(), &first.bin, "1.5.0").get().unwrap(), Some(SlashVerdict::NotExpanded));
+        let restarted = AgyQuotaState::default().read_checked(&second, true, false, path, || true).await;
+        assert_eq!(restarted.error_code, Some("slash_unexpanded"));
+        let prints: Vec<_> = fixture.calls().into_iter().filter(|s| s.contains("--print ")).collect();
+        assert_eq!(prints.len(), 1);
+        assert!(prints[0].ends_with("/usage"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn credits_model_response_blocks_later_probes_and_malformed_usage_is_not_verified() {
+        for valid_usage in [false, true] {
+            let usage = if valid_usage { response(json!(0.75)) } else { json!({"command":{"name":"usage"},"status":"SUCCESS"}) };
+            let fixture = crate::engine::agy::background_tests::Fixture::new(&format!(
+                "if \"%1\"==\"--version\" (echo 1.5.0& exit /b 0)\r\nif \"%6\"==\"/usage\" (echo {usage}& exit /b 0)\r\necho {{\"conversation_id\":\"credits-model-turn\",\"response\":\"oops\"}}"
+            ));
+            let binding = Binding { stamp: "credits-negative".into(), bin: fixture.bin(), workspace: fixture.0.clone(), provider: None };
+            let path = fixture.0.join("verdicts.json");
+            let snapshot = AgyQuotaState::default().read_checked(&binding, true, false, path.clone(), || true).await;
+            let store = VerdictStore::new(path.clone(), &binding.bin, "1.5.0");
+            if valid_usage {
+                assert_eq!(snapshot.error_code, Some("slash_unexpanded"));
+                assert_eq!(store.get().unwrap(), Some(SlashVerdict::NotExpanded));
+                AgyQuotaState::default().read_checked(&binding, true, false, path, || true).await;
+            } else { assert_eq!(store.get().unwrap(), None); }
+            assert_eq!(fixture.calls().iter().filter(|s| s.contains("--print ")).count(), if valid_usage { 2 } else { 1 });
+        }
+    }
 
     #[cfg(windows)]
     #[tokio::test]
@@ -668,16 +1026,16 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires a signed-in native AGY CLI; queries /usage without a model request"]
+    #[ignore = "requires explicit consent and a signed-in native AGY CLI; manual print probes may cause billed model requests"]
     async fn agy_live_smoke_reads_native_quota() {
         let workspace = std::env::var("CCGUI_AGY_SMOKE_WORKSPACE").expect("explicit local workspace");
         let binding = binding(None, Some(Path::new(&workspace))).expect("native local quota binding");
         let state = AgyQuotaState::default();
-        let snapshot = state.read_bound(&binding.stamp, false, query(&binding), || binding.current()).await;
+        let snapshot = state.read_checked(&binding, true, false, crate::paths::app_home().join(VERDICT_FILE), || binding.current()).await;
         assert_eq!(snapshot.status, "ready", "native quota status: {:?}", snapshot.error_code);
         assert_eq!(snapshot.source, Some("agy_usage"));
         assert!(!snapshot.groups.is_empty());
-        println!("AGY native /usage validated: {} model groups, no model request", snapshot.groups.len());
+        println!("AGY native /usage validated: {} model groups", snapshot.groups.len());
     }
     use serde_json::json;
     #[test]
