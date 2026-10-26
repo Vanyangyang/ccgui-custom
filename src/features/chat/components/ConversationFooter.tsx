@@ -40,8 +40,7 @@ import { ClaudeQuotaStatus } from "./ClaudeQuotaStatus";
 import { useCodexQuota } from "./use-codex-quota";
 import { CodexQuotaStatus } from "./CodexQuotaStatus";
 import { ThroughputStatus } from "./ThroughputStatus";
-import { useAgyQuota } from "./use-agy-quota";
-import { AgyQuotaStatus } from "./AgyQuotaStatus";
+import { AgyQuotaControl } from "./AgyQuotaStatus";
 import { CursorQuotaStatus } from "./CursorQuotaStatus";
 import { useCursorQuota } from "./use-cursor-quota";
 import { selectAgyContext } from "./agy-context";
@@ -280,7 +279,6 @@ function FooterStatusBar({
   const displayEngine = active?.engine ?? activeEngine;
   const quota = useClaudeQuota(displayEngine, providerId, active?.workspacePath);
   const codexQuota = useCodexQuota(displayEngine, providerId, active?.workspacePath);
-  const agyQuota = useAgyQuota(displayEngine, providerId, active?.workspacePath);
   const cursorQuota = useCursorQuota(displayEngine);
   const { window: autoCompactWindow, block: contextWindowBlock, refresh: refreshContextWindow, save: saveContextWindow } = useClaudeContextWindow(displayEngine);
   const codexContextWindow = useCodexContextWindow(displayEngine, providerId, active?.workspacePath);
@@ -433,7 +431,7 @@ function FooterStatusBar({
         modelContextMax={agyContext ? agyContext.reportedMax : autoCompactWindow && contextMaxKnown ? contextMax : undefined}
         contextSegments={cursorSegments ?? (cursorBillingOnly ? [] : contextSegments)}
         onContextOpen={() => { void refreshContextWindow(); void codexContextWindow.refresh(); void agyContextWindow.refresh(); }}
-        quotaStatus={quota.enabled ? <ClaudeQuotaStatus snapshot={quota.snapshot} now={quota.now} loading={quota.loading} refresh={quota.refresh} /> : codexQuota.enabled ? <CodexQuotaStatus snapshot={codexQuota.snapshot} now={codexQuota.now} loading={codexQuota.loading} refresh={codexQuota.refresh} /> : agyQuota.enabled ? <AgyQuotaStatus model={model} snapshot={agyQuota.snapshot} now={agyQuota.now} loading={agyQuota.loading} refresh={agyQuota.refresh} /> : cursorQuota.enabled ? <CursorQuotaStatus snapshot={cursorQuota.snapshot} now={cursorQuota.now} loading={cursorQuota.loading} refresh={cursorQuota.refresh} /> : undefined}
+        quotaStatus={quota.enabled ? <ClaudeQuotaStatus snapshot={quota.snapshot} now={quota.now} loading={quota.loading} refresh={quota.refresh} /> : codexQuota.enabled ? <CodexQuotaStatus snapshot={codexQuota.snapshot} now={codexQuota.now} loading={codexQuota.loading} refresh={codexQuota.refresh} /> : displayEngine === "agy" ? <AgyQuotaControl engine={displayEngine} providerId={providerId} workspacePath={active?.workspacePath} model={model} /> : cursorQuota.enabled ? <CursorQuotaStatus snapshot={cursorQuota.snapshot} now={cursorQuota.now} loading={cursorQuota.loading} refresh={cursorQuota.refresh} /> : undefined}
         throughputStatus={active ? <ThroughputStatus key={sessionKeyValue} throughput={throughput} scope={{engine: active.engine, sessionId: active.sessionId ?? undefined, workspacePath: active.workspacePath}} /> : undefined}
         contextSettings={displayEngine === "claude" ? <ContextWindowEditor
           window={autoCompactWindow} modelWindow={contextMax} block={contextWindowBlock} onSave={saveContextWindow}
