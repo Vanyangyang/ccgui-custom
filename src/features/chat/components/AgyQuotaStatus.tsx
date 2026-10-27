@@ -67,7 +67,7 @@ export function AgyQuotaStatus({ snapshot, model, loading, refresh, now = Date.n
       className="max-h-[calc(100dvh-2rem)] w-72 max-w-[calc(100vw-2rem)] origin-bottom-right overflow-y-auto rounded-xl border border-border-button-default bg-background-primary-default p-3 shadow-dropdown outline-none transition duration-150 ease-out data-[entering]:scale-95 data-[entering]:opacity-0 data-[exiting]:scale-95 data-[exiting]:opacity-0 motion-reduce:transition-none">
       <Dialog aria-label={t("chat.agyQuotaDetails")} className="flex flex-col gap-3 outline-none">
         <h3 className="text-body-2-medium text-text-secondary">{t("chat.agyQuotaPlan")}</h3>
-        {(["gemini", "gemini_argon", "third_party"] as const).filter(id => id !== "gemini_argon" || activeId === id || quota?.groups.some(group => group.id === id)).map(id => {
+        {(["gemini", "gemini_argon", "third_party"] as const).filter(id => id !== "gemini_argon" || quota?.groups.some(group => group.id === id)).map(id => {
           const group = quota?.groups.find(value => value.id === id);
           const label = t(id === "gemini" ? "chat.agyQuotaGemini" : id === "gemini_argon" ? "chat.agyQuotaGeminiArgon" : "chat.agyQuotaThirdParty");
           return <section key={id} className="flex flex-col gap-2" aria-label={label}>

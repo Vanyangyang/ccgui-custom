@@ -21,24 +21,24 @@ describe("AGY usage validation", () => {
     expect(valid.groups[0].windows.sevenDay?.usedPercentage).toBe(100);
     expect(valid.groups[1].windows.fiveHour?.usedPercentage).toBe(23.5);
   });
-  it("preserves Argon separately and never falls back to ordinary Gemini", () => {
+  it("uses the shared Gemini quota unless the API supplies a separate Argon group", () => {
     const data = quota();
     data.groups.push({ id: "gemini_argon", windows: { fiveHour: { usedPercentage: 87 } } });
     const valid = validAgyQuotaSnapshot(data, NOW);
     expect(valid.groups.map(group => group.id)).toEqual(["gemini", "gemini_argon", "third_party"]);
     expect(valid.groups[0].windows.fiveHour?.usedPercentage).toBe(0);
     expect(agyQuotaModelGroup("gemini-4-argon-pro", valid.groups)).toBe("gemini_argon");
-    expect(agyQuotaModelGroup("gemini-4-argon-pro", quota().groups)).toBe("gemini_argon");
-    expect(agyQuotaModelGroup("gemini-4-argon")).toBe("gemini_argon");
+    expect(agyQuotaModelGroup("gemini-4-argon-pro", quota().groups)).toBe("gemini");
+    expect(agyQuotaModelGroup("gemini-4-argon")).toBe("gemini");
     expect(agyQuotaModelGroup("gemini-pro", valid.groups)).toBe("gemini");
   });
-  it("keeps the Argon selection unknown when its disabled windows are omitted", () => {
+  it("does not invent an independent Argon quota from an empty group", () => {
     const data = quota();
     data.groups.push({ id: "gemini_argon", windows: {} });
     const valid = validAgyQuotaSnapshot(data, NOW);
     const selectedId = agyQuotaModelGroup("gemini-4-argon", valid.groups);
-    expect(selectedId).toBe("gemini_argon");
-    expect(valid.groups.find(group => group.id === selectedId)).toBeUndefined();
+    expect(selectedId).toBe("gemini");
+    expect(valid.groups.some(group => group.id === "gemini_argon")).toBe(false);
     expect(valid.groups.find(group => group.id === "gemini")?.windows.fiveHour?.usedPercentage).toBe(0);
   });
   it("rejects duplicate groups including a malformed duplicate without hiding other groups", () => {

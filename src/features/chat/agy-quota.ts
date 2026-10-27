@@ -2,8 +2,9 @@ import type { AgyQuotaSnapshot } from "@/lib/ipc";
 import { QUOTA_STALE_AGE } from "./subscription-quota";
 export { compactQuotaReset, quotaResetCountdown } from "./subscription-quota";
 
-export function agyQuotaModelGroup(model?: string, _groups?: AgyQuotaSnapshot["groups"]): AgyQuotaSnapshot["groups"][number]["id"] | undefined {
-  if (model?.startsWith("gemini-4-argon")) return "gemini_argon";
+export function agyQuotaModelGroup(model?: string, groups?: AgyQuotaSnapshot["groups"]): AgyQuotaSnapshot["groups"][number]["id"] | undefined {
+  // Model variants share Gemini quota unless the API supplies a distinct bucket.
+  if (model?.startsWith("gemini-4-argon") && groups?.some(group => group.id === "gemini_argon")) return "gemini_argon";
   if (model?.startsWith("gemini-")) return "gemini";
   if (model?.startsWith("claude-") || model?.startsWith("gpt-oss-")) return "third_party";
   return undefined;

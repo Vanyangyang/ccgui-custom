@@ -201,7 +201,7 @@ describe("AGY remaining usage status", () => {
     expect(document.querySelector('[role="dialog"]')).toBeNull();
     expect(refresh).not.toHaveBeenCalled();
   });
-  it("shows unknown Argon quota with its title when its independent group is missing", async () => {
+  it("maps Argon to the shared Gemini quota when no independent group is returned", async () => {
     const data = quota();
     data.groups.push({ id: "gemini_argon", windows: { fiveHour: { usedPercentage: 80 } } });
     await render(data, "gemini-4-argon");
@@ -209,19 +209,21 @@ describe("AGY remaining usage status", () => {
     const dialog = await open();
     expect(dialog.querySelector('section[aria-label="Gemini 4 Argon"]')?.textContent).toContain("20% remaining");
     await render(quota(), "gemini-4-argon");
-    expect(container.textContent).toBe("5h — · Week — remaining");
-    expect(dialog.querySelector('section[aria-label="Gemini 4 Argon"]')?.textContent).toContain("— remaining");
-    expect(dialog.querySelector('section[aria-label="Gemini 4 Argon"]')?.textContent).not.toContain("100%");
+    expect(container.textContent).toBe("5h 100% · Week 76.5% remaining");
+    expect(dialog.querySelector('section[aria-label="Gemini 4 Argon"]')).toBeNull();
+    expect(dialog.querySelector('section[aria-label="Gemini"]')?.textContent).toContain("76.5% remaining");
   });
-  it("keeps the Argon title and unknown quota when disabled windows have been omitted", async () => {
+  it("does not create an empty Argon section from the selected model or omitted windows", async () => {
     const data = quota();
     data.groups.push({ id: "gemini_argon", windows: {} });
     await render(data, "gemini-4-argon-pro");
-    expect(container.textContent).toBe("5h — · Week — remaining");
+    expect(container.textContent).toBe("5h 100% · Week 76.5% remaining");
     const dialog = await open();
     const argon = dialog.querySelector('section[aria-label="Gemini 4 Argon"]');
-    expect(argon).not.toBeNull();
-    expect([...argon!.querySelectorAll("dd")].map(node => node.textContent)).toEqual(["— remaining", "— remaining"]);
+    expect(argon).toBeNull();
+    await render(undefined, "gemini-4-argon-pro");
+    expect(container.textContent).toBe("5h — · Week — remaining");
+    expect(dialog.querySelector('section[aria-label="Gemini 4 Argon"]')).toBeNull();
   });
   it.each(["en", "zh"])("explains expired login in %s without suggesting another OAuth flow", async language => {
     await i18n.changeLanguage(language);
