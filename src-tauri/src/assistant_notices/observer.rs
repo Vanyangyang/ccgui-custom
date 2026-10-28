@@ -24,6 +24,36 @@ pub(super) fn source_engines() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The observer's callable directory is separate from auto-title capabilities.
+pub(super) async fn models() -> Result<Vec<crate::auto_title::config::NamingModel>, String> {
+    let mut result = crate::auto_title::auto_title_models().await?;
+    let enabled = crate::engine::list_engines().await?.into_iter()
+        .any(|engine| engine.id == "agy" && engine.available && engine.enabled);
+    if enabled {
+        let catalog = crate::engine::models::local_catalog("agy").await?;
+        result.extend(agy_models(catalog.models));
+    }
+    Ok(result)
+}
+
+fn agy_models(models: Vec<crate::engine::models::EngineModel>) -> Vec<crate::auto_title::config::NamingModel> {
+    models.into_iter().filter_map(|model| {
+        if model.id.is_empty() || !config::valid_model(&model.id) { return None; }
+        let encoded = crate::engine::agy::model_encodes_effort(&model.id);
+        let levels = if encoded {
+            vec![model.id.rsplit('-').next()?.to_ascii_lowercase()]
+        } else {
+            vec!["low".into(), "medium".into(), "high".into()]
+        };
+        Some(crate::auto_title::config::NamingModel {
+            engine: "agy".into(), provider: model.provider,
+            name: model.name.unwrap_or_else(|| model.id.clone()),
+            resolved_model: Some(model.id.clone()), id: model.id,
+            supports_effort: !encoded, effort_levels: Some(levels),
+        })
+    }).collect()
+}
+
 fn enabled_sources(config: &crate::config::CliConfig) -> Vec<String> {
     crate::config::ENGINES
         .iter()
@@ -102,7 +132,9 @@ pub(super) fn selection(config: &Config) -> Result<Selection, SideCallError> {
     if !config::valid_model(&model) {
         return Err(SideCallError::Unavailable);
     }
-    let effort = if config.observer_engine == "claude" && config.observer_effort == "ultra" {
+    let effort = if config.observer_engine == "agy" && crate::engine::agy::model_encodes_effort(&model) {
+        model.rsplit('-').next().unwrap_or("medium").to_ascii_lowercase()
+    } else if config.observer_engine == "claude" && config.observer_effort == "ultra" {
         "max".to_string()
     } else {
         config.observer_effort.clone()
@@ -117,6 +149,9 @@ pub(super) fn selection(config: &Config) -> Result<Selection, SideCallError> {
         &settings.codex_home,
         &settings.system_proxy_enabled,
         &settings.system_proxy_url,
+        if config.observer_engine == "agy" {
+            Some(side_call::agy_configuration_fingerprint().ok_or(SideCallError::Unavailable)?)
+        } else { None },
     ))
     .map_err(|_| SideCallError::Unavailable)?;
     Ok(Selection {
@@ -142,7 +177,7 @@ pub(super) async fn generate(
     let brief = json!({"provider":selection.engine,"locale":locale,"snapshot":snapshot});
     match selection.engine.as_str() {
         config::VERTEX_ENGINE => vertex::generate(&brief).await,
-        "claude" | "codex" | "pi" => {
+        "claude" | "codex" | "pi" | "agy" => {
             // Source IDs, tickets, routing and credentials are never sent as model input.
             let input = serde_json::to_string(&json!({"locale":locale,"snapshot":snapshot}))
                 .map_err(|_| SideCallError::BadOutput)?;
@@ -150,9 +185,7 @@ pub(super) async fn generate(
                 return Err(SideCallError::BadOutput);
             }
             let schema = schema();
-            let output = side_call::structured(
-                &selection.engine,
-                StructuredCall {
+            let call = StructuredCall {
                     provider_id: None,
                     system_prompt: vertex::INSTRUCTIONS,
                     input: &input,
@@ -160,9 +193,12 @@ pub(super) async fn generate(
                     model: &selection.model,
                     effort: &selection.effort,
                     timeout: Duration::from_secs(60),
-                },
-            )
-            .await?;
+                };
+            let output = if selection.engine == "agy" {
+                side_call::agy_structured(call).await?
+            } else {
+                side_call::structured(&selection.engine, call).await?
+            };
             vertex::parse_decision(&output.structured)
         }
         _ => Err(SideCallError::Unavailable),
@@ -181,6 +217,19 @@ pub(super) fn failure_code(error: SideCallError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agy_catalog_keeps_only_real_ids_and_their_supported_effort_shape() {
+        let model = |id: &str| crate::engine::models::EngineModel { id:id.into(), name:None, description:None, provider:"Google".into(), context_window:None };
+        let entries = agy_models(vec![model("gemini-3.8-flash-high"), model("gemini-custom"), model("bad model"), model("")]);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].engine, "agy");
+        assert_eq!(entries[0].id, "gemini-3.8-flash-high");
+        assert!(!entries[0].supports_effort);
+        assert_eq!(entries[0].effort_levels.as_ref().unwrap(), &vec!["high".to_string()]);
+        assert!(entries[1].supports_effort);
+        assert_eq!(entries[1].effort_levels.as_ref().unwrap(), &vec!["low".to_string(),"medium".to_string(),"high".to_string()]);
+    }
 
     #[test]
     fn all_enabled_source_engines_are_reported_independently_of_inference_support() {

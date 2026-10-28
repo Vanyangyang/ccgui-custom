@@ -145,6 +145,9 @@ impl Config {
                 self.observer_effort.as_str(),
                 "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
             ),
+            "agy" => !self.observer_model.is_empty() && matches!(self.observer_effort.as_str(), "low" | "medium" | "high")
+                && (!crate::engine::agy::model_encodes_effort(&self.observer_model)
+                    || self.observer_model.rsplit('-').next().is_some_and(|level| level.eq_ignore_ascii_case(&self.observer_effort))),
             _ => false,
         };
         if !valid_observer {
@@ -280,6 +283,19 @@ pub(super) fn save_config(path: &Path, config: &Config, generation: u64) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agy_preferences_preserve_exact_model_and_encoded_effort() {
+        for (model, effort) in [("gemini-3.8-flash-high", "high"), ("gemini-4-argon-medium", "medium"), ("gemini-custom", "low")] {
+            let config = Config { observer_engine:"agy".into(), observer_model:model.into(), observer_effort:effort.into(), ..Default::default() };
+            config.validate().unwrap();
+            let value = serde_json::to_string(&Persisted::new(config.clone(), 12)).unwrap();
+            assert_eq!(serde_json::from_str::<Persisted>(&value).unwrap().config(), config);
+        }
+        for (model, effort) in [("gemini-3.8-flash-high", "medium"), ("gemini-custom", "xhigh"), ("", "medium")] {
+            assert!(Config { observer_engine:"agy".into(), observer_model:model.into(), observer_effort:effort.into(), ..Default::default() }.validate().is_err());
+        }
+    }
 
     #[test]
     fn legacy_switches_are_preserved_and_new_preferences_get_defaults() {

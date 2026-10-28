@@ -6,7 +6,7 @@ import type { AssistantNoticesConfig, AssistantNoticesStatus } from "./types";
 import { defaultNoticeConfig, noticeConfig } from "./config";
 const mock = vi.hoisted(() => ({ invoke: vi.fn(), listen: vi.fn(), models: vi.fn(), providers: vi.fn() }));
 vi.mock("@/lib/transport", () => ({ ...mock, isWeb: false }));
-vi.mock("@/lib/ipc", () => ({ ipc: { autoTitleModels: mock.models, getCliConfig: mock.providers } }));
+vi.mock("@/lib/ipc", () => ({ ipc: { autoTitleModels: vi.fn(() => { throw new Error("autoTitleModels should not be used for assistant notices"); }), getCliConfig: mock.providers } }));
 import { useNoticeSettings } from "./use-notice-settings";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -27,6 +27,7 @@ beforeEach(() => {
   mock.invoke.mockReset().mockImplementation(async (command: string, args?: { config: AssistantNoticesConfig; expectedRevision: number }) => {
     if (command === "assistant_notices_status") return status;
     if (command === "assistant_notices_displays") return [];
+    if (command === "assistant_notices_models") return mock.models();
     if (command === "assistant_notices_configure") {
       if (args!.expectedRevision !== status.revision) throw new Error("config_conflict");
       status = { ...status, ...args!.config, revision: status.revision + 1 }; return status;
@@ -61,8 +62,9 @@ it("coalesces provider events, rejects late catalog snapshots and preserves the 
   await mount();
   await act(async () => current.change({ titleTextPercent: 150 }));
   const oldModels = Promise.withResolvers<AutoTitleModel[]>();
-  mock.models.mockReturnValueOnce(oldModels.promise).mockResolvedValue([{ ...model, id: "new-model", provider: "Provider B" }]);
-  mock.providers.mockResolvedValueOnce({ codex: { current: "old", providers: { old: { name: "Stale provider" } } } }).mockResolvedValue({ codex: { current: "b", providers: { b: { name: "Provider B" } } } });
+  const agyModel: AutoTitleModel = { engine: "agy", id: "gemini-3.8-flash-high", name: "Gemini 3.8 Flash (High)", provider: "Provider AGY B", supportsEffort: false, effortLevels: ["high"], resolvedModel: "gemini-3.8-flash-high" };
+  mock.models.mockReturnValueOnce(oldModels.promise).mockResolvedValue([{ ...model, id: "new-model", provider: "Provider B" }, agyModel]);
+  mock.providers.mockResolvedValueOnce({ codex: { current: "old", providers: { old: { name: "Stale provider" } } }, agy: { current: "old", providers: { old: { name: "Stale AGY" } } } }).mockResolvedValue({ codex: { current: "b", providers: { b: { name: "Provider B" } } }, agy: { current: "b", providers: { b: { name: "Provider AGY B" } } } });
   await event("engine-config://changed");
   await act(async () => { for (let i = 0; i < 20; i++) callbacks["engine-config://changed"]({ payload: null }); });
   expect(mock.models).toHaveBeenCalledTimes(2);
@@ -71,6 +73,8 @@ it("coalesces provider events, rejects late catalog snapshots and preserves the 
   expect(mock.models).toHaveBeenCalledTimes(3);
   expect(current.models.some(item => item.id === "stale-model")).toBe(false);
   expect(current.models.some(item => item.id === "new-model")).toBe(true);
+  expect(current.models.some(item => item.id === "gemini-3.8-flash-high")).toBe(true);
+  expect(current.providers.agy).toBe("Provider AGY B");
   expect(current.providers.codex).toBe("Provider B");
   expect(current.draft!.titleTextPercent).toBe(150);
   await event("settings://changed");
@@ -83,13 +87,18 @@ it("coalesces provider events, rejects late catalog snapshots and preserves the 
 
 it("offers an empty default model only for callable engines without inventing model effort support", async () => {
   status = { ...status, observerEngine: "codex", observerModel: "", observerEffort: "high" };
+  const agyModel: AutoTitleModel = { engine: "agy", id: "gemini-3.8-flash-high", name: "Gemini 3.8 Flash (High)", provider: "Provider AGY", supportsEffort: false, effortLevels: ["high"], resolvedModel: "gemini-3.8-flash-high" };
+  mock.models.mockResolvedValue([model, agyModel]);
   await mount();
   expect(current.models.find(item => item.engine === "codex" && item.id === "")).toMatchObject({ supportsEffort: false });
   expect(current.models.some(item => item.engine === "cursor")).toBe(false);
+  expect(current.models.some(item => item.engine === "agy" && item.id === "")).toBe(false);
+  expect(current.models.find(item => item.engine === "agy" && item.id === "gemini-3.8-flash-high")).toMatchObject({ supportsEffort: false, effortLevels: ["high"] });
   expect(current.draft).toMatchObject({ observerModel: "", observerEffort: "high" });
   mock.models.mockResolvedValue([]);
   await event("engine-config://changed");
   expect(current.models.some(item => item.engine === "codex")).toBe(false);
+  expect(current.models.some(item => item.engine === "agy")).toBe(false);
   expect(current.draft).toMatchObject({ observerModel: "", observerEffort: "high" });
   expect(mock.invoke.mock.calls.some(([command]) => command === "assistant_notices_configure")).toBe(false);
 });
@@ -103,4 +112,13 @@ it("cleans up catalog listeners registered after unmount without starting catalo
   await act(async () => registered.resolve(stop));
   expect(stop).toHaveBeenCalledTimes(2);
   expect(mock.models).not.toHaveBeenCalled();
+});
+
+it("preserves saved AGY observer selection when catalog lacks AGY and does not auto-mutate config", async () => {
+  status = { ...status, observerEngine: "agy", observerModel: "gemini-3.8-flash-high", observerEffort: "high" };
+  mock.models.mockResolvedValue([model]);
+  await mount();
+  expect(current.draft).toMatchObject({ observerEngine: "agy", observerModel: "gemini-3.8-flash-high", observerEffort: "high" });
+  expect(current.models.some(item => item.engine === "agy")).toBe(false);
+  expect(mock.invoke.mock.calls.some(([command]) => command === "assistant_notices_configure")).toBe(false);
 });

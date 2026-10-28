@@ -6,7 +6,7 @@ import { defaultNoticeConfig, noticeConfig } from "./config";
 const mock = vi.hoisted(() => ({ invoke: vi.fn(), listen: vi.fn(), models: vi.fn(), providers: vi.fn(), isWeb: false }));
 vi.mock("@/lib/transport", () => mock);
 vi.mock("@/lib/platform", () => ({ isWeb: false, IS_WINDOWS: true }));
-vi.mock("@/lib/ipc", () => ({ ipc: { autoTitleModels: mock.models, getCliConfig: mock.providers } }));
+vi.mock("@/lib/ipc", () => ({ ipc: { autoTitleModels: vi.fn(() => { throw new Error("autoTitleModels should not be used for assistant notices"); }), getCliConfig: mock.providers } }));
 vi.mock("react-i18next", () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
 import { AssistantNoticesOverlay } from "./AssistantNoticesOverlay";
 import { AssistantNoticesControl } from "./AssistantNoticesControl";
@@ -32,7 +32,7 @@ describe("built-in assistant notices", () => {
     mock.isWeb = false;
     mock.models.mockReset().mockResolvedValue([]); mock.providers.mockReset().mockResolvedValue({});
     notices = [notice]; history = []; callbacks = {};
-    mock.invoke.mockReset().mockImplementation(async (command: string) => audioResponse(command) ?? (command === "assistant_notices_list" ? notices : command === "assistant_notices_history" ? history : command === "assistant_notices_status" ? status : true));
+    mock.invoke.mockReset().mockImplementation(async (command: string) => audioResponse(command) ?? (command === "assistant_notices_models" ? mock.models() : command === "assistant_notices_list" ? notices : command === "assistant_notices_history" ? history : command === "assistant_notices_status" ? status : true));
     mock.listen.mockReset().mockImplementation(async (name: string, callback: (event: { payload: unknown }) => void) => { callbacks[name] = callback; return vi.fn(); });
     container = document.createElement("div"); document.body.appendChild(container); root = createRoot(container);
   });
@@ -158,6 +158,80 @@ describe("built-in assistant notices", () => {
     await act(async () => button("assistantNotices.save").click());
     expect(mock.invoke).toHaveBeenLastCalledWith("assistant_notices_configure", { config: { ...noticeConfig(status), observerEngine: "codex", observerModel: "astra" }, expectedRevision: 1 });
   });
+  it("lists AGY models with channels, selects encoded model without effort contradiction, selects unencoded model with low/medium/high, and saves without inference", async () => {
+    const encodedAgy = { engine: "agy", id: "gemini-3.8-flash-high", name: "Gemini 3.8 Flash (High)", provider: "Google Channel", supportsEffort: false, effortLevels: ["high"], resolvedModel: "gemini-3.8-flash-high" };
+    const unencodedAgy = { engine: "agy", id: "gemini-3.8-pro", name: "Gemini 3.8 Pro", provider: "Google Channel", supportsEffort: true, effortLevels: ["low", "medium", "high"], resolvedModel: "gemini-3.8-pro" };
+    mock.models.mockResolvedValue([encodedAgy, unencodedAgy]);
+    mock.providers.mockResolvedValue({ agy: { current: "g-chan", providers: { "g-chan": { name: "Google Channel", apiKey: "secret-token" } } } });
+    if (!globalThis.CSS) vi.stubGlobal("CSS", {});
+    if (!CSS.escape) CSS.escape = value => value.replace(/[^a-zA-Z0-9_-]/g, character => `\\${character}`);
+    await act(async () => root.render(<AssistantNoticesControl />));
+    expect(container.textContent).toContain("Gemini 4 Argon · Vertex");
+    expect(container.textContent).not.toContain("secret-token");
+    const press = async (element: Element) => act(async () => { for (const type of ["pointerdown", "mousedown", "mouseup", "click"]) element.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true })); });
+    await press(container.querySelector('[data-setting-anchor="observerModel"] button')!);
+    const options = [...document.querySelectorAll('[role="option"]')];
+    const encodedOption = options.find(element => element.textContent?.includes("Gemini 3.8 Flash (High)"));
+    const unencodedOption = options.find(element => element.textContent?.includes("Gemini 3.8 Pro"));
+    expect(encodedOption).toBeDefined();
+    expect(encodedOption!.textContent).toContain("Antigravity CLI");
+    expect(encodedOption!.textContent).toContain("Google Channel");
+    expect(unencodedOption).toBeDefined();
+    await press(encodedOption!);
+    expect(container.textContent).toContain("assistantNotices.agyModelDescription");
+    const effortButton = container.querySelector('[data-setting-anchor="observerEffort"] button')!;
+    expect(effortButton.hasAttribute("disabled")).toBe(true);
+    expect(effortButton.textContent).toContain("high");
+    const savedResponse1 = { ...status, observerEngine: "agy", observerModel: "gemini-3.8-flash-high", observerEffort: "high", revision: 2 };
+    mock.invoke.mockResolvedValueOnce(savedResponse1);
+    await act(async () => button("assistantNotices.save").click());
+    expect(mock.invoke).toHaveBeenLastCalledWith("assistant_notices_configure", {
+      config: { ...noticeConfig(status), observerEngine: "agy", observerModel: "gemini-3.8-flash-high", observerEffort: "high" },
+      expectedRevision: 1,
+    });
+    expect(mock.invoke.mock.calls.some(([cmd]) => /infer|complete|prompt|predict|chat/.test(cmd))).toBe(false);
+    await press(container.querySelector('[data-setting-anchor="observerModel"] button')!);
+    const refreshedOptions = [...document.querySelectorAll('[role="option"]')];
+    const unencodedChoice = refreshedOptions.find(element => element.textContent?.includes("Gemini 3.8 Pro"))!;
+    await press(unencodedChoice);
+    expect(container.querySelector('[data-setting-anchor="observerEffort"] button')?.hasAttribute("disabled")).toBe(false);
+    await press(container.querySelector('[data-setting-anchor="observerEffort"] button')!);
+    const effortOptions = [...document.querySelectorAll('[role="option"]')];
+    expect(effortOptions.map(el => el.textContent?.trim())).toEqual(expect.arrayContaining(["low", "medium", "high"]));
+    const lowOption = effortOptions.find(el => el.textContent?.trim() === "low")!;
+    await press(lowOption);
+    expect(container.querySelector('[data-setting-anchor="observerEffort"] button')?.textContent).toContain("low");
+    const savedResponse2 = { ...savedResponse1, observerEngine: "agy", observerModel: "gemini-3.8-pro", observerEffort: "low", revision: 3 };
+    mock.invoke.mockResolvedValueOnce(savedResponse2);
+    await act(async () => button("assistantNotices.save").click());
+    expect(mock.invoke).toHaveBeenLastCalledWith("assistant_notices_configure", {
+      config: { ...noticeConfig(savedResponse1), observerEngine: "agy", observerModel: "gemini-3.8-pro", observerEffort: "low" },
+      expectedRevision: 2,
+    });
+    expect(mock.invoke.mock.calls.some(([cmd]) => /infer|complete|prompt|predict|chat/.test(cmd))).toBe(false);
+  });
+  it("retains saved AGY selection when AGY catalog is disabled or removed without silently switching to Vertex", async () => {
+    mock.invoke.mockImplementation(async (command: string) => command === "assistant_notices_status" ? {
+      ...status,
+      observerEngine: "agy",
+      observerModel: "gemini-3.8-flash-high",
+      observerEffort: "high",
+    } : []);
+    mock.models.mockResolvedValue([]);
+    mock.providers.mockResolvedValue({ agy: { current: "chan", providers: { chan: { name: "Current AGY Channel" } } } });
+    if (!globalThis.CSS) vi.stubGlobal("CSS", {});
+    if (!CSS.escape) CSS.escape = value => value.replace(/[^a-zA-Z0-9_-]/g, character => `\\${character}`);
+    await act(async () => root.render(<AssistantNoticesControl />));
+    expect(container.textContent).toContain("gemini-3.8-flash-high");
+    expect(container.textContent).toContain("assistantNotices.modelUnavailable");
+    expect(container.querySelector('[data-setting-anchor="observerEffort"] button')?.textContent).toContain("high");
+    expect(container.querySelector('[data-setting-anchor="observerEffort"] button')?.hasAttribute("disabled")).toBe(true);
+    expect(mock.invoke.mock.calls.some(([cmd]) => cmd === "assistant_notices_configure")).toBe(false);
+    await act(async () => callbacks["engine-config://changed"]({ payload: null }));
+    expect(container.textContent).toContain("gemini-3.8-flash-high");
+    expect(container.textContent).toContain("assistantNotices.modelUnavailable");
+    expect(mock.invoke.mock.calls.some(([cmd]) => cmd === "assistant_notices_configure")).toBe(false);
+  });
   it("saves all config fields with its revision, prevents duplicate saves and retains conflict drafts on reload", async () => {
     await act(async () => root.render(<AssistantNoticesControl />));
     const toggle = () => container.querySelector<HTMLInputElement>('input[aria-label="assistantNotices.voiceEnabled"]')!;
@@ -188,7 +262,7 @@ describe("built-in assistant notices", () => {
   });
   it("labels a saved empty model as the engine default and retains it when its engine becomes unavailable", async () => {
     mock.models.mockResolvedValue([{ engine: "codex", id: "astra", name: "Astra", provider: "Selected provider", supportsEffort: true, resolvedModel: null }]);
-    mock.invoke.mockImplementation(async (command: string) => command === "assistant_notices_status" ? { ...status, observerEngine: "codex", observerModel: "", observerEffort: "high" } : []);
+    mock.invoke.mockImplementation(async (command: string) => command === "assistant_notices_models" ? mock.models() : command === "assistant_notices_status" ? { ...status, observerEngine: "codex", observerModel: "", observerEffort: "high" } : []);
     await act(async () => root.render(<AssistantNoticesControl />));
     expect(container.querySelector('[data-setting-anchor="observerModel"] button')?.textContent).toContain("assistantNotices.engineDefaultModel");
     expect(container.textContent).not.toContain("assistantNotices.modelUnavailable");

@@ -25,7 +25,7 @@ export function AssistantNoticesControl() {
   const disabled = !draft || busy;
   const selectedKey = draft ? noticeModelKey({ engine: draft.observerEngine, id: draft.observerModel }) : noticeModelKey(vertexModel);
   const selected = models.find(model => noticeModelKey(model) === selectedKey);
-  const choices = selected || !draft ? models : [{ engine: draft.observerEngine, id: draft.observerModel, name: draft.observerModel, provider: "", supportsEffort: false, resolvedModel: null }, ...models];
+  const choices = selected || !draft ? models : [{ engine: draft.observerEngine, id: draft.observerModel, name: draft.observerModel, provider: providers[draft.observerEngine] ?? "", supportsEffort: false, resolvedModel: null }, ...models];
   const levels: string[] = selected?.engine === "agy_vertex" ? ["medium"] : getEffortLevels(draft?.observerEngine ?? "claude").filter(level => !selected?.effortLevels || selected.effortLevels.includes(level));
   const efforts = draft && !levels.includes(draft.observerEffort) ? [draft.observerEffort, ...levels] : levels;
   const target = draft?.displayTarget;
@@ -43,13 +43,14 @@ export function AssistantNoticesControl() {
     <SettingsSectionLabel>{t("assistantNotices.observerGroup")}</SettingsSectionLabel>
     <p className="text-body-2-regular text-text-secondary">{t("assistantNotices.controlsDescription")}</p>
     <SettingsCard>{toggles(["observerEnabled", "paused", "focusMode"])}
-      <SettingsRow anchor="observerModel" label={t("assistantNotices.observerModel")} description={t(!selected ? "assistantNotices.modelUnavailable" : "assistantNotices.modelDescription")}>
+      <SettingsRow anchor="observerModel" label={t("assistantNotices.observerModel")} description={t(!selected ? "assistantNotices.modelUnavailable" : selected.engine === "agy" ? "assistantNotices.agyModelDescription" : "assistantNotices.modelDescription")}>
         <Select aria-label={t("assistantNotices.observerModel")} selectedKey={selectedKey} isDisabled={disabled} triggerClassName={trigger} onSelectionChange={key => {
           const model = models.find(item => noticeModelKey(item) === key); if (!model) return;
-          const effort = model.id === "" && draft?.observerEngine === model.engine && getEffortLevels(model.engine).some(level => level === draft.observerEffort)
-            ? draft.observerEffort : model.engine === "agy_vertex" ? "medium" : model.effortLevels?.includes(getDefaultEffort(model.engine)) ? getDefaultEffort(model.engine) : model.effortLevels?.[0] ?? getDefaultEffort(model.engine);
+          const effort = model.engine === "agy_vertex" ? "medium" : !model.supportsEffort && model.effortLevels?.[0] ? model.effortLevels[0]
+            : model.id === "" && draft?.observerEngine === model.engine && getEffortLevels(model.engine).some(level => level === draft.observerEffort)
+            ? draft.observerEffort : model.effortLevels?.includes(getDefaultEffort(model.engine)) ? getDefaultEffort(model.engine) : model.effortLevels?.[0] ?? getDefaultEffort(model.engine);
           change({ observerEngine: model.engine, observerModel: model.id, observerEffort: effort });
-        }}>{choices.map(model => <SelectItem key={noticeModelKey(model)} id={noticeModelKey(model)}>{[...new Set([model.id === "" ? t("assistantNotices.engineDefaultModel") : model.name, model.engine === "agy_vertex" ? "Vertex" : CLI_DISPLAY_NAMES[model.engine] ?? model.engine, model.provider].filter(Boolean))].join(" · ")}</SelectItem>)}</Select>
+        }}>{choices.map(model => <SelectItem key={noticeModelKey(model)} id={noticeModelKey(model)}>{[...new Set([model.id === "" ? t("assistantNotices.engineDefaultModel") : model.name, model.engine === "agy_vertex" ? "Vertex" : CLI_DISPLAY_NAMES[model.engine] ?? model.engine, model.provider || providers[model.engine]].filter(Boolean))].join(" · ")}</SelectItem>)}</Select>
       </SettingsRow>
       <SettingsRow anchor="observerEffort" label={t("assistantNotices.observerEffort")}>
         <Select aria-label={t("assistantNotices.observerEffort")} selectedKey={draft?.observerEffort ?? "medium"} isDisabled={disabled || !selected?.supportsEffort || selected.engine === "agy_vertex"} triggerClassName={trigger} onSelectionChange={key => change({ observerEffort: String(key) })}>

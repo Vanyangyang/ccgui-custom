@@ -1,5 +1,6 @@
 import { invoke, isWeb, listen } from "@/lib/transport";
 import { useEffect, useRef, useState } from "react";
+import type { AutoTitleModel } from "@/lib/ipc";
 import type { AssistantNotice, AssistantNoticeDisplay, AssistantNoticesConfig, AssistantNoticesStatus, CompletionAudioSettings, CompletionAudioView, CompletionAudioVoice } from "./types";
 
 export { isWeb };
@@ -9,6 +10,7 @@ function native<T>(command: string, args?: Record<string, unknown>): Promise<T> 
 }
 
 export const assistantNotices = {
+  models: () => native<AutoTitleModel[]>("assistant_notices_models"),
   status: () => native<AssistantNoticesStatus>("assistant_notices_status"),
   configure: (config: AssistantNoticesConfig, expectedRevision: number) => native<AssistantNoticesStatus>("assistant_notices_configure", { config, expectedRevision }),
   displays: () => native<AssistantNoticeDisplay[]>("assistant_notices_displays"),

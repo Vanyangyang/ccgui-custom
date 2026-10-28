@@ -76,6 +76,7 @@ export const en: Messages = {
     observerGroup: "Aside generation", observerModel: "Generation model", observerEffort: "Reasoning effort",
     engineDefaultModel: "Follow this engine’s default model",
     modelDescription: "Generation uses the provider currently selected for this engine in CCGUI. Source engines are independent of generation models; Vertex uses Gemini 4 Argon / medium.",
+    agyModelDescription: "Uses the current AGY channel and native login in a separate temporary session, outside CCGUI's session list, with no file, command or MCP access. Internal task management and automatic naming may make additional calls. Requires AGY CLI 1.3.4 or later.",
     modelUnavailable: "The saved generation model is temporarily unavailable. Your selection is retained; restore its provider or explicitly choose another model before saving.",
     voiceGroup: "Completion speech", voiceEnabled: "Speak completion reminders",
     completionAudioMode: "Announcement",

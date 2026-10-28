@@ -40,15 +40,15 @@ export function useNoticeSettings() {
         while (catalogPending && !catalogDisposed) {
           catalogPending = false;
           const epoch = catalogEpoch;
-          const results = await Promise.allSettled([ipc.autoTitleModels(), assistantNotices.displays(), ipc.getCliConfig()]);
+          const results = await Promise.allSettled([assistantNotices.models(), assistantNotices.displays(), ipc.getCliConfig()]);
           // An engine/provider change during a read invalidates the entire snapshot.
           if (catalogDisposed || epoch !== catalogEpoch) continue;
           const [modelResult, displayResult, providerResult] = results;
           if (modelResult.status === "fulfilled" && Array.isArray(modelResult.value)) {
-            const callable = modelResult.value.filter(item => ["claude", "codex", "pi"].includes(item.engine));
+            const callable = modelResult.value.filter(item => ["claude", "codex", "pi", "agy"].includes(item.engine));
             // Empty IDs are native's explicit "follow this engine's default" route.
             // Only offer it for engines present in the safe callable catalog.
-            const defaults = [...new Set(callable.map(item => item.engine))].map(engine => ({
+            const defaults = [...new Set(callable.filter(item => ["claude", "codex", "pi"].includes(item.engine)).map(item => item.engine))].map(engine => ({
               engine, id: "", name: "", provider: callable.find(item => item.engine === engine)?.provider ?? "",
               resolvedModel: null, supportsEffort: false,
             }));

@@ -344,6 +344,7 @@ pub fn run() -> Result<(), String> {
             assistant_notices_fixture_seed,
             assistant_notices_fixture_control,
             assistant_notices_status,
+            assistant_notices_models,
             assistant_notices_configure,
             assistant_notices_displays,
             // Preview is omitted: fixture runs must stay silent.

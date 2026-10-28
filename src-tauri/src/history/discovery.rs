@@ -984,6 +984,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn agy_observer_temporary_session_stays_out_of_discovery_while_alive() {
+        let root = std::env::temp_dir().join(format!("agy-hidden-observer-test-{}", uuid::Uuid::new_v4()));
+        let workspace = root.join("workspace");
+        let homes = [root.join("native"), root.join("vertex")];
+        let temporary = root.join("ccgui-observer-agy-fixture/home/.gemini/antigravity-cli");
+        for (home, id) in [(homes[0].as_path(), "native"), (homes[1].as_path(), "vertex"), (temporary.as_path(), "observer")] {
+            std::fs::create_dir_all(home.join("conversations")).unwrap();
+            std::fs::create_dir_all(home.join("cache")).unwrap();
+            std::fs::write(home.join("conversations").join(format!("{id}.db")), "").unwrap();
+            std::fs::write(home.join("cache/last_conversations.json"), serde_json::json!({workspace.to_string_lossy().to_string(): id}).to_string()).unwrap();
+        }
+        assert!(temporary.join("conversations/observer.db").is_file());
+        let sessions = discover_agy_in(&workspace, &homes);
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions.iter().all(|session| session.session_id != "observer" && !session.file_path.starts_with(&temporary)));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn agy_discovers_both_billing_homes_without_ambiguous_ids() {
         let root = std::env::temp_dir().join(format!("agy-discovery-{}", uuid::Uuid::new_v4()));
         let workspace = root.join("workspace");

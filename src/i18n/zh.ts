@@ -75,6 +75,7 @@ export const zh = {
     observerGroup: "旁白生成", observerModel: "生成模型", observerEffort: "思考强度",
     engineDefaultModel: "跟随该引擎默认模型",
     modelDescription: "生成使用所选引擎在 CCGUI 当前选择的供应商。来源引擎与生成模型相互独立；Vertex 固定使用 Gemini 4 Argon / medium。",
+    agyModelDescription: "使用当前 AGY 渠道及原生登录。每次在独立临时会话中生成，不进入 CCGUI 会话列表，不开放文件、命令或 MCP；CLI 内部任务管理和自动命名可能产生额外调用。需 AGY CLI 1.3.4 或更新版本。",
     modelUnavailable: "已保存的生成模型暂时不可用，选择已保留；恢复该供应商或明确选择其他模型后再保存。",
     voiceGroup: "完成播报", voiceEnabled: "播报完成提醒",
     completionAudioMode: "播报方式",

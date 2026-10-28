@@ -18,6 +18,9 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 mod codex;
+mod agy;
+pub(crate) use agy::structured as agy_structured;
+pub(crate) use agy::configuration_fingerprint as agy_configuration_fingerprint;
 pub(crate) mod diagnostics;
 mod pi;
 
@@ -326,11 +329,23 @@ async fn run(
 
 pub(super) async fn run_with_parser(
     engine: &str,
+    command: tokio::process::Command,
+    cwd: &Path,
+    input: &str,
+    timeout: Duration,
+    parse: fn(&[u8]) -> Result<SideCallOutput, SideCallError>,
+) -> Result<SideCallOutput, SideCallError> {
+    run_with_parser_in_home(engine, command, cwd, input, timeout, parse, None).await
+}
+
+pub(super) async fn run_with_parser_in_home(
+    engine: &str,
     mut command: tokio::process::Command,
     cwd: &Path,
     input: &str,
     timeout: Duration,
     parse: fn(&[u8]) -> Result<SideCallOutput, SideCallError>,
+    isolated_home: Option<&Path>,
 ) -> Result<SideCallOutput, SideCallError> {
     command
         .current_dir(cwd)
@@ -344,6 +359,11 @@ pub(super) async fn run_with_parser(
     #[cfg(windows)]
     super::hide_console(&mut command);
     crate::development_profile::enforce_homes(&mut command);
+    if let Some(home) = isolated_home {
+        // Apply last: a debug profile must not redirect an observer into a
+        // scanned history root or import its user customizations.
+        agy::isolate_homes(&mut command, home);
+    }
     let child = command.spawn().map_err(|e| {
         eprintln!("[side-call] {engine} spawn failed: {e}");
         SideCallError::Unavailable

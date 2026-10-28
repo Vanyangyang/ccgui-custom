@@ -561,6 +561,7 @@ pub fn run() {
             interactive_answer_state::interactive_answer_write,
             interactive_answer_state::interactive_answer_reset,
             assistant_notices::assistant_notices_status,
+            assistant_notices::assistant_notices_models,
             assistant_notices::assistant_notices_configure,
             assistant_notices::assistant_notices_displays,
             assistant_notices::assistant_notices_audio_settings,

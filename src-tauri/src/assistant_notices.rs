@@ -1221,6 +1221,13 @@ pub fn assistant_notices_status(
     Ok(state.status())
 }
 #[tauri::command]
+pub async fn assistant_notices_models(
+    window: tauri::Window,
+) -> Result<Vec<crate::auto_title::config::NamingModel>, String> {
+    gate(&window, true)?;
+    observer::models().await
+}
+#[tauri::command]
 pub async fn assistant_notices_configure(
     window: tauri::Window,
     state: tauri::State<'_, Arc<Service>>,
