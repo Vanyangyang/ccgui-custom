@@ -115,6 +115,15 @@ struct HandedPrompts {
     digests: std::collections::HashSet<String>,
 }
 
+#[derive(Default)]
+struct CodexHistoryContext {
+    model: Option<String>,
+    effort: Option<String>,
+    turn_id: Option<String>,
+    native_start: bool,
+    waiting_for_user: bool,
+}
+
 fn extractor_for(
     engine: &str,
     images: ImageMode,
@@ -122,10 +131,79 @@ fn extractor_for(
 ) -> LineExtractor<'static> {
     if engine == "dsh" {
         Box::new(extract_dsh_line)
-    } else if let Some(handed) = handed {
+    } else if engine == "codex" {
+        // Native turn_context is the per-turn model evidence. The session's
+        // latest picker choice and thread metadata cannot label older usage.
+        let context = std::cell::RefCell::new(CodexHistoryContext::default());
         Box::new(move |value| {
+            let mut context = context.borrow_mut();
+            let turn_id = value.pointer("/payload/turn_id")
+                .and_then(Value::as_str).map(str::to_string);
+            if type_str(value) == "event_msg" {
+                match value.pointer("/payload/type").and_then(Value::as_str) {
+                    Some("task_started") => {
+                        if turn_id.is_none() || context.turn_id != turn_id {
+                            *context = CodexHistoryContext::default();
+                        }
+                        context.turn_id = turn_id;
+                        context.native_start = true;
+                        return vec![LineRow::new("__codex_turn__", String::new(), None)];
+                    }
+                    Some("task_complete" | "turn_aborted") => {
+                        if context.turn_id == turn_id {
+                            context.native_start = false;
+                            context.waiting_for_user = false;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if type_str(value) == "turn_context" {
+                let model = value.pointer("/payload/model").and_then(Value::as_str)
+                    .map(str::trim).filter(|model| !model.is_empty()).map(str::to_string);
+                let effort = value.pointer("/payload/effort")
+                    .or_else(|| value.pointer("/payload/reasoning_effort"))
+                    .or_else(|| value.pointer("/payload/collaboration_mode/settings/reasoning_effort"))
+                    .and_then(Value::as_str).map(str::trim)
+                    .filter(|effort| !effort.is_empty()).map(str::to_string);
+                if context.turn_id != turn_id { context.native_start = false; }
+                context.turn_id = turn_id;
+                context.model = model;
+                context.effort = effort;
+                context.waiting_for_user = true;
+                return vec![LineRow::new("__codex_turn__", String::new(), None)];
+            }
             let mut rows = extract_codex_line(value, images);
-            rows.extend(codex_handed_prompt(value, &handed));
+            if let Some(handed) = handed.as_ref() {
+                rows.extend(codex_handed_prompt(value, handed));
+            }
+            let has_user = rows.iter().any(|row| {
+                if row.role != "user" { return false; }
+                let text = super::clean_user_turn(&row.text);
+                !super::is_injected_user_context(&text) && (!text.trim().is_empty() || !row.images.is_empty())
+            });
+            if has_user {
+                // Modern rollouts name the native turn before its user row.
+                // Legacy files may put context immediately before that row.
+                // A later user without either evidence starts an unknown turn.
+                if !context.native_start {
+                    if !context.waiting_for_user {
+                        context.model = None;
+                        context.effort = None;
+                    }
+                    rows.insert(0, LineRow::new("__codex_turn__", String::new(), None));
+                }
+                context.waiting_for_user = false;
+            }
+            if rows.iter().any(|row| matches!(row.role.as_str(), "assistant" | "thinking" | "tool")) {
+                context.waiting_for_user = false;
+            }
+            for row in &mut rows {
+                if matches!(row.role.as_str(), "assistant" | "thinking" | "tool" | "__usage__") {
+                    row.model = context.model.clone();
+                    row.effort = context.effort.clone();
+                }
+            }
             rows
         })
     } else {
@@ -293,11 +371,20 @@ fn fold_rows(rows: Vec<LineRow>) -> ParsedSession {
     let mut last_user_ts: Option<i64> = None;
     let mut context_window: Option<Value> = None;
     let mut context_model: Option<String> = None;
+    let mut codex_turn_start = 0;
     // tool call id -> index in `messages`. Results arrive in completion order,
     // so pairing them back up by the latest row still missing one mislabels
     // parallel calls; the id is what actually names the call.
     let mut call_rows: HashMap<String, usize> = HashMap::new();
     for row in coalesce_generated_rows(rows) {
+        if row.role == "__codex_turn__" {
+            // A new turn without output must not relabel an older turn's
+            // answer or attach its startup token sample to that answer.
+            codex_turn_start = messages.len();
+            context_window = None;
+            context_model = None;
+            continue;
+        }
         // Window metadata can precede the latest output row (for example,
         // text with usage followed by a tool). Remember only real capacity
         // reports from model output; an explicit model change invalidates it.
@@ -317,7 +404,7 @@ fn fold_rows(rows: Vec<LineRow>) -> ParsedSession {
         // Usage-only marker (codex token_count or claude compact_boundary): fold
         // onto the latest model output instead of creating an empty row.
         if row.role == "__usage__" {
-            if let Some(last) = messages.iter_mut().rev()
+            if let Some(last) = messages[codex_turn_start..].iter_mut().rev()
                 .find(|m| matches!(m.role.as_str(), "assistant" | "tool" | "thinking")) {
                 let mut new_usage = row.usage;
                 if let (Some(mcw), Some(next)) = (context_window.as_ref(), new_usage.as_mut()) {
@@ -2146,6 +2233,7 @@ mod guardian_tests;
 
 #[cfg(test)]
 mod tests {
+    mod codex_model_tests { include!("extract_codex_model_tests.rs"); }
 
     #[test]
     fn generated_images_history_recovers_structured_outputs_and_deduplicates_native_copies() {

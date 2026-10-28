@@ -2364,9 +2364,6 @@ async fn handshake_and_start(
         }
     }
     let thread_model = result.get("model").and_then(Value::as_str).map(str::to_string);
-    if let Some(model) = thread_model.as_deref() {
-        core.dispatch_event(state, EngineEvent::Model(model.to_string()));
-    }
     let reported_effort = result
         .get("reasoningEffort")
         .or_else(|| result.pointer("/thread/reasoningEffort"))
@@ -2416,7 +2413,20 @@ async fn handshake_and_start(
     view.turn_throughput = None;
     view.throughput.begin(&thread_id, req.session_id.is_none());
     if super::parse_compact_prompt(&req.prompt).is_some() {
+        // Compaction inherits the resumed thread; it has no turn-level model override.
+        if let Some(model) = thread_model.as_deref() {
+            core.dispatch_event(state, EngineEvent::Model(model.to_string()));
+        }
         return start_compact_turn(server, core, state, view, &thread_id, ack_timeout, killed).await;
+    }
+    // thread/resume may report the preceding turn's model. Attribute this turn
+    // to the settings actually sent in turn/start (collaborationMode wins).
+    let turn_model = turn_params.pointer("/collaborationMode/settings/model")
+        .or_else(|| turn_params.get("model"))
+        .and_then(Value::as_str)
+        .or(thread_model.as_deref());
+    if let Some(model) = turn_model {
+        core.dispatch_event(state, EngineEvent::Model(model.to_string()));
     }
     start_requested_turn(server, core, state, view, turn_params, ack_timeout, killed).await
 }
@@ -3013,6 +3023,7 @@ fn terminal_message(raw: String, stderr_buf: &Mutex<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("codex_app_model_tests.rs");
     use crate::engine::registry::ChildEntry;
     use crate::engine::ProcessRegistry;
     use crate::event_sink::{Emit, EventSink};

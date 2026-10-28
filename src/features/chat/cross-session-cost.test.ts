@@ -33,6 +33,26 @@ beforeEach(() => {
 });
 
 describe("cross-session cost review telemetry", () => {
+  it("keeps same-turn Sol usage attributed to Sol and still reviews a real Terra-to-Sol change", () => {
+    const f = fixture("codex", { info: {
+      last_token_usage: { input_tokens: 65000, output_tokens: 1000, total_tokens: 66000 },
+      model_context_window: 570000,
+    } });
+    f.meta.model = "gpt-6.1-sol";
+    f.state.openTabs[0].model = "gpt-6.1-sol";
+    f.session.messages = [{ model: "gpt-6.1-sol", usage: f.session.usage } as never];
+    f.meta.promptCache = null;
+    const same = f.review();
+    expect(same.context).toMatchObject({ usageModel: "gpt-6.1-sol", modelMismatch: false, used: 66000 });
+    expect(requiresSessionSendCostApproval(same, f.meta, f.session, NOW)).toBe(false);
+    expect(requiresCrossSessionCostApproval(same)).toBe(false);
+
+    f.session.messages = [{ model: "gpt-6.1-terra", usage: f.session.usage } as never];
+    const changed = f.review();
+    expect(changed.context).toMatchObject({ usageModel: "gpt-6.1-terra", modelMismatch: true, kind: "last_request" });
+    expect(requiresSessionSendCostApproval(changed, f.meta, f.session, NOW)).toBe(true);
+    expect(requiresCrossSessionCostApproval(changed)).toBe(true);
+  });
   it.each([0, 43920, 49999, 50000])("applies the cross-session threshold to current context %i", (used) => {
     const f = fixture("claude", { input_tokens: used });
     for (const cache of [null, { startedAt: NOW - 7200_000, observedAt: NOW - 7100_000, ttlSeconds: 3600, source: "anthropic-usage" as const },
