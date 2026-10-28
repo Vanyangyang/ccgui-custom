@@ -9,6 +9,9 @@ use tokio::process::Command;
 use tokio::time::Instant;
 
 const AGENT: &str = "ccgui-notice";
+mod staging;
+pub(crate) use staging::cleanup_orphans;
+pub(super) use staging::{before_spawn, spawned};
 const AGENT_HEADER: &str = "---\nname: ccgui-notice\ndescription: Restricted structured observer\nmainAgent: true\nsubagent: false\nmodel: inherit\ntools: [finish]\nexcludeDefaultComponents: true\ninheritCustomizations: false\ninheritMcp: false\ncommandExecutionPolicy: \"off\"\n---\n";
 
 #[derive(Default, Deserialize, Serialize)]
@@ -36,12 +39,18 @@ pub(crate) fn configuration_fingerprint() -> Option<[u8;32]> {
 
 /// Cancellation closes the process job before this guard drops, but Windows
 /// may release SQLite/log handles slightly later. Retry only this owned root.
-struct PrivateStaging(PathBuf);
+struct PrivateStaging {
+    root: PathBuf,
+    lease: Option<std::fs::File>,
+}
 impl Drop for PrivateStaging {
     fn drop(&mut self) {
-        if remove_staging(&self.0) { return; }
-        let root = self.0.clone();
+        // Closing the lease also works on process death; startup can reclaim it.
+        let lease = self.lease.take();
+        if remove_staging(&self.root) { return; }
+        let root = self.root.clone();
         let _ = std::thread::Builder::new().name("agy-observer-cleanup".into()).spawn(move || {
+            let _lease = lease;
             for _ in 0..20 {
                 std::thread::sleep(Duration::from_millis(100));
                 if remove_staging(&root) { return; }
@@ -51,10 +60,7 @@ impl Drop for PrivateStaging {
     }
 }
 fn remove_staging(path: &Path) -> bool {
-    match std::fs::remove_dir_all(path) {
-        Ok(()) => true,
-        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
-    }
+    staging::remove_payload_then_markers(path)
 }
 
 fn context(provider_id: Option<&str>) -> Result<Context, SideCallError> {
@@ -194,18 +200,14 @@ pub(crate) async fn structured(call: StructuredCall<'_>) -> Result<SideCallOutpu
         return Err(SideCallError::Unavailable);
     }
     let context = context(call.provider_id)?;
+    staging::cleanup_orphans();
     let root = std::env::temp_dir().join(format!("ccgui-observer-agy-{}", uuid::Uuid::new_v4()));
     execute_in(context, call, &root).await
 }
 
 async fn execute_in(context: Context, call: StructuredCall<'_>, root: &Path) -> Result<SideCallOutput, SideCallError> {
     let deadline = Instant::now() + call.timeout;
-    std::fs::create_dir(&root).map_err(|_| SideCallError::Unavailable)?;
-    let _cleanup = PrivateStaging(root.to_path_buf());
-    #[cfg(unix)] {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).map_err(|_| SideCallError::Unavailable)?;
-    }
+    let _cleanup = staging::create(root)?;
     let (home, cwd) = stage(&root, &call, &context.settings)?;
     let mut version = command(&context, &home);
     version.arg("--version");

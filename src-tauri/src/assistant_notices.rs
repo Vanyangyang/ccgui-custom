@@ -1062,6 +1062,10 @@ impl Service {
 }
 
 pub fn init(app: &tauri::AppHandle) -> Arc<Service> {
+    // A forced host exit cannot run staging Drop. Reclaim only unlocked,
+    // positively identified observer roots; never register them as chats.
+    let _ = std::thread::Builder::new().name("agy-observer-recovery".into())
+        .spawn(crate::engine::side_call::cleanup_agy_observer_orphans);
     let path = crate::paths::app_home().join("assistant-notices.json");
     let mut fatal = None;
     let mut configuration_error = None;

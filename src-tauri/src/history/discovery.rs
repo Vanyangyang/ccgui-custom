@@ -984,7 +984,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn agy_observer_temporary_session_stays_out_of_discovery_while_alive() {
+    fn agy_observer_temporary_session_stays_out_of_discovery_including_after_host_exit() {
         let root = std::env::temp_dir().join(format!("agy-hidden-observer-test-{}", uuid::Uuid::new_v4()));
         let workspace = root.join("workspace");
         let homes = [root.join("native"), root.join("vertex")];
@@ -999,6 +999,11 @@ mod tests {
         let sessions = discover_agy_in(&workspace, &homes);
         assert_eq!(sessions.len(), 2);
         assert!(sessions.iter().all(|session| session.session_id != "observer" && !session.file_path.starts_with(&temporary)));
+        // A restart discovers from the same fixed native homes, not the temp
+        // tree. Isolation must hold even when crash cleanup has not run yet.
+        let after_restart = discover_agy_in(&workspace, &homes);
+        assert_eq!(after_restart.len(), 2);
+        assert!(after_restart.iter().all(|session| session.session_id != "observer"));
         std::fs::remove_dir_all(root).unwrap();
     }
 

@@ -77,7 +77,7 @@ async fn private_cleanup_retries_until_windows_releases_native_file_handles() {
     let root = scratch(); std::fs::create_dir(&root).unwrap();
     let path = root.join("history.db"); std::fs::write(&path,"synthetic snapshot").unwrap();
     let handle = std::fs::OpenOptions::new().read(true).share_mode(0).open(&path).unwrap();
-    drop(PrivateStaging(root.clone()));
+    drop(PrivateStaging { root: root.clone(), lease: None });
     assert!(root.exists());
     tokio::time::sleep(Duration::from_millis(250)).await;
     drop(handle);

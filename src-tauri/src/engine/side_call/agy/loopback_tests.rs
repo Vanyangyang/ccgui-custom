@@ -10,7 +10,7 @@ async fn installed_agy_blocks_privileged_tools_and_cleans_success_timeout_and_ca
     for mode in ["success", "timeout", "cancel"] {
         let root = scratch();
         let witness = scratch(); std::fs::create_dir(&witness).unwrap();
-        let _witness_cleanup = PrivateStaging(witness.clone());
+        let _witness_cleanup = PrivateStaging { root: witness.clone(), lease: None };
         let marker = witness.join("forbidden-write.txt");
         let command_marker = witness.join("forbidden-command.txt");
         let secret = witness.join("synthetic-secret.txt");

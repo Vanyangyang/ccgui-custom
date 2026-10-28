@@ -21,6 +21,7 @@ mod codex;
 mod agy;
 pub(crate) use agy::structured as agy_structured;
 pub(crate) use agy::configuration_fingerprint as agy_configuration_fingerprint;
+pub(crate) use agy::cleanup_orphans as cleanup_agy_observer_orphans;
 pub(crate) mod diagnostics;
 mod pi;
 
@@ -363,12 +364,21 @@ pub(super) async fn run_with_parser_in_home(
         // Apply last: a debug profile must not redirect an observer into a
         // scanned history root or import its user customizations.
         agy::isolate_homes(&mut command, home);
+        agy::before_spawn(home)?;
     }
     let child = command.spawn().map_err(|e| {
         eprintln!("[side-call] {engine} spawn failed: {e}");
         SideCallError::Unavailable
     })?;
     let mut process = ProcessGuard::new(child);
+    if let Some(home) = isolated_home {
+        #[cfg(windows)]
+        if process.job.is_some() {
+            agy::spawned(home, process.child.id())?;
+        }
+        #[cfg(not(windows))]
+        agy::spawned(home, process.child.id())?;
+    }
     let mut stdin = process.child.stdin.take().ok_or(SideCallError::Failed)?;
     let stdout = process.child.stdout.take().ok_or(SideCallError::Failed)?;
     let stderr = process.child.stderr.take().ok_or(SideCallError::Failed)?;
