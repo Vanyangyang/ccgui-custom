@@ -69,7 +69,7 @@ export function CrossSessionQueue({ active, className }: { active: ActiveSession
     </div>}
     {inbox.length > 0 && <section className={className} data-testid="cross-session-inbox" aria-label={t("crossSession.inboxTitle")}>
       <div className="flex max-h-[45vh] flex-col gap-2 overflow-y-auto rounded-xl border border-border-secondary bg-background-secondary-default p-2">
-        <h3 className="text-caption-1-medium text-text-primary">{t("crossSession.inboxTitle")}</h3>
+        <h3 className="text-caption-1-medium text-text-primary">{t(inbox.every(record => record.mailbox?.relation === "task") ? "crossSession.managedParentTitle" : "crossSession.inboxTitle")}</h3>
         {inbox.map((record) => <div key={record.scopedId} data-testid="cross-session-inbox-message" className="flex flex-col gap-2 text-caption-1-regular text-text-secondary [overflow-wrap:anywhere]">
           <p>{t("crossSession.inboxFrom", { title: sessions.find((s) => crossSessionParticipantKey(s) === crossSessionParticipantKey(record.sender))?.customTitle || record.sender.title || `${record.sender.engine} · ${record.sender.sessionId.slice(0, 8)}` })} · {t(`crossSession.mailboxPhase.${record.mailbox!.phase}`)} · {t(`crossSession.mailboxKind.${record.mailbox!.kind}`)}</p>
           {record.mailbox!.waitReason && <p>{t(`crossSession.mailboxWait.${record.mailbox!.waitReason}`)}</p>}
@@ -80,7 +80,9 @@ export function CrossSessionQueue({ active, className }: { active: ActiveSession
             {record.mailbox!.impactReview && <p className="whitespace-pre-wrap">{t("crossSession.inboxImpactReview")}： {record.mailbox!.impactReview}</p>}
           </details>
           {record.mailbox!.phase === "received" && !["permission", "cost_approval", "stopped", "target_unavailable"].includes(record.mailbox!.waitReason ?? "") && record.status !== "awaiting_permission" && <div className="flex flex-wrap gap-1">
+            {record.mailbox!.relation !== "task" &&
             <Button size="xs" title={t("crossSession.inboxInterruptTooltip")} onClick={() => handleSendNow(record.scopedId)}>{t("crossSession.inboxInterrupt")}</Button>
+            }
             <Button size="xs" onClick={() => handleRemove(record.scopedId)}>{t("crossSession.costCancel")}</Button>
           </div>}
         </div>)}

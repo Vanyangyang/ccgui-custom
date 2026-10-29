@@ -285,7 +285,8 @@ export function createMessagingActions(
       if (options.hostLaunch && !matchesHostTaskSelection(current, session, options.hostLaunch)) {
         throw new HostChatBusyError("Host task session selection changed before delivery");
       }
-      if ((session.streaming && !(live && options.hostContinuation)) || session.queue.length || hasOpenCard(session)) {
+      if ((session.streaming && !(live && options.hostContinuation)) ||
+        (session.queue.length && !options.hostContinuation?.priority) || hasOpenCard(session)) {
         throw new HostChatBusyError();
       }
     };

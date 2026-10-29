@@ -49,6 +49,8 @@ export interface SendOptions {
   /** Host-owned durable continuation queue. Never enters the ordinary composer
    * queue or retries after a lost native ACK. Called immediately before IPC. */
   hostContinuation?: {
+    /** Trusted child-to-parent input may precede, but never consume, queued user rows. */
+    priority?: true;
     beforeDelivery: (delivery: "turn" | "steer" | "live", runId: string) => Promise<void>;
     onReceived: (delivery: "turn" | "steer" | "live", runId: string) => void;
   };

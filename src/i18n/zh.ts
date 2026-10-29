@@ -2965,6 +2965,7 @@ export const zh = {
   },
   crossSession: {
     inboxTitle: "关联消息收件箱",
+    managedParentTitle: "子任务回传",
     inboxFrom: "来自 {{title}}",
     inboxWith: "关联消息 · {{title}}",
     inboxOriginal: "查看原文",

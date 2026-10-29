@@ -14,13 +14,16 @@ import { workspaceCatalogPathKey } from "@/lib/workspace-path";
 import { handlePluginManagementRequest, isPluginManagementMethod } from "@/features/plugins/runtime/management";
 import { handleWorkspaceOrganizationRequest, isWorkspaceOrganizationMethod } from "@/features/projects/management";
 import { sameParticipant, targetParticipant, type CorrespondenceEnvelope, type CorrespondenceReceipt, type InboxCaller,
-  type InboxMessageKind, type InboxReceiptState, type InboxSummary } from "@/features/plugins/runtime/chat-inbox";
+  type InboxMessageKind, type InboxReceiptState, type InboxSummary, type ManagedParentTarget } from "@/features/plugins/runtime/chat-inbox";
+import { createManagedParentDelivery } from "./managed-parent-delivery";
 
 export interface CrossSessionRequest {
   requestId: string;
   sender: { runId: string; engine: string; sessionId: string | null; workspacePath: string };
   method: string;
   arguments: Record<string, unknown>;
+  /** Native-only proof; send_message arguments cannot select this route. */
+  managedParent?: ManagedParentTarget;
 }
 
 export type CrossSessionCommunicationStatus = "preparing" | HostChatReceipt["status"];
@@ -360,8 +363,25 @@ export function guardClaudeProcess(host: HostChatFacade, deps = {
     const session = host.inspect(target, options);
     return session && busy.has(key(target)) && session.status === "idle" ? { ...session, status: "busy" } : session;
   };
+  const beforeIdleSend: NonNullable<HostChatFacade["beforeIdleSend"]> = async target => {
+    await host.beforeIdleSend?.(target);
+    if (target.engine !== "claude") return;
+    if (!endedReady) throw new Error("Native process guard is not subscribed");
+    await endedReady;
+    const identity = key(target);
+    while (!disposed) {
+      const observedGeneration = generation;
+      const running = await deps.running(target.nativeSessionId);
+      if (disposed) throw new Error("Native process guard has been disposed");
+      if (observedGeneration !== generation) continue;
+      if (running) { busy.add(identity); throw new HostChatBusyError(); }
+      busy.delete(identity);
+      return;
+    }
+    throw new Error("Native process guard has been disposed");
+  };
   return {
-    ...host, inspect,
+    ...host, inspect, beforeIdleSend,
     current: () => { const current = host.current(); return current ? inspect(current) : null; },
     subscribe(callback) {
       const offHost = host.subscribe(callback);
@@ -387,21 +407,7 @@ export function guardClaudeProcess(host: HostChatFacade, deps = {
       if (disposed) throw new Error("Native process guard has been disposed");
     },
     async send(target, prompt, runId, options) {
-      if (target.engine === "claude") {
-        if (!endedReady) throw new Error("Native process guard is not subscribed");
-        await endedReady;
-        const identity = key(target);
-        while (!disposed) {
-          const observedGeneration = generation;
-          const running = await deps.running(target.nativeSessionId);
-          if (disposed) throw new Error("Native process guard has been disposed");
-          // Retirement during the probe invalidates a stale true response.
-          if (observedGeneration !== generation) continue;
-          if (running) { busy.add(identity); throw new HostChatBusyError(); }
-          busy.delete(identity);
-          break;
-        }
-      }
+      await beforeIdleSend(target);
       if (disposed) throw new Error("Native process guard has been disposed");
       return host.send(target, prompt, runId, options);
     },
@@ -537,6 +543,9 @@ export function createCrossSessionHandler(deps: Dependencies) {
     const matches = exact.length ? exact : sessionId.length >= 8 ? scopedRows.filter((s) => s.sessionId.startsWith(sessionId)) : [];
     if (matches.length !== 1) throw new Error(matches.length ? "Ambiguous session_id; specify exact engine and workspace" : "Unknown or unavailable local session_id");
     const meta = matches[0];
+    if (request.managedParent && !sameParticipant(request.managedParent, meta)) {
+      throw new Error("Resolved target does not match the native task parent");
+    }
     if (rows.filter((s) => s.engine === meta.engine && s.sessionId === meta.sessionId).length !== 1) throw new Error("Conflicting native session identities across workspaces");
     if (meta.engine === request.sender.engine && meta.sessionId === request.sender.sessionId) throw new Error("Cannot send a message to the sender's own session");
     const prompt = `[Message from CC GUI ${JSON.stringify({ engine: request.sender.engine, session_id: request.sender.sessionId })}]\n\n${message}`;
@@ -544,6 +553,7 @@ export function createCrossSessionHandler(deps: Dependencies) {
     const target: HostChatTarget = { client: "ccgui", engine: meta.engine, nativeSessionId: meta.sessionId, guiSessionId: meta.sessionId,
       workspacePath: meta.workspacePath, ...await deps.bridge.identity() };
     const envelope: CorrespondenceEnvelope = { sender: { engine: caller.engine, sessionId: caller.sessionId, workspacePath: caller.workspacePath }, requestId: id,
+      ...(request.managedParent && !relatedId ? { managedParent: request.managedParent } : {}),
       ...(relatedId ? { relation: { type: updateOf ? "update" : "reply", requestId: relatedId,
         scopedId: await scopedId(updateOf ? request.sender : { ...request.sender, engine: meta.engine, sessionId: meta.sessionId, workspacePath: meta.workspacePath }, relatedId) },
         kind: (args.message_kind ?? "information") as InboxMessageKind } : {}) };
@@ -580,6 +590,7 @@ export function createCrossSessionHandler(deps: Dependencies) {
       acceptedAt: now,
       updatedAt: now,
       ...(envelope.relation ? { mailbox: { phase: "received", relation: envelope.relation.type, parentRequestId: envelope.relation.requestId, kind: envelope.kind! } as InboxReceiptState } : {}),
+      ...(envelope.managedParent ? { mailbox: { phase: "received", relation: "task", parentRequestId: id, kind: "information" } as InboxReceiptState } : {}),
     });
     try {
       if (!deps.store.getState().initialized) await deps.store.getState().init();
@@ -690,8 +701,13 @@ export function startCrossSessionRuntime(): () => void {
   // The bootstrap participant observes this rejection. Also handle disposal
   // before bootstrap begins waiting, so StrictMode does not leak a rejection.
   void initialized.promise.catch(() => {});
+  let managedHost: HostChatFacade | undefined;
   const bridge = createHostChatBridge("ccgui-cross-session", storage, {
-    host: async () => guardClaudeProcess(await desktopChatFacade()), checkpointReady: () => initialized.promise,
+    host: async () => (managedHost = guardClaudeProcess(await desktopChatFacade())), checkpointReady: () => initialized.promise,
+    managedParent: async () => createManagedParentDelivery(async target => {
+      if (!managedHost?.beforeIdleSend) throw new HostChatBusyError("Native parent process guard is unavailable");
+      await managedHost.beforeIdleSend(target);
+    }),
   });
   queueControls = bridge;
   const handler = createCrossSessionHandler({ store: useChatStore, bridge,

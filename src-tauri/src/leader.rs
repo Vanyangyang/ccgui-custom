@@ -1853,7 +1853,7 @@ fn require_main(window: &tauri::WebviewWindow) -> Result<(), String> {
 }
 
 mod parent_messages;
-pub(crate) use parent_messages::validate_parent_message;
+pub(crate) use parent_messages::{managed_parent_message, validate_parent_message, ManagedParent};
 
 fn role(child: bool) -> String {
     let description = if child {

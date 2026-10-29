@@ -266,6 +266,10 @@ fn tool_publication_and_guidance_follow_trusted_capabilities() {
             assert!(!instructions.contains("Leader mode"));
             assert_eq!(instructions.contains("ccgui-self-update"), self_update);
             assert_eq!(instructions.contains("coordinate_self_update"), self_update);
+            if task_tools {
+                assert!(instructions.contains("verified child-to-parent"));
+                assert!(instructions.contains("acknowledge_message with outcome=handled"));
+            }
             if !task_tools {
                 for tool in tools {
                     let text = tool.description.as_deref().unwrap_or_default();

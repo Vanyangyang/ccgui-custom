@@ -48,6 +48,18 @@ it("receives related messages quietly and expands verbatim originals with explic
   await act(async () => button.click()); expect(actions.send).toHaveBeenCalledWith("message");
 });
 
+it("keeps managed parent input out of ordinary consultation queue and never offers interrupt", async () => {
+  store.getState().upsertRecord(record({ mailbox: { phase: "received", relation: "task", parentRequestId: "question", kind: "information", waitReason: "target_busy" } }));
+  await render();
+  expect(node.textContent).toContain(i18n.t("crossSession.managedParentTitle"));
+  expect(node.textContent).not.toContain(i18n.t("crossSession.queueTitle"));
+  expect(Array.from(node.querySelectorAll("button")).some(button => button.textContent === i18n.t("crossSession.inboxInterrupt"))).toBe(false);
+  const cancel = Array.from(node.querySelectorAll("button")).find(button => button.textContent === i18n.t("crossSession.costCancel"))!;
+  await act(async () => cancel.click());
+  expect(actions.cancel).toHaveBeenCalledWith("message");
+  expect(actions.send).not.toHaveBeenCalled();
+});
+
 it.each(["retrieved", "deferred", "uncertain"] as const)("keeps %s visible without dangerous resend controls", async (phase) => {
   const item = record(); item.mailbox = { ...item.mailbox!, phase, waitReason: "processing_unconfirmed" }; item.status = "unknown";
   store.getState().upsertRecord(item); await render();

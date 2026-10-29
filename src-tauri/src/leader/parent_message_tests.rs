@@ -1,5 +1,66 @@
 use super::*;
 
+#[test]
+fn managed_parent_message_requires_the_unique_actual_parent() {
+    let f = basic();
+    let (id, _, sender) = child(&f);
+    for target in [f.parent.session_id.as_str(), "parent-s"] {
+        let route = f.manager.managed_parent_message(&sender, target, None, None).unwrap();
+        assert_eq!(route.branch_id, id);
+        assert_eq!(route.session_id, f.parent.session_id);
+        assert_eq!(route.engine, f.parent.engine);
+        assert_eq!(route.workspace_path, f.parent.workspace_path);
+    }
+    for target in ["other-session", "child-session", "parent"] {
+        assert!(f.manager.managed_parent_message(&sender, target, None, None).is_none());
+    }
+    assert!(f.manager.managed_parent_message(&sender, &f.parent.session_id, Some("agy"), None).is_none());
+    assert!(f.manager.managed_parent_message(&sender, &f.parent.session_id, None, Some("elsewhere")).is_none());
+    for impostor in [f.parent.clone(), identity("claude", "child-session", &sender.workspace_path),
+        identity("codex", "sibling-session", &sender.workspace_path), identity("codex", "child-session", "elsewhere")] {
+        assert!(f.manager.managed_parent_message(&impostor, &f.parent.session_id, None, None).is_none());
+    }
+}
+
+#[test]
+fn managed_parent_message_rejects_retired_duplicate_and_ambiguous_relationships() {
+    let f = basic();
+    let (id, _, sender) = child(&f);
+    for state in ["reclaimed", "handed_off"] {
+        f.manager.inner.lock().branches.get_mut(&id).unwrap().branch.state = state.into();
+        assert!(f.manager.managed_parent_message(&sender, &f.parent.session_id, None, None).is_none());
+    }
+    f.manager.inner.lock().branches.get_mut(&id).unwrap().branch.state = "running".into();
+    let (other, _) = spawn(&f, "other-child");
+    {
+        let mut inner = f.manager.inner.lock();
+        inner.branches.get_mut(&other).unwrap().branch.parent_session_id = "parent-something-else".into();
+    }
+    assert!(f.manager.managed_parent_message(&sender, "parent-s", None, None).is_none());
+    assert!(f.manager.managed_parent_message(&sender, &f.parent.session_id, None, None).is_some());
+    {
+        let mut inner = f.manager.inner.lock();
+        inner.branches.get_mut(&other).unwrap().branch.session_id = Some(sender.session_id.clone());
+    }
+    assert!(f.manager.managed_parent_message(&sender, &f.parent.session_id, None, None).is_none());
+}
+
+#[test]
+fn managed_parent_message_uses_durable_parent_workspace_and_aliases() {
+    let f = basic();
+    let (id, run, sender) = child(&f);
+    f.manager.inner.lock().branches.get_mut(&id).unwrap().branch.parent_workspace_path = Some("G:/Parent/Workspace".into());
+    let alias = if cfg!(windows) { "G:\\Parent\\Workspace" } else { "G:/Parent/Workspace" };
+    let route = f.manager.managed_parent_message(&sender, &f.parent.session_id, Some(&f.parent.engine), Some(alias)).unwrap();
+    assert_eq!(route.workspace_path, "G:/Parent/Workspace");
+    assert!(f.manager.managed_parent_message(&sender, &f.parent.session_id, None, Some(&sender.workspace_path)).is_none());
+    observe(&f, &run, "child-session", "done", json!({}), 2);
+    let restored = LeaderManager::with_services(f.manager.db.clone(),
+        Arc::new(crate::engine::ProcessRegistry::default()), f.emitter.clone(),
+        Arc::new(|| 1_000_100), Arc::new(|_, _, _| Ok(()))).unwrap();
+    assert!(restored.managed_parent_message(&sender, &f.parent.session_id, None, Some(alias)).is_some());
+}
+
 fn child(f: &Fixture) -> (String, String, LeaderIdentity) {
     let (id, run) = spawn(f, "message-child");
     observe(f, &run, "child-session", "session", json!("child-session"), 1);

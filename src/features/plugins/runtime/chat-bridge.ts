@@ -7,19 +7,27 @@ import { crossSessionCostReview, requiresCrossSessionCostApproval } from "@/feat
 import { resolveSessionModel } from "@/features/chat/store/stream";
 import { cloneCheckpointValue, runtimeCheckpoint, type RuntimeCheckpoint, type RuntimeCheckpointParticipant } from "@/lib/runtime-checkpoint";
 import type { PluginStorageBackend } from "./context";
+import { TaskPreSpawnError } from "./task-facade";
 import {
   INBOX_GUIDANCE, MAX_INBOX_TEXT, MAX_INBOX_RESPONSE_BYTES, MAX_RELATED_MESSAGE_BYTES, acknowledgementCopy, callerCopy, envelopeCopy,
   readOptionsCopy, renderInboxTurn, sameParticipant, targetParticipant, validCorrespondenceId, validMessageId,
   type CorrespondenceEnvelope, type CorrespondenceReceipt, type InboxAcknowledgement, type InboxCaller,
   type InboxClaim, type InboxMessage, type InboxParticipant, type InboxRead, type InboxReadOptions,
-  type InboxReadResult, type InboxSummary, type InboxWaitReason,
+  type InboxReadResult, type InboxSummary, type InboxWaitReason, type ManagedParentTarget,
 } from "./chat-inbox";
 
 /** A request the user chose to send ahead of the target's own queued rows. */
 export interface HostChatDeliveryOptions { priority?: boolean }
+export interface ManagedParentDeliveryFacade {
+  inspect(target: HostChatTarget): { status: "idle" | "busy" | "awaiting_permission"; canDeliver: boolean; runId: string | null } | null;
+  validate(target: HostChatTarget, parent: ManagedParentTarget, sender: InboxParticipant): Promise<boolean>;
+  deliver(target: HostChatTarget, prompt: string, requestedRunId: string, beforeDelivery: (delivery: "turn" | "steer" | "live", runId: string) => Promise<void>): Promise<{ delivery: "turn" | "steer" | "live"; runId: string }>;
+}
 
 /** Host-only seam: plugins see only the SDK facade, never the store. */
 export interface HostChatFacade {
+  /** Host-only native retirement fence, reusable before an idle managed send. */
+  beforeIdleSend?(target: HostChatTarget): Promise<void>;
   current(): HostChatSession | null;
   inspect(target: HostChatTarget, options?: HostChatDeliveryOptions): HostChatSession | null;
   model?(target: HostChatTarget): string | undefined;
@@ -220,19 +228,20 @@ function ledgerEntries(value: unknown, identity?: HostChatIdentity): Entry[] {
       error: entry.receipt.error === undefined ? undefined : clip(entry.receipt.error, 1024) };
     if (entry.envelope) entry.envelope = envelopeCopy(entry.envelope);
     const mailbox = entry.receipt.mailbox;
-    if (mailbox && (!entry.envelope?.relation || !["received", "retrieved", "handled", "deferred", "uncertain"].includes(mailbox.phase) ||
-      mailbox.relation !== entry.envelope.relation.type || mailbox.parentRequestId !== entry.envelope.relation.requestId || mailbox.kind !== entry.envelope.kind ||
+    if (mailbox && ((!entry.envelope?.relation && !entry.envelope?.managedParent) || !["received", "retrieved", "handled", "deferred", "uncertain"].includes(mailbox.phase) ||
+      mailbox.relation !== (entry.envelope?.managedParent ? "task" : entry.envelope?.relation?.type) || mailbox.parentRequestId !== (entry.envelope?.managedParent ? entry.envelope.requestId : entry.envelope?.relation?.requestId) || mailbox.kind !== (entry.envelope?.kind ?? "information") ||
       (mailbox.waitReason !== undefined && !["target_busy", "permission", "cost_approval", "stopped", "parent_pending", "target_unavailable", "processing_unconfirmed"].includes(mailbox.waitReason)) ||
       [mailbox.retrievedAt, mailbox.handledAt].some(at => at !== undefined && !Number.isFinite(at)) ||
       (mailbox.impactReview !== undefined && (typeof mailbox.impactReview !== "string" || [...mailbox.impactReview].length > 8000)))) throw new Error("Invalid inbox receipt ledger");
-    if (entry.envelope?.relation && !mailbox) throw new Error("Missing inbox receipt ledger");
+    if ((entry.envelope?.relation || entry.envelope?.managedParent) && !mailbox) throw new Error("Missing inbox receipt ledger");
     if (entry.claim && (typeof entry.claim.runId !== "string" || !entry.claim.runId || !validCorrespondenceId(entry.claim.readRequestId) ||
       !["tool", "turn"].includes(entry.claim.mode) || !Number.isFinite(entry.claim.at) || typeof entry.claim.review !== "boolean" || !mailbox)) throw new Error("Invalid inbox claim ledger");
     if (mailbox && ["retrieved", "handled", "deferred"].includes(mailbox.phase) && !entry.claim) throw new Error("Inbox receipt has no retrieval proof");
     if (entry.acknowledgement) {
       const ack = acknowledgementCopy(entry.acknowledgement, entry.acknowledgement.runId);
       if (!entry.claim || ack.runId !== entry.claim.runId || ack.readRequestId !== entry.claim.readRequestId ||
-        (mailbox?.kind === "correction" && ack.outcome === "handled" && !ack.impactReview)) throw new Error("Invalid inbox acknowledgement ledger");
+        (mailbox?.kind === "correction" && ack.outcome === "handled" && !ack.impactReview) ||
+        (entry.envelope?.managedParent && ack.outcome === "handled" && !ack.response?.trim())) throw new Error("Invalid inbox acknowledgement ledger");
     }
     return entry;
   });
@@ -252,6 +261,7 @@ function ledgerInboxReads(value: Ledger, entries: Map<string, Entry>): InboxRead
 interface CorrespondenceCostOptions { requiresCostApproval?: boolean; costGuard?: boolean; reviewedModel?: string | null; checkCost?: () => Promise<boolean> | boolean }
 export interface HostChatBridgeDependencies {
   host?: () => Promise<HostChatFacade>;
+  managedParent?: () => Promise<ManagedParentDeliveryFacade>;
   listen?: (callback: (events: EngineEventPayload[]) => void) => Promise<Disposer>;
   now?: () => number;
   runId?: () => string;
@@ -302,9 +312,13 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
   const pendingStarts = new Map<string, HostChatReceipt["status"]>();
   const costGuards = new Map<string, () => Promise<boolean> | boolean>();
   const inFlightStarts = new Set<string>();
+  // A conclusively rejected delivery waits for a host-state change; it must
+  // neither spin nor prevent other children from using the released target.
+  const managedHolds = new Set<string>();
   const listeners = new Set<(receipt: HostChatReceipt) => void>();
   const disposers: Disposer[] = [];
   let host: HostChatFacade;
+  let managedParent: ManagedParentDeliveryFacade | undefined;
   let ledgerKey: string;
   let init: Promise<void> | undefined;
   let chain: Promise<unknown> = Promise.resolve();
@@ -357,7 +371,7 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
     if (check) return (await check()) === true;
     return (await host.requiresCostApproval?.(target)) === true;
   };
-  const ownsNativeRun = (entry: Entry) => !entry.claim || entry.claim.runId === entry.receipt.runId;
+  const ownsNativeRun = (entry: Entry) => !entry.envelope?.managedParent && (!entry.claim || entry.claim.runId === entry.receipt.runId);
   const stopReason = (entry: Entry): boolean => {
     const parent = entry.envelope?.relation && entries.get(entry.envelope.relation.scopedId);
     return host.wasInterrupted(entry.receipt.target) || !!(parent && parent.receipt.status === "failed" && /interrupted|cancelled/i.test(parent.receipt.error ?? ""));
@@ -366,7 +380,7 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
     if (!terminal.has(entry.receipt.status)) return [];
     const changed: Entry[] = [];
     for (const other of entries.values()) {
-      if (other.claim?.mode !== "turn" || other.claim.runId !== entry.receipt.runId || !other.receipt.mailbox ||
+      if (other.envelope?.managedParent || other.claim?.mode !== "turn" || other.claim.runId !== entry.receipt.runId || !other.receipt.mailbox ||
         !sameParticipant(targetParticipant(other.receipt.target), targetParticipant(entry.receipt.target)) ||
         ["handled", "deferred", "uncertain"].includes(other.receipt.mailbox.phase)) continue;
       const completed = entry.receipt.status === "completed" && other.receipt.mailbox.kind !== "correction";
@@ -403,6 +417,7 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
   const ensure = () => init ??= (async () => {
     assertOwner();
     host = await (deps.host ?? desktopChatFacade)();
+    managedParent = await deps.managedParent?.();
     assertOwner();
     if (restoredIdentity && (host.identity.clientInstanceId !== restoredIdentity.clientInstanceId || host.identity.windowId !== restoredIdentity.windowId)) {
       throw new Error("Host chat checkpoint belongs to another desktop document");
@@ -419,7 +434,7 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
     });
     if (disposed) { off(); throw new Error("Host chat bridge has been disposed"); }
     disposers.push(off);
-    disposers.push(host.subscribe(() => kick()));
+    disposers.push(host.subscribe(() => { managedHolds.clear(); kick(); }));
     await host.ready?.();
     assertOwner();
     await predecessorDrain;
@@ -449,6 +464,7 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
       }
     }
     if (loaded || restored) await persist();
+    if (!managedParent && [...entries.values()].some(entry => entry.envelope?.managedParent)) throw new Error("Managed parent ledger requires a host capability");
     assertOwner();
     for (const entry of entries.values()) emit(entry.receipt);
     kick();
@@ -467,10 +483,10 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
   function waitingReason(entry: Entry): InboxWaitReason | undefined {
     if (!entry.receipt.mailbox || entry.receipt.mailbox.phase !== "received") return entry.receipt.mailbox?.phase === "handled" ? undefined : "processing_unconfirmed";
     if (entry.receipt.status === "awaiting_cost_approval") return "cost_approval";
-    if (!entry.priority && stopReason(entry)) return "stopped";
+    if ((!entry.priority || entry.envelope?.managedParent) && stopReason(entry)) return "stopped";
     const parent = entry.envelope?.relation && entries.get(entry.envelope.relation.scopedId);
     if (entry.envelope?.relation?.type === "update" && parent && ["queued", "received", "awaiting_cost_approval"].includes(parent.receipt.status)) return "parent_pending";
-    const session = host.inspect(entry.receipt.target);
+    const session = entry.envelope?.managedParent ? managedParent?.inspect(entry.receipt.target) : host.inspect(entry.receipt.target);
     return !session ? "target_unavailable" : session.status === "awaiting_permission" ? "permission" : session.status === "busy" ? "target_busy" : undefined;
   }
   function inboxSummary(caller: InboxParticipant): InboxSummary {
@@ -498,7 +514,7 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
   function inboxMessage(entry: Entry, readRequestId: string, review: boolean): InboxMessage {
     const envelope = entry.envelope!;
     return { message_id: entry.receipt.requestId, request_id: envelope.requestId, sender: { ...envelope.sender },
-      relation: { type: envelope.relation!.type, request_id: envelope.relation!.requestId }, message_kind: envelope.kind ?? "information",
+      relation: { type: envelope.managedParent ? "task" : envelope.relation!.type, request_id: envelope.managedParent ? envelope.requestId : envelope.relation!.requestId }, message_kind: envelope.kind ?? "information",
       message: entry.prompt, read_request_id: readRequestId, needs_reconciliation: review, processing_state: entry.receipt.mailbox!.phase };
   }
   function claimMessage(entry: Entry, runId: string, readRequestId: string, mode: InboxClaim["mode"], review = false) {
@@ -508,7 +524,9 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
       mailbox: { ...entry.receipt.mailbox!, phase: "retrieved", retrievedAt: now(), waitReason: "processing_unconfirmed" } };
   }
   function turnPrompt(entry: Entry, messages: InboxMessage[]) {
-    const base = entry.receipt.mailbox ? "Handle the following associated messages in the existing conversation. Continue from established context; do not replay or restart the original request." : entry.prompt;
+    const base = entry.envelope?.managedParent
+      ? "Answer this managed child's question using the existing parent context. Call acknowledge_message with this message_id and read_request_id, outcome=handled and response containing the final answer to this question. Turn output alone is not an answer receipt."
+      : entry.receipt.mailbox ? "Handle the following associated messages in the existing conversation. Continue from established context; do not replay or restart the original request." : entry.prompt;
     return renderInboxTurn(base, entry.envelope, messages);
   }
   async function readMessages(rawCaller: InboxCaller, rawOptions: InboxReadOptions): Promise<InboxReadResult> {
@@ -525,7 +543,7 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
       }
       if (inboxReads.size >= MAX_REQUESTS) throw new Error("Inbox retrieval ledger capacity reached");
       const explicit = options.messageIds !== undefined;
-      const candidates = inboxRunEnded(caller) ? [] : explicit ? options.messageIds!.map(id => {
+      const candidates = explicit ? options.messageIds!.map(id => {
         const entry = entries.get(id);
         if (!entry?.receipt.mailbox || !sameParticipant(caller, targetParticipant(entry.receipt.target))) throw new Error("Message does not belong to the caller's inbox");
         if (entry.receipt.mailbox.phase === "retrieved" && entry.claim?.runId !== caller.runId) throw new Error("Message belongs to another active retrieval; reconcile after that turn settles");
@@ -533,6 +551,9 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
       }) : [...entries.values()].filter(entry => entry.receipt.mailbox?.phase === "received" && sameParticipant(caller, targetParticipant(entry.receipt.target)));
       const selected: Entry[] = [], reviewIds: string[] = []; let size = 0;
       for (const entry of candidates) {
+        if (inboxRunEnded(caller) && !entry.envelope?.managedParent) continue;
+        if (entry.envelope?.managedParent && (!explicit || entry.receipt.mailbox?.phase === "received")) continue;
+        if (entry.envelope?.managedParent && !await managedParent?.validate(entry.receipt.target, entry.envelope.managedParent, entry.envelope.sender)) continue;
         if (selected.length >= options.limit) break;
         if (entry.receipt.status === "failed" || entry.receipt.mailbox!.phase === "handled") continue;
         const reason = waitingReason(entry);
@@ -552,7 +573,10 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
         if (entry.receipt.mailbox!.phase !== "received" || (explicit && stopReason(entry))) reviewIds.push(entry.receipt.requestId);
         selected.push(entry);
       }
-      if (inboxRunEnded(caller)) { selected.length = 0; reviewIds.length = 0; }
+      if (inboxRunEnded(caller)) {
+        for (let i = selected.length - 1; i >= 0; i--) if (!selected[i].envelope?.managedParent) selected.splice(i, 1);
+        for (let i = reviewIds.length - 1; i >= 0; i--) if (!selected.some(entry => entry.receipt.requestId === reviewIds[i])) reviewIds.splice(i, 1);
+      }
       const read: InboxRead = { caller, requestId: options.requestId, fingerprint, messageIds: selected.map(entry => entry.receipt.requestId), reviewIds };
       for (const entry of selected) claimMessage(entry, caller.runId, options.requestId, "tool", reviewIds.includes(entry.receipt.requestId));
       inboxReads.set(key, read);
@@ -579,6 +603,7 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
       }
       if (entry.receipt.mailbox.phase === "handled" || entry.receipt.status === "failed") throw new Error("Inbox message is already settled");
       if (entry.receipt.mailbox.kind === "correction" && ack.outcome === "handled" && !ack.impactReview) throw new Error("A correction requires impact_review of completed and in-flight actions before acknowledgement");
+      if (entry.envelope?.managedParent && ack.outcome === "handled" && !ack.response?.trim()) throw new Error("A managed parent question requires its final answer in response");
       entry.acknowledgement = ack;
       const runningOwner = ownsNativeRun(entry) && !terminal.has(entry.receipt.status);
       await change(entry, { ...(runningOwner ? {} : { status: ack.outcome === "handled" ? "completed" as const : "unknown" as const,
@@ -588,6 +613,52 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
           waitReason: ack.outcome === "handled" ? undefined : "processing_unconfirmed", impactReview: ack.impactReview } }, false);
       return visible(entry.receipt);
     });
+  }
+
+  function deliverManaged(entry: Entry, key: string) {
+    const facade = managedParent!, envelope = entry.envelope!, target = entry.receipt.target;
+    const requestRunId = entry.receipt.runId, readRequestId = `task-${requestRunId}`;
+    const previous = { receipt: copy(entry.receipt), claim: entry.claim, acknowledgement: entry.acknowledgement };
+    let deliveredClaim: InboxClaim | undefined;
+    reservations.add(key);
+    inFlightStarts.add(requestRunId);
+    const prompt = turnPrompt(entry, [inboxMessage(entry, readRequestId, false)]);
+    // deliver may synchronously call beforeDelivery. Start outside the current
+    // ledger transaction so its serial claim cannot deadlock against itself.
+    void Promise.resolve().then(() => facade.deliver(target, prompt, requestRunId, async (delivery, actualRunId) => {
+      await serial(async () => {
+        const check = async () => {
+          assertOwner();
+          if (checkpoint.isPaused() || fenced || entry.acknowledgement || terminal.has(entry.receipt.status) || stopReason(entry)) throw new TaskPreSpawnError("Managed parent delivery is held");
+          if (await shouldHoldForCost(entry)) throw new TaskPreSpawnError("Managed parent delivery requires cost approval");
+          if (!await facade.validate(target, envelope.managedParent!, envelope.sender)) throw new TaskPreSpawnError("Managed parent relationship changed");
+          const state = facade.inspect(target);
+          if (checkpoint.isPaused() || fenced || stopReason(entry) || !state?.canDeliver || state.status === "awaiting_permission" ||
+            (delivery === "turn" ? state.status !== "idle" || actualRunId !== requestRunId : state.runId !== actualRunId) ||
+            (entry.costReviewedModel !== undefined && entry.costReviewedModel !== (host.model?.(target) ?? null))) throw new TaskPreSpawnError("Managed parent target changed");
+        };
+        await check();
+        if (entry.receipt.mailbox?.phase !== "received") throw new TaskPreSpawnError("Managed parent message was already retrieved");
+        claimMessage(entry, actualRunId, readRequestId, "tool");
+        deliveredClaim = entry.claim;
+        try { await persist(); } catch { fenced = true; throw new Error("Managed parent claim persistence is uncertain"); }
+        await check();
+        emit(entry.receipt);
+      });
+    })).then(result => serial(async () => {
+      if (disposed || entry.acknowledgement || terminal.has(entry.receipt.status) || (deliveredClaim && entry.claim !== deliveredClaim)) return;
+      if (!deliveredClaim || result.runId !== deliveredClaim.runId) {
+        await change(entry, { status: "unknown", error: "Managed parent delivery identity is uncertain", mailbox: { ...entry.receipt.mailbox!, phase: "uncertain", waitReason: "processing_unconfirmed" } }, false);
+      }
+    }), error => serial(async () => {
+      if (disposed || entry.acknowledgement || terminal.has(entry.receipt.status) || (deliveredClaim && entry.claim !== deliveredClaim)) return;
+      if (error instanceof TaskPreSpawnError && !fenced) {
+        managedHolds.add(entry.receipt.requestId);
+        entry.receipt = previous.receipt; entry.claim = previous.claim; entry.acknowledgement = previous.acknowledgement;
+        await change(entry, await shouldHoldForCost(entry) ? { status: "awaiting_cost_approval" } : {}, false);
+      } else await change(entry, { status: "unknown", error: "Managed parent delivery may have started; reconcile before any retry",
+        mailbox: { ...entry.receipt.mailbox!, phase: "uncertain", waitReason: "processing_unconfirmed" } }, false);
+    })).finally(() => { inFlightStarts.delete(requestRunId); reservations.delete(key); kick(); });
   }
 
   function kick() {
@@ -602,7 +673,7 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
       const blockedTargets = new Set<string>();
       // Per target, a request the user sent ahead goes first; the rest keep
       // their acceptance order.
-      const ordered = [...entries.values()].sort((x, y) => Number(y.priority === true) - Number(x.priority === true));
+      const ordered = [...entries.values()].sort((x, y) => Number(!!y.envelope?.managedParent) - Number(!!x.envelope?.managedParent) || Number(y.priority === true) - Number(x.priority === true));
       for (const entry of ordered) {
         if (disposed || fenced || checkpoint.isPaused()) break;
         if (entry.receipt.status !== "queued" && entry.receipt.status !== "received") continue;
@@ -614,6 +685,15 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
         }
         const { target, runId } = entry.receipt;
         const key = targetKey(target);
+        if (entry.envelope?.managedParent) {
+          if (managedHolds.has(entry.receipt.requestId)) continue;
+          const state = managedParent?.inspect(target);
+          if (!state?.canDeliver || state.status === "awaiting_permission" || stopReason(entry) || reservations.has(key)) continue;
+          if (await shouldHoldForCost(entry)) { await change(entry, { status: "awaiting_cost_approval" }); continue; }
+          if (disposed || fenced || checkpoint.isPaused()) continue;
+          deliverManaged(entry, key);
+          continue;
+        }
         if (blockedTargets.has(key)) continue;
         blockedTargets.add(key);
         const delivery = entry.priority ? { priority: true } : undefined;
@@ -786,6 +866,7 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
         for (const message of entries.values()) {
           if (message.claim?.mode !== "tool" || message.claim.runId !== event.runId || message.receipt.mailbox?.phase !== "retrieved" ||
             event.engine !== message.receipt.target.engine || event.sessionId !== message.receipt.target.nativeSessionId) continue;
+          if (message.envelope?.managedParent && (event.kind === "turn_complete" && (event.data as { interrupted?: boolean } | null)?.interrupted !== true || !Number.isInteger(event.seq))) continue;
           update(message, { status: "unknown", error: "The receiving turn ended without an explicit processing receipt; do not automatically replay the message",
             mailbox: { ...message.receipt.mailbox, phase: "uncertain", waitReason: "processing_unconfirmed" } });
         }
@@ -938,6 +1019,7 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
       const cache = restorationCache(checkpoint);
       if (cache.get(participantId)?.owner === checkpointOwner) cache.delete(participantId);
       wakeRequested = false;
+      managedHolds.clear();
       kick();
       deps.resumed?.();
     },
@@ -974,14 +1056,16 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
     const prompt = request.prompt;
     const fingerprint = JSON.stringify([target, prompt]);
     const envelope = rawEnvelope ? envelopeCopy(rawEnvelope) : undefined;
+    if (envelope?.managedParent && !deps.managedParent) throw new Error("Managed parent delivery requires a host capability");
     if (envelope && sameParticipant(envelope.sender, targetParticipant(target))) throw new Error("Cannot send correspondence to the sender's own session");
-    if (envelope?.relation && (!validMessageId(requestId) || new TextEncoder().encode(JSON.stringify(prompt)).length > MAX_RELATED_MESSAGE_BYTES)) throw new Error("Associated message is too large; split it into smaller updates with the same original request reference");
+    if ((envelope?.relation || envelope?.managedParent) && (!validMessageId(requestId) || new TextEncoder().encode(JSON.stringify(prompt)).length > MAX_RELATED_MESSAGE_BYTES)) throw new Error("Associated message is too large; split it into smaller updates with the same original request reference");
     await ensure();
     return serial(async () => {
       if (disposed) throw new Error("Host chat bridge has been disposed");
       if (target.clientInstanceId !== host.identity.clientInstanceId || target.windowId !== host.identity.windowId) throw new Error("Exact host chat target belongs to a different desktop document");
       const previous = entries.get(requestId);
       if (previous) {
+        if (JSON.stringify(previous.envelope?.managedParent) !== JSON.stringify(envelope?.managedParent)) throw new Error("Managed parent identity changed");
         if (previous.fingerprint !== fingerprint) throw new Error("Host chat requestId already belongs to a different target or prompt");
         if (envelope && previous.envelope && (!sameParticipant(envelope.sender, previous.envelope.sender) || previous.envelope.requestId !== envelope.requestId ||
           previous.envelope.kind !== envelope.kind || previous.envelope.relation?.type !== envelope.relation?.type || previous.envelope.relation?.requestId !== envelope.relation?.requestId)) throw new Error("Correspondence requestId already belongs to a different relation or sender");
@@ -993,6 +1077,7 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
       const initialSession = host.inspect(target);
       if (!initialSession) throw new Error("Exact host chat target is unavailable (open, loaded native timeline required)");
       if (entries.size >= MAX_REQUESTS) throw new Error("Host chat request ledger capacity reached");
+      if (envelope?.managedParent && (!sameParticipant(envelope.managedParent, targetParticipant(target)) || !await managedParent?.validate(target, envelope.managedParent, envelope.sender))) throw new Error("Managed parent relationship is unavailable");
       if (envelope?.relation) {
         const relation = envelope.relation;
         const matches = [...entries.values()].filter(candidate => !candidate.envelope?.relation &&
@@ -1026,6 +1111,7 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
       const entry: Entry = { prompt, fingerprint, lastSeq: -1, ...(costGuard ? { costGuard: true, costReviewedModel } : {}), receipt: { requestId, target,
         runId: deps.runId?.() ?? `run-${newId()}`, status: needsApproval ? "awaiting_cost_approval" : session.status === "idle" ? "received" : "queued", acceptedAt: at, updatedAt: at } };
       if (envelope) entry.envelope = envelope;
+      if (envelope?.managedParent) entry.receipt.mailbox = { phase: "received", relation: "task", parentRequestId: envelope.requestId, kind: "information" };
       if (envelope?.relation) entry.receipt.mailbox = { phase: "received", relation: envelope.relation.type, parentRequestId: envelope.relation.requestId,
         kind: envelope.kind ?? "information", waitReason: needsApproval ? "cost_approval" : session.status === "awaiting_permission" ? "permission" : session.status === "busy" ? "target_busy" : undefined };
       if (turnPrompt(entry, entry.receipt.mailbox ? [inboxMessage(entry, `turn-${entry.receipt.runId}`, false)] : []).length > 131_072) {
@@ -1078,6 +1164,7 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
           const currentModel = host.model?.(entry.receipt.target) ?? null;
           if (reviewedModel !== undefined && reviewedModel !== currentModel) throw new Error("Host chat target model changed before cost approval");
           entry.costReviewedModel = currentModel;
+          managedHolds.delete(requestId);
           delete entry.costGuard;
           costGuards.delete(requestId);
           await change(entry, { status: session.status === "idle" ? "received" : "queued" });
@@ -1091,7 +1178,7 @@ export function createHostChatBridge(pluginId: string, storage: PluginStorageBac
     async prioritize(requestId: string): Promise<HostChatReceipt | null> {
       await ensure();
       const receipt = await pending(requestId, async (entry) => {
-        if (entry.priority) return;
+        if (entry.priority || entry.envelope?.managedParent) return;
         if (fenced) throw new Error("Host chat ledger is fenced after an ambiguous storage failure");
         entry.priority = true;
         const parent = entry.envelope?.relation?.type === "update" ? entries.get(entry.envelope.relation.scopedId) : undefined;

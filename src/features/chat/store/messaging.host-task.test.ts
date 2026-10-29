@@ -53,6 +53,18 @@ describe("host continuation native delivery seam", () => {
     });
     return { ...f, tab, key: k };
   }
+  it.each(["codex", "claude"])("trusted parent input precedes queued user rows without consuming them: %s", async engine => {
+    const f = streaming(engine);
+    const queued = { id: "user-pending", text: "user draft", images: [], queuedAt: 1 };
+    f.get().bySession[f.key].queue = [queued];
+    await f.actions.sendWhileBusy("child question", [], { requestedRunId: "parent-input", hostContinuation: {
+      priority: true, beforeDelivery: async () => {}, onReceived: vi.fn(),
+    } }, f.tab);
+    expect(mocks.ipc.sendFollowUp).toHaveBeenCalledOnce();
+    expect(mocks.ipc.sendMessage).not.toHaveBeenCalled();
+    expect(f.get().bySession[f.key].queue).toEqual([queued]);
+    expect(f.get().active).toEqual(user);
+  });
   it.each(["codex", "claude"])("reports actual %s ACK after the durable fence and preserves the exact target", async engine => {
     const f = streaming(engine); const order: string[] = [];
     const beforeDelivery = vi.fn(async () => { order.push("fence"); expect(mocks.ipc.sendFollowUp).not.toHaveBeenCalled(); });

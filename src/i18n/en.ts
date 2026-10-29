@@ -3023,6 +3023,7 @@ export const en: Messages = {
   },
   crossSession: {
     inboxTitle: "Related message inbox",
+    managedParentTitle: "Child task messages",
     inboxFrom: "From {{title}}",
     inboxWith: "Related message · {{title}}",
     inboxOriginal: "Original message",

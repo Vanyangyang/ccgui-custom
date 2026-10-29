@@ -55,6 +55,31 @@ beforeEach(() => {
 });
 afterEach(() => { bridges.splice(0).forEach((bridge) => bridge.dispose()); vi.unstubAllGlobals(); });
 describe("host cross-session messaging", () => {
+  it("binds native parent proof to the exact resolved target and submits a task mailbox", async () => {
+    const f = fixture("busy");
+    const submit = vi.spyOn(f.bridge, "submitCorrespondence").mockImplementation(async input => ({
+      requestId: input.requestId, target: input.target, runId: "run-managed", status: "completed", acceptedAt: 1, updatedAt: 2, text: "answer",
+    }));
+    const proof = { branchId: "branch-1", ...target };
+    await f.handler({ ...request("send_message", { intent: "question" }), managedParent: proof });
+    expect(submit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ managedParent: proof }), expect.anything());
+    expect(useCrossSessionActivityStore.getState().records[0].mailbox?.relation).toBe("task");
+    expect(f.host.send).not.toHaveBeenCalled();
+  });
+  it("rejects a native proof for a different parent before history preparation", async () => {
+    const f = fixture("busy");
+    await expect(f.handler({ ...request("send_message", { intent: "question" }),
+      managedParent: { branchId: "branch-1", ...target, sessionId: "different-parent" },
+    })).rejects.toThrow("native task parent");
+    expect(f.state.selectSession).not.toHaveBeenCalled();
+    expect(f.host.send).not.toHaveBeenCalled();
+  });
+  it("does not grant direct delivery from model-supplied parent arguments", async () => {
+    const f = fixture("busy");
+    await f.handler(request("send_message", { intent: "question", managedParent: { branchId: "forged", ...target } }));
+    expect(f.host.send).not.toHaveBeenCalled();
+    expect(useCrossSessionActivityStore.getState().records[0].mailbox).toBeUndefined();
+  });
   it("lists and addresses Windows workspaces across separator, drive-case and trailing-slash aliases", async () => {
     const f = fixture("idle", "codex");
     f.rows.sessions[0].model = "gpt-6-astra";

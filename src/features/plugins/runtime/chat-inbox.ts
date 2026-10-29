@@ -4,18 +4,20 @@ import { workspaceCatalogPathKey } from "@/lib/workspace-path";
 /** Host-owned correspondence metadata. This is not part of the plugin chat API. */
 export interface InboxParticipant { engine: string; sessionId: string; workspacePath: string }
 export interface InboxCaller extends InboxParticipant { runId: string }
+export interface ManagedParentTarget extends InboxParticipant { branchId: string }
 export type InboxMessageKind = "information" | "constraint" | "correction";
 export interface CorrespondenceEnvelope {
   sender: InboxParticipant;
   requestId: string;
   relation?: { type: "update" | "reply"; requestId: string; scopedId: string };
+  managedParent?: ManagedParentTarget;
   kind?: InboxMessageKind;
 }
 export type InboxPhase = "received" | "retrieved" | "handled" | "deferred" | "uncertain";
 export type InboxWaitReason = "target_busy" | "permission" | "cost_approval" | "stopped" | "parent_pending" | "target_unavailable" | "processing_unconfirmed";
 export interface InboxReceiptState {
   phase: InboxPhase;
-  relation: "update" | "reply";
+  relation: "update" | "reply" | "task";
   parentRequestId: string;
   kind: InboxMessageKind;
   waitReason?: InboxWaitReason;
@@ -57,7 +59,7 @@ export interface InboxMessage {
   message_id: string;
   request_id: string;
   sender: InboxParticipant;
-  relation: { type: "update" | "reply"; request_id: string };
+  relation: { type: "update" | "reply" | "task"; request_id: string };
   message_kind: InboxMessageKind;
   message: string;
   read_request_id: string;
@@ -101,9 +103,12 @@ export function envelopeCopy(value: CorrespondenceEnvelope): CorrespondenceEnvel
   const sender = participantCopy(value?.sender);
   if (!validCorrespondenceId(value.requestId)) throw new Error("Invalid correspondence request identity");
   const relation = value.relation;
+  const parent = value.managedParent;
+  if (parent && (relation || typeof parent.branchId !== "string" || !parent.branchId.trim() || parent.branchId.length > 4096)) throw new Error("Invalid managed parent relation");
+  const managedParent = parent ? { ...participantCopy(parent), branchId: parent.branchId } : undefined;
   if (relation && (!["update", "reply"].includes(relation.type) || !validCorrespondenceId(relation.requestId) || !validMessageId(relation.scopedId))) throw new Error("Invalid correspondence relation");
   if (value.kind !== undefined && (!relation || !["information", "constraint", "correction"].includes(value.kind))) throw new Error("Invalid related message kind");
-  return { sender, requestId: value.requestId, ...(relation ? { relation: { ...relation }, kind: value.kind ?? "information" } : {}) };
+  return { sender, requestId: value.requestId, ...(managedParent ? { managedParent } : {}), ...(relation ? { relation: { ...relation }, kind: value.kind ?? "information" } : {}) };
 }
 export function readOptionsCopy(options: InboxReadOptions): Required<Pick<InboxReadOptions, "requestId" | "limit">> & Pick<InboxReadOptions, "messageIds"> {
   if (!validCorrespondenceId(options?.requestId)) throw new Error("Invalid inbox read request identity");
