@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+mod persistence;
 
 const COOLDOWN: Duration = Duration::from_secs(120);
 const MAX_CACHE_AGE: u64 = 3600;
@@ -457,6 +458,7 @@ struct Entry {
     revision: u64,
     auth_revision: u64,
     verified: bool,
+    identity_hash: Option<String>,
 }
 
 #[derive(Default)]
@@ -464,13 +466,57 @@ pub struct CodexQuotaState {
     cache: Mutex<HashMap<String, Entry>>,
     query: tokio::sync::Mutex<()>,
     changed: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    persistence_path: Option<PathBuf>,
+    persistence_enabled: std::sync::atomic::AtomicBool,
+    persistence_loaded: std::sync::atomic::AtomicBool,
+    persistence_warned: std::sync::atomic::AtomicBool,
 }
 pub static STATE: LazyLock<Arc<CodexQuotaState>> =
-    LazyLock::new(|| Arc::new(CodexQuotaState::default()));
+    LazyLock::new(|| Arc::new(CodexQuotaState {
+        persistence_path: if cfg!(any(test, feature = "test-harness")) {
+            None
+        } else if crate::paths::is_dev_profile() || dirs::home_dir().is_some() {
+            Some(crate::paths::app_home().join("codex-quota-cache.json"))
+        } else { None },
+        ..Default::default()
+    }));
+
+fn identity_hash(account: Option<&QuotaAccount>) -> Option<String> {
+    account.and_then(|a| a.email.as_ref())
+        .map(|email| format!("{:x}", Sha256::digest(email.as_bytes())))
+}
+
+fn merge_account(old: Option<&QuotaAccount>, new: Option<QuotaAccount>) -> Option<QuotaAccount> {
+    new.map(|mut account| {
+        if account.email.is_none() { account.email = old.and_then(|a| a.email.clone()); }
+        account
+    }).or_else(|| old.cloned())
+}
+
+/// Missing windows retain their original age, never the newer window's age.
+fn merge_windows(old: Option<&CodexQuotaSnapshot>, mut windows: QuotaWindows, at: u64)
+    -> (QuotaWindows, u64, bool)
+{
+    let mut retained = false;
+    if let Some(old) = old {
+        for (new, previous) in [(&mut windows.five_hour, &old.windows.five_hour),
+            (&mut windows.seven_day, &old.windows.seven_day)] {
+            if new.is_none() && previous.is_some() {
+                *new = previous.clone();
+                retained = true;
+            }
+        }
+        if retained { return (windows, old.collected_at.unwrap_or(at).min(at), true); }
+    }
+    (windows, at, false)
+}
 
 pub(crate) fn install_events(app: &tauri::AppHandle) {
     use crate::event_sink::Emit;
     use tauri::Manager;
+    // Only the native host owns the disk cache. Workers publish sanitized
+    // observations; they must never restore or overwrite host persistence.
+    STATE.persistence_enabled.store(true, std::sync::atomic::Ordering::Relaxed);
     let emitters = Arc::clone(&app.state::<crate::AppState>().emitters);
     *STATE.changed.lock().unwrap_or_else(|p| p.into_inner()) = Some(Box::new(move || {
         emitters.emit_json("codex-quota://changed", "null");
@@ -478,8 +524,16 @@ pub(crate) fn install_events(app: &tauri::AppHandle) {
 }
 
 impl CodexQuotaState {
+    fn discard_binding(&self, stamp: &str) {
+        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        self.restore(&mut cache);
+        cache.remove(stamp);
+        self.persist(&cache);
+    }
+
     fn register_binding(&self, binding: &Binding) {
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        self.restore(&mut cache);
         if cache.len() >= MAX_BINDINGS && !cache.contains_key(&binding.stamp) {
             if let Some(oldest) = cache.iter().min_by_key(|(_, entry)| entry.last_attempt).map(|(key, _)| key.clone()) {
                 cache.remove(&oldest);
@@ -501,17 +555,18 @@ impl CodexQuotaState {
 
     fn cached(&self, stamp: &str, current: impl Fn() -> bool) -> CodexQuotaSnapshot {
         if !current() {
+            self.invalidate_account_at(stamp, now_millis());
             return CodexQuotaSnapshot::unavailable("auth_changed");
         }
-        let mut result = self
-            .cache
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(stamp)
+        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        self.restore(&mut cache);
+        let mut result = cache.get(stamp)
             .and_then(|entry| entry.snapshot.clone())
             .unwrap_or_else(|| CodexQuotaSnapshot::unavailable("not_loaded"));
+        drop(cache);
         result.expire(now_seconds());
         if !current() {
+            self.invalidate_account_at(stamp, now_millis());
             return CodexQuotaSnapshot::unavailable("auth_changed");
         }
         result
@@ -543,18 +598,20 @@ impl CodexQuotaState {
             if observed_at_ms < entry.observed_at_ms || !current() {
                 return;
             }
+            let (windows, collected_at, retained) = merge_windows(entry.snapshot.as_ref(), windows, observed_at_ms / 1000);
             entry.snapshot = Some(CodexQuotaSnapshot {
-                status: "ready",
+                status: if retained { "stale" } else { "ready" },
                 windows,
                 account: entry.snapshot.as_ref().and_then(|s| s.account.clone()),
                 credits: entry.snapshot.as_ref().and_then(|s| s.credits.clone()),
                 reset_credits: entry.snapshot.as_ref().and_then(|s| s.reset_credits.clone()),
-                collected_at: Some(observed_at_ms / 1000),
+                collected_at: Some(collected_at),
                 source: Some("codex_app_server"),
                 error_code: None,
             });
             entry.revision = entry.revision.wrapping_add(1);
             entry.observed_at_ms = observed_at_ms;
+            self.persist(&cache);
         }
         self.notify();
     }
@@ -567,10 +624,12 @@ impl CodexQuotaState {
     ) -> CodexQuotaSnapshot {
         let _query = self.query.lock().await;
         if !current() {
+            self.discard_binding(stamp);
             return CodexQuotaSnapshot::unavailable("auth_changed");
         }
         let (revision, auth_revision, query_started_at_ms) = {
             let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+            self.restore(&mut cache);
             if cache.len() >= MAX_BINDINGS && !cache.contains_key(stamp) {
                 if let Some(oldest) = cache.iter().min_by_key(|(_, entry)| entry.last_attempt).map(|(key, _)| key.clone()) {
                     cache.remove(&oldest);
@@ -588,11 +647,14 @@ impl CodexQuotaState {
             .await
             .unwrap_or(Err("query_timeout"));
         if !current() {
+            self.discard_binding(stamp);
             return CodexQuotaSnapshot::unavailable("auth_changed");
         }
         let snapshot = {
             let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
             if !current() {
+                cache.remove(stamp);
+                self.persist(&cache);
                 return CodexQuotaSnapshot::unavailable("auth_changed");
             }
             let entry = cache.entry(stamp.to_owned()).or_default();
@@ -601,12 +663,14 @@ impl CodexQuotaState {
             }
             let snapshot = match result {
                 Ok(result) => {
-                    let identity_changed = entry.snapshot.as_ref().and_then(|s| s.account.as_ref())
-                        .and_then(|a| a.email.as_ref()).zip(result.account.as_ref().and_then(|a| a.email.as_ref()))
+                    let new_identity = identity_hash(result.account.as_ref());
+                    let identity_changed = entry.identity_hash.as_ref().zip(new_identity.as_ref())
                         .is_some_and(|(old, new)| old != new);
                     if identity_changed {
                         entry.snapshot = None;
                     }
+                    if new_identity.is_some() { entry.identity_hash = new_identity; }
+                    let account = merge_account(entry.snapshot.as_ref().and_then(|s| s.account.as_ref()), result.account);
                     entry.verified = true;
                     // Worker delivery can lag behind the query. Observations
                     // created during it remain newer than its baseline, even
@@ -618,7 +682,23 @@ impl CodexQuotaState {
                             .snapshot
                             .clone()
                             .unwrap_or_else(|| CodexQuotaSnapshot::unavailable("not_loaded"));
-                        if result.account.is_some() { latest.account = result.account; }
+                        // Passive data wins wherever present, but a partial
+                        // notification must not discard another query window.
+                        let baseline = CodexQuotaSnapshot {
+                            windows: result.windows,
+                            collected_at: Some(query_started_at_ms / 1000),
+                            ..Default::default()
+                        };
+                        let (windows, at, filled) = merge_windows(
+                            Some(&baseline), std::mem::take(&mut latest.windows),
+                            latest.collected_at.unwrap_or(query_started_at_ms / 1000),
+                        );
+                        latest.windows = windows;
+                        if filled {
+                            latest.collected_at = Some(at);
+                            latest.status = "stale";
+                        }
+                        latest.account = account;
                         latest.credits = result.credits;
                         latest.reset_credits = result.reset_credits;
                         latest
@@ -627,19 +707,20 @@ impl CodexQuotaState {
                         // replace the last usage sample or renew its timestamp.
                         let mut latest = entry.snapshot.clone()
                             .unwrap_or_else(|| CodexQuotaSnapshot::unavailable("quota_not_available"));
-                        if result.account.is_some() { latest.account = result.account; }
+                        latest.account = account;
                         latest.credits = result.credits;
                         latest.reset_credits = result.reset_credits;
                         latest.status = "stale";
                         latest
                     } else {
+                        let (windows, collected_at, retained) = merge_windows(entry.snapshot.as_ref(), result.windows, now_seconds());
                         CodexQuotaSnapshot {
-                            status: "ready",
-                            windows: result.windows,
-                            account: result.account.or_else(|| entry.snapshot.as_ref().and_then(|s| s.account.clone())),
+                            status: if retained { "stale" } else { "ready" },
+                            windows,
+                            account,
                             credits: result.credits,
                             reset_credits: result.reset_credits,
-                            collected_at: Some(now_seconds()),
+                            collected_at: Some(collected_at),
                             source: Some("codex_app_server"),
                             error_code: None,
                         }
@@ -652,6 +733,7 @@ impl CodexQuotaState {
                     ) =>
                 {
                     entry.verified = false;
+                    entry.identity_hash = None;
                     entry.observed_at_ms = entry.observed_at_ms.max(query_started_at_ms);
                     entry.auth_checked_at_ms = query_started_at_ms;
                     CodexQuotaSnapshot::unavailable(code)
@@ -670,12 +752,14 @@ impl CodexQuotaState {
             };
             entry.snapshot = Some(snapshot.clone());
             entry.revision = entry.revision.wrapping_add(1);
+            self.persist(&cache);
             snapshot
         };
         self.notify();
         let mut snapshot = snapshot;
         snapshot.expire(now_seconds());
         if !current() {
+            self.discard_binding(stamp);
             return CodexQuotaSnapshot::unavailable("auth_changed");
         }
         snapshot
@@ -689,6 +773,7 @@ impl CodexQuotaState {
     fn invalidate_account_at(&self, stamp: &str, observed_at_ms: u64) {
         {
             let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+            self.restore(&mut cache);
             if let Some(entry) = cache.get_mut(stamp) {
                 if observed_at_ms < entry.auth_checked_at_ms {
                     return;
@@ -697,10 +782,12 @@ impl CodexQuotaState {
                 entry.observed_at_ms = entry.observed_at_ms.max(observed_at_ms);
                 entry.auth_checked_at_ms = observed_at_ms;
                 entry.verified = false;
+                entry.identity_hash = None;
                 entry.auth_revision = entry.auth_revision.wrapping_add(1);
                 entry.revision = entry.revision.wrapping_add(1);
                 entry.last_attempt = None;
             }
+            self.persist(&cache);
         }
         self.notify();
     }
@@ -858,7 +945,7 @@ mod tests {
     fn window(minutes: u64, percent: f64) -> Value {
         json!({"windowDurationMins":minutes,"usedPercent":percent,"resetsAt":2000})
     }
-    fn query(percent: f64) -> QueryResult {
+    pub(super) fn query(percent: f64) -> QueryResult {
         QueryResult {
             windows: QuotaWindows {
                 five_hour: None,
@@ -1211,7 +1298,7 @@ mod tests {
         assert!(state.cached(&MAX_BINDINGS.to_string(), || true).windows.seven_day.is_some());
     }
 
-    fn fixture_binding() -> Binding {
+    pub(super) fn fixture_binding() -> Binding {
         Binding {
             stamp: format!("{:x}", Sha256::digest(b"fixture-metadata")),
             provider: None,

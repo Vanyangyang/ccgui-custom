@@ -20,6 +20,7 @@ export function useCodexQuota(engine: string, providerId: string | undefined, wo
     let inFlight = false;
     let queued = false;
     let missingAttempted = false;
+    let initialCacheRead = false;
     let loadMissing = false;
     let unlisten: (() => void) | undefined;
     let unlistenConnected: (() => void) | undefined;
@@ -34,10 +35,16 @@ export function useCodexQuota(engine: string, providerId: string | undefined, wo
       setState(previous => ({ ...previous, loading: true }));
       try {
         const snapshot = await ipc.codexQuotaRead({ cacheOnly, force: !cacheOnly, providerId, workspacePath });
-        // A changed native auth/config binding has a new, explicitly missing
-        // cache. Revalidate it once, including after mount; repeated missing
-        // replies never loop into account queries. Ready/stale reads remain passive.
-        loadMissing = cacheOnly && snapshot.errorCode === "not_loaded" && !missingAttempted;
+        // Restore first, then revalidate an old/partial initial sample without
+        // requiring the details popup. Later events/minute reads stay passive;
+        // only a newly missing auth/config binding can bootstrap again.
+        const initial = cacheOnly && !initialCacheRead;
+        if (cacheOnly) initialCacheRead = true;
+        const validated = validSubscriptionQuotaSnapshot(snapshot);
+        const identityUnavailable = Boolean(snapshot.errorCode && /auth|provider|custom_channel/.test(snapshot.errorCode));
+        const initialNeedsRefresh = initial && (validated.status === "stale"
+          || (validated.status === "ready" && (!validated.windows.fiveHour || !validated.windows.sevenDay)));
+        loadMissing = cacheOnly && !identityUnavailable && (initialNeedsRefresh || (snapshot.errorCode === "not_loaded" && !missingAttempted));
         if (loadMissing) missingAttempted = true;
         if (snapshot.status === "ready" || snapshot.status === "stale") missingAttempted = false;
         if (current()) {
