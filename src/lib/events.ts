@@ -13,6 +13,10 @@ export interface NativeTask {
   background?: boolean;
   /** Housekeeping/watchers are visible tasks, but do not keep a run busy. */
   ambient?: boolean;
+  /** Host epoch ms when the task was first observed running. */
+  startedAt?: number;
+  /** Host epoch ms of the latest output growth, progress event, or state transition. */
+  lastProgressAt?: number;
 }
 
 export type NativeActivity = "running" | "waiting" | "requires_action";

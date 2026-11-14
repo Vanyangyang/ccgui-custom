@@ -918,4 +918,88 @@ describe("agy acp native task lifecycle", () => {
     ], deps);
     expect(deps.get().bySession[AGY_KEY].nativeTasks?.[0].status).toBe("stopped");
   });
+
+  it("parses and preserves startedAt/lastProgressAt and keeps silent running tasks protected as running", async () => {
+    const t0 = 1_700_000_000_000;
+    const parsed = readNativeTasks({
+      tasks: [
+        {
+          id: "task-453",
+          kind: "command",
+          description: "node --test",
+          status: "running",
+          background: true,
+          startedAt: t0,
+          lastProgressAt: t0 + 10_000,
+        },
+        {
+          id: "bad-ts",
+          kind: "command",
+          description: "bad",
+          status: "running",
+          startedAt: -5,
+          lastProgressAt: Number.NaN,
+        },
+      ],
+    });
+    expect(parsed).toEqual([
+      {
+        id: "task-453",
+        kind: "command",
+        description: "node --test",
+        status: "running",
+        background: true,
+        startedAt: t0,
+        lastProgressAt: t0 + 10_000,
+      },
+      {
+        id: "bad-ts",
+        kind: "command",
+        description: "bad",
+        status: "running",
+      },
+    ]);
+
+    handleEngineEvents([
+      agyEvent("tasks", 1, {
+        tasks: [{
+          id: "task-453",
+          kind: "command",
+          description: "node --test",
+          status: "running",
+          background: true,
+          startedAt: t0,
+          lastProgressAt: t0,
+        }],
+      }),
+      agyEvent("delta", 2, "Running node --test"),
+      agyEvent("turn_complete", 3, { usage: null }),
+      agyEvent("activity", 4, { state: "waiting" }),
+    ], deps);
+
+    // Later update omitting startedAt retains initial startedAt.
+    handleEngineEvents([
+      agyEvent("tasks", 5, {
+        tasks: [{
+          id: "task-453",
+          kind: "command",
+          description: "node --test",
+          status: "running",
+          background: true,
+          lastProgressAt: t0 + 30_000,
+        }],
+      }),
+    ], deps);
+    expect(deps.get().bySession[AGY_KEY].nativeTasks?.[0]).toMatchObject({
+      status: "running",
+      startedAt: t0,
+      lastProgressAt: t0 + 30_000,
+    });
+
+    // Silence beyond stall threshold & orphan threshold must not auto-mutate status or drop protection.
+    vi.advanceTimersByTime(60 * 60_000);
+    await reconcileOrphanRuns(ipc.activeRunIds, () => {});
+    expect(runRouting.get("agy-run")).toBe(AGY_KEY);
+    expect(deps.get().bySession[AGY_KEY].nativeTasks?.[0].status).toBe("running");
+  });
 });

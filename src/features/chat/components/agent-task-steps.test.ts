@@ -1,7 +1,14 @@
 // @vitest-environment node
 import { describe, expect, it } from "vitest";
 import type { Message } from "@/lib/ipc";
-import { deriveAgentTaskSteps, deriveNativeTaskSteps, deriveTodoList, subagentRefsFromArgs } from "./agent-task-steps";
+import {
+  NATIVE_TASK_STALL_THRESHOLD_MS,
+  deriveAgentTaskSteps,
+  deriveNativeTaskSteps,
+  deriveTodoList,
+  getNativeStepSilence,
+  subagentRefsFromArgs,
+} from "./agent-task-steps";
 
 function tool(seq: number, text: string, args?: unknown, result?: unknown): Message {
   return { seq, role: "tool", text, ts: null, args, result } as Message;
@@ -437,5 +444,79 @@ describe("subagent counting", () => {
     ];
     const items = deriveTodoList(messages);
     expect(items).toEqual([{ content: "实现功能", status: "complete", phase: "impl", reason: undefined, detail: undefined }]);
+  });
+
+  it("derives timestamps and flags silence >= NATIVE_TASK_STALL_THRESHOLD_MS only for running non-ambient native tasks", () => {
+    const t0 = 1_700_000_000_000;
+    const steps = deriveNativeTaskSteps([
+      {
+        id: "task-453",
+        kind: "command",
+        description: "Run node tests",
+        status: "running",
+        summary: "node --test",
+        progress: "ok 12",
+        startedAt: t0,
+        lastProgressAt: t0 + 60_000,
+      },
+      {
+        id: "task-daemon",
+        kind: "command",
+        description: "Dev server",
+        status: "running",
+        ambient: true,
+        startedAt: t0,
+        lastProgressAt: t0,
+      },
+      {
+        id: "task-paused",
+        kind: "command",
+        description: "Paused",
+        status: "paused",
+        startedAt: t0,
+        lastProgressAt: t0,
+      },
+      {
+        id: "task-no-ts",
+        kind: "command",
+        description: "Legacy snapshot",
+        status: "running",
+      },
+    ], "run-1");
+
+    expect(NATIVE_TASK_STALL_THRESHOLD_MS).toBe(5 * 60_000);
+    expect(steps[0]).toMatchObject({
+      nativeStartedAt: t0,
+      nativeLastProgressAt: t0 + 60_000,
+      nativeSummary: "node --test",
+      nativeProgress: "ok 12",
+    });
+
+    // Under threshold (< 5m after lastProgressAt) -> not stalled.
+    expect(getNativeStepSilence(steps[0], t0 + 60_000 + NATIVE_TASK_STALL_THRESHOLD_MS - 1)).toEqual({
+      stalled: false,
+      quietMs: NATIVE_TASK_STALL_THRESHOLD_MS - 1,
+      quietMinutes: 4,
+      since: t0 + 60_000,
+    });
+
+    // At threshold (=== 5m) -> stalled.
+    expect(getNativeStepSilence(steps[0], t0 + 60_000 + NATIVE_TASK_STALL_THRESHOLD_MS)).toEqual({
+      stalled: true,
+      quietMs: NATIVE_TASK_STALL_THRESHOLD_MS,
+      quietMinutes: 5,
+      since: t0 + 60_000,
+    });
+
+    // 18 minutes silent -> quietMinutes = 18.
+    expect(getNativeStepSilence(steps[0], t0 + 60_000 + 18 * 60_000)).toMatchObject({
+      stalled: true,
+      quietMinutes: 18,
+    });
+
+    // Ambient, paused, and missing timestamps never trigger stalled.
+    expect(getNativeStepSilence(steps[1], t0 + 30 * 60_000).stalled).toBe(false);
+    expect(getNativeStepSilence(steps[2], t0 + 30 * 60_000).stalled).toBe(false);
+    expect(getNativeStepSilence(steps[3], t0 + 30 * 60_000).stalled).toBe(false);
   });
 });

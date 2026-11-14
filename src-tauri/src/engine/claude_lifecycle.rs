@@ -127,10 +127,20 @@ impl ClaudeLifecycle {
                 self.background = next;
                 self.snapshot_ids = ids;
                 self.snapshot_seen = true;
+                let now_opt = Self::now_opt();
                 for task in tasks {
+                    let prev = text(task, "task_id")
+                        .and_then(|id| self.tasks.iter().find(|t| t.id == id))
+                        .map(|t| (t.status.clone(), t.summary.clone(), t.progress.clone()));
                     if let Some(row) = self.row(task) {
                         Self::patch(row, task);
                         row.background = Some(true);
+                        let changed = prev.is_none_or(|(status, summary, progress)| {
+                            status != row.status || summary != row.summary || progress != row.progress
+                        });
+                        if changed && now_opt.is_some() {
+                            row.last_progress_at = now_opt;
+                        }
                     }
                 }
                 self.publish_tasks(out);
@@ -155,9 +165,16 @@ impl ClaudeLifecycle {
                         self.background.insert(id);
                     }
                 }
+                let now_opt = Self::now_opt();
                 if let Some(row) = self.row(value) {
                     Self::patch(row, value);
                     row.status = "running".into();
+                    if row.started_at.is_none() {
+                        row.started_at = now_opt;
+                    }
+                    if now_opt.is_some() {
+                        row.last_progress_at = now_opt;
+                    }
                 }
                 self.publish_tasks(out);
             }
@@ -176,8 +193,12 @@ impl ClaudeLifecycle {
                         self.background.insert(id.clone());
                     }
                 }
+                let now_opt = Self::now_opt();
                 if let Some(row) = self.row(value) {
                     Self::patch(row, patch);
+                    if now_opt.is_some() {
+                        row.last_progress_at = now_opt;
+                    }
                     let terminal = matches!(row.status.as_str(), "completed" | "failed" | "stopped");
                     let quiet = row.status == "stopped" || row.ambient == Some(true);
                     if (terminal || quiet) && !self.snapshot_seen {
@@ -200,8 +221,12 @@ impl ClaudeLifecycle {
                 if !self.snapshot_seen {
                     self.background.remove(&id);
                 }
+                let now_opt = Self::now_opt();
                 if let Some(row) = self.row(value) {
                     Self::patch(row, value);
+                    if now_opt.is_some() {
+                        row.last_progress_at = now_opt;
+                    }
                 }
                 self.publish_tasks(out);
                 let stopped = self.tasks.iter().any(|task| task.id == id && task.status == "stopped");
@@ -225,12 +250,16 @@ impl ClaudeLifecycle {
                 }
             }
             "task_progress" => {
+                let now_opt = Self::now_opt();
                 if let Some(row) = self.row(value) {
                     if let Some(summary) = text(value, "summary") {
                         row.summary = Some(summary);
                     }
                     row.progress =
                         text(value, "description").or_else(|| text(value, "last_tool_name"));
+                    if now_opt.is_some() {
+                        row.last_progress_at = now_opt;
+                    }
                 }
                 self.publish_tasks(out);
             }
@@ -381,11 +410,17 @@ impl ClaudeLifecycle {
         out.push(EngineEvent::Done { session_id, usage });
     }
 
+    fn now_opt() -> Option<u64> {
+        let ts = super::events::now_epoch_ms();
+        (ts > 0).then_some(ts)
+    }
+
     fn row(&mut self, value: &Value) -> Option<&mut NativeTask> {
         let id = text(value, "task_id")?;
         let i = if let Some(i) = self.tasks.iter().position(|t| t.id == id) {
             i
         } else {
+            let now_opt = Self::now_opt();
             self.tasks.push(NativeTask {
                 description: id.clone(),
                 id,
@@ -396,6 +431,8 @@ impl ClaudeLifecycle {
                 progress: None,
                 background: None,
                 ambient: None,
+                started_at: now_opt,
+                last_progress_at: now_opt,
             });
             self.tasks.len() - 1
         };
@@ -1325,5 +1362,55 @@ mod tests {
         lifecycle.interrupt_acknowledged(&mut events);
         state(&mut lifecycle, "idle", &mut events);
         assert!(lifecycle.take_interrupt());
+    }
+
+    #[test]
+    fn task_progress_advances_last_progress_at_while_sibling_snapshots_preserve_silent_task() {
+        let mut lifecycle = ClaudeLifecycle::default();
+        let mut events = vec![];
+        state(&mut lifecycle, "running", &mut events);
+        lifecycle.system(
+            &json!({"subtype":"task_started", "task_id":"silent-bg", "task_type":"local_bash", "description":"long wait", "is_backgrounded":true}),
+            &mut events,
+        );
+        lifecycle.system(
+            &json!({"subtype":"task_started", "task_id":"active-bg", "task_type":"local_bash", "description":"active work", "is_backgrounded":true}),
+            &mut events,
+        );
+        let initial_silent = last_tasks(&events)
+            .into_iter()
+            .find(|t| t.id == "silent-bg")
+            .expect("silent-bg exists");
+        let started_at = initial_silent.started_at.expect("started_at populated");
+        assert!(initial_silent.last_progress_at.unwrap_or(0) >= started_at);
+
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        // Unchanged sibling in a snapshot must not refresh silent-bg's last_progress_at.
+        snapshot(
+            &mut lifecycle,
+            json!([
+                {"task_id":"silent-bg", "status":"running", "description":"long wait"},
+                {"task_id":"active-bg", "status":"running", "description":"active work", "summary":"step 2"}
+            ]),
+            &mut events,
+        );
+        let after_sibling = last_tasks(&events);
+        let silent_after_sibling = after_sibling.iter().find(|t| t.id == "silent-bg").unwrap();
+        let active_after_sibling = after_sibling.iter().find(|t| t.id == "active-bg").unwrap();
+        assert_eq!(silent_after_sibling.last_progress_at, initial_silent.last_progress_at);
+        assert!(active_after_sibling.last_progress_at.unwrap() > started_at);
+
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        lifecycle.system(
+            &json!({"subtype":"task_progress", "task_id":"silent-bg", "description":"resumed output"}),
+            &mut events,
+        );
+        let after_progress = last_tasks(&events)
+            .into_iter()
+            .find(|t| t.id == "silent-bg")
+            .unwrap();
+        assert_eq!(after_progress.started_at, Some(started_at));
+        assert!(after_progress.last_progress_at.unwrap() > initial_silent.last_progress_at.unwrap());
+        assert_eq!(after_progress.progress.as_deref(), Some("resumed output"));
     }
 }

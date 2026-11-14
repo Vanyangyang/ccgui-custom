@@ -200,6 +200,17 @@ pub struct NativeTask {
     /// Native housekeeping/watchers that the CLI excludes from activity.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ambient: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_progress_at: Option<u64>,
+}
+
+pub(crate) fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().min(9_007_199_254_740_991) as u64)
+        .unwrap_or(0)
 }
 /// One todo entry carried to the frontend.
 #[derive(Debug, Clone, Serialize)]

@@ -167,6 +167,7 @@ fn stoppable_task() -> super::events::NativeTask {
         id: "bg".into(), kind: "local_bash".into(), description: "Test scan".into(),
         status: "running".into(), tool_use_id: None, summary: None,
         progress: None, background: Some(true), ambient: None,
+        started_at: None, last_progress_at: None,
     }
 }
 

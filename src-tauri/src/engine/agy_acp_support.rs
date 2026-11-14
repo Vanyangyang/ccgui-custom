@@ -589,6 +589,8 @@ struct TrackedTask {
     ambient: bool,
     log_path: Option<PathBuf>,
     last_log_len: Option<u64>,
+    started_at: u64,
+    last_progress_at: u64,
 }
 
 impl TrackedTask {
@@ -612,6 +614,8 @@ impl TrackedTask {
             progress: self.progress.clone(),
             background: Some(true),
             ambient: self.ambient.then_some(true),
+            started_at: (self.started_at > 0).then_some(self.started_at),
+            last_progress_at: (self.last_progress_at > 0).then_some(self.last_progress_at),
         }
     }
 }
@@ -937,6 +941,7 @@ impl AgyAcpTaskTracker {
     }
 
     fn apply_kill_target(&mut self, target: &KillTarget) {
+        let now_ms = crate::engine::events::now_epoch_ms();
         for task in &mut self.tasks {
             if !matches!(task.status.as_str(), "running" | "paused") {
                 continue;
@@ -948,6 +953,7 @@ impl AgyAcpTaskTracker {
             if matched {
                 task.status = "stopped".to_string();
                 task.last_log_len = None;
+                task.last_progress_at = now_ms.max(task.last_progress_at);
             }
         }
     }
@@ -989,6 +995,7 @@ impl AgyAcpTaskTracker {
             let sub = self.pending_subagents.remove(pos);
             if !is_error {
                 if let Some(conv_id) = extract_subagent_conversation_id(output, &out_text) {
+                    let now_ms = crate::engine::events::now_epoch_ms();
                     self.upsert_task(TrackedTask {
                         id: conv_id.clone(),
                         raw_id: conv_id,
@@ -1002,6 +1009,8 @@ impl AgyAcpTaskTracker {
                         ambient: false,
                         log_path: None,
                         last_log_len: None,
+                        started_at: now_ms,
+                        last_progress_at: now_ms,
                     });
                     self.emit_if_changed(core, state);
                 }
@@ -1056,9 +1065,11 @@ impl AgyAcpTaskTracker {
     }
 
     pub(super) fn mark_running_stopped(&mut self, core: &TurnCore, state: &mut TurnState) {
+        let now_ms = crate::engine::events::now_epoch_ms();
         for task in &mut self.tasks {
             if matches!(task.status.as_str(), "running" | "paused") {
                 task.status = "stopped".to_string();
+                task.last_progress_at = now_ms.max(task.last_progress_at);
             }
         }
         self.pending_wakeup = false;
@@ -1159,6 +1170,7 @@ impl AgyAcpTaskTracker {
                             self.pending_subagents.iter().position(|s| s.tool_id.is_empty())
                         {
                             let sub = self.pending_subagents.remove(pos);
+                            let now_ms = crate::engine::events::now_epoch_ms();
                             self.upsert_task(TrackedTask {
                                 id: conv_id.clone(),
                                 raw_id: conv_id,
@@ -1172,6 +1184,8 @@ impl AgyAcpTaskTracker {
                                 ambient: false,
                                 log_path: None,
                                 last_log_len: None,
+                                started_at: now_ms,
+                                last_progress_at: now_ms,
                             });
                         }
                     }
@@ -1311,6 +1325,7 @@ impl AgyAcpTaskTracker {
             .as_ref()
             .map(|brain| resolve_confined_task_log(brain, &short_id));
 
+        let now_ms = crate::engine::events::now_epoch_ms();
         self.upsert_task(TrackedTask {
             id: short_id,
             raw_id,
@@ -1324,6 +1339,8 @@ impl AgyAcpTaskTracker {
             ambient,
             log_path,
             last_log_len: None,
+            started_at: now_ms,
+            last_progress_at: now_ms,
         });
     }
 
@@ -1335,12 +1352,14 @@ impl AgyAcpTaskTracker {
                 || quoted_task.as_deref().is_some_and(|q| t.matches_id(q))
         });
 
+        let now_ms = crate::engine::events::now_epoch_ms();
         let Some(idx) = matched_idx else {
             if is_global_tasks_stopped_notice(content, sender.as_deref()) {
                 for task in &mut self.tasks {
                     if matches!(task.status.as_str(), "running" | "paused" | "unknown") {
                         task.status = "stopped".to_string();
                         task.last_log_len = None;
+                        task.last_progress_at = now_ms.max(task.last_progress_at);
                     }
                 }
                 self.pending_wakeup = false;
@@ -1358,6 +1377,7 @@ impl AgyAcpTaskTracker {
         }
         // Force a final log read on completion even if metadata cached the old length.
         self.tasks[idx].last_log_len = None;
+        self.tasks[idx].last_progress_at = now_ms.max(self.tasks[idx].last_progress_at);
 
         if !ambient {
             self.pending_wakeup = true;
@@ -1368,6 +1388,7 @@ impl AgyAcpTaskTracker {
     }
 
     fn refresh_task_logs(&mut self) {
+        let now_ms = crate::engine::events::now_epoch_ms();
         for task in &mut self.tasks {
             let Some(ref path) = task.log_path else {
                 continue;
@@ -1379,7 +1400,11 @@ impl AgyAcpTaskTracker {
             if task.last_log_len == Some(len) {
                 continue;
             }
+            let prev_len = task.last_log_len;
             task.last_log_len = Some(len);
+            if prev_len.is_some() || len > 0 {
+                task.last_progress_at = now_ms.max(task.started_at);
+            }
             if let Some(tail) = read_clean_log_tail(path, len) {
                 task.progress = Some(tail);
             }
@@ -1402,6 +1427,12 @@ impl AgyAcpTaskTracker {
             existing.ambient |= incoming.ambient;
             if existing.log_path.is_none() {
                 existing.log_path = incoming.log_path;
+            }
+            if existing.started_at == 0 && incoming.started_at > 0 {
+                existing.started_at = incoming.started_at;
+            }
+            if existing.last_progress_at == 0 && incoming.last_progress_at > 0 {
+                existing.last_progress_at = incoming.last_progress_at;
             }
             return;
         }

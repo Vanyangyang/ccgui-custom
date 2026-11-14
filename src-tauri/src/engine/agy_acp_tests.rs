@@ -2529,6 +2529,7 @@ async fn ambient_tasks_survive_only_successful_agy_completion() {
             id: "daemon".into(), kind: "command".into(), description: "dev server".into(),
             status: "running".into(), tool_use_id: None, summary: None, progress: None,
             background: Some(true), ambient: Some(true),
+            started_at: None, last_progress_at: None,
         }]));
         core.dispatch_event(&mut state, if error {
             crate::engine::EngineEvent::Error("daemon disconnected".into())
@@ -2690,4 +2691,103 @@ fn telemetry_partitions_question_and_retry_waits_and_caps_finish_at_prompt_end()
     assert_eq!(b["modelMs"], 1100.0);
     assert_eq!(sample["elapsedMs"], 1100.0);
     assert_eq!(sample["outputTokens"], 110);
+}
+
+#[tokio::test]
+async fn background_tracker_records_started_at_and_advances_last_progress_on_log_growth() {
+    use std::io::Write;
+
+    let root = std::env::temp_dir().join(format!("agy-stall-ts-test-{}", uuid::Uuid::new_v4()));
+    let sid = "stall-ts-session";
+    let logs = root.join("brain").join(sid).join(".system_generated/logs");
+    let tasks_dir = root.join("brain").join(sid).join(".system_generated/tasks");
+    std::fs::create_dir_all(&logs).unwrap();
+    std::fs::create_dir_all(&tasks_dir).unwrap();
+    let transcript = logs.join("transcript.jsonl");
+    std::fs::write(&transcript, "").unwrap();
+    let task_log = tasks_dir.join("task-453.log");
+    std::fs::write(&task_log, "").unwrap();
+
+    let mut req = base_req(&root, Some("auto"));
+    req.session_id = Some(sid.into());
+    let mut built = AgyEngine::new().build_command(&req, "fake-agy").unwrap();
+    built.command.env("ANTIGRAVITY_APP_DATA_DIR", &root);
+    let launch = extract_launch("stall-ts-tracker", &req, "fake-agy", built).unwrap();
+    let mut tracker = super::support::AgyAcpTaskTracker::new(&launch.profile, sid, Some(0));
+    let (core, _, emitter, _) = make_turn_core("stall-ts-tracker", 4_100_000_021);
+    let mut state = crate::engine::TurnState::new(Some(sid.into()));
+
+    tracker.on_tool_started(
+        "tc-453",
+        "run_command",
+        Some(&json!({ "CommandLine": "node --test", "toolSummary": "Node tests", "IsDaemon": false })),
+    );
+    tracker.on_tool_completed(
+        &core,
+        &mut state,
+        "tc-453",
+        Some(&json!(format!(
+            "Tool is running as a background task with task id: {sid}/task-453\nTask Description: node --test\n"
+        ))),
+        false,
+    );
+
+    assert_eq!(state.tasks.len(), 1);
+    let initial_started = state.tasks[0].started_at.expect("started_at set on adoption");
+    let initial_progress_at = state.tasks[0]
+        .last_progress_at
+        .expect("last_progress_at set on adoption");
+    assert_eq!(initial_progress_at, initial_started);
+    core.sink.flush();
+    let emitted_after_adopt = emitter.0.lock().unwrap().len();
+
+    // Unchanged empty log after a short wait must not refresh last_progress_at or emit duplicate events.
+    std::thread::sleep(Duration::from_millis(20));
+    tracker.poll(&core, &mut state);
+    core.sink.flush();
+    assert_eq!(emitter.0.lock().unwrap().len(), emitted_after_adopt);
+    assert_eq!(state.tasks[0].started_at, Some(initial_started));
+    assert_eq!(state.tasks[0].last_progress_at, Some(initial_progress_at));
+
+    // Replaying the same task in transcript must preserve original started_at.
+    {
+        let mut tfile = std::fs::OpenOptions::new().append(true).open(&transcript).unwrap();
+        writeln!(
+            tfile,
+            "{}",
+            json!({
+                "type": "GENERIC",
+                "status": "RUNNING",
+                "content": format!("Background command running with id {sid}/task-453")
+            })
+        )
+        .unwrap();
+    }
+    tracker.poll(&core, &mut state);
+    assert_eq!(state.tasks[0].started_at, Some(initial_started));
+    assert_eq!(state.tasks[0].last_progress_at, Some(initial_progress_at));
+
+    // Appending new output to task-453.log advances last_progress_at and emits updated progress.
+    std::thread::sleep(Duration::from_millis(20));
+    {
+        let mut lfile = std::fs::OpenOptions::new().append(true).open(&task_log).unwrap();
+        writeln!(lfile, "ok 1 - initial suite").unwrap();
+    }
+    tracker.poll(&core, &mut state);
+    core.sink.flush();
+    assert!(emitter.0.lock().unwrap().len() > emitted_after_adopt);
+    assert_eq!(state.tasks[0].started_at, Some(initial_started));
+    let updated_progress_at = state.tasks[0].last_progress_at.unwrap();
+    assert!(updated_progress_at > initial_progress_at);
+    assert_eq!(state.tasks[0].progress.as_deref(), Some("ok 1 - initial suite"));
+
+    // Polling again while log length is unchanged keeps updated_progress_at stable.
+    let emitted_after_growth = emitter.0.lock().unwrap().len();
+    std::thread::sleep(Duration::from_millis(20));
+    tracker.poll(&core, &mut state);
+    core.sink.flush();
+    assert_eq!(emitter.0.lock().unwrap().len(), emitted_after_growth);
+    assert_eq!(state.tasks[0].last_progress_at, Some(updated_progress_at));
+
+    std::fs::remove_dir_all(root).unwrap();
 }

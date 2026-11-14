@@ -4018,6 +4018,8 @@ mod retry_lifecycle_tests {
                 progress: None,
                 background: None,
                 ambient: Some(true),
+                started_at: None,
+                last_progress_at: None,
             }]),
         ] {
             core.dispatch_event(&mut state, event);

@@ -1,5 +1,8 @@
 import type { Message, TodoItem, TodosPayload } from "@/lib/ipc";
 import type { NativeTask } from "@/lib/events";
+import { NATIVE_TASK_STALL_THRESHOLD_MS } from "../store/native-tasks";
+
+export { NATIVE_TASK_STALL_THRESHOLD_MS };
 
 export type AgentTaskStepState = "active" | "paused" | "complete";
 
@@ -18,6 +21,34 @@ export interface AgentTaskStep {
   nativeTaskId?: string;
   nativeKind?: string;
   nativeAmbient?: boolean;
+  nativeStartedAt?: number;
+  nativeLastProgressAt?: number;
+  nativeSummary?: string;
+  nativeProgress?: string;
+}
+
+export interface NativeStepSilence {
+  stalled: boolean;
+  quietMs: number;
+  quietMinutes: number;
+  since?: number;
+}
+
+export function getNativeStepSilence(step: AgentTaskStep, now: number): NativeStepSilence {
+  if (step.nativeStatus !== "running" || step.nativeAmbient) {
+    return { stalled: false, quietMs: 0, quietMinutes: 0 };
+  }
+  const since = step.nativeLastProgressAt ?? step.nativeStartedAt;
+  if (since === undefined || !Number.isFinite(since)) {
+    return { stalled: false, quietMs: 0, quietMinutes: 0 };
+  }
+  const quietMs = Math.max(0, now - since);
+  return {
+    stalled: quietMs >= NATIVE_TASK_STALL_THRESHOLD_MS,
+    quietMs,
+    quietMinutes: Math.floor(quietMs / 60_000),
+    since,
+  };
 }
 
 export function deriveNativeTaskSteps(tasks: NativeTask[], runId: string): AgentTaskStep[] {
@@ -29,6 +60,10 @@ export function deriveNativeTaskSteps(tasks: NativeTask[], runId: string): Agent
     nativeTaskId: task.id,
     nativeKind: task.kind,
     nativeAmbient: task.ambient,
+    ...(task.startedAt !== undefined ? { nativeStartedAt: task.startedAt } : {}),
+    ...(task.lastProgressAt !== undefined ? { nativeLastProgressAt: task.lastProgressAt } : {}),
+    ...(task.summary !== undefined ? { nativeSummary: task.summary } : {}),
+    ...(task.progress !== undefined ? { nativeProgress: task.progress } : {}),
     detail: [task.summary, task.progress].filter(Boolean).join("\n\n") || undefined,
   }));
 }

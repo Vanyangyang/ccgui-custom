@@ -117,7 +117,10 @@ async function openTask(index = 0) {
 
 function stopButton() {
   return [...container.querySelectorAll<HTMLButtonElement>("button")].find((button) =>
-    button.textContent === "停止此任务" || button.textContent === "正在停止…");
+    button.textContent === "停止此任务"
+    || button.textContent === "正在停止…"
+    || button.textContent === "Stop this task"
+    || button.textContent === "Stopping…");
 }
 
 describe("native task stop", () => {
@@ -1257,5 +1260,195 @@ describe("RunStatusStrip", () => {
     expect(detail?.textContent).toContain("后台命令");
     expect(detail?.textContent).toContain("vite v6.4.3 building for production...");
     expect(stopButton()).toBeUndefined();
+  });
+});
+
+describe("native task stall detection", () => {
+  const spySetInterval = () => vi.spyOn(window, "setInterval");
+  const spyClearInterval = () => vi.spyOn(window, "clearInterval");
+  let setIntervalSpy: ReturnType<typeof spySetInterval>;
+  let clearIntervalSpy: ReturnType<typeof spyClearInterval>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(1_700_000_000_000));
+    setIntervalSpy = spySetInterval();
+    clearIntervalSpy = spyClearInterval();
+  });
+
+  afterEach(() => {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  });
+
+  it("stops breathing, warns after 5m/18m silence on AGY background tasks, recovers on new output, and cleans timers", async () => {
+    const t0 = Date.now();
+    seedStopTasks([
+      {
+        id: "task-453",
+        kind: "command",
+        description: "Node integration tests",
+        status: "running",
+        summary: "node --test --test-timeout=0",
+        progress: "ok 42 - shutdownCli waiting...",
+        background: true,
+        startedAt: t0,
+        lastProgressAt: t0,
+      },
+      {
+        id: "task-daemon",
+        kind: "command",
+        description: "Background daemon",
+        status: "running",
+        ambient: true,
+        background: true,
+        startedAt: t0,
+        lastProgressAt: t0,
+      },
+    ], "agy-run-stall");
+
+    await renderNativeStrip(KEY, "agy");
+    expect(setIntervalSpy).toHaveBeenCalledTimes(1);
+    expect(setIntervalSpy).toHaveBeenCalledWith(expect.any(Function), 1000);
+    const activeTimerId = setIntervalSpy.mock.results[0]?.value;
+    expect(pill("任务").querySelector(".animate-ping")).not.toBeNull();
+    expect(container.querySelector("[data-testid='run-status-stalled-badge']")).toBeNull();
+
+    // Advance 4m59s -> still below 5 minute threshold.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5 * 60_000 - 1000);
+    });
+    expect(container.querySelector("[data-testid='run-status-stalled-badge']")).toBeNull();
+    expect(pill("任务").querySelector(".animate-ping")).not.toBeNull();
+
+    // Cross 5 minutes, then advance to 18 minutes -> stalled warning appears, status remains running.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(13 * 60_000 + 1000);
+    });
+    expect(container.querySelector("[data-testid='run-status-stalled-badge']")?.textContent).toBe("疑似停滞");
+    expect(pill("任务").querySelector(".animate-ping")).toBeNull();
+    expect(container.querySelector("[data-testid='pill-glyph-stalled']")).not.toBeNull();
+    expect(useChatStore.getState().bySession[KEY].nativeTasks?.[0].status).toBe("running");
+
+    // Open task list -> non-ambient row shows stalled dot & 18m silence; ambient row does not.
+    await click(pill("任务"));
+    const rows = container.querySelectorAll("[data-agent-step-key]");
+    expect(rows).toHaveLength(2);
+    expect(rows[0].querySelector("[data-testid='task-glyph-stalled']")).not.toBeNull();
+    expect(rows[0].querySelector(".animate-ping")).toBeNull();
+    expect(rows[0].textContent).toContain("已 18 分钟无输出");
+    expect(rows[0].textContent).toContain("运行中");
+    expect(rows[1].querySelector("[data-testid='task-glyph-ambient']")).not.toBeNull();
+    expect(rows[1].textContent).not.toContain("无输出");
+
+    // Open AGY task detail -> elapsed duration, last output time, log tail, and Stop hint shown.
+    await openTask(0);
+    const detail = container.querySelector("[data-testid='subagent-detail-overlay']");
+    expect(detail?.querySelector("[data-testid='detail-stalled-badge']")?.textContent).toBe("疑似停滞");
+    expect(detail?.querySelector("[data-testid='native-task-timing']")?.textContent).toContain("已运行 18m00s");
+    expect(detail?.querySelector("[data-testid='native-task-timing']")?.textContent).toContain("最近输出");
+    expect(detail?.querySelector("[data-testid='native-task-log-tail']")?.textContent).toContain("shutdownCli waiting...");
+    expect(detail?.querySelector("[data-testid='native-task-stalled-hint']")?.textContent).toContain("输入框「停止」按钮");
+    expect(stopButton()).toBeUndefined();
+
+    // New output updates lastProgressAt -> stalled warning clears immediately and breathing resumes.
+    const tNew = Date.now();
+    await act(async () => {
+      seedStopTasks([
+        {
+          id: "task-453",
+          kind: "command",
+          description: "Node integration tests",
+          status: "running",
+          summary: "node --test --test-timeout=0",
+          progress: "ok 43 - test suite finished",
+          background: true,
+          startedAt: t0,
+          lastProgressAt: tNew,
+        },
+        {
+          id: "task-daemon",
+          kind: "command",
+          description: "Background daemon",
+          status: "running",
+          ambient: true,
+          background: true,
+          startedAt: t0,
+          lastProgressAt: t0,
+        },
+      ], "agy-run-stall");
+    });
+    expect(container.querySelector("[data-testid='run-status-stalled-badge']")).toBeNull();
+    expect(detail?.querySelector("[data-testid='detail-stalled-badge']")).toBeNull();
+    expect(pill("任务").querySelector(".animate-ping")).not.toBeNull();
+    expect(setIntervalSpy).toHaveBeenCalledTimes(1);
+
+    // Completing foreground task clears interval timer cleanly even with ambient still running.
+    await act(async () => {
+      seedStopTasks([
+        {
+          id: "task-453",
+          kind: "command",
+          description: "Node integration tests",
+          status: "completed",
+          background: true,
+          startedAt: t0,
+          lastProgressAt: tNew,
+        },
+        {
+          id: "task-daemon",
+          kind: "command",
+          description: "Background daemon",
+          status: "running",
+          ambient: true,
+          background: true,
+          startedAt: t0,
+          lastProgressAt: t0,
+        },
+      ], "agy-run-stall");
+    });
+    expect(clearIntervalSpy).toHaveBeenCalledWith(activeTimerId);
+  });
+
+  it("shows Claude single-task stop hint in stalled detail, supports English i18n, and unmounts timer cleanly", async () => {
+    await i18n.changeLanguage("en");
+    const t0 = Date.now();
+    seedStopTasks([
+      {
+        id: "bash-claude",
+        kind: "local_bash",
+        description: "Long build",
+        status: "running",
+        summary: "cargo test",
+        startedAt: t0 - 6 * 60_000,
+        lastProgressAt: t0 - 6 * 60_000,
+      },
+    ], "claude-run-stall");
+
+    await renderNativeStrip(KEY, "claude");
+    expect(setIntervalSpy).toHaveBeenCalledTimes(1);
+    const activeTimerId = setIntervalSpy.mock.results[0]?.value;
+    expect(container.querySelector("[data-testid='run-status-stalled-badge']")?.textContent).toBe("Possibly stalled");
+
+    await click(pill("Tasks"));
+    expect(container.textContent).toContain("No output for 6m");
+    await openTask(0);
+    expect(container.querySelector("[data-testid='native-task-stalled-hint']")?.textContent).toContain("Stop this task");
+    expect(stopButton()?.textContent).toBe("Stop this task");
+
+    await act(async () => root.unmount());
+    expect(clearIntervalSpy).toHaveBeenCalledTimes(1);
+    expect(clearIntervalSpy).toHaveBeenCalledWith(activeTimerId);
+  });
+
+  it("does not mount interval timers when no running non-ambient native task exists", async () => {
+    seedStopTasks([
+      { id: "done-1", kind: "command", description: "Done", status: "completed", startedAt: Date.now() - 600_000 },
+      { id: "amb-1", kind: "command", description: "Watcher", status: "running", ambient: true, startedAt: Date.now() - 600_000 },
+    ], "agy-run-idle");
+
+    await renderNativeStrip(KEY, "agy");
+    expect(setIntervalSpy).not.toHaveBeenCalled();
+    expect(container.querySelector("[data-testid='run-status-stalled-badge']")).toBeNull();
   });
 });

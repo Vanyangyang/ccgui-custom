@@ -8,18 +8,36 @@ export function supportsNativeTasks(engine: string): boolean {
   return engine === "claude" || engine === "agy";
 }
 
+/** Running non-ambient native tasks silent for >= 5 minutes surface a non-destructive stall warning. */
+export const NATIVE_TASK_STALL_THRESHOLD_MS = 5 * 60_000;
+
+function finiteEpochMs(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
 /** Within one run, a task id denotes one execution. A confirmed terminal from
  * an event or stop result must survive a delayed running/paused snapshot;
  * other incoming fields and statuses remain authoritative. */
 export function mergeNativeTaskSnapshot(previous: NativeTask[] | undefined, incoming: NativeTask[]): NativeTask[] {
   if (!previous?.length) return incoming;
-  const confirmed = new Map(previous.filter((task) =>
-    task.status === "completed" || task.status === "failed" || task.status === "stopped",
-  ).map((task) => [task.id, task.status]));
-  if (!confirmed.size) return incoming;
+  const prevById = new Map(previous.map((task) => [task.id, task]));
   return incoming.map((task) => {
-    const status = confirmed.get(task.id);
-    return status && (task.status === "running" || task.status === "paused") ? { ...task, status } : task;
+    const prev = prevById.get(task.id);
+    if (!prev) return task;
+    const preservedStatus =
+      (prev.status === "completed" || prev.status === "failed" || prev.status === "stopped") &&
+      (task.status === "running" || task.status === "paused")
+        ? prev.status
+        : undefined;
+    const preservedStartedAt = task.startedAt === undefined && prev.startedAt !== undefined
+      ? prev.startedAt
+      : undefined;
+    if (!preservedStatus && preservedStartedAt === undefined) return task;
+    return {
+      ...task,
+      ...(preservedStatus ? { status: preservedStatus } : {}),
+      ...(preservedStartedAt !== undefined ? { startedAt: preservedStartedAt } : {}),
+    };
   });
 }
 
@@ -90,6 +108,8 @@ export function readNativeTasks(data: unknown): NativeTask[] | null {
     if (!value || typeof value !== "object") continue;
     const row = value as Record<string, unknown>;
     if (typeof row.id !== "string" || !row.id.trim()) continue;
+    const startedAt = finiteEpochMs(row.startedAt);
+    const lastProgressAt = finiteEpochMs(row.lastProgressAt);
     tasks.set(row.id, {
       id: row.id,
       kind: typeof row.kind === "string" ? row.kind : "unknown",
@@ -101,6 +121,8 @@ export function readNativeTasks(data: unknown): NativeTask[] | null {
       ...(typeof row.progress === "string" ? { progress: row.progress } : {}),
       ...(typeof row.background === "boolean" ? { background: row.background } : {}),
       ...(typeof row.ambient === "boolean" ? { ambient: row.ambient } : {}),
+      ...(startedAt !== undefined ? { startedAt } : {}),
+      ...(lastProgressAt !== undefined ? { lastProgressAt } : {}),
     });
   }
   return [...tasks.values()];

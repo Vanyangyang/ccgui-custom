@@ -12,6 +12,7 @@ import {
   deriveNativeTaskSteps,
   deriveEditedFiles,
   deriveTodoList,
+  getNativeStepSilence,
   type AgentTaskStep,
 } from "./agent-task-steps";
 import { createEditLineStatsBuilder, type EditLineStat } from "./edit-line-stats";
@@ -185,6 +186,38 @@ function PanelTopCloseIcon() {
   );
 }
 
+export function StalledTaskDot({
+  testId,
+  className,
+}: {
+  testId?: string;
+  className?: string;
+}) {
+  return (
+    <span
+      aria-hidden="true"
+      data-testid={testId}
+      className={cx("inline-flex size-2.5 shrink-0 items-center justify-center", className)}
+    >
+      <span className="size-1.5 rounded-full bg-amber-500" />
+    </span>
+  );
+}
+
+function formatTaskDuration(ms: number): string {
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m${String(seconds % 60).padStart(2, "0")}s`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h${String(minutes % 60).padStart(2, "0")}m`;
+}
+
+function formatWallClockTime(epochMs: number): string {
+  const d = new Date(epochMs);
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")}`;
+}
+
 export function BreathingDot({
   active = true,
   className,
@@ -217,6 +250,8 @@ export function BreathingDot({
 function Pill({
   selected,
   running,
+  stalled,
+  warning,
   label,
   count,
   stats,
@@ -226,6 +261,8 @@ function Pill({
 }: {
   selected: boolean;
   running?: boolean;
+  stalled?: boolean;
+  warning?: string;
   label: string;
   count?: string;
   stats?: React.ReactNode;
@@ -244,13 +281,24 @@ function Pill({
         "flex h-[26px] cursor-pointer items-center gap-1.5 rounded-[5px] border border-dashed px-2 text-caption-1-medium transition-colors duration-150",
         selected
           ? "border-foreground-icon-secondary bg-background-tertiary-default/60 text-text-primary"
-          : "border-border-button-default text-text-secondary hover:bg-background-tertiary-default/60",
+          : stalled && !running
+            ? "border-amber-500/50 text-text-secondary hover:bg-background-tertiary-default/60"
+            : "border-border-button-default text-text-secondary hover:bg-background-tertiary-default/60",
       )}
     >
-      {running && <BreathingDot active={true} className="mr-0.5" />}
+      {running ? (
+        <BreathingDot active={true} className="mr-0.5" />
+      ) : stalled ? (
+        <StalledTaskDot testId="pill-glyph-stalled" className="mr-0.5" />
+      ) : null}
       {icon}
       <span>{label}</span>
       {count ? <span className="tabular-nums text-text-tertiary">{count}</span> : null}
+      {warning ? (
+        <span data-testid="run-status-stalled-badge" className="text-text-warning-primary">
+          {warning}
+        </span>
+      ) : null}
       {stats}
     </button>
   );
@@ -536,7 +584,7 @@ function taskTypeLabel(t: TFunction, step: AgentTaskStep): string | undefined {
   return t(NATIVE_TASK_KIND_KEYS.get(kind) ?? "chat.nativeTaskUnknownKind");
 }
 
-function TaskStatusGlyph({ step }: { step: AgentTaskStep }) {
+function TaskStatusGlyph({ step, stalled }: { step: AgentTaskStep; stalled?: boolean }) {
   if (step.nativeStatus === "paused") return <span aria-hidden className="text-caption-1-medium text-text-secondary">Ⅱ</span>;
   if (step.nativeStatus === "failed" || step.nativeStatus === "stopped" || step.nativeStatus === "unknown") {
     return <span aria-hidden className={cx("text-caption-1-medium", taskStatusTone(step))}>
@@ -551,6 +599,9 @@ function TaskStatusGlyph({ step }: { step: AgentTaskStep }) {
         <span className="size-1.5 rounded-full border border-text-secondary" />
       </span>
     );
+  }
+  if (step.state === "active" && stalled) {
+    return <StalledTaskDot testId="task-glyph-stalled" />;
   }
   return <BreathingDot active={step.state === "active"} />;
 }
@@ -650,9 +701,10 @@ function useNativeTaskStop(
   };
 }
 
-function SubagentDetail({ step, native, taskStop, onBack }: {
+function SubagentDetail({ step, native, now, taskStop, onBack }: {
   step: AgentTaskStep;
   native: boolean;
+  now: number;
   taskStop: NativeTaskStopActions;
   onBack: () => void;
 }) {
@@ -660,12 +712,15 @@ function SubagentDetail({ step, native, taskStop, onBack }: {
   const backLabel = t(native ? "chat.nativeTaskDetailBack" : "chat.agentDetailBack");
   const typeLabel = taskTypeLabel(t, step);
   const stopState = taskStop.stateFor(step);
+  const silence = native ? getNativeStepSilence(step, now) : { stalled: false, quietMs: 0, quietMinutes: 0 };
+  const hasTiming = native && (step.nativeStartedAt !== undefined || step.nativeLastProgressAt !== undefined);
+  const elapsedEnd = step.nativeStatus === "running" ? now : (step.nativeLastProgressAt ?? now);
   // The row that opened this overlay unmounted with the list; move focus
   // into the overlay instead of dropping it on document.body.
   const backRef = useRef<HTMLButtonElement>(null);
   useEffect(() => backRef.current?.focus(), []);
   return (
-    <div data-testid="subagent-detail-overlay" className="flex flex-col gap-1 p-1">
+    <div data-testid="subagent-detail-overlay" className="flex flex-col gap-1.5 p-1">
       <div className="flex items-center gap-1.5 px-1">
         <button
           ref={backRef}
@@ -685,18 +740,91 @@ function SubagentDetail({ step, native, taskStop, onBack }: {
           )}
           <span className="truncate text-caption-1-medium text-text-primary">{step.label}</span>
         </div>
-        <span
-          className={cx(
-            "ml-auto shrink-0 text-caption-2-medium",
-            taskStatusTone(step),
+        <div className="ml-auto flex shrink-0 items-center gap-1.5">
+          {silence.stalled && (
+            <span data-testid="detail-stalled-badge" className="text-caption-2-medium text-text-warning-primary">
+              {t("chat.nativeTaskStalledPill")}
+            </span>
           )}
-        >
-          {taskStatusLabel(t, step)}
-        </span>
+          <span
+            className={cx(
+              "text-caption-2-medium",
+              taskStatusTone(step),
+            )}
+          >
+            {taskStatusLabel(t, step)}
+          </span>
+        </div>
       </div>
-      <pre className="max-h-52 overflow-y-auto rounded bg-background-secondary-default px-2 py-1.5 text-caption-1-medium break-words whitespace-pre-wrap text-text-secondary">
-        {step.detail ?? step.label}
-      </pre>
+      {hasTiming && (
+        <div
+          data-testid="native-task-timing"
+          className="flex flex-wrap items-center gap-x-3 gap-y-1 px-1 text-caption-1-regular text-text-tertiary tabular-nums"
+        >
+          {step.nativeStartedAt !== undefined && (
+            <span>
+              {t("chat.nativeTaskElapsed", {
+                duration: formatTaskDuration(Math.max(0, elapsedEnd - step.nativeStartedAt)),
+              })}
+            </span>
+          )}
+          {step.nativeLastProgressAt !== undefined && (
+            <span>
+              {step.nativeStatus === "running"
+                ? t("chat.nativeTaskLastOutput", {
+                    time: formatWallClockTime(step.nativeLastProgressAt),
+                    ago: formatTaskDuration(Math.max(0, now - step.nativeLastProgressAt)),
+                  })
+                : t("chat.nativeTaskLastOutputAt", {
+                    time: formatWallClockTime(step.nativeLastProgressAt),
+                  })}
+            </span>
+          )}
+          {silence.stalled && (
+            <span className="text-text-warning-primary">
+              {t("chat.nativeTaskSilentFor", { minutes: silence.quietMinutes })}
+            </span>
+          )}
+        </div>
+      )}
+      {native && (step.nativeSummary || step.nativeProgress || silence.stalled) ? (
+        <div className="flex flex-col gap-1.5">
+          <pre className="max-h-32 overflow-y-auto rounded bg-background-secondary-default px-2 py-1.5 text-caption-1-medium break-words whitespace-pre-wrap text-text-secondary">
+            {step.nativeSummary ?? step.label}
+          </pre>
+          {step.nativeProgress ? (
+            <div className="flex flex-col gap-1">
+              <span className="px-1 text-[11px] font-medium text-text-tertiary">
+                {t("chat.nativeTaskLogTail")}
+              </span>
+              <pre
+                data-testid="native-task-log-tail"
+                className="max-h-40 overflow-y-auto rounded bg-background-secondary-default px-2 py-1.5 text-caption-1-medium break-words whitespace-pre-wrap text-text-secondary"
+              >
+                {step.nativeProgress}
+              </pre>
+            </div>
+          ) : silence.stalled ? (
+            <p className="rounded bg-background-secondary-default px-2 py-1.5 text-caption-1-regular text-text-tertiary">
+              {t("chat.nativeTaskNoOutputYet")}
+            </p>
+          ) : null}
+        </div>
+      ) : (
+        <pre className="max-h-52 overflow-y-auto rounded bg-background-secondary-default px-2 py-1.5 text-caption-1-medium break-words whitespace-pre-wrap text-text-secondary">
+          {step.detail ?? step.label}
+        </pre>
+      )}
+      {silence.stalled && (
+        <p
+          data-testid="native-task-stalled-hint"
+          className="rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-caption-1-regular text-text-warning-primary"
+        >
+          {t(stopState ? "chat.nativeTaskStalledHintStopTask" : "chat.nativeTaskStalledHintStopRun", {
+            minutes: silence.quietMinutes,
+          })}
+        </p>
+      )}
       {stopState && (
         <div className="flex flex-col items-start gap-1.5 px-1 py-1">
           <Button
@@ -720,7 +848,7 @@ function SubagentDetail({ step, native, taskStop, onBack }: {
   );
 }
 
-function SubagentRows({ steps, native, taskStop }: { steps: AgentTaskStep[]; native: boolean; taskStop: NativeTaskStopActions }) {
+function SubagentRows({ steps, native, now, taskStop }: { steps: AgentTaskStep[]; native: boolean; now: number; taskStop: NativeTaskStopActions }) {
   const { t } = useTranslation();
   // Open detail lives here, not in the strip: closing the panel unmounts this
   // component, so reopening always starts on the list.
@@ -746,7 +874,7 @@ function SubagentRows({ steps, native, taskStop }: { steps: AgentTaskStep[]; nat
   const open = openKey ? steps.find((step) => step.key === openKey) : undefined;
   if (open) return (
     <div data-testid="run-status-subagents">
-      <SubagentDetail step={open} native={native} taskStop={taskStop} onBack={() => setOpenKey(null)} />
+      <SubagentDetail step={open} native={native} now={now} taskStop={taskStop} onBack={() => setOpenKey(null)} />
     </div>
   );
   return (
@@ -755,6 +883,7 @@ function SubagentRows({ steps, native, taskStop }: { steps: AgentTaskStep[]; nat
         {steps.map((step) => {
           const complete = step.state === "complete";
           const typeLabel = taskTypeLabel(t, step);
+          const silence = native ? getNativeStepSilence(step, now) : { stalled: false, quietMs: 0, quietMinutes: 0 };
           return (
             <li key={step.key}>
               <button
@@ -765,7 +894,7 @@ function SubagentRows({ steps, native, taskStop }: { steps: AgentTaskStep[]; nat
                 className="grid w-full cursor-pointer grid-cols-[14px_minmax(0,1fr)_auto] items-center gap-2 rounded px-2 py-1.5 text-left transition-colors hover:bg-background-tertiary-default/50"
               >
                 <div className="flex items-center justify-center">
-                  <TaskStatusGlyph step={step} />
+                  <TaskStatusGlyph step={step} stalled={silence.stalled} />
                 </div>
                 <div className="flex min-w-0 items-center gap-1.5">
                   {typeLabel && (
@@ -784,11 +913,18 @@ function SubagentRows({ steps, native, taskStop }: { steps: AgentTaskStep[]; nat
                 </div>
                 <span
                   className={cx(
-                    "text-caption-2-medium flex shrink-0 items-center gap-1",
-                    taskStatusTone(step),
+                    "text-caption-2-medium flex shrink-0 items-center gap-1.5",
+                    silence.stalled ? "text-text-warning-primary" : taskStatusTone(step),
                   )}
                 >
-                  {taskStatusLabel(t, step)}
+                  {silence.stalled && (
+                    <span data-testid="task-row-silent">
+                      {t("chat.nativeTaskSilentFor", { minutes: silence.quietMinutes })} ·
+                    </span>
+                  )}
+                  <span className={silence.stalled ? taskStatusTone(step) : undefined}>
+                    {taskStatusLabel(t, step)}
+                  </span>
                 </span>
               </button>
             </li>
@@ -851,6 +987,7 @@ function RunStatusPanel({
   total,
   live,
   native,
+  now,
   taskStop,
 }: {
   section: SectionId | null;
@@ -861,6 +998,7 @@ function RunStatusPanel({
   total: FileStat | null;
   live: boolean;
   native: boolean;
+  now: number;
   taskStop: NativeTaskStopActions;
 }) {
   return (
@@ -875,7 +1013,7 @@ function RunStatusPanel({
           role="tabpanel"
           className="mb-1.5 max-h-[min(40vh,280px)] overflow-y-auto rounded-md border border-dashed border-border-button-default bg-background-primary-default shadow-[0_8px_24px_rgba(0,0,0,0.08)]"
         >
-          {section === "subagent" && <SubagentRows steps={steps} native={native} taskStop={taskStop} />}
+          {section === "subagent" && <SubagentRows steps={steps} native={native} now={now} taskStop={taskStop} />}
           {section === "todo" && <TodoRows items={todos} live={live} native={native} />}
           {section === "files" && (
             <FileRows files={files} perFile={perFile} total={total} live={live} />
@@ -896,6 +1034,7 @@ function RunStatusPills({
   stats,
   streaming,
   native,
+  now,
   onToggle,
 }: {
   section: SectionId | null;
@@ -905,16 +1044,21 @@ function RunStatusPills({
   stats: FileStat | null;
   streaming: boolean;
   native: boolean;
+  now: number;
   onToggle: (id: SectionId) => void;
 }) {
   const { t } = useTranslation();
   const completedCount = steps.filter((step) => step.nativeStatus ? step.nativeStatus === "completed" : step.state === "complete").length;
   const nativeRunningCount = native ? steps.filter((step) => step.nativeStatus === "running" && !step.nativeAmbient).length : 0;
+  const stalledCount = native ? steps.filter((step) => getNativeStepSilence(step, now).stalled).length : 0;
+  const allRunningStalled = nativeRunningCount > 0 && stalledCount === nativeRunningCount;
   // Legacy mode keys off step.state, not completedCount: a historical async
   // launch of unknown status is state "complete" but never counts as completed,
   // so completedCount < steps.length would pulse the pill all turn for a step
   // that is settled history.
-  const anyRunning = native ? nativeRunningCount > 0 : streaming && steps.some((step) => step.state === "active");
+  const anyRunning = native
+    ? nativeRunningCount > 0 && !allRunningStalled
+    : streaming && steps.some((step) => step.state === "active");
   const todosDone = todos.filter((item) => item.status === "complete").length;
   const todosRunning = streaming && todos.some((item) => item.status === "active");
   return (
@@ -933,6 +1077,8 @@ function RunStatusPills({
         <Pill
           selected={section === "subagent"}
           running={anyRunning}
+          stalled={allRunningStalled}
+          warning={stalledCount > 0 ? t("chat.nativeTaskStalledPill") : undefined}
           label={t(native ? "chat.nativeTasksPill" : "chat.subagentPill")}
           count={nativeRunningCount > 0 ? `${t("chat.nativeTaskRunningCount", { count: nativeRunningCount })} · ${completedCount}/${steps.length}` : `${completedCount}/${steps.length}`}
           icon={<BotIcon />}
@@ -999,6 +1145,18 @@ export const RunStatusStrip = memo(function RunStatusStrip({
     () => native ? deriveNativeTaskSteps(nativeTasks!, nativeRunId ?? "") : deriveAgentTaskSteps(allHistory, streaming, engine),
     [allHistory, streaming, engine, native, nativeTasks, nativeRunId],
   );
+  const hasRunningNativeTask = useMemo(
+    () => native && steps.some((step) => step.nativeStatus === "running" && !step.nativeAmbient),
+    [native, steps],
+  );
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!hasRunningNativeTask) return;
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [hasRunningNativeTask]);
+
   const taskStop = useNativeTaskStop(sessionKey, engine, nativeRunId, steps);
   const files = useMemo(() => deriveEditedFiles(messages), [messages]);
   const todos = useMemo(() => deriveTodoList(allHistory), [allHistory]);
@@ -1065,6 +1223,7 @@ export const RunStatusStrip = memo(function RunStatusStrip({
         total={total}
         live={streaming}
         native={native}
+        now={now}
         taskStop={taskStop}
       />
       <div className="flex min-h-7 items-center gap-1.5">
@@ -1077,6 +1236,7 @@ export const RunStatusStrip = memo(function RunStatusStrip({
             stats={total}
             streaming={streaming}
             native={native}
+            now={now}
             onToggle={toggleSection}
           />
         ) : (

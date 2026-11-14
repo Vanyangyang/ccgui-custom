@@ -18,6 +18,8 @@ fn task(id: &str, status: &str) -> NativeTask {
         progress: None,
         background: Some(true),
         ambient: None,
+        started_at: None,
+        last_progress_at: None,
     }
 }
 
