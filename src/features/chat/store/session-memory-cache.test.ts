@@ -9,6 +9,7 @@ import { createChatCheckpointParticipant } from "./runtime-checkpoint";
 import { EMPTY_SESSION, patchSession, runRouting, type SessionState } from "./stream";
 import { handleEngineEvents, settledRuns, settledRunOutcomes } from "./engine-events";
 import { askLoops } from "./ask-loop";
+import { clearComposerPrediction, reconcileComposerPrediction } from "../composer-prediction";
 
 vi.mock("@/lib/ipc", () => ({ ipc: {
   listPlanReviews: vi.fn(async () => []), rescanSessions: vi.fn(async () => {}), activeRunIds: vi.fn(async () => []),
@@ -16,7 +17,7 @@ vi.mock("@/lib/ipc", () => ({ ipc: {
 } }));
 vi.mock("@/features/plugins/runtime/events", () => ({ emitSessionActivated: vi.fn() }));
 vi.mock("@/features/settings/usage-tracking", () => ({ usageTrackingEnabled: () => false }));
-vi.mock("@/features/chat/composer-prediction", () => ({ clearComposerPrediction: vi.fn(), requestComposerPrediction: vi.fn() }));
+vi.mock("@/features/chat/composer-prediction", () => ({ clearComposerPrediction: vi.fn(), requestComposerPrediction: vi.fn(), reconcileComposerPrediction: vi.fn() }));
 vi.mock("@/features/sidechat/store", () => ({
   useSidechatStore: { getState: () => ({ dismissBtw: vi.fn(), discardSidechat: vi.fn(async () => {}) }) },
   isSideRunEvent: () => false,
@@ -72,6 +73,32 @@ const sweep = () => vi.advanceTimersByTimeAsync(1_000);
 const retained = (f: ReturnType<typeof fixture>) => Object.values(f.get().bySession).filter(session => session.messages.length > 0);
 
 describe("inactive session history memory", () => {
+  it("checks saved prediction turn ownership after a native history load", async () => {
+    const f = fixture();
+    const messages: Message[] = [
+      { seq: 1, role: "user", text: "新问题", ts: null },
+      { seq: 2, role: "assistant", text: "新回答🙂", ts: null },
+    ];
+    f.load.mockResolvedValueOnce(page(messages));
+    await f.get().selectSession("codex", "prediction-owner", "G:/fixture");
+    expect(reconcileComposerPrediction).toHaveBeenCalledWith("codex/prediction-owner", messages);
+  });
+
+  it("checks idle checkpoint predictions and clears predictions from active restored turns", () => {
+    const first = fixture();
+    const idleMessages = [row("已完成的回合")];
+    first.put("idle", { messages: idleMessages });
+    first.put("busy", { streaming: true });
+    const saved = first.checkpoint.capture();
+    first.dispose();
+    vi.mocked(clearComposerPrediction).mockClear();
+    vi.mocked(reconcileComposerPrediction).mockClear();
+    const next = fixture();
+    next.checkpoint.restore(saved);
+    expect(reconcileComposerPrediction).toHaveBeenCalledWith("codex/idle", idleMessages);
+    expect(clearComposerPrediction).toHaveBeenCalledWith("codex/busy", { resetTurn: true });
+  });
+
   it("rebuilds the whole closed cache after a checkpoint, retaining shells and only ten histories", async () => {
     const first = fixture();
     for (let i = 0; i < 10; i++) await first.openClose(`old-${i}`);

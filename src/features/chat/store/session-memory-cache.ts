@@ -124,7 +124,7 @@ export function createSessionMemoryCache(deps: {
     for (const [key, session] of Object.entries(state.bySession)) {
       if (key.startsWith("new:") || state.archivedSessionKeys[key] || open.has(key) || routed.has(key) || askLoops.has(key) || session.loading || session.draftLaunching ||
         session.streaming || state.streamingByKey[key] || state.retryingByKey[key] || session.retry || session.compaction ||
-        session.error || session.queue.length || session.interrupted || session.queueParked || session.handoff ||
+        session.error || session.failedTurn || session.queue.length || session.interrupted || session.queueParked || session.handoff ||
         session.interruptRequestedAt != null || session.followUpAt != null || session.nativeActivity ||
         session.hostTaskOrigin && !session.hostTaskOrigin.sessionId ||
         session.nativeTasks?.some(task => !["completed", "failed", "stopped"].includes(task.status)) ||

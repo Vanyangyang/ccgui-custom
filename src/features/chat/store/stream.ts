@@ -116,6 +116,9 @@ export interface SessionState {
   /** Bounded terminal-run history; late events must not revive a finished turn. */
   settledRunIds?: string[];
   error: string | null;
+  /** Failed user turn anchored inline in the timeline (persists until retry,
+   *  new turn, or manual dismiss; never auto-cleared by the 5s ErrorBanner). */
+  failedTurn?: { userSeq: number; error: string } | null;
   /** Live provider-retry progress for the running turn ("重试中 2/5"). The
    * CLI is backing off and will re-issue the request, so this is progress,
    * not a failure: it clears on the next content event or when the turn
@@ -147,6 +150,25 @@ export function isUnloadedHistory(session: Pick<SessionState, "historyReloadRequ
   return !!session?.historyReloadRequired && !session.messages.length && !session.subagentHistory?.length;
 }
 
+export function findLastTurnUserSeq(messages: readonly Message[]): number | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "user" && !messages[i].steer) return messages[i].seq;
+  }
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "user") return messages[i].seq;
+  }
+  return null;
+}
+
+export function hasInlineTurnError(
+  session: Pick<SessionState, "streaming" | "failedTurn" | "messages"> | undefined,
+): boolean {
+  if (!session || session.streaming || !session.failedTurn) return false;
+  return session.messages.some(
+    (m) => m.role === "user" && m.seq === session.failedTurn!.userSeq,
+  );
+}
+
 export const EMPTY_SESSION: SessionState = {
   messages: [],
   subagentHistory: [],
@@ -161,6 +183,7 @@ export const EMPTY_SESSION: SessionState = {
   turnUsage: null,
   throughput: null,
   error: null,
+  failedTurn: null,
   retry: null,
   compaction: null,
   queue: [],
@@ -737,8 +760,13 @@ export function patchSession<T extends BySessionSlice>(
     bySession: {
       ...s.bySession,
       [key]: { ...(s.bySession[key] ?? EMPTY_SESSION), ...patch,
-        // Observed native activity likewise supersedes any old history error.
-        ...(patch.streaming === true ? { historyReloadError: undefined } : {}) },
+        // Observed native activity likewise supersedes any old history error or failed turn.
+        ...(patch.streaming === true
+          ? {
+              historyReloadError: undefined,
+              ...(!("failedTurn" in patch) ? { failedTurn: null } : {}),
+            }
+          : {}) },
     },
   }) as Partial<T>);
 }

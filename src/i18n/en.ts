@@ -555,6 +555,7 @@ export const en: Messages = {
     grantDecline: "Decline",
     grantGranted: "Granted {{dir}}. The grant applies on the next message —",
     grantResend: "Resend last message",
+    turnFailedRetry: "Retry",
     grantDeclined: "Access request declined.",
     grantTitleAction: "Permission required",
     grantUnavailable:

@@ -36,6 +36,7 @@ import {
   setStreamingFlag,
   settleLiveRows,
   untrackRun,
+  findLastTurnUserSeq,
   type QueuedMessage,
   type SessionState,
 } from "./stream";
@@ -524,6 +525,7 @@ export function createMessagingActions(
         ...(engine === "codex" ? { codexRunId: requestedRunId, liveLaunch: { model, effort, provider, permission } } : {}),
         streaming: true,
         error: null,
+        failedTurn: null,
         interrupted: false,
         turnStartedAt: Date.now(),
         activeModel: model,
@@ -538,6 +540,7 @@ export function createMessagingActions(
         turnUsage: null,
         throughput: startThroughput(requestedRunId),
       },
+      { replaceTrailingUserSeq: options?.replaceTrailingUserSeq },
     );
     // Refresh independently: a slow history read must not delay sending or Stop.
     const hostUserRow = get().bySession[key]?.messages.at(-1);
@@ -864,8 +867,11 @@ export function createMessagingActions(
       set((s) => ({
         streamingByKey: setStreamingFlag(s.streamingByKey, failedKey, false),
       }));
+      const failedUserSeq = findLastTurnUserSeq(get().bySession[failedKey]?.messages ?? []);
+      const failedMessage = String(error);
       patchSession(set, failedKey, {
-        error: String(error),
+        error: failedMessage,
+        failedTurn: failedUserSeq !== null && failedMessage ? { userSeq: failedUserSeq, error: failedMessage } : null,
         streaming: false,
         turnStartedAt: null,
         throughput: settleThroughput(get().bySession[failedKey]?.throughput, requestedRunId, true),
@@ -1773,18 +1779,26 @@ export function createMessagingActions(
 
     resendLastUser: async (key) => {
       const s = get();
-      if (s.streamingByKey[key]) return; // a turn is already running
+      if (s.streamingByKey[key] || s.bySession[key]?.draftLaunching) return; // a turn is already running
       const messages = s.bySession[key]?.messages ?? [];
       const lastUser = [...messages].reverse().find((m) => m.role === "user");
       if (!lastUser) return;
       const tab =
         s.openTabs.find(
           (t) => sessionKey(t.engine, t.sessionId, t.workspacePath) === key,
-        ) ?? s.active;
-      if (tab)
+        ) ??
+        (s.active &&
+        sessionKey(s.active.engine, s.active.sessionId, s.active.workspacePath) === key
+          ? s.active
+          : null);
+      if (tab) {
+        const replaceTrailingUserSeq =
+          messages.at(-1)?.seq === lastUser.seq ? lastUser.seq : undefined;
         await sendPrompt(tab, lastUser.text, lastUser.images ?? [], {
           computerUse: s.bySession[key]?.activeComputerUse === true,
+          replaceTrailingUserSeq,
         });
+      }
     },
 
     queueMessage: (text, images, options, target) => {

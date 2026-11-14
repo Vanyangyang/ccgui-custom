@@ -1,4 +1,5 @@
 import { cloneCheckpointValue, registerRuntimeCheckpointParticipant, type RuntimeCheckpointParticipant } from "@/lib/runtime-checkpoint";
+import { clearComposerPrediction, reconcileComposerPrediction } from "../composer-prediction";
 import type { ChatStore } from "./types";
 import { askLoops, type AskLoop } from "./ask-loop";
 import { captureEngineEventRuntime, restoreEngineEventRuntime, engineEventCheckpointBlockers } from "./engine-events";
@@ -68,6 +69,15 @@ function parseCheckpoint(value: unknown): ChatCheckpoint {
   }
   for (const [key, session] of Object.entries(state.bySession)) {
     if (!object(session) || !Array.isArray(session.messages) || !Array.isArray(session.queue) || typeof session.streaming !== "boolean" || typeof session.loading !== "boolean") {
+      throw new Error("Invalid checkpoint session");
+    }
+    if (
+      session.failedTurn !== undefined &&
+      session.failedTurn !== null &&
+      (!object(session.failedTurn) ||
+        typeof session.failedTurn.userSeq !== "number" ||
+        typeof session.failedTurn.error !== "string")
+    ) {
       throw new Error("Invalid checkpoint session");
     }
     if (session.hostTaskOrigin !== undefined) {
@@ -167,6 +177,13 @@ export function createChatCheckpointParticipant(store: ChatCheckpointStore, get:
       restored.add(get);
       store.setState({ ...data, initialized: false });
       flushPendingStreams(store.setState);
+      for (const [key, session] of Object.entries(store.getState().bySession)) {
+        if (session.streaming || session.draftLaunching || session.interrupted || session.error || session.queue.length) {
+          clearComposerPrediction(key, { resetTurn: true });
+        } else if (!session.loading && !session.historyReloadRequired) {
+          reconcileComposerPrediction(key, session.messages);
+        }
+      }
     },
     resumed,
   };

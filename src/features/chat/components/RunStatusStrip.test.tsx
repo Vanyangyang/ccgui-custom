@@ -1498,4 +1498,56 @@ describe("native task stall detection", () => {
     await renderNativeStrip(KEY, "agy");
     expect(container.textContent).not.toContain("子代理");
   });
+
+  it("prioritizes Chinese display summaries for native background commands in zh UI while keeping originals in detail and en UI", async () => {
+    seedStopTasks([
+      {
+        id: "cmd-fail",
+        kind: "command",
+        description: "Run isolated test suite and MCP smoke check",
+        status: "failed",
+        summary: "node scripts/test.mjs",
+      },
+      {
+        id: "cmd-run",
+        kind: "command",
+        description: "Dual-env test suite and MCP smoke",
+        status: "running",
+      },
+      {
+        id: "cmd-zh",
+        kind: "local_bash",
+        description: "运行全量回归测试",
+        status: "completed",
+      },
+    ], "agy-zh-summary");
+
+    await renderNativeStrip(KEY, "agy");
+    await click(pill("任务"));
+
+    const rows = [...container.querySelectorAll<HTMLButtonElement>("[data-agent-step-key]")];
+    expect(rows).toHaveLength(3);
+    expect(rows[0].textContent).toContain("运行隔离测试套件与 MCP 冒烟检查");
+    expect(rows[0].textContent).not.toContain("Run isolated test suite and MCP smoke check");
+    expect(rows[1].textContent).toContain("双环境测试套件与 MCP 冒烟");
+    expect(rows[2].textContent).toContain("运行全量回归测试");
+
+    // Detail keeps Chinese title and retains original English description + command in <pre>.
+    await click(rows[0]);
+    const detail = container.querySelector("[data-testid='subagent-detail-overlay']");
+    expect(detail?.textContent).toContain("运行隔离测试套件与 MCP 冒烟检查");
+    expect(detail?.querySelector("pre")?.textContent).toBe(
+      "Run isolated test suite and MCP smoke check\nnode scripts/test.mjs",
+    );
+
+    // Switching UI to English restores original English labels verbatim.
+    await act(async () => {
+      await i18n.changeLanguage("en");
+    });
+    expect(detail?.textContent).toContain("Run isolated test suite and MCP smoke check");
+    await click(container.querySelector("[aria-label='Back to tasks']")!);
+    const enRows = [...container.querySelectorAll<HTMLButtonElement>("[data-agent-step-key]")];
+    expect(enRows[0].textContent).toContain("Run isolated test suite and MCP smoke check");
+    expect(enRows[1].textContent).toContain("Dual-env test suite and MCP smoke");
+  });
 });

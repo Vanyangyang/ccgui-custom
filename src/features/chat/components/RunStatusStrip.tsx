@@ -16,6 +16,7 @@ import {
   type AgentTaskStep,
 } from "./agent-task-steps";
 import { createEditLineStatsBuilder, type EditLineStat } from "./edit-line-stats";
+import { formatNativeTaskDisplayLabel } from "./native-command-label";
 import { RollingStat } from "./RollingStat";
 
 const EMPTY_MESSAGES: Message[] = [];
@@ -708,7 +709,14 @@ function SubagentDetail({ step, native, now, taskStop, onBack }: {
   taskStop: NativeTaskStopActions;
   onBack: () => void;
 }) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  const displayLabel = native ? formatNativeTaskDisplayLabel(step, i18n.language) : step.label;
+  const detailSummary =
+    displayLabel !== step.label
+      ? step.nativeSummary && step.nativeSummary !== step.label
+        ? `${step.label}\n${step.nativeSummary}`
+        : step.label
+      : step.nativeSummary;
   const backLabel = t(native ? "chat.nativeTaskDetailBack" : "chat.agentDetailBack");
   const typeLabel = taskTypeLabel(t, step);
   const stopState = taskStop.stateFor(step);
@@ -738,7 +746,7 @@ function SubagentDetail({ step, native, now, taskStop, onBack }: {
               {typeLabel}
             </span>
           )}
-          <span className="truncate text-caption-1-medium text-text-primary">{step.label}</span>
+          <span className="truncate text-caption-1-medium text-text-primary">{displayLabel}</span>
         </div>
         <div className="ml-auto flex shrink-0 items-center gap-1.5">
           {silence.stalled && (
@@ -787,10 +795,10 @@ function SubagentDetail({ step, native, now, taskStop, onBack }: {
           )}
         </div>
       )}
-      {native && (step.nativeSummary || step.nativeProgress || silence.stalled) ? (
+      {native && (detailSummary || step.nativeProgress || silence.stalled) ? (
         <div className="flex flex-col gap-1.5">
           <pre className="max-h-32 overflow-y-auto rounded bg-background-secondary-default px-2 py-1.5 text-caption-1-medium break-words whitespace-pre-wrap text-text-secondary">
-            {step.nativeSummary ?? step.label}
+            {detailSummary ?? step.label}
           </pre>
           {step.nativeProgress ? (
             <div className="flex flex-col gap-1">
@@ -849,7 +857,7 @@ function SubagentDetail({ step, native, now, taskStop, onBack }: {
 }
 
 function SubagentRows({ steps, native, now, taskStop }: { steps: AgentTaskStep[]; native: boolean; now: number; taskStop: NativeTaskStopActions }) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   // Open detail lives here, not in the strip: closing the panel unmounts this
   // component, so reopening always starts on the list.
   const [openKey, setOpenKey] = useState<string | null>(null);
@@ -882,6 +890,7 @@ function SubagentRows({ steps, native, now, taskStop }: { steps: AgentTaskStep[]
       <ul className="flex flex-col gap-0.5 p-1">
         {steps.map((step) => {
           const complete = step.state === "complete";
+          const displayLabel = native ? formatNativeTaskDisplayLabel(step, i18n.language) : step.label;
           const typeLabel = taskTypeLabel(t, step);
           const silence = native ? getNativeStepSilence(step, now) : { stalled: false, quietMs: 0, quietMinutes: 0 };
           return (
@@ -890,7 +899,7 @@ function SubagentRows({ steps, native, now, taskStop }: { steps: AgentTaskStep[]
                 type="button"
                 data-agent-step-key={step.key}
                 onClick={() => setOpenKey(step.key)}
-                title={step.label}
+                title={displayLabel === step.label ? step.label : `${displayLabel} (${step.label})`}
                 className="grid w-full cursor-pointer grid-cols-[14px_minmax(0,1fr)_auto] items-center gap-2 rounded px-2 py-1.5 text-left transition-colors hover:bg-background-tertiary-default/50"
               >
                 <div className="flex items-center justify-center">
@@ -908,7 +917,7 @@ function SubagentRows({ steps, native, now, taskStop }: { steps: AgentTaskStep[]
                       complete ? "text-text-secondary" : "text-text-primary",
                     )}
                   >
-                    {step.label}
+                    {displayLabel}
                   </span>
                 </div>
                 <span

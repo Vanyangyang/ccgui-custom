@@ -83,8 +83,9 @@ mod sidechat_codex;
 /// workspace that is the expensive call of the whole turn, so it gets far more
 /// headroom than a plain RPC.
 const THREAD_TIMEOUT: Duration = Duration::from_secs(90);
-/// `thread/resume` only re-attaches an existing thread.
-const RESUME_TIMEOUT: Duration = Duration::from_secs(30);
+/// `thread/resume` / `thread/fork` re-attaches an existing thread; large threads
+/// or busy startup share the same 90s budget as `thread/start`.
+const RESUME_TIMEOUT: Duration = Duration::from_secs(90);
 /// Grace for the CLI to react to `turn/interrupt` with its own terminal
 /// notification before the process tree is killed anyway.
 const INTERRUPT_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);

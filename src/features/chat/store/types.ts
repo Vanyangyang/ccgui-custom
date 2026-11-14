@@ -29,6 +29,8 @@ export interface SendOptions {
   hostUserRow?: (row: HostUserRowIdentity) => Promise<void>;
   /** Internal composer acceptance: user row is committed, before native launch. */
   onCommitted?: () => void;
+  /** Replace a trailing failed user row atomically on retry instead of stacking a duplicate bubble. */
+  replaceTrailingUserSeq?: number;
   /** 电脑操控: mount the app's computer-use driver (screenshot/input MCP
    *  server + virtual pointer overlay) for this turn. Engines that cannot
    *  mount it are refused before the send (see computer-use.ts). */
@@ -221,6 +223,8 @@ export interface ChatStore {
   dismissActionError: () => void;
   /** Clear a session's turn/load error banner. */
   dismissSessionError: (key: string) => void;
+  /** Clear an inline failed-turn notice anchored under a user message. */
+  dismissTurnError: (key: string) => void;
   /** Surface a banner on a session without a send (e.g. a refused
    *  computer-use command); the composer keeps the user's draft. */
   setSessionError: (key: string, message: string) => void;

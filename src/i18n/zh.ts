@@ -550,6 +550,7 @@ export const zh = {
     grantDecline: "拒绝",
     grantGranted: "已授权 {{dir}}。权限在下一条消息生效——",
     grantResend: "重新发送上一条",
+    turnFailedRetry: "重试",
     grantDeclined: "已拒绝该访问请求。",
     grantTitleAction: "需要权限",
     grantUnavailable:

@@ -7,6 +7,7 @@ import type {
 import { EMPTY_SESSION, type SessionState } from "./stream";
 import { sessionKey } from "./persistence";
 import type { ChatStore } from "./types";
+import { clearComposerPrediction } from "../composer-prediction";
 
 /** Sidebar workspace groups (工作区二级分类), ordered by sortOrder then name. */
 export function sortedWorkspaceGroups(
@@ -90,12 +91,24 @@ export function appendCommittedRows(
   key: string,
   rows: Omit<Message, "seq">[],
   patch: Partial<SessionState> = {},
+  options?: { replaceTrailingUserSeq?: number },
 ) {
+  // Every real send (composer, host/plugin, queued follow-up, or resend) uses
+  // this commit path. Revoke the previous turn before any new output arrives.
+  if (rows.some((row) => row.role === "user")) clearComposerPrediction(key, { resetTurn: true });
   set((s) => {
     const prev = s.bySession[key] ?? EMPTY_SESSION;
     const lastSeq = prev.messages.length
       ? prev.messages[prev.messages.length - 1].seq
       : 0;
+    const hasUserRow = rows.some((row) => row.role === "user");
+    const lastMsg = prev.messages[prev.messages.length - 1];
+    const baseMessages =
+      options?.replaceTrailingUserSeq !== undefined &&
+      lastMsg?.role === "user" &&
+      lastMsg.seq === options.replaceTrailingUserSeq
+        ? prev.messages.slice(0, -1)
+        : prev.messages;
     return {
       bySession: {
         ...s.bySession,
@@ -104,9 +117,14 @@ export function appendCommittedRows(
           ...patch,
           // A new user input revokes a previous history read's error identity,
           // even when a later send happens to fail with the same text.
-          ...(rows.some((row) => row.role === "user") ? { historyReloadError: undefined } : {}),
+          ...(hasUserRow
+            ? {
+                historyReloadError: undefined,
+                ...(!("failedTurn" in patch) ? { failedTurn: null } : {}),
+              }
+            : {}),
           messages: [
-            ...prev.messages,
+            ...baseMessages,
             ...rows.map((row, i) => ({ ...row, seq: lastSeq + 1 + i })),
           ],
         },

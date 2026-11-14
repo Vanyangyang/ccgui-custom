@@ -20,6 +20,7 @@ export function createComposerActions(
   | "clearPendingMention"
   | "dismissActionError"
   | "dismissSessionError"
+  | "dismissTurnError"
   | "setSessionError"
 > {
   const { set } = deps;
@@ -47,7 +48,32 @@ export function createComposerActions(
       set({ actionError: null });
     },
     dismissSessionError: (key) => {
-      patchSession(set, key, { error: null });
+      set((s) => {
+        const cur = s.bySession[key];
+        if (!cur) return {};
+        return {
+          bySession: {
+            ...s.bySession,
+            [key]: { ...cur, error: cur.failedTurn ? cur.failedTurn.error : null },
+          },
+        };
+      });
+    },
+    dismissTurnError: (key) => {
+      set((s) => {
+        const cur = s.bySession[key];
+        if (!cur?.failedTurn) return {};
+        return {
+          bySession: {
+            ...s.bySession,
+            [key]: {
+              ...cur,
+              failedTurn: null,
+              ...(cur.error === cur.failedTurn.error ? { error: null } : {}),
+            },
+          },
+        };
+      });
     },
     setSessionError: (key, message) => {
       patchSession(set, key, { error: message });

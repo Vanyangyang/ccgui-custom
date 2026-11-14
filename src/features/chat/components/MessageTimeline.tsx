@@ -1,13 +1,17 @@
-import { lazy, memo, Suspense, useEffect, useMemo, useRef, useState, type MutableRefObject, type RefObject } from "react";
+import { lazy, memo, Suspense, useCallback, useEffect, useMemo, useRef, useState, type MutableRefObject, type RefObject } from "react";
 import { useVirtualizer, type Virtualizer } from "@tanstack/react-virtual";
 import { useTranslation } from "react-i18next";
 import Copy from "lucide-react/dist/esm/icons/copy";
 import Check from "lucide-react/dist/esm/icons/check";
 import MessagesSquare from "lucide-react/dist/esm/icons/messages-square";
+import CircleAlert from "lucide-react/dist/esm/icons/circle-alert";
+import RotateCcw from "lucide-react/dist/esm/icons/rotate-ccw";
 import type { Message } from "@/lib/ipc";
 
 import type { SessionState } from "../store";
 import { useChatStore } from "../store";
+import { useScopedSessionKey } from "../split/session-scope";
+import { desktopTaskMayContinue, localizeRunError } from "../run-error";
 import { parseUsage } from "../usage";
 import { formatTokens } from "@/utils/format-tokens";
 import { cx } from "@/utils/cx";
@@ -48,6 +52,67 @@ import {
   searchHighlightSupported,
 } from "./timeline-search";
 
+function TurnErrorNotice({
+  error,
+  align,
+  retryDisabled,
+  onRetry,
+  onDismiss,
+}: {
+  error: string;
+  align: "start" | "end";
+  retryDisabled?: boolean;
+  onRetry?: () => void;
+  onDismiss?: () => void;
+}) {
+  const { t } = useTranslation();
+  const displayError = localizeRunError(error, t) ?? error;
+  const canRetry = !desktopTaskMayContinue(error) && Boolean(onRetry);
+  return (
+    <div
+      role="alert"
+      data-turn-error=""
+      className={cx(
+        "flex w-fit min-w-0 flex-col gap-2 rounded-xl border border-border-error-default bg-background-tertiary-error px-3 py-2 text-left text-caption-1-regular text-text-error-primary",
+        align === "end"
+          ? "mt-1.5 ml-auto max-w-[72%] max-md:max-w-[85%]"
+          : "mt-2 max-w-[85%]",
+      )}
+    >
+      <div className="flex min-w-0 items-start gap-2">
+        <CircleAlert className="mt-0.5 size-3.5 shrink-0" aria-hidden />
+        <span className="max-h-32 min-w-0 flex-1 overflow-y-auto overscroll-contain whitespace-pre-wrap [overflow-wrap:anywhere]">
+          {displayError}
+        </span>
+      </div>
+      {(canRetry || onDismiss) && (
+        <div className="flex flex-wrap items-center gap-2">
+          {canRetry && (
+            <button
+              type="button"
+              disabled={retryDisabled}
+              onClick={onRetry}
+              className="inline-flex cursor-pointer items-center gap-1 rounded-md bg-background-primary-default px-2.5 py-1 text-caption-1-medium text-text-error-primary transition-colors hover:bg-background-tertiary-hover disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <RotateCcw className="size-3.5" aria-hidden />
+              {t("chat.turnFailedRetry")}
+            </button>
+          )}
+          {onDismiss && (
+            <button
+              type="button"
+              onClick={onDismiss}
+              className="inline-flex cursor-pointer items-center rounded-md px-2 py-1 text-caption-1-medium text-text-secondary transition-colors hover:bg-background-tertiary-hover hover:text-text-primary"
+            >
+              {t("common.close")}
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 const TimelineRowView = memo(function TimelineRowView({
   engine,
   sessionIdentity,
@@ -58,6 +123,10 @@ const TimelineRowView = memo(function TimelineRowView({
   thinkingAutoCollapse,
   seenTools,
   searchTarget,
+  turnError,
+  retryDisabled,
+  onRetryTurn,
+  onDismissTurnError,
 }: {
   engine?: string;
   sessionIdentity?: string;
@@ -72,6 +141,10 @@ const TimelineRowView = memo(function TimelineRowView({
   thinkingAutoCollapse: boolean;
   seenTools: Set<string>;
   searchTarget?: ProcessSearchTarget;
+  turnError?: string | null;
+  retryDisabled?: boolean;
+  onRetryTurn?: () => void;
+  onDismissTurnError?: () => void;
 }) {
   // Plugin-defined row kinds (plan §4.2 #5) dispatch to the registered
   // renderer before the builtin switch below; builtin kinds never hit this
@@ -84,6 +157,15 @@ const TimelineRowView = memo(function TimelineRowView({
     return (
       <PluginBoundary pluginId={pluginId}>
         <Renderer row={row} />
+        {turnError && (
+          <TurnErrorNotice
+            error={turnError}
+            align="start"
+            retryDisabled={retryDisabled}
+            onRetry={onRetryTurn}
+            onDismiss={onDismissTurnError}
+          />
+        )}
       </PluginBoundary>
     );
   }
@@ -92,26 +174,54 @@ const TimelineRowView = memo(function TimelineRowView({
   // the per-step details.
   if (row.kind === "process") {
     return (
-      <ProcessDisclosure
-        items={row.items}
-        autoExpand={autoExpand}
-        turnLive={turnLive}
-        thinkingAutoCollapse={thinkingAutoCollapse}
-        processId={row.firstSeq}
-        seenTools={seenTools}
-        searchTarget={searchTarget}
-      />
+      <>
+        <ProcessDisclosure
+          items={row.items}
+          autoExpand={autoExpand}
+          turnLive={turnLive}
+          thinkingAutoCollapse={thinkingAutoCollapse}
+          processId={row.firstSeq}
+          seenTools={seenTools}
+          searchTarget={searchTarget}
+        />
+        {turnError && (
+          <TurnErrorNotice
+            error={turnError}
+            align="start"
+            retryDisabled={retryDisabled}
+            onRetry={onRetryTurn}
+            onDismiss={onDismissTurnError}
+          />
+        )}
+      </>
     );
   }
+  const errorForUserRow = row.message.role === "user" ? turnError : null;
+  const errorAfterMessage = row.message.role !== "user" ? turnError : null;
   return (
-    <MessageRow
-      engine={engine}
-      sessionIdentity={sessionIdentity}
-      message={row.message}
-      workspacePath={workspacePath}
-      turnFinal={row.turnFinal && !turnLive}
-      turnTools={row.turnTools}
-    />
+    <>
+      <MessageRow
+        engine={engine}
+        sessionIdentity={sessionIdentity}
+        message={row.message}
+        workspacePath={workspacePath}
+        turnFinal={row.turnFinal && !turnLive}
+        turnTools={row.turnTools}
+        turnError={errorForUserRow}
+        retryDisabled={errorForUserRow ? retryDisabled : undefined}
+        onRetryTurn={errorForUserRow ? onRetryTurn : undefined}
+        onDismissTurnError={errorForUserRow ? onDismissTurnError : undefined}
+      />
+      {errorAfterMessage && (
+        <TurnErrorNotice
+          error={errorAfterMessage}
+          align="start"
+          retryDisabled={retryDisabled}
+          onRetry={onRetryTurn}
+          onDismiss={onDismissTurnError}
+        />
+      )}
+    </>
   );
 });
 
@@ -253,13 +363,28 @@ function UserMessageCopy({ text }: { text: string }) {
 /** User bubble. The agent block sendPrompt appended stays in history (the
  *  CLI transcript owns it), but the bubble strips it and carries the agent
  *  identity as a small badge above, mirroring the meta row's caption type. */
-function UserMessageRow({ message, workspacePath }: { message: Message; workspacePath: string }) {
+function UserMessageRow({
+  message,
+  workspacePath,
+  turnError,
+  retryDisabled,
+  onRetryTurn,
+  onDismissTurnError,
+}: {
+  message: Message;
+  workspacePath: string;
+  turnError?: string | null;
+  retryDisabled?: boolean;
+  onRetryTurn?: () => void;
+  onDismissTurnError?: () => void;
+}) {
   const { t } = useTranslation();
   const stripped = useMemo(() => stripAgentBlock(message.text), [message.text]);
   const internal = useMemo(() => message.internalSource ? { source: message.internalSource, text: stripped.text }
     : parseInternalMessage(stripped.text), [message.internalSource, stripped.text]);
   if (internal) return <InternalMessageRow source={internal.source} text={internal.text} message={message} workspacePath={workspacePath}
-    agentName={stripped.agentName} agentIcon={stripped.agentIcon} />;
+    agentName={stripped.agentName} agentIcon={stripped.agentIcon}
+    turnError={turnError} retryDisabled={retryDisabled} onRetryTurn={onRetryTurn} onDismissTurnError={onDismissTurnError} />;
   return (
     <div className="group -mr-1.5 ml-auto flex w-full min-w-0 flex-col items-end">
       {stripped.agentName && (
@@ -279,18 +404,31 @@ function UserMessageRow({ message, workspacePath }: { message: Message; workspac
           {stripped.text}
         </CollapsibleMessage>
       </div>
+      {turnError && (
+        <TurnErrorNotice
+          error={turnError}
+          align="end"
+          retryDisabled={retryDisabled}
+          onRetry={onRetryTurn}
+          onDismiss={onDismissTurnError}
+        />
+      )}
       <UserMessageCopy text={stripped.text} />
     </div>
   );
 }
 
-function InternalMessageRow({ source, text, message, workspacePath, agentName, agentIcon }: {
+function InternalMessageRow({ source, text, message, workspacePath, agentName, agentIcon, turnError, retryDisabled, onRetryTurn, onDismissTurnError }: {
   source: InternalMessageSource;
   text: string;
   message: Message;
   workspacePath: string;
   agentName?: string;
   agentIcon?: string;
+  turnError?: string | null;
+  retryDisabled?: boolean;
+  onRetryTurn?: () => void;
+  onDismissTurnError?: () => void;
 }) {
   const { t } = useTranslation();
   const sessions = useChatStore(state => state.sessions);
@@ -312,6 +450,15 @@ function InternalMessageRow({ source, text, message, workspacePath, agentName, a
           {text}
         </CollapsibleMessage>
       </div>
+      {turnError && (
+        <TurnErrorNotice
+          error={turnError}
+          align="start"
+          retryDisabled={retryDisabled}
+          onRetry={onRetryTurn}
+          onDismiss={onDismissTurnError}
+        />
+      )}
       <UserMessageCopy text={text} />
     </div>
   );
@@ -324,6 +471,10 @@ export const MessageRow = memo(function MessageRow({
   workspacePath,
   turnFinal,
   turnTools,
+  turnError,
+  retryDisabled,
+  onRetryTurn,
+  onDismissTurnError,
 }: {
   engine?: string;
   sessionIdentity?: string;
@@ -332,6 +483,10 @@ export const MessageRow = memo(function MessageRow({
   turnFinal: boolean;
   /** Tool calls in the turn this reply closes (turnFinal rows only). */
   turnTools?: number;
+  turnError?: string | null;
+  retryDisabled?: boolean;
+  onRetryTurn?: () => void;
+  onDismissTurnError?: () => void;
 }) {
   // A live row's text grows per store flush; a full markdown reparse per
   // flush scales linearly with reply length (~30ms at 32KB) and starves the
@@ -356,7 +511,16 @@ export const MessageRow = memo(function MessageRow({
     return <PlanReviewCard message={message} workspacePath={workspacePath} />;
   }
   if (message.role === "user") {
-    return <UserMessageRow message={message} workspacePath={workspacePath} />;
+    return (
+      <UserMessageRow
+        message={message}
+        workspacePath={workspacePath}
+        turnError={turnError}
+        retryDisabled={retryDisabled}
+        onRetryTurn={onRetryTurn}
+        onDismissTurnError={onDismissTurnError}
+      />
+    );
   }
   return (
     <div className="group flex flex-col text-left">
@@ -531,9 +695,34 @@ export const MessageTimeline = memo(function MessageTimeline({
 
   const { t } = useTranslation();
   const thinkingAutoCollapse = useChatStore((s) => s.thinkingAutoCollapse);
+  const resendLastUser = useChatStore((s) => s.resendLastUser);
+  const dismissTurnError = useChatStore((s) => s.dismissTurnError);
+  const scopedSessionKey = useScopedSessionKey();
+  const resolvedSessionKey = sessionIdentity || scopedSessionKey || "";
+  const handleRetryTurn = useCallback(() => {
+    if (resolvedSessionKey) void resendLastUser(resolvedSessionKey);
+  }, [resendLastUser, resolvedSessionKey]);
+  const handleDismissTurnError = useCallback(() => {
+    if (resolvedSessionKey) dismissTurnError(resolvedSessionKey);
+  }, [dismissTurnError, resolvedSessionKey]);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const items = session.messages;
   const rows = useMemo(() => buildRows(items), [items]);
+  const failedTurnRowIndex = useMemo(() => {
+    if (streaming || !session.failedTurn) return -1;
+    const targetSeq = session.failedTurn.userSeq;
+    const userIdx = rows.findIndex(
+      (row) => row.kind === "msg" && row.message.role === "user" && row.message.seq === targetSeq,
+    );
+    if (userIdx < 0) return -1;
+    let endIdx = userIdx;
+    for (let i = userIdx + 1; i < rows.length; i++) {
+      const row = rows[i];
+      if (row.kind === "msg" && row.message.role === "user" && !row.message.steer) break;
+      endIdx = i;
+    }
+    return endIdx;
+  }, [rows, session.failedTurn, streaming]);
   // Match buildRows' turn boundaries: steering prompts continue the same
   // turn. Starting a new turn must not hide earlier replies' settled facts.
   const currentTurnStart = useMemo(() => {
@@ -786,6 +975,22 @@ export const MessageTimeline = memo(function MessageTimeline({
                     thinkingAutoCollapse={thinkingAutoCollapse}
                     seenTools={seenTools}
                     searchTarget={item.index === currentSearchRow ? processSearchTarget : undefined}
+                    turnError={
+                      item.index === failedTurnRowIndex && !streaming
+                        ? (session.failedTurn?.error ?? null)
+                        : undefined
+                    }
+                    retryDisabled={item.index === failedTurnRowIndex ? streaming : undefined}
+                    onRetryTurn={
+                      item.index === failedTurnRowIndex && resolvedSessionKey
+                        ? handleRetryTurn
+                        : undefined
+                    }
+                    onDismissTurnError={
+                      item.index === failedTurnRowIndex && resolvedSessionKey
+                        ? handleDismissTurnError
+                        : undefined
+                    }
                   />
                 )}
               </div>

@@ -36,7 +36,7 @@ import { useEngineModels } from "./use-engine-models";
 import { useLeaderStore } from "@/features/leader/store";
 import { isManagedCodexChild } from "./child-service-tier";
 import { useTabModelDisplay } from "./use-tab-model-display";
-import { resolveClaudeUltracode, resolveSessionModel } from "../store/stream";
+import { resolveClaudeUltracode, resolveSessionModel, hasInlineTurnError } from "../store/stream";
 import type { EngineInfo, Workspace } from "@/lib/ipc";
 import type { OmpServiceTier } from "@/lib/omp-service-tier";
 import { EmptyState } from "@/components/base/empty-state";
@@ -336,9 +336,15 @@ export const ChatConversation = memo(function ChatConversation({
   const streaming = useChatStore((s) =>
     key ? !!(s.bySession[key]?.streaming || s.bySession[key]?.draftLaunching) : false,
   );
-  const sessionError = useChatStore((s) =>
-    key ? (s.bySession[key]?.error ?? null) : null,
-  );
+  const sessionError = useChatStore((s) => {
+    if (!key) return null;
+    const session = s.bySession[key];
+    if (!session?.error) return null;
+    if (hasInlineTurnError(session) && session.error === session.failedTurn?.error) {
+      return null;
+    }
+    return session.error;
+  });
   const dismissSessionError = useChatStore((s) => s.dismissSessionError);
   const queue = useChatStore((s) =>
     key ? (s.bySession[key]?.queue ?? EMPTY_QUEUE) : EMPTY_QUEUE,

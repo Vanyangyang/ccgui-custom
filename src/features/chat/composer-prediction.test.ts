@@ -14,12 +14,38 @@ import {
 import { handleEngineEvents, type EngineEventDeps } from "./store/engine-events";
 import { EMPTY_SESSION } from "./store/stream";
 import type { ChatStore } from "./store/types";
+import { appendCommittedRows } from "./store/session-utils";
 
 describe("composer-prediction across channels", () => {
   beforeEach(() => {
     clearAllComposerPredictions();
     setComposerPredictionEnabled(true);
     vi.restoreAllMocks();
+  });
+
+  it("invalidates ready and in-flight predictions when a user row is committed outside the composer", async () => {
+    const key = "agy/host-follow-up";
+    const messages = [
+      { seq: 1, ts: null, role: "user", text: "之前的问题" },
+      { seq: 2, ts: null, role: "assistant", text: "之前的回答" },
+    ];
+    let state = { bySession: { [key]: { ...EMPTY_SESSION, messages } } } as unknown as ChatStore;
+    const set = (fn: (current: ChatStore) => Partial<ChatStore>) => { state = { ...state, ...fn(state) }; };
+    setComposerPrediction(key, "旧回合建议");
+    appendCommittedRows(set, key, [{ role: "user", text: "新的问题", ts: null }]);
+    expect(getComposerPrediction(key)).toBeNull();
+
+    const pending = Promise.withResolvers<string | null>();
+    vi.spyOn(ipc, "predictNextPrompt").mockReturnValueOnce(pending.promise).mockResolvedValueOnce("新回合建议");
+    requestComposerPrediction(key, messages);
+    appendCommittedRows(set, key, [{ role: "user", text: "又一轮新的问题", ts: null }]);
+    pending.resolve("晚到的旧回合建议");
+    await Promise.resolve();
+    expect(getComposerPrediction(key)).toBeNull();
+    appendCommittedRows(set, key, [{ role: "assistant", text: "新回答🙂", ts: null }]);
+    requestComposerPrediction(key, state.bySession[key].messages);
+    await Promise.resolve();
+    expect(getComposerPrediction(key)).toBe("新回合建议");
   });
 
   it("gives each newly generated prediction a stable identity across migration and rejects a previous generation", () => {
@@ -66,6 +92,15 @@ describe("composer-prediction across channels", () => {
         assistant: "已完成重构，需要运行单元测试吗？",
       },
     ]);
+  });
+
+  it.each(["/compact", ""])("does not reuse an earlier turn when the latest user input is %j", (text) => {
+    expect(extractPredictionTurns([
+      { seq: 1, ts: null, role: "user", text: "之前的问题" },
+      { seq: 2, ts: null, role: "assistant", text: "之前的回答" },
+      { seq: 3, ts: null, role: "user", text },
+      { seq: 4, ts: null, role: "assistant", text: "本轮命令或图片的回复" },
+    ])).toEqual([]);
   });
 
   it("requests Codex GPT prediction on done across any channel and clears on next turn start", async () => {

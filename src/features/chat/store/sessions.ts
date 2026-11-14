@@ -9,6 +9,7 @@ import type { EffortLevel } from "@/components/application/ai-chat/cli-menu";
 import { supportsIndependentModelEffort } from "@/components/application/ai-chat/model-effort";
 import { listenEngineEvents, listenSessionsChanged, listenComputerUseEscape } from "@/lib/events";
 import { errorText } from "@/lib/errors";
+import { reconcileComposerPrediction } from "../composer-prediction";
 import { writeStored } from "@/lib/storage";
 import { hasRestoredChatCheckpoint } from "./runtime-checkpoint";
 import {
@@ -167,6 +168,7 @@ export function createSessionActions(
     // Failed optimistic prompts may never have reached the native file.
     // Keep them available to resend; only our own history-read error is retryable here.
     return session && (!session.loading || refresh?.loadingShell) && !session.streaming && !session.queue.length &&
+      !session.failedTurn &&
       (!session.error || session.error === historyError) && !session.messages.some((m) =>
       m.question?.status === "pending" || m.grant?.status === "pending" ||
       ["awaiting_review", "deferred", "submitting"].includes(m.planReview?.status ?? ""));
@@ -288,7 +290,7 @@ export function createSessionActions(
         const interactive = current.messages.some((m) => m.question?.status === "pending" || m.grant?.status === "pending" ||
           ["awaiting_review", "deferred", "submitting"].includes(m.planReview?.status ?? ""));
         const historyError = current.historyReloadRequired ? current.historyReloadError : refresh?.error;
-        const failedPrompt = !!current.error && current.error !== historyError;
+        const failedPrompt = (!!current.error && current.error !== historyError) || !!current.failedTurn;
         if (!sawActivity && (!refresh || isOpen(refresh)) && current.messages === originalMessages && !current.streaming && !current.queue.length && !interactive && !failedPrompt) {
           const messages = plans?.length ? mergePlanReviewHistory(page.messages, plans) ?? page.messages : page.messages;
           markReloadableHistory(messages, page.subagentHistory);
@@ -308,6 +310,7 @@ export function createSessionActions(
               : hasAcpContextUsage(current.usage) ? mergeUsage(pageUsage, current.usage) : pageUsage,
             error: refresh?.error === current.error ? null : current.error,
           });
+          reconcileComposerPrediction(key, messages);
         } else {
           // Never infer overlap from seq values. Keep live row/approval
           // identities and re-read the latest authoritative native page later.

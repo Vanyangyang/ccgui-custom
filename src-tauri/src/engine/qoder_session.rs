@@ -62,8 +62,10 @@ pub(crate) const RPC_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 /// session/new scans the workspace on first contact (measured 30s+ in a
 /// large repo), so the setup call needs far more headroom than a plain RPC.
 pub(crate) const SESSION_NEW_TIMEOUT: Duration = Duration::from_secs(90);
-/// session/resume re-attaches without the workspace scan.
-pub(crate) const SESSION_RESUME_TIMEOUT: Duration = Duration::from_secs(30);
+/// session/resume / session/load re-attaches without the workspace scan, but
+/// cold-loading large session transcripts with MCP/directories can take >30s, so
+/// give resume the same 90s budget as session/new.
+pub(crate) const SESSION_RESUME_TIMEOUT: Duration = Duration::from_secs(90);
 pub(crate) const PROMPT_TIMEOUT: Duration = Duration::from_secs(60 * 30);
 /// qodercli interleaves the prompt response into the session/update stream:
 /// keep reading after it until the stream goes idle, else the tail is lost.

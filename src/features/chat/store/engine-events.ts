@@ -38,6 +38,7 @@ import {
   touchRun,
   untrackRun,
   updatePendingStreamModel,
+  findLastTurnUserSeq,
   type HandoffState,
   type ToolMessageInput,
 } from "./stream";
@@ -1145,6 +1146,13 @@ function onError(
               : t,
           )
         : cur.nativeTasks;
+    const failedUserSeq = findLastTurnUserSeq(messages);
+    const errorTextValue =
+      typeof event.data === "string"
+        ? event.data
+        : event.data != null
+          ? String(event.data)
+          : "";
     return {
       bySession: {
         ...s.bySession,
@@ -1152,6 +1160,10 @@ function onError(
           ...cur,
           messages,
           error: event.data as string,
+          failedTurn:
+            failedUserSeq !== null && errorTextValue
+              ? { userSeq: failedUserSeq, error: errorTextValue }
+              : null,
           streaming: false,
           turnStartedAt: null,
           turnUsage: null,
@@ -1783,6 +1795,7 @@ function onDone(event: ChatEngineEvent, key: string, deps: EngineEventDeps, resp
           ...cur,
           messages,
           error: null,
+          failedTurn: responseOnly ? cur.failedTurn : null,
           streaming: responseOnly ? cur.streaming : false,
           turnStartedAt: responseOnly ? cur.turnStartedAt : null,
           usage: settledUsage,

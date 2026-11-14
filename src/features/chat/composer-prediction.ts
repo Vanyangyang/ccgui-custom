@@ -21,6 +21,8 @@ const MAX_PREDICTION_LENGTH = 240;
 
 export interface ComposerPredictionSnapshot { readonly id: number; readonly text: string }
 const predictions = new Map<string, ComposerPredictionSnapshot>();
+const predictionTurnBindings = new Map<string, string>();
+const unverifiedPredictions = new Set<string>();
 let predictionsLoaded = false;
 let nextPredictionId = 0;
 let nextRequestToken = 0;
@@ -35,23 +37,34 @@ function loadPredictions(): void {
   if (!isComposerPredictionEnabled()) return;
   const stored = readStoredJson(PREDICTIONS_KEY, (value) => Array.isArray(value) ? value : null);
   for (const entry of stored?.slice(-MAX_PREDICTIONS) ?? []) {
-    if (!Array.isArray(entry) || entry.length !== 2) continue;
-    const [key, text] = entry;
+    // Old two-field records have no turn evidence and cannot be restored safely.
+    if (!Array.isArray(entry) || entry.length !== 3) continue;
+    const [key, text, binding] = entry;
     if (typeof key !== "string" || !key || key.length > 4096 ||
         typeof text !== "string" || !text.trim() ||
-        text.length > MAX_PREDICTION_LENGTH || /[\r\n]/.test(text)) continue;
+        text.length > MAX_PREDICTION_LENGTH || /[\r\n]/.test(text) ||
+        typeof binding !== "string" || binding.length > 96 ||
+        !/^v1:\d+:\d+:[0-9a-f]{1,8}:[0-9a-f]{1,8}$/.test(binding)) continue;
     // Generation identities belong to this process; never restore old ids or
     // in-flight requests. Only the ready suggestion is durable.
     predictions.set(key, predictionSnapshot(text.trim()));
+    predictionTurnBindings.set(key, binding);
+    unverifiedPredictions.add(key);
   }
 }
 
 function persistPredictions(): void {
   while (predictions.size > MAX_PREDICTIONS) {
-    predictions.delete(predictions.keys().next().value!);
+    const key = predictions.keys().next().value!;
+    predictions.delete(key);
+    predictionTurnBindings.delete(key);
+    unverifiedPredictions.delete(key);
   }
   writeStored(PREDICTIONS_KEY, JSON.stringify(
-    Array.from(predictions, ([key, prediction]) => [key, prediction.text]),
+    Array.from(predictions).flatMap(([key, prediction]) => {
+      const binding = predictionTurnBindings.get(key);
+      return binding ? [[key, prediction.text, binding]] : [];
+    }),
   ));
 }
 
@@ -67,7 +80,19 @@ function notifyChanged(): void {
 function predictionTurnsFingerprint(turns: readonly PredictionTurn[]): string {
   const last = turns[turns.length - 1];
   if (!last) return "";
-  return `${turns.length}\u0000${last.user}\u0000${last.assistant ?? ""}`;
+  const assistant = last.assistant ?? "";
+  // A bounded content digest keeps conversation text out of persisted metadata.
+  // Ignore older page length, seq and timestamps: live/history loaders can
+  // represent the same final turn with different pagination and row identities.
+  let first = 0x811c9dc5, second = 0x9e3779b9;
+  for (const part of [last.user, assistant]) {
+    for (let i = 0; i < part.length; i++) {
+      const code = part.charCodeAt(i);
+      first = Math.imul(first ^ code, 0x01000193);
+      second = Math.imul(second ^ code, 0x5bd1e995);
+    }
+  }
+  return `v1:${last.user.length}:${assistant.length}:${(first >>> 0).toString(16)}:${(second >>> 0).toString(16)}`;
 }
 
 /** Master switch for post-turn composer prompt prediction (default: on). */
@@ -80,6 +105,8 @@ export function setComposerPredictionEnabled(enabled: boolean): void {
   if (!enabled) {
     predictionsLoaded = true;
     predictions.clear();
+    predictionTurnBindings.clear();
+    unverifiedPredictions.clear();
     requestTokens.clear();
     inFlightTurnFingerprints.clear();
     settledTurnFingerprints.clear();
@@ -103,7 +130,30 @@ export function getComposerPrediction(sessionKey?: string): string | null {
 export function getComposerPredictionSnapshot(sessionKey?: string): ComposerPredictionSnapshot | null {
   if (!sessionKey || !isComposerPredictionEnabled()) return null;
   loadPredictions();
+  if (unverifiedPredictions.has(sessionKey)) return null;
   return predictions.get(sessionKey) ?? null;
+}
+
+/** Validate saved suggestions against the actual loaded latest turn before
+ * exposing them. A history refresh also revokes requests for an older turn. */
+export function reconcileComposerPrediction(sessionKey: string, messages: readonly Message[]): void {
+  if (!sessionKey) return;
+  loadPredictions();
+  if (!messages.length) return; // An unloaded history shell proves nothing.
+  const binding = predictionTurnBindings.get(sessionKey);
+  const inFlight = inFlightTurnFingerprints.get(sessionKey);
+  const settled = settledTurnFingerprints.get(sessionKey);
+  if (!predictions.has(sessionKey) && !inFlight && !settled) return;
+  const current = predictionTurnsFingerprint(extractPredictionTurns(messages));
+  if ((predictions.has(sessionKey) && (!binding || binding !== current)) ||
+      (inFlight && inFlight !== current) || (settled && settled !== current)) {
+    clearComposerPrediction(sessionKey, { resetTurn: true });
+    return;
+  }
+  if (unverifiedPredictions.delete(sessionKey)) {
+    settledTurnFingerprints.set(sessionKey, current);
+    notifyChanged();
+  }
 }
 
 function predictionSnapshot(text: string): ComposerPredictionSnapshot {
@@ -116,7 +166,13 @@ function newRequestToken(): number {
   return ++nextRequestToken;
 }
 
-export function setComposerPrediction(sessionKey: string, suggestion: string | null): void {
+/** Suggestions without source messages are runtime-only; durable suggestions
+ * must carry enough evidence to verify the originating turn after a restart. */
+export function setComposerPrediction(
+  sessionKey: string,
+  suggestion: string | null,
+  sourceMessages?: readonly Message[],
+): void {
   if (!sessionKey) return;
   loadPredictions();
   const clean = suggestion?.trim() ?? "";
@@ -124,12 +180,19 @@ export function setComposerPrediction(sessionKey: string, suggestion: string | n
   if (!clean) {
     if (prev === null) return;
     predictions.delete(sessionKey);
+    predictionTurnBindings.delete(sessionKey);
+    unverifiedPredictions.delete(sessionKey);
     notifyChanged();
     return;
   }
-  if (!isComposerPredictionEnabled() || prev === clean) return;
+  const binding = sourceMessages ? predictionTurnsFingerprint(extractPredictionTurns(sourceMessages)) : undefined;
+  if (!isComposerPredictionEnabled() || (prev === clean && predictionTurnBindings.get(sessionKey) === binding &&
+      !unverifiedPredictions.has(sessionKey))) return;
   predictions.delete(sessionKey);
   predictions.set(sessionKey, predictionSnapshot(clean));
+  if (binding) predictionTurnBindings.set(sessionKey, binding);
+  else predictionTurnBindings.delete(sessionKey);
+  unverifiedPredictions.delete(sessionKey);
   notifyChanged();
 }
 
@@ -146,6 +209,8 @@ export function clearComposerPrediction(
   if (options?.resetTurn) {
     settledTurnFingerprints.delete(sessionKey);
   }
+  predictionTurnBindings.delete(sessionKey);
+  unverifiedPredictions.delete(sessionKey);
   if (predictions.delete(sessionKey)) {
     notifyChanged();
   }
@@ -169,7 +234,12 @@ export function migrateComposerPredictionSessionKey(fromKey: string, toKey: stri
     predictions.delete(fromKey);
     if (!predictions.has(toKey)) {
       predictions.set(toKey, existing);
+      const binding = predictionTurnBindings.get(fromKey);
+      if (binding) predictionTurnBindings.set(toKey, binding);
+      if (unverifiedPredictions.has(fromKey)) unverifiedPredictions.add(toKey);
     }
+    predictionTurnBindings.delete(fromKey);
+    unverifiedPredictions.delete(fromKey);
     notifyChanged();
   }
 }
@@ -177,6 +247,8 @@ export function migrateComposerPredictionSessionKey(fromKey: string, toKey: stri
 export function clearAllComposerPredictions(): void {
   predictionsLoaded = true;
   predictions.clear();
+  predictionTurnBindings.clear();
+  unverifiedPredictions.clear();
   requestTokens.clear();
   inFlightTurnFingerprints.clear();
   settledTurnFingerprints.clear();
@@ -188,24 +260,24 @@ export function clearAllComposerPredictions(): void {
 export function extractPredictionTurns(messages: readonly Message[]): PredictionTurn[] {
   if (messages.some((m) => m.live)) return [];
   const turns: PredictionTurn[] = [];
-  let skipSlashTurn = false;
+  let skipUnsupportedTurn = false;
   for (const message of messages) {
     if (message.role === "user") {
       const text = message.text.trim();
-      if (!text) continue;
-      if (text.startsWith("/")) {
-        skipSlashTurn = true;
+      if (!text || text.startsWith("/")) {
+        skipUnsupportedTurn = true;
         continue;
       }
-      skipSlashTurn = false;
+      skipUnsupportedTurn = false;
       turns.push({ user: text });
     } else if (message.role === "assistant") {
-      if (skipSlashTurn) continue;
+      if (skipUnsupportedTurn) continue;
       const text = message.text.trim();
       if (!text || turns.length === 0) continue;
       turns[turns.length - 1].assistant = text;
     }
   }
+  if (skipUnsupportedTurn) return [];
   const last = turns[turns.length - 1];
   if (!last || !last.assistant?.trim()) return [];
   return turns;
@@ -261,7 +333,7 @@ export function requestComposerPrediction(
       settledTurnFingerprints.set(sessionKey, fingerprint);
       const clean = typeof suggestion === "string" ? suggestion.trim() : "";
       if (!clean) return;
-      setComposerPrediction(sessionKey, clean);
+      setComposerPrediction(sessionKey, clean, messages);
     })
     .catch(() => {
       if (requestTokens.get(sessionKey) === token) {
