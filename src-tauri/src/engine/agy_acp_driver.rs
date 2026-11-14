@@ -15,7 +15,7 @@ use super::support::{
     AGY_BG_TASK_WAKEUP_PROMPT, BG_TASK_POLL_INTERVAL,
 };
 use super::{
-    finish_remote_lease, read_ndjson_line, AgyAcpState, HostChatEndpoint, WorkerProfileKey,
+    finish_remote_lease, retire_remote_lease, read_ndjson_line, AgyAcpState, HostChatEndpoint, WorkerProfileKey,
 };
 use crate::engine::agy::{
     effort_flag, model_encodes_effort,
@@ -45,6 +45,7 @@ const SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 const AGY_PROMPT_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const CANCEL_SETTLE_TIMEOUT: Duration = Duration::from_millis(2500);
 const CANCELLED_MARKER: &str = "agy acp turn cancelled";
+const RETIREMENT_UNCONFIRMED: &str = "Antigravity worker cleanup could not be confirmed";
 const NATIVE_REFUSAL_ERROR: &str = "Antigravity refused this turn; no successful completion was confirmed";
 const MIN_STARTUP_STRIP_MS: f64 = 20.0;
 const TRANSCRIPT_TICK_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -216,6 +217,7 @@ pub(crate) async fn run_acp_turn(
 
     let interrupted = killed.load(Ordering::SeqCst);
     let cancelled = interrupted || outcome.as_ref().is_err_and(|e| e == CANCELLED_MARKER);
+    let cleanup_unconfirmed = outcome.as_ref().is_err_and(|e| e.starts_with(RETIREMENT_UNCONFIRMED));
     // Settle parked questions and plan reviews BEFORE terminal Error/Done so
     // `TurnState`'s saw_done/saw_error guard does not swallow cleanup events.
     let settled_session_id = state.native_session_id.clone();
@@ -228,7 +230,16 @@ pub(crate) async fn run_acp_turn(
             preassigned_session_id.clone(),
         ],
     );
-    if cancelled {
+    if cleanup_unconfirmed {
+        // A cancellation request is not evidence that background work stopped.
+        let mut tasks = state.tasks.clone();
+        for task in &mut tasks {
+            if matches!(task.status.as_str(), "running" | "paused") {
+                task.status = "unknown".into();
+            }
+        }
+        if tasks != state.tasks { core.dispatch_event(&mut state, EngineEvent::Tasks(tasks)); }
+    } else if cancelled {
         settle_running_tasks_stopped(&core, &mut state);
     }
 
@@ -254,7 +265,7 @@ pub(crate) async fn run_acp_turn(
             if let Some(sample) = telemetry.finish(true, None, Instant::now()) {
                 core.dispatch_event(&mut state, EngineEvent::Throughput(sample));
             }
-            if !interrupted && error != CANCELLED_MARKER {
+            if cleanup_unconfirmed || (!interrupted && error != CANCELLED_MARKER) {
                 core.dispatch_event(&mut state, EngineEvent::Error(error));
             }
         }
@@ -510,8 +521,11 @@ async fn execute_leased_turn(
             context_usage,
         )
         .await;
-        let poisoned = io.poisoned;
-        if !poisoned {
+        let retire = io.poisoned || killed.load(Ordering::SeqCst) || res.is_err();
+        if retire {
+            retire_remote_lease(&mut reader, &mut line_buf, &mut write_half).await
+                .map_err(|error| format!("{RETIREMENT_UNCONFIRMED}: {error}"))?;
+        } else {
             let _ = finish_remote_lease(&mut reader, &mut line_buf, &mut write_half).await;
         }
         return res;
@@ -556,7 +570,8 @@ async fn execute_leased_turn(
             context_usage,
         )
         .await;
-        (res, !io.poisoned)
+        let healthy = !io.poisoned && !killed.load(Ordering::SeqCst) && res.is_ok();
+        (res, healthy)
     };
     service.release_local(worker, healthy).await;
     res.map_err(|raw| {
@@ -838,7 +853,6 @@ where
                     }),
                 ))
                 .await;
-            tracker.mark_running_stopped(core, state);
             return Err(CANCELLED_MARKER.to_string());
         }
 
@@ -1051,7 +1065,14 @@ where
     )
     .await;
 
-    // Always close the session cleanly before terminal dispatch so SQLite WAL/file
+    // A native cancellation response only acknowledges the prompt. AGY may still
+    // have workflow agents/background processes. Retire this exclusive worker
+    // instead of returning it to the warm pool or declaring its tasks stopped.
+    if killed.load(Ordering::SeqCst) || turn_res.as_ref().is_err_and(|e| e == CANCELLED_MARKER) {
+        io.poisoned = true;
+    }
+
+    // Always close a healthy session before terminal dispatch so SQLite WAL/file
     // locks on `<sid>.db` release before post-turn context reads or `/btw` cleanup.
     if !io.poisoned {
         let never_kill = AtomicBool::new(false);
@@ -1277,7 +1298,6 @@ where
             .and_then(Value::as_str)
             .unwrap_or("");
         if stop_reason == "cancelled" {
-            tracker.mark_running_stopped(core, state);
             return Err(CANCELLED_MARKER.to_string());
         }
         if let Some(failure) = native_failure {
@@ -1430,11 +1450,7 @@ fn handle_prompt_line(
                         .or_else(|| tool_names.get(&tool_id).cloned())
                         .unwrap_or_else(|| "tool".to_string());
                     let is_err = error.is_some();
-                    let result = match (output, error) {
-                        (Some(out), _) => out,
-                        (None, Some(err)) => json!({ "error": err, "isError": true }),
-                        (None, None) => Value::Null,
-                    };
+                    let result = crate::engine::qoder_session::tool_completion_result(output, error);
                     core.dispatch_event(state, tool_result_patch(name, Some(&result)));
                     if let Some(t) = tracker.as_deref_mut() {
                         t.on_tool_completed(core, state, &tool_id, Some(&result), is_err);

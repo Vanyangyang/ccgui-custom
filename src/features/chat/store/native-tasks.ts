@@ -71,7 +71,9 @@ export function applyConfirmedNativeTaskStop<T extends BySessionSlice>(
 }
 
 /** Replace the previous catalog at a run boundary; never carry running tasks
- * into a newer run or infer a terminal status from the parent's reply. */
+ * into a newer run or infer a terminal status from the parent's reply.
+ * Keep an explicit empty catalog `[]` so native sessions stay in native task
+ * mode across turns instead of falling back to heuristic message scanning. */
 export function beginNativeRun(session: SessionState, runId: string): Partial<SessionState> {
   if (session.nativeTaskRunId === runId) return {};
   return {
@@ -81,7 +83,7 @@ export function beginNativeRun(session: SessionState, runId: string): Partial<Se
     // A run adopted without sendPrompt (leader child, remote client) is a new
     // run: its events must not be dropped on the strength of the old stop.
     interrupted: false,
-    nativeTasks: undefined,
+    nativeTasks: [],
     nativeTaskSeq: undefined,
     nativeActivity: null,
     // Per-run live-CLI state never carries over: the launch settings, the

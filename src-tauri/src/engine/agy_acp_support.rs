@@ -760,23 +760,36 @@ impl AgyAcpTaskTracker {
             }
             "schedule" => {
                 let prompt = arg_str(parsed.as_ref(), &["Prompt", "prompt"]);
-                let cron = arg_str(parsed.as_ref(), &["CronExpression", "cron"]);
-                let dur = arg_u64(parsed.as_ref(), &["DurationSeconds", "durationSeconds"]);
-                let has_explicit_label = prompt.is_some() || cron.is_some();
+                let cron = arg_str(
+                    parsed.as_ref(),
+                    &["CronExpression", "cron", "cronExpression"],
+                );
+                let dur = arg_u64(
+                    parsed.as_ref(),
+                    &["DurationSeconds", "durationSeconds", "duration_seconds"],
+                );
+                let has_explicit_label = prompt.is_some();
                 let description = prompt
                     .as_deref()
                     .map(|p| truncate_one_line(p, 96))
-                    .or_else(|| cron.clone())
+                    .or_else(|| cron.as_deref().map(|c| format!("Cron: {c}")))
+                    .or_else(|| dur.map(|s| format!("Timer: {}", format_agy_duration(s))))
                     .unwrap_or_else(|| "Scheduled task".to_string());
                 let summary = match (cron, dur, prompt) {
-                    (Some(c), _, Some(p)) => Some(truncate_chars(&format!("{c} · {p}"), 500)),
-                    (_, Some(s), Some(p)) => Some(truncate_chars(&format!("{s}s · {p}"), 500)),
+                    (Some(c), _, Some(p)) => {
+                        Some(truncate_chars(&format!("Cron: {c} · {p}"), 500))
+                    }
+                    (_, Some(s), Some(p)) => Some(truncate_chars(
+                        &format!("Timer: {} · {p}", format_agy_duration(s)),
+                        500,
+                    )),
                     (_, _, Some(p)) => Some(truncate_chars(&p, 500)),
-                    (Some(c), _, None) => Some(c),
-                    (_, Some(s), None) => Some(format!("{s}s")),
+                    (Some(c), _, None) => Some(format!("Cron: {c}")),
+                    (_, Some(s), None) => Some(format!("Timer: {}", format_agy_duration(s))),
                     (None, None, None) => None,
                 };
-                let ambient = arg_bool(parsed.as_ref(), &["IsDaemon"]).unwrap_or(false);
+                let ambient = arg_bool(parsed.as_ref(), &["IsDaemon", "isDaemon", "is_daemon"])
+                    .unwrap_or(false);
                 self.upsert_bg_candidate(PendingBgCandidate {
                     tool_id: tool_id.to_string(),
                     tool_name: display_tool_name.to_string(),
@@ -837,7 +850,10 @@ impl AgyAcpTaskTracker {
             (!incoming.tool_id.is_empty() && task.tool_use_id.as_deref() == Some(&incoming.tool_id))
                 || (task.kind == incoming.kind
                     && !task.has_explicit_label
-                    && summaries_compatible(task.summary.as_deref(), incoming.summary.as_deref()))
+                    && candidate_matches_task_desc(
+                        incoming.summary.as_deref(),
+                        task.summary.as_deref(),
+                    ))
         }) {
             if !matches!(
                 existing_task.status.as_str(),
@@ -866,8 +882,10 @@ impl AgyAcpTaskTracker {
                     self.pending_candidates.iter().position(|c| {
                         c.tool_id.is_empty()
                             && c.kind == incoming.kind
-                            && (summaries_compatible(c.summary.as_deref(), incoming.summary.as_deref())
-                                || incoming.summary.is_none())
+                            && (candidate_matches_task_desc(
+                                c.summary.as_deref(),
+                                incoming.summary.as_deref(),
+                            ) || incoming.summary.is_none())
                     })
                 })
         } else {
@@ -878,7 +896,7 @@ impl AgyAcpTaskTracker {
                 if c.tool_id.is_empty() {
                     return c.description == incoming.description && c.summary == incoming.summary;
                 }
-                summaries_compatible(c.summary.as_deref(), incoming.summary.as_deref())
+                candidate_matches_task_desc(c.summary.as_deref(), incoming.summary.as_deref())
                     || (!c.has_explicit_label && c.summary.is_none() && incoming.summary.is_some())
             })
         };
@@ -1221,6 +1239,10 @@ impl AgyAcpTaskTracker {
         };
 
         let task_desc_in_log = extract_task_description_block(content);
+        let parsed_schedule = task_desc_in_log
+            .as_deref()
+            .and_then(parse_schedule_task_description);
+        let expected_kind = parsed_schedule.as_ref().map(|_| "monitor");
 
         // ACP results and the transcript describe the same task. A replay must
         // not consume another tool's candidate or overwrite an explicit label,
@@ -1233,7 +1255,7 @@ impl AgyAcpTaskTracker {
                 let upgrade_idx = self.pending_candidates.iter().position(|c| {
                     c.has_explicit_label
                         && c.kind == existing.kind
-                        && summaries_compatible(
+                        && candidate_matches_task_desc(
                             c.summary.as_deref(),
                             task_desc_in_log.as_deref().or(existing.summary.as_deref()),
                         )
@@ -1252,18 +1274,31 @@ impl AgyAcpTaskTracker {
                 let trimmed_desc = desc.trim();
                 let first_line = trimmed_desc.lines().next().unwrap_or("").trim();
                 if let Some(pos) = self.pending_candidates.iter().position(|c| {
-                    summaries_compatible(c.summary.as_deref(), Some(trimmed_desc))
-                        || (!first_line.is_empty()
-                            && summaries_compatible(c.summary.as_deref(), Some(first_line)))
+                    expected_kind.map_or(c.kind != "monitor", |k| c.kind == k)
+                        && (candidate_matches_task_desc(c.summary.as_deref(), Some(trimmed_desc))
+                            || (!first_line.is_empty()
+                                && candidate_matches_task_desc(
+                                    c.summary.as_deref(),
+                                    Some(first_line),
+                                )))
                 }) {
                     return self.pending_candidates.remove(pos);
                 }
-                if self
-                    .pending_candidates
-                    .front()
-                    .is_some_and(|c| c.summary.is_none())
-                {
-                    return self.pending_candidates.pop_front();
+                if let Some(pos) = self.pending_candidates.iter().position(|c| {
+                    candidate_matches_task_desc(c.summary.as_deref(), Some(trimmed_desc))
+                        || (!first_line.is_empty()
+                            && candidate_matches_task_desc(
+                                c.summary.as_deref(),
+                                Some(first_line),
+                            ))
+                }) {
+                    return self.pending_candidates.remove(pos);
+                }
+                if let Some(pos) = self.pending_candidates.iter().position(|c| {
+                    expected_kind.map_or(c.kind != "monitor", |k| c.kind == k)
+                        && c.summary.is_none()
+                }) {
+                    return self.pending_candidates.remove(pos);
                 }
                 return None;
             }
@@ -1293,6 +1328,17 @@ impl AgyAcpTaskTracker {
                     });
                     core.dispatch_event(state, tool_result_patch(cand.tool_name, Some(&patch)));
                 }
+                if !cand.has_explicit_label && cand.kind == "monitor" {
+                    if let Some((sched_desc, sched_has_label)) = task_desc_in_log
+                        .as_deref()
+                        .and_then(parse_schedule_task_description)
+                    {
+                        if sched_has_label {
+                            cand.description = sched_desc;
+                            cand.has_explicit_label = true;
+                        }
+                    }
+                }
                 (
                     cand.kind,
                     cand.description,
@@ -1303,20 +1349,35 @@ impl AgyAcpTaskTracker {
                 )
             }
             None => {
-                let fallback_desc = task_desc_in_log
+                if let Some((sched_desc, sched_has_label)) = task_desc_in_log
                     .as_deref()
-                    .map(summarize_bare_command)
-                    .filter(|d| !d.is_empty())
-                    .unwrap_or_else(|| short_id.clone());
-                let fallback_sum = task_desc_in_log.map(|d| truncate_chars(&d, 500));
-                (
-                    "command".to_string(),
-                    fallback_desc,
-                    false,
-                    fallback_sum,
-                    false,
-                    None,
-                )
+                    .and_then(parse_schedule_task_description)
+                {
+                    let fallback_sum = task_desc_in_log.map(|d| truncate_chars(&d, 500));
+                    (
+                        "monitor".to_string(),
+                        sched_desc,
+                        sched_has_label,
+                        fallback_sum,
+                        false,
+                        None,
+                    )
+                } else {
+                    let fallback_desc = task_desc_in_log
+                        .as_deref()
+                        .map(summarize_bare_command)
+                        .filter(|d| !d.is_empty())
+                        .unwrap_or_else(|| short_id.clone());
+                    let fallback_sum = task_desc_in_log.map(|d| truncate_chars(&d, 500));
+                    (
+                        "command".to_string(),
+                        fallback_desc,
+                        false,
+                        fallback_sum,
+                        false,
+                        None,
+                    )
+                }
             }
         };
 
@@ -1512,27 +1573,28 @@ fn classify_tracked_tool(names: &[&str], parsed_args: Option<&Value>) -> Option<
         }
     }
     let obj = parsed_args.and_then(Value::as_object)?;
-    if obj.contains_key("CommandLine")
-        || ((obj.contains_key("command") || obj.contains_key("cmd"))
-            && (obj.contains_key("WaitMsBeforeAsync")
-                || obj.contains_key("IsDaemon")
+    let has_key = |needle: &str| obj.keys().any(|k| k.eq_ignore_ascii_case(needle));
+    if has_key("CommandLine")
+        || ((has_key("command") || has_key("cmd"))
+            && (has_key("WaitMsBeforeAsync")
+                || has_key("IsDaemon")
                 || names.iter().any(|n| n.trim().eq_ignore_ascii_case("execute"))))
     {
         return Some("run_command");
     }
-    if (obj.contains_key("CronExpression") || obj.contains_key("DurationSeconds"))
-        && obj.contains_key("Prompt")
+    if (has_key("CronExpression") || has_key("DurationSeconds") || has_key("duration_seconds"))
+        && has_key("Prompt")
     {
         return Some("schedule");
     }
-    if obj.contains_key("TypeName") && (obj.contains_key("Role") || obj.contains_key("Prompt")) {
+    if has_key("TypeName") && (has_key("Role") || has_key("Prompt")) {
         return Some("invoke_subagent");
     }
-    if obj.contains_key("Action") && obj.contains_key("TaskId") {
+    if has_key("Action") && has_key("TaskId") {
         return Some("manage_task");
     }
-    if obj.contains_key("Action")
-        && (obj.contains_key("ConversationIds")
+    if has_key("Action")
+        && (has_key("ConversationIds")
             || arg_str(parsed_args, &["Action", "action"])
                 .is_some_and(|a| a.eq_ignore_ascii_case("kill_all")))
     {
@@ -1560,8 +1622,382 @@ fn summaries_compatible(a: Option<&str>, b: Option<&str>) -> bool {
     !line_a.is_empty() && !line_b.is_empty() && (sa.contains(line_b) || sb.contains(line_a))
 }
 
+fn format_agy_duration(secs: u64) -> String {
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    let hours = secs / 3600;
+    let mins = (secs % 3600) / 60;
+    let rem = secs % 60;
+    let mut parts = Vec::with_capacity(3);
+    if hours > 0 {
+        parts.push(format!("{hours}h"));
+    }
+    if mins > 0 {
+        parts.push(format!("{mins}m"));
+    }
+    if rem > 0 {
+        parts.push(format!("{rem}s"));
+    }
+    parts.join(" ")
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ParsedScheduleFields {
+    header: String,
+    prompt: Option<String>,
+}
+
+fn strip_schedule_metadata_suffix(line: &str) -> &str {
+    for (idx, _) in line.match_indices(", ") {
+        let after = line[idx + 2..].trim_start();
+        let key_len = after
+            .bytes()
+            .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+            .count();
+        if key_len > 0 && after.as_bytes().get(key_len) == Some(&b':') {
+            return line[..idx].trim_end();
+        }
+    }
+    line.trim_end_matches(',').trim_end()
+}
+
+fn parse_schedule_fields(raw: &str) -> Option<ParsedScheduleFields> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut lines = trimmed.lines();
+    let first_line = lines.next()?.trim();
+    let lower = first_line.to_ascii_lowercase();
+    let prefix_kind = if lower.starts_with("timer:") {
+        "Timer"
+    } else if lower.starts_with("cron:") {
+        "Cron"
+    } else {
+        return None;
+    };
+
+    if let Some((head_part, prompt_part)) = first_line.split_once(" · ") {
+        let rest_of_head = head_part.split_once(':').map(|x| x.1.trim()).unwrap_or("");
+        let clean_head = strip_schedule_metadata_suffix(rest_of_head);
+        let header = format!("{prefix_kind}: {clean_head}").trim_end().to_string();
+        let prompt_rest = prompt_part.trim();
+        let prompt = (!prompt_rest.is_empty()).then(|| prompt_rest.to_string());
+        return Some(ParsedScheduleFields { header, prompt });
+    }
+
+    let rest_of_head = first_line.split_once(':').map(|x| x.1.trim()).unwrap_or("");
+    let clean_head = strip_schedule_metadata_suffix(rest_of_head);
+    let header = if clean_head.is_empty() {
+        format!("{prefix_kind}:")
+    } else {
+        format!("{prefix_kind}: {clean_head}")
+    };
+
+    let mut prompt_lines: Vec<String> = Vec::new();
+    let mut in_prompt = false;
+    for line in lines {
+        let t = line.trim();
+        if !in_prompt {
+            let t_lower = t.to_ascii_lowercase();
+            if t_lower.starts_with("prompt:") {
+                in_prompt = true;
+                let after = t.split_once(':').map(|x| x.1.trim()).unwrap_or("");
+                if !after.is_empty() {
+                    prompt_lines.push(after.to_string());
+                }
+            }
+        } else if !t.is_empty() {
+            prompt_lines.push(t.to_string());
+        }
+    }
+    let prompt_joined = prompt_lines.join(" ");
+    let prompt = (!prompt_joined.is_empty()).then(|| prompt_joined);
+    Some(ParsedScheduleFields { header, prompt })
+}
+
+fn parse_schedule_task_description(raw: &str) -> Option<(String, bool)> {
+    let fields = parse_schedule_fields(raw)?;
+    if let Some(ref prompt) = fields.prompt {
+        let desc = truncate_one_line(prompt, 96);
+        if !desc.is_empty() {
+            return Some((desc, true));
+        }
+    }
+    let fallback = fields.header.trim_end_matches(',').trim();
+    if fallback.is_empty() || fallback == "Timer:" || fallback == "Cron:" {
+        return Some(("Scheduled task".to_string(), false));
+    }
+    Some((fallback.to_string(), false))
+}
+
+fn candidate_matches_task_desc(a: Option<&str>, b: Option<&str>) -> bool {
+    if summaries_compatible(a, b) {
+        return true;
+    }
+    let (Some(sa), Some(sb)) = (
+        a.map(str::trim).filter(|s| !s.is_empty()),
+        b.map(str::trim).filter(|s| !s.is_empty()),
+    ) else {
+        return false;
+    };
+    if let (Some(fa), Some(fb)) = (parse_schedule_fields(sa), parse_schedule_fields(sb)) {
+        if fa.header.eq_ignore_ascii_case(&fb.header) {
+            return match (&fa.prompt, &fb.prompt) {
+                (Some(pa), Some(pb)) => summaries_compatible(Some(pa), Some(pb)),
+                _ => true,
+            };
+        }
+    }
+    if let Some(fb) = parse_schedule_fields(sb) {
+        if let Some(ref pb) = fb.prompt {
+            if summaries_compatible(Some(sa), Some(pb)) {
+                return true;
+            }
+        }
+    }
+    if let Some(fa) = parse_schedule_fields(sa) {
+        if let Some(ref pa) = fa.prompt {
+            if summaries_compatible(Some(pa), Some(sb)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn unescape_outer_command(raw: &str) -> std::borrow::Cow<'_, str> {
+    let trimmed = raw.trim();
+    if !trimmed.starts_with("\\\"") {
+        return std::borrow::Cow::Borrowed(trimmed);
+    }
+    let mut out = String::with_capacity(trimmed.len());
+    let mut chars = trimmed.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.peek().copied() {
+                Some('"') => {
+                    chars.next();
+                    out.push('"');
+                    continue;
+                }
+                Some('\\') => {
+                    chars.next();
+                    out.push('\\');
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        out.push(c);
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+fn split_next_command_token(input: &str) -> Option<(String, &str, bool)> {
+    let s = input.trim_start();
+    if s.is_empty() {
+        return None;
+    }
+    let first = s.chars().next()?;
+    if matches!(first, '"' | '\'') {
+        let mut buf = String::new();
+        let mut iter = s[first.len_utf8()..].char_indices().peekable();
+        let mut end_byte = None;
+        while let Some((idx, ch)) = iter.next() {
+            if first == '"' && ch == '\\' {
+                if let Some(&(_, next_ch)) = iter.peek() {
+                    if matches!(next_ch, '"' | '\\') {
+                        iter.next();
+                        buf.push(next_ch);
+                        continue;
+                    }
+                }
+            } else if first == '\'' && ch == '\'' {
+                if let Some(&(_, '\'')) = iter.peek() {
+                    iter.next();
+                    buf.push('\'');
+                    continue;
+                }
+            }
+            if ch == first {
+                end_byte = Some(first.len_utf8() + idx + ch.len_utf8());
+                break;
+            }
+            buf.push(ch);
+        }
+        let close = end_byte?;
+        let rest = s[close..].trim_start();
+        return Some((buf, rest, true));
+    }
+    let end = s.find(char::is_whitespace).unwrap_or(s.len());
+    Some((s[..end].to_string(), s[end..].trim_start(), false))
+}
+
+fn normalized_exe_stem(raw_exe: &str) -> String {
+    let base = raw_exe.rsplit(['/', '\\']).next().unwrap_or(raw_exe);
+    let mut exe = base.to_string();
+    for ext in [".exe", ".cmd", ".bat", ".ps1"] {
+        if exe.len() > ext.len() && exe[exe.len() - ext.len()..].eq_ignore_ascii_case(ext) {
+            exe.truncate(exe.len() - ext.len());
+            break;
+        }
+    }
+    exe
+}
+
+fn extract_shell_payload(rest: &str) -> Option<String> {
+    let r = rest.trim_start();
+    if r.is_empty() {
+        return None;
+    }
+    let mut payload = if r.starts_with(['"', '\'']) {
+        let (inner, trailing, was_quoted) = split_next_command_token(r)?;
+        if !was_quoted {
+            return None;
+        }
+        if trailing.starts_with("&&")
+            || trailing.starts_with("||")
+            || trailing.starts_with(';')
+            || trailing.starts_with('|')
+        {
+            return None;
+        }
+        inner
+    } else {
+        if r.starts_with('-') {
+            return None;
+        }
+        r.to_string()
+    };
+    let t = payload.trim_start();
+    if let Some(after_amp) = t.strip_prefix('&') {
+        if after_amp.starts_with(char::is_whitespace) || after_amp.starts_with(['"', '\'']) {
+            payload = after_amp.trim_start().to_string();
+        }
+    }
+    let final_trimmed = payload.trim();
+    (!final_trimmed.is_empty()).then(|| final_trimmed.to_string())
+}
+
+fn unwrap_shell_wrapper(cmd: &str) -> String {
+    let mut current = cmd.trim().to_string();
+    for _ in 0..3 {
+        let Some((raw_exe, mut rest, _)) = split_next_command_token(&current) else {
+            break;
+        };
+        let shell = normalized_exe_stem(&raw_exe).to_ascii_lowercase();
+        let mut unwrapped: Option<String> = None;
+        match shell.as_str() {
+            "pwsh" | "powershell" => {
+                while let Some((tok, next_rest, was_quoted)) = split_next_command_token(rest) {
+                    if was_quoted {
+                        break;
+                    }
+                    let lower = tok.to_ascii_lowercase();
+                    if matches!(lower.as_str(), "-command" | "-c") {
+                        unwrapped = extract_shell_payload(next_rest);
+                        break;
+                    }
+                    if matches!(
+                        lower.as_str(),
+                        "-windowstyle"
+                            | "-w"
+                            | "-executionpolicy"
+                            | "-ep"
+                            | "-workingdirectory"
+                            | "-wd"
+                            | "-settingsfile"
+                            | "-configurationname"
+                            | "-config"
+                            | "-inputformat"
+                            | "-if"
+                            | "-outputformat"
+                            | "-of"
+                    ) {
+                        if let Some((_, after_val, _)) = split_next_command_token(next_rest) {
+                            rest = after_val;
+                            continue;
+                        }
+                        break;
+                    }
+                    if lower.starts_with('-')
+                        && !matches!(
+                            lower.as_str(),
+                            "-file" | "-f" | "-encodedcommand" | "-e" | "-ec" | "-enc"
+                        )
+                    {
+                        rest = next_rest;
+                        continue;
+                    }
+                    break;
+                }
+            }
+            "cmd" => {
+                while let Some((tok, next_rest, was_quoted)) = split_next_command_token(rest) {
+                    if was_quoted {
+                        break;
+                    }
+                    let lower = tok.to_ascii_lowercase();
+                    if matches!(lower.as_str(), "/c" | "/k") {
+                        unwrapped = extract_shell_payload(next_rest);
+                        break;
+                    }
+                    if lower.starts_with('/') {
+                        rest = next_rest;
+                        continue;
+                    }
+                    break;
+                }
+            }
+            "bash" | "sh" | "zsh" => {
+                while let Some((tok, next_rest, was_quoted)) = split_next_command_token(rest) {
+                    if was_quoted {
+                        break;
+                    }
+                    if tok == "-o" {
+                        if let Some((_, after_val, _)) = split_next_command_token(next_rest) {
+                            rest = after_val;
+                            continue;
+                        }
+                        break;
+                    }
+                    if tok.starts_with('-')
+                        && tok.len() >= 2
+                        && tok[1..]
+                            .bytes()
+                            .all(|b| matches!(b, b'c' | b'e' | b'i' | b'l' | b'u' | b'x'))
+                        && tok.ends_with('c')
+                    {
+                        unwrapped = extract_shell_payload(next_rest);
+                        break;
+                    }
+                    if tok.starts_with('-') && !tok.starts_with("--") {
+                        rest = next_rest;
+                        continue;
+                    }
+                    break;
+                }
+            }
+            _ => break,
+        }
+        let Some(next) = unwrapped else {
+            break;
+        };
+        current = next;
+    }
+    current
+}
+
 fn summarize_bare_command(raw: &str) -> String {
-    let non_empty: Vec<&str> = raw
+    let unescaped = unescape_outer_command(raw);
+    let working = if unescaped.starts_with("@'") || unescaped.starts_with("@\"") {
+        unescaped.into_owned()
+    } else {
+        unwrap_shell_wrapper(&unescaped)
+    };
+    let non_empty: Vec<&str> = working
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
@@ -1606,25 +2042,8 @@ fn compact_command_head(line: &str) -> Option<String> {
     if trimmed.is_empty() || trimmed.starts_with('#') {
         return None;
     }
-    let (raw_exe, mut rest) = if let Some(q @ ('"' | '\'')) = trimmed.chars().next() {
-        let after = &trimmed[1..];
-        let end = after.find(q)?;
-        (&after[..end], after[end + 1..].trim_start())
-    } else {
-        let mut split = trimmed.splitn(2, char::is_whitespace);
-        (split.next()?, split.next().unwrap_or("").trim_start())
-    };
-    let base = raw_exe
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(raw_exe);
-    let mut exe = base.to_string();
-    for ext in [".exe", ".cmd", ".bat", ".ps1"] {
-        if exe.len() > ext.len() && exe[exe.len() - ext.len()..].eq_ignore_ascii_case(ext) {
-            exe.truncate(exe.len() - ext.len());
-            break;
-        }
-    }
+    let (raw_exe, mut rest, _) = split_next_command_token(trimmed)?;
+    let exe = normalized_exe_stem(&raw_exe);
     if exe.is_empty() || exe.chars().count() > 32 {
         return None;
     }
@@ -1632,8 +2051,35 @@ fn compact_command_head(line: &str) -> Option<String> {
     let mut parts = vec![exe];
     let mut skip_next = false;
     while !rest.is_empty() && parts.len() < 3 {
-        if rest.starts_with([';', '|', '&', '>', '<', '"', '\'', '$', '(']) {
+        if rest.starts_with([';', '|', '&', '>', '<', '$', '(']) {
             break;
+        }
+        if rest.starts_with(['"', '\'']) {
+            let Some((quoted, next_rest, true)) = split_next_command_token(rest) else {
+                break;
+            };
+            rest = next_rest;
+            if skip_next {
+                skip_next = false;
+                continue;
+            }
+            let q_trimmed = quoted.trim();
+            if q_trimmed.is_empty() || q_trimmed.contains('\n') {
+                break;
+            }
+            if q_trimmed.contains('/') || q_trimmed.contains('\\') {
+                let base = q_trimmed
+                    .trim_end_matches(['/', '\\'])
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .unwrap_or(q_trimmed);
+                if !base.is_empty() {
+                    parts.push(truncate_chars(base, 24));
+                }
+            } else {
+                parts.push(truncate_chars(q_trimmed, 24));
+            }
+            continue;
         }
         let mut split = rest.splitn(2, char::is_whitespace);
         let tok = split.next().unwrap_or("");
@@ -1943,22 +2389,81 @@ fn extract_quoted_after(text: &str, prefix: &str) -> Option<String> {
 
 fn extract_task_description_block(content: &str) -> Option<String> {
     let (_, rest) = content.split_once("Task Description:")?;
-    let body = if let Some((before_logs, _)) = rest.split_once("\nTask logs are available at:") {
-        before_logs
-    } else if let Some((before_action, _)) = rest.split_once("\nYOU MUST TAKE ONE OF") {
-        before_action
-    } else {
-        rest.lines().next().unwrap_or("")
-    };
+    let mut kept = Vec::new();
+    for (idx, line) in rest.lines().enumerate() {
+        let trimmed_start = line.trim_start();
+        if idx > 0
+            && (trimmed_start.starts_with("Task logs are available at:")
+                || trimmed_start.starts_with("YOU MUST TAKE ONE OF")
+                || trimmed_start.starts_with("Completed At:")
+                || trimmed_start.starts_with("</SYSTEM_MESSAGE>")
+                || trimmed_start.starts_with("<SYSTEM_MESSAGE>"))
+        {
+            break;
+        }
+        kept.push(line.trim_end_matches('\r'));
+    }
+    let body = kept.join("\n");
     let trimmed = body.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 fn classify_system_message_status(content: &str, task: &TrackedTask) -> Option<&'static str> {
-    if let Some(code) = extract_exit_code(content) {
+    let mut notice = content.trim();
+    const SYSTEM_PREAMBLE: &str = "The following is a <SYSTEM_MESSAGE> not actually sent by the user. It is provided by the system as important information to pay attention to.";
+    notice = notice.strip_prefix(SYSTEM_PREAMBLE).unwrap_or(notice).trim_start();
+    let matches_notice_id = |id: &str| {
+        task.matches_id(id)
+            && (!id.contains('/') || !task.raw_id.contains('/') || id == task.raw_id)
+    };
+    if notice.starts_with("<SYSTEM_MESSAGE") {
+        let (header, body) = notice.split_once('>')?;
+        if let Some(sender) = extract_token_after(header, "sender=") {
+            if !matches_notice_id(&sender) {
+                return None;
+            }
+        }
+        notice = body.trim();
+    }
+    notice = notice.strip_suffix("</SYSTEM_MESSAGE>").unwrap_or(notice).trim();
+    if notice.starts_with("[Message] ") {
+        let (metadata, body) = notice.split_once(" content=")?;
+        let sender = extract_token_after(metadata, "sender=")?;
+        if !matches_notice_id(&sender) {
+            return None;
+        }
+        notice = body.trim_start();
+    }
+    let (status_line, result_line) = if let Some(rest) = notice.strip_prefix("Task id \"") {
+        let (id, rest) = rest.split_once('"')?;
+        if !matches_notice_id(id) {
+            return None;
+        }
+        let mut lines = rest.trim().lines();
+        (lines.next().unwrap_or(""), lines.next().unwrap_or("").trim())
+    } else {
+        // Older command/agent notices have no task header; retain their
+        // existing free-form status handling.
+        (notice, "")
+    };
+    // For structured task notices, only the header and immediate result prefix
+    // carry status. Later output can quote failures from other tasks.
+    let lower = status_line.to_ascii_lowercase();
+    if lower.starts_with("failed with result:")
+        || lower.starts_with("failed with error")
+        || (lower.starts_with("finished with result:")
+            && result_line.starts_with("Encountered error in tool execution:"))
+    {
+        return Some("failed");
+    }
+    let exit_status = if lower.starts_with("finished with result:") {
+        result_line
+    } else {
+        status_line
+    };
+    if let Some(code) = extract_exit_code(exit_status) {
         return Some(if code == 0 { "completed" } else { "failed" });
     }
-    let lower = content.to_ascii_lowercase();
     if lower.contains("was killed")
         || lower.contains("task killed")
         || lower.contains("cancelled")
@@ -2095,6 +2600,52 @@ fn read_clean_log_tail(path: &Path, file_len: u64) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workflow_system_message_status_uses_own_terminal_notice() {
+        let task = TrackedTask {
+            id: "task-2".to_string(), raw_id: "session/task-2".to_string(),
+            kind: "workflow".to_string(), description: String::new(),
+            has_explicit_label: false, status: "running".to_string(),
+            tool_use_id: None, summary: None, progress: None, ambient: false,
+            log_path: None, last_log_len: None, started_at: 0, last_progress_at: 0,
+        };
+        for (body, expected) in [
+            ("failed with result:\nEncountered error in tool execution: workflow execution failed (line 13): RuntimeError: boom", "failed"),
+            ("failed with result:\n", "failed"),
+            ("failed with error: boom", "failed"),
+            ("timed out", "failed"),
+            ("was cancelled", "stopped"),
+            ("was killed", "stopped"),
+            ("finished with result:\nnull", "completed"),
+            ("finished with result:\nCommand exited with code 0.", "completed"),
+            ("finished with result:\nCommand exited with code 1.", "failed"),
+            ("finished with result:\nEncountered error in tool execution: boom", "failed"),
+            ("finished with result:\nExample: failed with error; timed out; cancelled", "completed"),
+            ("finished with result:\nTask id \"other/task-9\" failed with result:\nEncountered error in tool execution: boom", "completed"),
+            ("finished with result:\nOutput:\nEncountered error in tool execution: quoted example\nCommand exited with code 1.", "completed"),
+        ] {
+            let notice = format!("<SYSTEM_MESSAGE sender=session/task-2>\nTask id \"session/task-2\" {body}\n</SYSTEM_MESSAGE>");
+            assert_eq!(classify_system_message_status(&notice, &task), Some(expected), "{body}");
+        }
+        assert_eq!(classify_system_message_status("Task id \"other/task-9\" failed with result:\nboom", &task), None);
+        assert_eq!(classify_system_message_status("<SYSTEM_MESSAGE sender=session/task-2>failed with error</SYSTEM_MESSAGE>", &task), Some("failed"));
+        let full_notice = |sender: &str, task_id: &str, result: &str| format!(
+            "The following is a <SYSTEM_MESSAGE> not actually sent by the user. It is provided by the system as important information to pay attention to.\n\n<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-14T12:58:46Z sender={sender} priority=MESSAGE_PRIORITY_HIGH content=Task id \"{task_id}\" {result}\n</SYSTEM_MESSAGE>"
+        );
+        let failure = "failed with result:\nEncountered error in tool execution: workflow execution failed (line 13): RuntimeError: WF_EXPECTED_BRANCH_FAILURE_159\nTraceback...";
+        let replay_id = "15f141cd-2a1f-46a1-bda8-2b851393be37/task-2";
+        let replay_task = TrackedTask { raw_id: replay_id.to_string(), ..task.clone() };
+        assert_eq!(classify_system_message_status(&full_notice(replay_id, replay_id, failure), &replay_task), Some("failed"));
+        assert_eq!(classify_system_message_status(&full_notice("session/task-2", "session/task-2", failure), &task), Some("failed"));
+        assert_eq!(classify_system_message_status(&full_notice("other/task-2", "session/task-2", failure), &task), None);
+        assert_eq!(classify_system_message_status(&full_notice("session/task-2", "other/task-2", failure), &task), None);
+        assert_eq!(classify_system_message_status(&full_notice("session/task-2", "session/task-2", "was cancelled"), &task), Some("stopped"));
+        let quoted_failure = format!("finished with result:\nExample notification:\n{}", full_notice("other/task-9", "other/task-9", failure));
+        assert_eq!(classify_system_message_status(&full_notice("session/task-2", "session/task-2", &quoted_failure), &task), Some("completed"));
+        let monitor = TrackedTask { ambient: true, kind: "monitor".to_string(), ..task };
+        assert_eq!(classify_system_message_status("Task id \"session/task-2\" finished with result:\nnull", &monitor), None);
+    }
 
     #[test]
     fn elicitation_maps_declared_choices_write_ins_and_cancel() {

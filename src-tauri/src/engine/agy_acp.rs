@@ -1009,6 +1009,39 @@ pub(super) async fn finish_remote_lease<R: AsyncBufRead + Unpin, W: AsyncWrite +
     Ok(())
 }
 
+/// Half-close only the client write side. Both legacy and current v2 brokers
+/// retire an unclean lease on EOF, then close their write side *after* dropping
+/// the worker and its process-tree guard. Never send the healthy-lease sentinel
+/// for a cancelled/failed turn: older resident brokers would put it back in pool.
+pub(super) async fn retire_remote_lease<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut R,
+    line_buf: &mut Vec<u8>,
+    writer: &mut W,
+) -> Result<(), String> {
+    // Prompt cancellation can already spend 2.5s settling. Finish before the
+    // registry's 10s reader-abort backstop so an unconfirmed cleanup is visible.
+    retire_remote_lease_with_timeout(reader, line_buf, writer, Duration::from_secs(6)).await
+}
+
+async fn retire_remote_lease_with_timeout<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut R,
+    line_buf: &mut Vec<u8>,
+    writer: &mut W,
+    timeout: Duration,
+) -> Result<(), String> {
+    tokio::time::timeout(timeout, async {
+        writer.shutdown().await.map_err(|e| format!("close ACP lease input: {e}"))?;
+        loop {
+            match read_ndjson_line(reader, line_buf).await {
+                Ok(LineRead::Eof) => return Ok(()),
+                Ok(LineRead::Line(_)) => {}, // Drain late replies without reviving the turn.
+                Ok(LineRead::TooLong) => return Err("oversized ACP retirement frame".into()),
+                Err(e) => return Err(format!("read ACP retirement: {e}")),
+            }
+        }
+    }).await.map_err(|_| "ACP broker did not finish retiring the worker in time".to_string())?
+}
+
 #[allow(dead_code)]
 fn _assert_send_sync() {
     fn check<T: Send + Sync>() {}

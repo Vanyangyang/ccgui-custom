@@ -34,6 +34,7 @@ import {
 } from "./PromptHistorySettings";
 import { useChatStore } from "@/features/chat/store";
 import { AutoTitleModelSettings } from "./AutoTitleModelSettings";
+import { ComposerPredictionModelSettings } from "./ComposerPredictionModelSettings";
 import { useOnboardingStore } from "@/features/onboarding/store";
 
 export const LANGUAGE_STORAGE_KEY = "ccgui-next.language";
@@ -77,7 +78,7 @@ function useGeneralSettingsState() {
   const [decorated, setDecorated] = useState<boolean | null>(null);
   const [restartPending, setRestartPending] = useState(false);
   const restartInFlight = useRef(false);
-  const namingSaveQueue = useRef<Promise<unknown>>(Promise.resolve());
+  const backgroundSaveQueue = useRef<Promise<unknown>>(Promise.resolve());
 
   useEffect(() => {
     let cancelled = false;
@@ -216,23 +217,33 @@ function useGeneralSettingsState() {
     useChatStore.getState().setThinkingAutoCollapse(autoCollapse);
     void save({ thinkingAutoCollapse: autoCollapse });
   };
+  // Read natively on each session_create call; no store mirror.
+  const onSessionCreateChange = (sessionCreateEnabled: boolean) => {
+    if (!settings) return;
+    setSettings({ ...settings, sessionCreateEnabled });
+    void save({ sessionCreateEnabled });
+  };
   // Only the host reads these (after each turn), so no store mirror.
-  const saveNaming = (patch: Partial<AppSettings>) => {
-    // Serialize rapid naming picks: each merge reads the preceding saved value.
-    namingSaveQueue.current = namingSaveQueue.current.then(() => save(patch));
+  const saveBackground = (patch: Partial<AppSettings>) => {
+    // Serialize naming and prediction picks: each merge reads the preceding save.
+    backgroundSaveQueue.current = backgroundSaveQueue.current.then(() => save(patch));
   };
   const onAutoTitleEnabledChange = (autoTitleEnabled: boolean) => {
     if (!settings) return;
-    saveNaming({ autoTitleEnabled });
+    saveBackground({ autoTitleEnabled });
   };
   const onAutoTitleModelChange = (model: AutoTitleModel) => {
     if (!settings) return;
-    saveNaming({ autoTitleEngine: model.engine, autoTitleModel: model.id });
+    saveBackground({ autoTitleEngine: model.engine, autoTitleModel: model.id });
   };
   const onAutoTitleEffortChange = (key: Key | null) => {
     if (!settings || key == null) return;
     const autoTitleEffort = String(key);
-    saveNaming({ autoTitleEffort });
+    saveBackground({ autoTitleEffort });
+  };
+  const onComposerPredictionModelChange = (composerPredictionModel: string | null) => {
+    if (!settings) return;
+    saveBackground({ composerPredictionModel });
   };
   /** Font mode commits (默认 / 系统 / 自定义): apply to the document root at
    *  once (bootstrap re-reads the mirror on the next launch) and persist.
@@ -292,9 +303,11 @@ function useGeneralSettingsState() {
     onThreadLimitKeyDown,
     onSendShortcutChange,
     onThinkingAutoCollapseChange,
+    onSessionCreateChange,
     onAutoTitleEnabledChange,
     onAutoTitleModelChange,
     onAutoTitleEffortChange,
+    onComposerPredictionModelChange,
     onFontModeChange,
     onFontFilePick,
   };
@@ -583,16 +596,20 @@ function BehaviorCard({
   settings,
   onSendShortcutChange,
   onThinkingAutoCollapseChange,
+  onSessionCreateChange,
   onAutoTitleEnabledChange,
   onAutoTitleModelChange,
   onAutoTitleEffortChange,
+  onComposerPredictionModelChange,
 }: {
   settings: AppSettings;
   onSendShortcutChange: (key: Key | null) => void;
   onThinkingAutoCollapseChange: (autoCollapse: boolean) => void;
+  onSessionCreateChange: (enabled: boolean) => void;
   onAutoTitleEnabledChange: (enabled: boolean) => void;
   onAutoTitleModelChange: (model: AutoTitleModel) => void;
   onAutoTitleEffortChange: (key: Key | null) => void;
+  onComposerPredictionModelChange: (model: string | null) => void;
 }) {
   const { t } = useTranslation();
   const autoTitleEnabled = settings.autoTitleEnabled ?? false;
@@ -632,6 +649,19 @@ function BehaviorCard({
         </SettingsRow>
 
         <SettingsRow
+          anchor="sessionCreate"
+          label={t("settings.sessionCreate")}
+          description={t("settings.sessionCreateDesc")}
+        >
+          <Switch
+            size="sm"
+            aria-label={t("settings.sessionCreate")}
+            isSelected={settings.sessionCreateEnabled !== false}
+            onChange={onSessionCreateChange}
+          />
+        </SettingsRow>
+
+        <SettingsRow
           anchor="autoTitle"
           label={t("settings.autoTitle")}
           description={t("settings.autoTitleDesc")}
@@ -646,6 +676,7 @@ function BehaviorCard({
         <AutoTitleModelSettings settings={settings}
           onModelChange={onAutoTitleModelChange} onEffortChange={onAutoTitleEffortChange} />
         <ComposerPredictionToggleRow />
+        <ComposerPredictionModelSettings settings={settings} onModelChange={onComposerPredictionModelChange} />
         <PromptHistoryToggleRow />
       </SettingsCard>
     </div>
@@ -671,9 +702,11 @@ export function GeneralSection() {
     onThreadLimitKeyDown,
     onSendShortcutChange,
     onThinkingAutoCollapseChange,
+    onSessionCreateChange,
     onAutoTitleEnabledChange,
     onAutoTitleModelChange,
     onAutoTitleEffortChange,
+    onComposerPredictionModelChange,
     fontBusy,
     onFontModeChange,
     onFontFilePick,
@@ -712,9 +745,11 @@ export function GeneralSection() {
           settings={settings}
           onSendShortcutChange={onSendShortcutChange}
           onThinkingAutoCollapseChange={onThinkingAutoCollapseChange}
+          onSessionCreateChange={onSessionCreateChange}
           onAutoTitleEnabledChange={onAutoTitleEnabledChange}
           onAutoTitleModelChange={onAutoTitleModelChange}
           onAutoTitleEffortChange={onAutoTitleEffortChange}
+          onComposerPredictionModelChange={onComposerPredictionModelChange}
         />
       )}
       {settings && <PromptHistoryManager />}

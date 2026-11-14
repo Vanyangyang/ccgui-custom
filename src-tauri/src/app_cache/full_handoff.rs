@@ -19,6 +19,10 @@ use exact_anchors::AnchorCatalog;
 mod visible;
 use visible::visible_row;
 
+#[cfg(test)]
+#[path = "full_handoff_source_tests.rs"]
+mod source_tests;
+
 pub(super) const MAX_TEXT_BYTES: usize = 8 * 1024 * 1024;
 pub(super) const CHUNK_CHARS: usize = 64_000;
 const MAX_SUMMARY_UNITS: usize = 4_000;
@@ -34,6 +38,12 @@ fn units(text: &str) -> usize { text.encode_utf16().count() }
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct SourceStamp {
+    files: SourceFiles,
+    visible_hash: [u8; 32],
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SourceFiles {
     path: PathBuf,
     file: (u64, SystemTime),
     wal: Option<(u64, SystemTime)>,
@@ -41,46 +51,66 @@ pub(super) struct SourceStamp {
 }
 
 impl SourceStamp {
-    pub(super) fn cache(&self, route: &str) -> CallCache { CallCache::scoped(&self.path, route) }
+    pub(super) fn cache(&self, route: &str) -> CallCache { CallCache::scoped(&self.files.path, route) }
 }
 
 fn file_stamp(path: &Path) -> Result<(u64, SystemTime), String> {
     let meta = std::fs::metadata(path).map_err(|e| format!("full handoff source metadata failed: {e}"))?;
+    metadata_stamp(meta)
+}
+
+fn metadata_stamp(meta: std::fs::Metadata) -> Result<(u64, SystemTime), String> {
     if !meta.is_file() { return Err("full handoff directory-backed history sources are not supported".into()); }
     Ok((meta.len(), meta.modified().map_err(|e| format!("full handoff source timestamp failed: {e}"))?))
 }
 
-fn source_stamp(db: &crate::db::Db, engine: &str, session: &str) -> Result<SourceStamp, String> {
+fn source_stamp(db: &crate::db::Db, engine: &str, session: &str) -> Result<SourceFiles, String> {
     let path = crate::history::reader::resolve_session_file_path(db, engine, session)?
         .ok_or("full handoff saved session not found")?;
     let mut wal = path.as_os_str().to_os_string();
     wal.push("-wal");
     let wal_path = Path::new(&wal);
     let wal = match std::fs::metadata(wal_path) {
-        Ok(_) => Some(file_stamp(wal_path)?),
+        // Opening a quiet WAL database read-only can create a zero-byte WAL.
+        // It contains no transactions and is equivalent to an absent WAL.
+        Ok(meta) => Some(metadata_stamp(meta)?).filter(|(size, _)| *size > 0),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(format!("full handoff WAL metadata failed: {e}")),
     };
     let prompt_history = if engine == "agy" {
         crate::history::agy::user_history_path(&path).map(|history_path| {
             let stamp = match std::fs::metadata(&history_path) {
-                Ok(_) => Some(file_stamp(&history_path)?),
+                Ok(meta) => Some(metadata_stamp(meta)?),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
                 Err(e) => return Err(format!("full handoff AGY prompt history metadata failed: {e}")),
             };
             Ok((history_path, stamp))
         }).transpose()?
     } else { None };
-    Ok(SourceStamp { file: file_stamp(&path)?, path, wal, prompt_history })
+    Ok(SourceFiles { file: file_stamp(&path)?, path, wal, prompt_history })
 }
 
-fn verify_stamp(expected: &SourceStamp, actual: &SourceStamp) -> Result<(), String> {
-    if actual != expected { Err("full handoff source changed while reading; retry after the session stops writing".into()) }
+fn verify_stamp(expected: &SourceFiles, actual: &SourceFiles) -> Result<(), String> {
+    if actual != expected { Err("full handoff source changed during reading".into()) }
     else { Ok(()) }
 }
 
 pub(super) fn ensure_saved_history_unchanged(db: &crate::db::Db, engine: &str, session: &str, initial: &SourceStamp) -> Result<(), String> {
-    verify_stamp(initial, &source_stamp(db, engine, session)?)
+    if source_stamp(db, engine, session)?.path != initial.files.path {
+        return Err("full handoff source identity changed".into());
+    }
+    // Re-read even when physical metadata is unchanged: same-sized rewrites and
+    // external prompt/delivery records can change the actual compressed input.
+    // Conversely, empty WALs, checkpoints and unrelated prompt-log rows must not
+    // discard an already completed summary when its visible input is identical.
+    let (_, current) = read_saved_history(db, engine, session)?;
+    if current.files.path != initial.files.path {
+        return Err("full handoff source identity changed".into());
+    }
+    if current.visible_hash != initial.visible_hash {
+        return Err("full handoff visible history changed during compression".into());
+    }
+    Ok(())
 }
 
 pub(super) fn read_saved_history(db: &crate::db::Db, engine: &str, session: &str) -> Result<(String, SourceStamp), String> {
@@ -102,33 +132,28 @@ fn retry_history_snapshot<T>(mut read: impl FnMut() -> Result<T, SnapshotReadErr
             Err(SnapshotReadError::Failed(error)) => return Err(error),
         }
     }
-    Err("full handoff source kept changing during the bounded history read; retry after the client finishes writing".into())
+    Err("full handoff source kept changing during the bounded history read".into())
 }
 
 fn read_saved_history_once(db: &crate::db::Db, engine: &str, session: &str) -> Result<(String, SourceStamp), SnapshotReadError> {
     let initial = source_stamp(db, engine, session)?;
-    let agy = if engine == "agy" {
-        let snapshot = crate::history::reader::load_full_agy_history_blocking(&initial.path)?;
-        // A writer may commit while the read-only query waits for a lock. Take
-        // the whole source again rather than accepting data under an old stamp.
-        if initial != source_stamp(db, engine, session)? { return Err(SnapshotReadError::Changed); }
-        Some(snapshot)
-    } else { None };
-    let mut changed = false;
-    let text = collect_pages(|before| {
-        let check = verify_stamp(&initial, &source_stamp(db, engine, session)?);
-        if check.is_err() { changed = true; }
-        check?;
-        let page = match &agy {
-            Some(snapshot) => snapshot.page(before),
-            None => crate::history::reader::load_session_page_blocking(db, engine, session, Some(500), before)?,
-        };
-        let check = verify_stamp(&initial, &source_stamp(db, engine, session)?);
-        if check.is_err() { changed = true; }
-        check?;
-        Ok(page)
-    }).map_err(|error| if changed { SnapshotReadError::Changed } else { SnapshotReadError::Failed(error) })?;
-    Ok((text, initial))
+    let text = crate::history::reader::load_full_history_blocking(db, engine, session, &initial.path)
+        .and_then(|snapshot| collect_pages(|before| Ok(snapshot.page(before))));
+    // Pages belong to one immutable, fresh parse. Check the source again after
+    // projection so a commit while parsing/waiting still causes a bounded reread.
+    finish_snapshot_read(initial, source_stamp(db, engine, session)?, text)
+}
+
+fn finish_snapshot_read(initial: SourceFiles, actual: SourceFiles, text: Result<String, String>)
+    -> Result<(String, SourceStamp), SnapshotReadError> {
+    // A truncate/rewrite may temporarily parse as empty or incomplete. Classify
+    // the moving source before propagating that error (or a child fallback).
+    if verify_stamp(&initial, &actual).is_err() {
+        return Err(SnapshotReadError::Changed);
+    }
+    let text = text?;
+    let visible_hash = Sha256::digest(text.as_bytes()).into();
+    Ok((text, SourceStamp { files: initial, visible_hash }))
 }
 
 fn collect_pages(mut load: impl FnMut(Option<i64>) -> Result<SessionPage, String>) -> Result<String, String> {
@@ -473,7 +498,7 @@ mod tests {
             assert!(crate::history::reader::find_session_file_path(db, "agy", sid).unwrap().is_none());
             let (text, stamp) = read_saved_history(db, "agy", sid).unwrap();
             assert!(text.contains("hello"), "{text}");
-            assert_eq!(stamp.path, session);
+            assert_eq!(stamp.files.path, session);
             ensure_saved_history_unchanged(db, "agy", sid, &stamp).unwrap();
         });
     }
@@ -1138,7 +1163,7 @@ mod tests {
 
     #[test]
     fn rejects_changed_source_identity_size_mtime_and_wal() {
-        let stamp = |path: &str, size, time, wal| SourceStamp { path: path.into(), file: (size, SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(time)), wal, prompt_history: None };
+        let stamp = |path: &str, size, time, wal| SourceFiles { path: path.into(), file: (size, SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(time)), wal, prompt_history: None };
         let initial = stamp("fixture", 12, 1, None);
         assert!(verify_stamp(&initial, &stamp("fixture", 12, 1, None)).is_ok());
         for changed in [stamp("other", 12, 1, None), stamp("fixture", 13, 1, None), stamp("fixture", 12, 2, None), stamp("fixture", 12, 1, Some((1, SystemTime::UNIX_EPOCH)))] {
@@ -1168,7 +1193,10 @@ mod tests {
         assert!(text.lines().last().unwrap().contains("visible-fact-1000"));
         ensure_saved_history_unchanged(&db, "claude", "synthetic", &stamp).unwrap();
         std::fs::write(&fixture.0, format!("{source}\n")).unwrap();
-        assert!(ensure_saved_history_unchanged(&db, "claude", "synthetic", &stamp).unwrap_err().contains("source changed"));
+        ensure_saved_history_unchanged(&db, "claude", "synthetic", &stamp).unwrap();
+        let new_message = serde_json::json!({"type":"user", "message":{"role":"user", "content":"new visible correction"}});
+        std::fs::write(&fixture.0, format!("{source}\n{new_message}\n")).unwrap();
+        assert!(ensure_saved_history_unchanged(&db, "claude", "synthetic", &stamp).unwrap_err().contains("visible history changed"));
     }
 
     #[test]
@@ -1232,7 +1260,7 @@ mod tests {
         assert_eq!(absent.prompt_history.as_ref().unwrap().1, None);
         let history = fixture.0.join("history.jsonl");
         std::fs::write(&history, r#"{"conversationId":"synthetic","display":"old cached user prompt"}"#).unwrap();
-        assert!(ensure_saved_history_unchanged(&db, "agy", "synthetic", &absent).is_err());
+        assert!(verify_stamp(&absent, &source_stamp(&db, "agy", "synthetic").unwrap()).is_err());
         let page = crate::history::reader::load_session_page_blocking(&db, "agy", "synthetic", Some(500), None).unwrap();
         assert_eq!(page.messages[0].text, "old cached user prompt");
         let (_, old_stamp) = read_saved_history(&db, "agy", "synthetic").unwrap();
@@ -1241,7 +1269,7 @@ mod tests {
         let (text, current) = read_saved_history(&db, "agy", "synthetic").unwrap();
         assert!(text.contains("new prompt with a later correction"));
         assert!(!text.contains("old cached user prompt"));
-        assert_eq!(old_stamp.file, current.file, "only the prompt log changed");
+        assert_eq!(old_stamp.files.file, current.files.file, "only the prompt log changed");
 
         // The busy read can resume after a writer commits, which invalidates
         // the stamp captured before waiting. Re-read the complete pre-model
@@ -1262,7 +1290,7 @@ mod tests {
         let (text, committed) = loaded.unwrap();
         assert!(text.contains("new prompt with a later correction"));
         assert!(text.contains("New committed assistant reply"));
-        assert!(committed.file.0 > current.file.0, "committed source must replace the pre-lock stamp");
+        assert!(committed.files.file.0 > current.files.file.0, "committed source must replace the pre-lock stamp");
         ensure_saved_history_unchanged(&db, "agy", "synthetic", &committed).unwrap();
         std::fs::remove_file(&history).unwrap();
         assert!(ensure_saved_history_unchanged(&db, "agy", "synthetic", &committed).is_err());

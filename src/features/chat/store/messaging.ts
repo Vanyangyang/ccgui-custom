@@ -563,7 +563,7 @@ export function createMessagingActions(
       // failed spawn), so the system-wide hotkey never outlives the run.
       void ipc.computerUseSetActive?.(true)?.catch(() => {});
     }
-    const nativeLaunch = engine === "claude"
+    const nativeLaunch = supportsNativeTasks(engine)
       ? { runId: requestedRunId, ready: false, retryInterrupt: false }
       : undefined;
     if (nativeLaunch) pendingNativeLaunches.set(requestedRunId, nativeLaunch);
@@ -769,9 +769,14 @@ export function createMessagingActions(
             ? [ipc.interruptSession(result.sessionId).catch(() => false)]
             : []),
         ]);
-      } else if (nativeLaunch?.retryInterrupt && get().bySession[liveKey]?.nativeTaskRunId === result.runId &&
-        shouldInterruptTurn(get().bySession[liveKey], liveKey)) {
-        await interruptReplyOnly(liveKey, get().bySession[liveKey]?.queueParked === true, true);
+      } else if (ownsIndependentTurn && nativeLaunch?.retryInterrupt && get().bySession[liveKey]?.nativeTaskRunId === result.runId &&
+        get().bySession[liveKey]?.streaming && !get().bySession[liveKey]?.settledRunIds?.includes(result.runId)) {
+        if (usesNativeInterrupt(liveKey)) {
+          if (shouldInterruptTurn(get().bySession[liveKey], liveKey))
+            await interruptReplyOnly(liveKey, get().bySession[liveKey]?.queueParked === true, true);
+        } else {
+          await killByKey(liveKey);
+        }
       }
     } catch (error) {
       if (options?.hostIndependentDraft && !nativeInvoked) {
@@ -1506,6 +1511,51 @@ export function createMessagingActions(
   /** Stop that ends the run: kill the process tree (and with it any background
    *  task) and park the queue. */
   async function killByKey(key: string) {
+    const session = get().bySession[key];
+    const nativeRunId = session?.nativeTaskRunId;
+    if (nativeRunId && session.streaming && !usesNativeInterrupt(key) && runRouting.get(nativeRunId) === key) {
+      // Virtual native runs accept cancellation before their worker is reaped.
+      // Keep the busy state and terminal route until Done/Error confirms that
+      // cleanup; parking immediately prevents that terminal from draining input.
+      const requested = Date.now();
+      patchSession(set, key, { queueParked: true, interruptRequestedAt: requested });
+      if (interruptsInFlight.has(nativeRunId)) return;
+      const request = { at: requested };
+      const launch = pendingNativeLaunches.get(nativeRunId);
+      interruptsInFlight.set(nativeRunId, request);
+      const ownerKey = () => {
+        const runId = launch?.ready ? launch.runId : nativeRunId;
+        const routed = runRouting.get(runId);
+        const current = routed ? get().bySession[routed] : undefined;
+        return routed && current?.streaming && current.nativeTaskRunId === runId ? routed : undefined;
+      };
+      try {
+        const accepted = await ipc.interruptSession(nativeRunId);
+        const currentKey = ownerKey();
+        if (accepted || !currentKey) return;
+        if (launch && !launch.ready) {
+          launch.retryInterrupt = true;
+        } else if (launch?.ready && launch.runId !== nativeRunId) {
+          // Only a remapped registration needs another address. Retrying the
+          // same registered ID after false cannot discover a different run.
+          interruptsInFlight.delete(nativeRunId);
+          await killByKey(currentKey);
+        } else {
+          // False confirms no live registered run; no terminal event is owed.
+          settleStopped(currentKey);
+          patchSession(set, currentKey, { settledRunIds: rememberSettledRun(get().bySession[currentKey], nativeRunId) });
+          runRouting.delete(nativeRunId);
+          untrackRun(nativeRunId);
+          dropRunUsage(nativeRunId);
+        }
+      } catch (error) {
+        const currentKey = ownerKey();
+        if (currentKey) patchSession(set, currentKey, { error: i18n.t("chat.interruptFailed", { error: errorText(error) }) });
+      } finally {
+        if (interruptsInFlight.get(nativeRunId) === request) interruptsInFlight.delete(nativeRunId);
+      }
+      return;
+    }
     const deadRunIds = [...runRouting].filter(([, routed]) => routed === key).map(([runId]) => runId);
     // Settle locally FIRST: the killed run's done event can arrive while
     // the kill IPCs below are still in flight, and onDone drains the queue

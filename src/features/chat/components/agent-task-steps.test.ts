@@ -520,3 +520,31 @@ describe("subagent counting", () => {
     expect(getNativeStepSilence(steps[3], t0 + 30 * 60_000).stalled).toBe(false);
   });
 });
+
+describe("isSubagentToolLabel strict matching", () => {
+  it("excludes shell commands mentioning subagent/workflow and management tools", async () => {
+    const { isSubagentToolLabel } = await import("./agent-task-steps");
+
+    expect(
+      isSubagentToolLabel(
+        "\"C:\\Program Files\\PowerShell\\7\\pwsh.exe\" -Command \"python 'C:\\Projects\\sample-app\\scripts\\subagent_check.py'\"",
+      ),
+    ).toBe(false);
+    expect(isSubagentToolLabel("python C:/work/workflow_runner.py")).toBe(false);
+    expect(isSubagentToolLabel("grep subagent src/features")).toBe(false);
+    expect(isSubagentToolLabel("rg --type ts workflow")).toBe(false);
+    expect(isSubagentToolLabel("manage_subagents")).toBe(false);
+    expect(isSubagentToolLabel("mcp__ccgui__manage_subagents")).toBe(false);
+    expect(isSubagentToolLabel("list_workflows")).toBe(false);
+    expect(isSubagentToolLabel("kill_subagent")).toBe(false);
+    expect(isSubagentToolLabel("get_subagent_status")).toBe(false);
+
+    expect(isSubagentToolLabel("task · Explore codebase")).toBe(true);
+    expect(isSubagentToolLabel("Agent · Review diff")).toBe(true);
+    expect(isSubagentToolLabel("run_workflow")).toBe(true);
+    expect(isSubagentToolLabel("mcp__subagents__invoke_subagent")).toBe(true);
+    expect(isSubagentToolLabel("Subagent 1")).toBe(true);
+    expect(isSubagentToolLabel("Agent Swarm")).toBe(true);
+    expect(isSubagentToolLabel("Spawn Subagent · worker")).toBe(true);
+  });
+});

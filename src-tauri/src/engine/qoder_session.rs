@@ -326,6 +326,30 @@ fn extract_tool_content_text(update: &Value) -> String {
     extract_content_text(update.get("output"))
 }
 
+fn tool_failure_message(update: &Value) -> String {
+    let detail = extract_tool_content_text(update).trim().to_string();
+    if detail.is_empty() {
+        "Tool execution failed without error details.".to_string()
+    } else {
+        detail
+    }
+}
+
+/// A terminal ACP status is authoritative even when rawOutput is null, empty,
+/// or contains partial output. Keep that output without losing the failure bit.
+pub(crate) fn tool_completion_result(output: Option<Value>, error: Option<String>) -> Value {
+    match error {
+        None => output.unwrap_or(Value::Null),
+        Some(message) => {
+            let mut result = json!({"text": message, "isError": true});
+            if let Some(output) = output.filter(|value| !value.is_null()) {
+                result["output"] = output;
+            }
+            result
+        }
+    }
+}
+
 /// qodercli prefixes model-level failures it could not map to an RPC error
 /// ("[Error] Network attempt failed") into the text stream; the driver
 /// holds such chunks back and joins them into the terminal error message
@@ -377,9 +401,7 @@ pub(crate) fn map_session_update(update: &Value) -> QoderSessionUpdate {
                     .cloned()
                     .or_else(|| update.get("output").cloned())
                     .or_else(|| update.get("content").cloned());
-                let error = (status == "failed")
-                    .then(|| extract_tool_content_text(update).trim().to_string())
-                    .filter(|value| !value.is_empty());
+                let error = (status == "failed").then(|| tool_failure_message(update));
                 return QoderSessionUpdate::ToolCompleted {
                     tool_id,
                     tool_name: Some(tool_name),
@@ -409,9 +431,7 @@ pub(crate) fn map_session_update(update: &Value) -> QoderSessionUpdate {
                 .cloned()
                 .or_else(|| update.get("output").cloned())
                 .or_else(|| update.get("content").cloned());
-            let error = (status == "failed")
-                .then(|| extract_tool_content_text(update).trim().to_string())
-                .filter(|value| !value.is_empty());
+            let error = (status == "failed").then(|| tool_failure_message(update));
             QoderSessionUpdate::ToolCompleted {
                 tool_id,
                 tool_name: extract_tool_name(update),
@@ -1160,11 +1180,7 @@ fn handle_session_update(
             let name = tool_name
                 .or_else(|| view.tool_names.get(&tool_id).cloned())
                 .unwrap_or_else(|| "tool".to_string());
-            let result = match (output, error) {
-                (Some(output), _) => output,
-                (None, Some(error)) => json!({ "text": error, "isError": true }),
-                (None, None) => Value::Null,
-            };
+            let result = tool_completion_result(output, error);
             core.dispatch_event(state, super::tool_result_patch(name, Some(&result)));
         }
         QoderSessionUpdate::Ignore => {}
@@ -1415,6 +1431,47 @@ mod tests {
                 text: "wrapped".to_string()
             }
         );
+    }
+
+    #[test]
+    fn terminal_tool_snapshots_preserve_failure_without_output() {
+        for kind in ["tool_call", "tool_call_update"] {
+            for output in [None, Some(Value::Null), Some(json!("  "))] {
+                let mut update = json!({"sessionUpdate":kind,"toolCallId":"workflow-1",
+                    "name":"run_workflow","title":"Run run_workflow","status":"failed"});
+                if let Some(output) = output {
+                    update["rawOutput"] = output;
+                }
+                let QoderSessionUpdate::ToolCompleted { error, .. } = map_session_update(&update) else {
+                    panic!("terminal tool must be completed");
+                };
+                assert_eq!(error.as_deref(), Some("Tool execution failed without error details."));
+                update["status"] = json!("completed");
+                let QoderSessionUpdate::ToolCompleted { error, .. } = map_session_update(&update) else {
+                    panic!("terminal tool must be completed");
+                };
+                assert_eq!(error, None);
+                update["status"] = json!("failed");
+                update["rawOutput"] = json!("specific workflow error");
+                let QoderSessionUpdate::ToolCompleted { error, .. } = map_session_update(&update) else {
+                    panic!("terminal tool must be completed");
+                };
+                assert_eq!(error.as_deref(), Some("specific workflow error"));
+            }
+        }
+    }
+
+    #[test]
+    fn tool_failure_reaches_the_ui_with_null_and_partial_output() {
+        for output in [None, Some(Value::Null), Some(json!("partial output")), Some(json!({"items":[1]}))] {
+            let result = tool_completion_result(output.clone(), Some("failed".into()));
+            assert_eq!(result["isError"], true);
+            assert_eq!(result["text"], "failed");
+            if let Some(value) = output.as_ref().filter(|value| !value.is_null()) {
+                assert_eq!(&result["output"], value);
+            }
+            assert_eq!(tool_completion_result(output.clone(), None), output.unwrap_or(Value::Null));
+        }
     }
 
     #[test]

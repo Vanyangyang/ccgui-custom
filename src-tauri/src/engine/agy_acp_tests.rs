@@ -20,6 +20,12 @@ use crate::event_sink::{Emit, EventSink};
 
 struct CollectingEmitter(StdMutex<Vec<Value>>);
 
+#[path = "agy_acp_cancel_tests.rs"]
+mod cancel_tests;
+
+#[path = "agy_acp_live_workflow_tests.rs"]
+mod live_workflow_tests;
+
 impl Emit for CollectingEmitter {
     fn emit_json(&self, name: &str, raw_json: &str) {
         if name == crate::event_sink::ENGINE_EVENT_NAME {
@@ -469,6 +475,10 @@ rl.on('line', async (line) => {
       process.exit(1);
     }
     if (text === 'HANG_FOR_CANCEL') {
+      if (behavior.cancelChild) {
+        const beat = path.join(fixtureRoot, 'descendant-heartbeat');
+        require('node:child_process').spawn(process.execPath, ['-e', `require('fs').writeFileSync(${JSON.stringify(beat + '.pid')},String(process.pid));setInterval(()=>require('fs').appendFileSync(${JSON.stringify(beat)},'.'),20)`], {stdio:'ignore',windowsHide:true});
+      }
       pendingPromptId = msg.id;
       send({
         jsonrpc: '2.0',
@@ -1278,7 +1288,7 @@ fn auth_overrides_cannot_be_identified_by_the_shared_native_keyring() {
 }
 
 #[tokio::test]
-async fn permission_modes_cancel_keep_daemon_warm_and_crash_respawns() {
+async fn permission_modes_cancel_retires_daemon_and_crash_respawns() {
     let Some(fixture) = FakeAcpFixture::new() else {
         return;
     };
@@ -1335,7 +1345,7 @@ async fn permission_modes_cancel_keep_daemon_warm_and_crash_respawns() {
     assert!(text_b.contains("PERM_CHOICE=allow_once"), "{text_b}");
     assert!(!ev_b.iter().any(|e| e["kind"] == "permission_denied"));
 
-    // 3. Cancel mid-stream keeps the same warm daemon alive!
+    // 3. Cancel retires this worker even when the CLI acknowledges the prompt.
     let mut req_cancel = base_req(&ws, Some("auto"));
     req_cancel.prompt = "HANG_FOR_CANCEL".into();
     let built_cancel = engine.build_command(&req_cancel, &bin).unwrap();
@@ -1361,8 +1371,9 @@ async fn permission_modes_cancel_keep_daemon_warm_and_crash_respawns() {
     assert_eq!(
         fixture.spawn_pids().len(),
         1,
-        "cancel should preserve warm daemon"
+        "cancel must not start a replacement before the next turn"
     );
+    assert!(service.inner.lock().unwrap().idle.is_empty(), "cancelled workers must leave the pool");
 
     // 4. Simulated crash triggers clean error and auto-respawns on next turn!
     let mut req_crash = base_req(&ws, Some("auto"));
@@ -1407,8 +1418,8 @@ async fn permission_modes_cancel_keep_daemon_warm_and_crash_respawns() {
         .any(|e| e["kind"] == "done"));
     assert_eq!(
         fixture.spawn_pids().len(),
-        2,
-        "expected fresh daemon spawn after crash"
+        3,
+        "expected fresh daemon spawns after cancellation and crash"
     );
 
     service.kill_spawned();
@@ -1434,6 +1445,7 @@ impl BgAndQuestionFixture {
 import fs from 'fs';
 import path from 'path';
 import readline from 'readline';
+import {spawn} from 'child_process';
 
 const appDir = process.env.ANTIGRAVITY_APP_DATA_DIR;
 const cancelLog = process.env.FAKE_CANCEL_LOG;
@@ -1583,6 +1595,8 @@ rl.on('line', (line) => {
       return;
     }
     if (text === 'BG_STOP') {
+      const beat = path.join(path.dirname(cancelLog), 'descendant-heartbeat');
+      spawn(process.execPath, ['-e', `require('fs').writeFileSync(${JSON.stringify(beat + '.pid')},String(process.pid));setInterval(()=>require('fs').appendFileSync(${JSON.stringify(beat)},'.'),20)`], {stdio:'ignore',windowsHide:true});
       send({
         jsonrpc: '2.0',
         method: 'session/update',
@@ -1919,9 +1933,11 @@ async fn exercise_background_and_questions() {
     let (core_s, _reg_s, emit_s, killed_s) = make_turn_core(&format!("run-bg-stop-{remote}"), 4_100_000_003);
     let stop_flag = Arc::clone(&killed_s);
     let stop_events = Arc::clone(&emit_s);
+    let stop_beat = fixture.root.join("descendant-heartbeat");
     tokio::spawn(async move {
         for _ in 0..200 {
-            if stop_events.0.lock().unwrap().iter().any(|e| e["kind"] == "activity" && e["data"]["state"] == "waiting") {
+            if std::fs::metadata(&stop_beat).is_ok_and(|m| m.len() > 0)
+                && stop_events.0.lock().unwrap().iter().any(|e| e["kind"] == "activity" && e["data"]["state"] == "waiting") {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1944,6 +1960,11 @@ async fn exercise_background_and_questions() {
     let cancel_json: Value =
         serde_json::from_str(&std::fs::read_to_string(&fixture.cancel_log).unwrap()).unwrap();
     assert_eq!(cancel_json["killBackgroundTasks"], true);
+    let beat = fixture.root.join("descendant-heartbeat");
+    let stopped_beat = std::fs::read(&beat).expect("background descendant must actually start");
+    assert!(!stopped_beat.is_empty());
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(std::fs::read(&beat).unwrap(), stopped_beat, "background descendant survived terminal stop (remote={remote})");
 
     // 3b. Global server-restart SYSTEM_MESSAGE settles waiting background task and captures ACP late toolSummary.
     let mut req_restart = base_req(&ws, Some("auto"));
@@ -2788,6 +2809,194 @@ async fn background_tracker_records_started_at_and_advances_last_progress_on_log
     core.sink.flush();
     assert_eq!(emitter.0.lock().unwrap().len(), emitted_after_growth);
     assert_eq!(state.tasks[0].last_progress_at, Some(updated_progress_at));
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn background_tracker_handles_schedule_normal_reverse_and_fallback_cleanly() {
+    use std::io::Write;
+
+    let root = std::env::temp_dir().join(format!("agy-sched-test-{}", uuid::Uuid::new_v4()));
+    let sid = "sched-session";
+    let logs = root.join("brain").join(sid).join(".system_generated/logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    let transcript = logs.join("transcript.jsonl");
+    std::fs::write(&transcript, "").unwrap();
+
+    let mut req = base_req(&root, Some("auto"));
+    req.session_id = Some(sid.into());
+    let mut built = AgyEngine::new().build_command(&req, "fake-agy").unwrap();
+    built.command.env("ANTIGRAVITY_APP_DATA_DIR", &root);
+    let launch = extract_launch("sched-tracker", &req, "fake-agy", built).unwrap();
+    let mut tracker = super::support::AgyAcpTaskTracker::new(&launch.profile, sid, Some(0));
+    let (core, _, _, _) = make_turn_core("sched-tracker", 4_100_000_031);
+    let mut state = crate::engine::TurnState::new(Some(sid.into()));
+
+    {
+        let mut f = std::fs::OpenOptions::new().append(true).open(&transcript).unwrap();
+        // Normal order: PLANNER_RESPONSE before GENERIC(RUNNING) without Task logs footer.
+        writeln!(
+            f,
+            "{}",
+            json!({
+                "type": "PLANNER_RESPONSE",
+                "tool_calls": [{
+                    "id": "call-sched-1",
+                    "name": "schedule",
+                    "args": { "DurationSeconds": 150, "Prompt": "等待构建并汇报结果" }
+                }]
+            })
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "{}",
+            json!({
+                "type": "GENERIC",
+                "status": "RUNNING",
+                "content": format!("Tool is running as a background task with task id: {sid}/task-s1\nTask Description: Timer: 2m 30s, condition: never\nPrompt: 等待构建并汇报结果")
+            })
+        )
+        .unwrap();
+
+        // Reverse order: GENERIC(RUNNING) arrives without Prompt first, then late PLANNER_RESPONSE upgrades it.
+        writeln!(
+            f,
+            "{}",
+            json!({
+                "type": "GENERIC",
+                "status": "RUNNING",
+                "content": format!("Tool is running as a background task with task id: {sid}/task-s2\nTask Description: Timer: 2m 30s, condition: never")
+            })
+        )
+        .unwrap();
+    }
+    tracker.poll(&core, &mut state);
+
+    assert_eq!(state.tasks.len(), 2);
+    assert_eq!(state.tasks[0].kind, "monitor");
+    assert_eq!(state.tasks[0].description, "等待构建并汇报结果");
+    assert_eq!(state.tasks[1].kind, "monitor");
+    assert_eq!(state.tasks[1].description, "Timer: 2m 30s");
+
+    {
+        let mut f = std::fs::OpenOptions::new().append(true).open(&transcript).unwrap();
+        writeln!(
+            f,
+            "{}",
+            json!({
+                "type": "PLANNER_RESPONSE",
+                "tool_calls": [{
+                    "name": "schedule",
+                    "args": { "DurationSeconds": 150, "Prompt": "复检定时结果" }
+                }]
+            })
+        )
+        .unwrap();
+        // Pure fallback with Prompt and Cron list fallback without Prompt.
+        writeln!(
+            f,
+            "{}",
+            json!({
+                "type": "GENERIC",
+                "status": "RUNNING",
+                "content": format!("Tool is running as a background task with task id: {sid}/task-s3\nTask Description: Timer: 1m, condition: never\nPrompt: 等待发布窗口\nTask logs are available at: /logs")
+            })
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "{}",
+            json!({
+                "type": "GENERIC",
+                "status": "RUNNING",
+                "content": format!("Tool is running as a background task with task id: {sid}/task-s4\nTask Description: Cron: 0,30 * * * *, max_iterations: 2")
+            })
+        )
+        .unwrap();
+    }
+    tracker.poll(&core, &mut state);
+
+    assert_eq!(state.tasks[1].description, "复检定时结果");
+    assert_eq!(state.tasks[2].kind, "monitor");
+    assert_eq!(state.tasks[2].description, "等待发布窗口");
+    assert_eq!(state.tasks[3].kind, "monitor");
+    assert_eq!(state.tasks[3].description, "Cron: 0,30 * * * *");
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn background_tracker_unwraps_escaped_pwsh_wrapper_and_preserves_python_dash_c() {
+    use std::io::Write;
+
+    let root = std::env::temp_dir().join(format!("agy-unwrap-test-{}", uuid::Uuid::new_v4()));
+    let sid = "unwrap-session";
+    let logs = root.join("brain").join(sid).join(".system_generated/logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    let transcript = logs.join("transcript.jsonl");
+    std::fs::write(&transcript, "").unwrap();
+
+    let mut req = base_req(&root, Some("auto"));
+    req.session_id = Some(sid.into());
+    let mut built = AgyEngine::new().build_command(&req, "fake-agy").unwrap();
+    built.command.env("ANTIGRAVITY_APP_DATA_DIR", &root);
+    let launch = extract_launch("unwrap-tracker", &req, "fake-agy", built).unwrap();
+    let mut tracker = super::support::AgyAcpTaskTracker::new(&launch.profile, sid, Some(0));
+    let (core, _, _, _) = make_turn_core("unwrap-tracker", 4_100_000_032);
+    let mut state = crate::engine::TurnState::new(Some(sid.into()));
+
+    {
+        let mut f = std::fs::OpenOptions::new().append(true).open(&transcript).unwrap();
+        writeln!(
+            f,
+            "{}",
+            json!({
+                "type": "GENERIC",
+                "status": "RUNNING",
+                "content": format!("Tool is running as a background task with task id: {sid}/task-u1\nTask Description: \\\"C:\\\\Program Files\\\\PowerShell\\\\7\\\\pwsh.exe\\\" -NoProfile -Command \\\"python 'C:\\\\Projects\\\\sample-app\\\\scripts\\\\verify.py' --fast\\\"")
+            })
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "{}",
+            json!({
+                "type": "GENERIC",
+                "status": "RUNNING",
+                "content": format!("Tool is running as a background task with task id: {sid}/task-u2\nTask Description: \"C:\\\\Program Files\\\\PowerShell\\\\7\\\\pwsh.exe\" -Command \"python 'C:\\\\Projects\\\\sample-app\\\\tests\\\\subagent_check.py' --fast\"")
+            })
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "{}",
+            json!({
+                "type": "GENERIC",
+                "status": "RUNNING",
+                "content": format!("Tool is running as a background task with task id: {sid}/task-u3\nTask Description: cmd /c \"bash -lc \\\"cargo test --manifest-path C:\\\\Projects\\\\sample-app\\\\src-tauri\\\\Cargo.toml --lib agy_acp\\\"\"")
+            })
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "{}",
+            json!({
+                "type": "GENERIC",
+                "status": "RUNNING",
+                "content": format!("Tool is running as a background task with task id: {sid}/task-u4\nTask Description: python -c \"import sys; print('long diagnostic output for regression test')\"")
+            })
+        )
+        .unwrap();
+    }
+    tracker.poll(&core, &mut state);
+
+    assert_eq!(state.tasks.len(), 4);
+    assert_eq!(state.tasks[0].description, "python verify.py --fast");
+    assert_eq!(state.tasks[1].description, "python subagent_check.py --fast");
+    assert_eq!(state.tasks[2].description, "cargo test --lib");
+    assert_eq!(state.tasks[3].description, "python -c");
 
     std::fs::remove_dir_all(root).unwrap();
 }

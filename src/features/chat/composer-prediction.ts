@@ -5,18 +5,23 @@
  * After an assistant reply settles without interruption or pending interactive
  * cards, the recent conversation turns are sent to `ipc.predictNextPrompt`.
  * When the suggestion arrives and the session is still idle, it is stored per
- * `sessionKey` and rendered as ghost text in an empty composer (accepted via
- * `Tab`, dismissed via `Escape`, never auto-submitted).
+ * `sessionKey`, retained across restarts, and rendered as ghost text in an
+ * empty composer (accepted via `Tab`, dismissed via `Escape`, never auto-submitted).
  */
 
 import { ipc, type Message, type PredictionTurn } from "@/lib/ipc";
-import { readStoredBool, writeStored } from "@/lib/storage";
+import { readStoredBool, readStoredJson, writeStored } from "@/lib/storage";
 
 const ENABLED_KEY = "ccgui-next.composerPredictionEnabled";
+const PREDICTIONS_KEY = "ccgui-next.composerPredictions:v1";
 const CHANGED_EVENT = "ccgui-next:composer-prediction-changed";
+const MAX_PREDICTIONS = 200;
+// The native predictor returns at most 120 Unicode characters (240 UTF-16 units).
+const MAX_PREDICTION_LENGTH = 240;
 
 export interface ComposerPredictionSnapshot { readonly id: number; readonly text: string }
 const predictions = new Map<string, ComposerPredictionSnapshot>();
+let predictionsLoaded = false;
 let nextPredictionId = 0;
 let nextRequestToken = 0;
 const requestTokens = new Map<string, number>();
@@ -24,7 +29,36 @@ const inFlightTurnFingerprints = new Map<string, string>();
 const settledTurnFingerprints = new Map<string, string>();
 const idleChecks = new Map<string, () => boolean>();
 
+function loadPredictions(): void {
+  if (predictionsLoaded) return;
+  predictionsLoaded = true;
+  if (!isComposerPredictionEnabled()) return;
+  const stored = readStoredJson(PREDICTIONS_KEY, (value) => Array.isArray(value) ? value : null);
+  for (const entry of stored?.slice(-MAX_PREDICTIONS) ?? []) {
+    if (!Array.isArray(entry) || entry.length !== 2) continue;
+    const [key, text] = entry;
+    if (typeof key !== "string" || !key || key.length > 4096 ||
+        typeof text !== "string" || !text.trim() ||
+        text.length > MAX_PREDICTION_LENGTH || /[\r\n]/.test(text)) continue;
+    // Generation identities belong to this process; never restore old ids or
+    // in-flight requests. Only the ready suggestion is durable.
+    predictions.set(key, predictionSnapshot(text.trim()));
+  }
+}
+
+function persistPredictions(): void {
+  while (predictions.size > MAX_PREDICTIONS) {
+    predictions.delete(predictions.keys().next().value!);
+  }
+  writeStored(PREDICTIONS_KEY, JSON.stringify(
+    Array.from(predictions, ([key, prediction]) => [key, prediction.text]),
+  ));
+}
+
 function notifyChanged(): void {
+  // Save synchronously with mutations, including dismiss/accept, so closing
+  // immediately afterwards cannot revive a consumed suggestion on restart.
+  if (predictionsLoaded) persistPredictions();
   if (typeof window !== "undefined") {
     window.dispatchEvent(new CustomEvent(CHANGED_EVENT));
   }
@@ -44,6 +78,7 @@ export function isComposerPredictionEnabled(): boolean {
 export function setComposerPredictionEnabled(enabled: boolean): void {
   writeStored(ENABLED_KEY, enabled ? "1" : "0");
   if (!enabled) {
+    predictionsLoaded = true;
     predictions.clear();
     requestTokens.clear();
     inFlightTurnFingerprints.clear();
@@ -67,6 +102,7 @@ export function getComposerPrediction(sessionKey?: string): string | null {
  * prediction with the same text after a turn or session transition. */
 export function getComposerPredictionSnapshot(sessionKey?: string): ComposerPredictionSnapshot | null {
   if (!sessionKey || !isComposerPredictionEnabled()) return null;
+  loadPredictions();
   return predictions.get(sessionKey) ?? null;
 }
 
@@ -82,6 +118,7 @@ function newRequestToken(): number {
 
 export function setComposerPrediction(sessionKey: string, suggestion: string | null): void {
   if (!sessionKey) return;
+  loadPredictions();
   const clean = suggestion?.trim() ?? "";
   const prev = predictions.get(sessionKey)?.text ?? null;
   if (!clean) {
@@ -91,6 +128,7 @@ export function setComposerPrediction(sessionKey: string, suggestion: string | n
     return;
   }
   if (!isComposerPredictionEnabled() || prev === clean) return;
+  predictions.delete(sessionKey);
   predictions.set(sessionKey, predictionSnapshot(clean));
   notifyChanged();
 }
@@ -101,6 +139,7 @@ export function clearComposerPrediction(
   options?: { resetTurn?: boolean },
 ): void {
   if (!sessionKey) return;
+  loadPredictions();
   requestTokens.set(sessionKey, newRequestToken());
   inFlightTurnFingerprints.delete(sessionKey);
   idleChecks.delete(sessionKey);
@@ -114,6 +153,7 @@ export function clearComposerPrediction(
 
 export function migrateComposerPredictionSessionKey(fromKey: string, toKey: string): void {
   if (!fromKey || !toKey || fromKey === toKey) return;
+  loadPredictions();
   requestTokens.set(fromKey, newRequestToken());
   inFlightTurnFingerprints.delete(fromKey);
   idleChecks.delete(fromKey);
@@ -135,6 +175,7 @@ export function migrateComposerPredictionSessionKey(fromKey: string, toKey: stri
 }
 
 export function clearAllComposerPredictions(): void {
+  predictionsLoaded = true;
   predictions.clear();
   requestTokens.clear();
   inFlightTurnFingerprints.clear();
@@ -220,8 +261,7 @@ export function requestComposerPrediction(
       settledTurnFingerprints.set(sessionKey, fingerprint);
       const clean = typeof suggestion === "string" ? suggestion.trim() : "";
       if (!clean) return;
-      predictions.set(sessionKey, predictionSnapshot(clean));
-      notifyChanged();
+      setComposerPrediction(sessionKey, clean);
     })
     .catch(() => {
       if (requestTokens.get(sessionKey) === token) {

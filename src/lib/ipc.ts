@@ -129,7 +129,7 @@ export interface SessionMeta {
   /** Sidebar-only grouping override; workspacePath remains the execution cwd. */
   sidebarWorkspacePath?: string | null;
   promptCache?: PromptCacheWindow | null;
-  auxiliaryKind?: "cursor_cce" | "cursor_do" | null;
+  auxiliaryKind?: "cursor_cce" | "cursor_do" | "agy_workflow" | "agy_probe" | null;
   engine: string;
   sessionId: string;
   workspacePath: string;
@@ -737,6 +737,8 @@ export interface AppSettings {
   autoTitleModel?: string | null;
   /** Independent naming effort; null/absent = legacy "low". */
   autoTitleEffort?: string | null;
+  /** Independent Codex model for composer prediction; null/absent follows Codex config. */
+  composerPredictionModel?: string | null;
   /** Beta entry points (设置 → 其他 → 内测功能): feature id -> enabled.
    *  Missing/false = the entry stays hidden (default off). */
   betaFeatures?: Record<string, boolean> | null;
@@ -749,6 +751,8 @@ export interface AppSettings {
 
   /** Auto-adopt-or-spawn the DSH host on app start (default true). */
   dshAutoStart?: boolean | null;
+  /** Allow agents to start independent root chats via host `session_create` (default true). */
+  sessionCreateEnabled?: boolean | null;
   /** Global network proxy switch; spawned children inherit the proxy env. */
   systemProxyEnabled: boolean;
   /** Proxy URL (http/https/socks5); null = unset. */

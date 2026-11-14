@@ -244,6 +244,12 @@ export function HandoffOverlayCard({
           </div>
         </header>
 
+        {entry.mode === "grok" && entry.grokStatus === "error" && entry.grokError && (
+          <p role="status" data-testid="handoff-compression-error" className="whitespace-pre-wrap break-words text-caption-1-regular text-text-warning-primary">
+            {entry.grokError}
+          </p>
+        )}
+
         <HandoffChildrenControl workspacePath={workspacePath} entry={entry} />
 
         <HandoffWorkspaceControl workspacePath={workspacePath} entry={entry} />

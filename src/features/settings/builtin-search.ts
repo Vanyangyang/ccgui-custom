@@ -101,6 +101,13 @@ const generalEntries: SettingsSearchEntry[] = [
   },
   {
     page: "general",
+    anchor: "sessionCreate",
+    labelKey: "settings.sessionCreate",
+    sectionKey: "settings.behavior",
+    keywords: ["session_create", "agent", "chat", "智能体", "新建会话", "独立会话"],
+  },
+  {
+    page: "general",
     anchor: "autoTitle",
     labelKey: "settings.autoTitle",
     sectionKey: "settings.behavior",
@@ -126,6 +133,13 @@ const generalEntries: SettingsSearchEntry[] = [
     labelKey: "settings.composerPrediction",
     sectionKey: "settings.behavior",
     keywords: ["prediction", "suggest", "ghost", "codex", "gpt", "tab", "预测", "补全", "输入框"],
+  },
+  {
+    page: "general",
+    anchor: "composerPredictionModel",
+    labelKey: "settings.composerPredictionModel",
+    sectionKey: "settings.behavior",
+    keywords: ["prediction", "model", "codex", "gpt", "预测", "模型", "输入框"],
   },
   {
     page: "general",

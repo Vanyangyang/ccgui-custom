@@ -40,6 +40,40 @@ describe("handoff timeout feedback", () => {
     expect(formatHandoffError(new Error("HTTP 503 unavailable"))).toBe("HTTP 503 unavailable");
     expect(formatHandoffError("other task timed out")).toBe("other task timed out");
   });
+  it.each([
+    "full handoff source changed while reading; retry after the session stops writing",
+    "full handoff source kept changing during the bounded history read",
+    "full handoff source identity changed",
+  ])("does not infer live activity from a storage consistency error: %s", async raw => {
+    await i18n.changeLanguage("zh");
+    const message = formatHandoffError(raw);
+    expect(message).toContain("不代表旧会话仍在运行");
+    expect(message).toContain("所选子对话");
+    expect(message.endsWith(raw)).toBe(true);
+    expect(formatHandoffError(message)).toBe(message);
+  });
+  it("distinguishes a proven visible-history change and retains the affected child identity", async () => {
+    await i18n.changeLanguage("en");
+    const raw = "selected handoff child agy/child-fixture: full handoff visible history changed during compression";
+    const message = formatHandoffError(raw);
+    expect(message).toContain("Visible history changed during compression");
+    expect(message).toContain("main session or selected child");
+    expect(message.endsWith(raw)).toBe(true);
+    expect(formatHandoffError(message)).toBe(message);
+  });
+  it.each(["oauth_token_mismatch", "oauth_account_changed"])("explains the specific authentication failure %s without claiming other segments were not sent", async stage => {
+    const raw = `Full handoff segment 1/9: codex handoff provider/model unavailable [stage=${stage}; diagnostic_id=auth-fixture]`;
+    await i18n.changeLanguage("zh");
+    const chinese = formatHandoffError(raw);
+    expect(chinese).toContain("该分段尚未发送给模型");
+    expect(chinese).toContain("原始草稿已保留");
+    expect(chinese.endsWith(raw)).toBe(true);
+    expect(formatHandoffError(chinese)).toBe(chinese);
+    await i18n.changeLanguage("en");
+    expect(formatHandoffError(chinese)).toBe(chinese);
+    expect(formatHandoffError(raw)).toContain("segment");
+    expect(formatHandoffError(raw)).not.toContain("No compression model was called");
+  });
   it("explains the old intermediate rejection without discarding its diagnostic", async () => {
     await i18n.changeLanguage("zh");
     const raw = "full handoff intermediate summary exceeds 4000 UTF-16 units";

@@ -901,11 +901,7 @@ fn handle_session_update(
             let name = tool_name
                 .or_else(|| view.tool_names.get(&tool_id).cloned())
                 .unwrap_or_else(|| "tool".to_string());
-            let result = match (output, error) {
-                (Some(output), _) => output,
-                (None, Some(error)) => json!({ "text": error, "isError": true }),
-                (None, None) => Value::Null,
-            };
+            let result = crate::engine::qoder_session::tool_completion_result(output, error);
             core.dispatch_event(state, crate::engine::tool_result_patch(name, Some(&result)));
         }
         QoderSessionUpdate::Ignore => {}

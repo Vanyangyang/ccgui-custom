@@ -75,19 +75,50 @@ export function deriveNativeTaskSteps(tasks: NativeTask[], runId: string): Agent
  * tool label (engine-dependent: Claude "Task" / "Agent" / "Workflow",
  * pi-family "task · intent", Codex/Grok spawn_* names, Kimi agent swarm).
  */
+const SUBAGENT_TOOL_NAMES = new Set([
+  "task",
+  "agent",
+  "subagent",
+  "spawn",
+  "spawn_agent",
+  "spawn_subagent",
+  "workflow",
+  "run_workflow",
+  "pipeline",
+  "dispatch",
+  "dispatch_agent",
+  "delegate",
+  "invoke_subagent",
+  "agent_swarm",
+]);
+
+const SUBAGENT_MANAGEMENT_PREFIX_RE = /^(?:manage|list|kill|stop|get|check|cancel)_/;
+
+const SUBAGENT_WHOLE_TOKEN_RE = /(?:^|_)(?:subagents?|workflows?)(?:$|_)/;
+
+const SUBAGENT_SHORT_PHRASE_RE =
+  /^(?:subagent\s*#?\d+|spawn\s+(?:a\s+)?subagents?|spawn\s+(?:an?\s+)?agents?|agent\s+swarm|run\s+workflow|dispatch\s+(?:parallel\s+)?(?:agents?|subagents?))$/i;
+
 export function isSubagentToolLabel(text: string): boolean {
   if (!text) return false;
   // pi-family labels are "name · intent" — match on the tool name head.
   const head = text.split("·")[0].trim().toLowerCase();
-  const first = head.split(/[\s/\\]+/)[0].replace(/-/g, "_");
-  if (first === "task" || first === "agent" || first === "subagent") return true;
-  if (first === "spawn" || first === "spawn_agent" || first === "spawn_subagent") return true;
-  if (first === "workflow" || first === "run_workflow" || first === "pipeline") return true;
-  if (first === "dispatch" || first === "dispatch_agent" || first === "delegate") return true;
-  if (/^subagent\s*\d+/.test(head)) return true;
-  if (head.includes("spawn agent") || head.includes("spawn subagent")) return true;
-  if (head.includes("agent swarm") || head.includes("agent_swarm")) return true;
-  if (head.includes("workflow") || head.includes("subagent")) return true;
+  if (!head) return false;
+  if (/["'`/\\;|&<$]/.test(head)) return false;
+  if (/^[a-z]:/.test(head)) return false;
+  if (/(?:^|\s)-/.test(head)) return false;
+
+  if (SUBAGENT_SHORT_PHRASE_RE.test(head)) return true;
+
+  if (!/^[a-z0-9_:-]+$/.test(head)) return false;
+  const tail = head
+    .replace(/^mcp__(?:[^_]|_(?!_))+__/, "")
+    .split(":")
+    .pop()!
+    .replace(/-/g, "_");
+  if (!tail || SUBAGENT_MANAGEMENT_PREFIX_RE.test(tail)) return false;
+  if (SUBAGENT_TOOL_NAMES.has(tail)) return true;
+  if (SUBAGENT_WHOLE_TOKEN_RE.test(tail)) return true;
   return false;
 }
 

@@ -539,7 +539,9 @@ function handoffSummarySection(currentDraft: string) {
   const headerIdx = findHandoffHeaderIndex(currentDraft);
   if (headerIdx === -1) return null;
   const afterHeader = currentDraft.slice(headerIdx);
-  const footerMatch = /\r?\n\r?\n接下来请继续(?:[：:]|(?=\r?\n|$))|\r?\n接下来请继续(?:[：:]|(?=\r?\n|$))/.exec(afterHeader);
+  // The next-task line is editable: deleting its colon must not disconnect the
+  // draft from retry, summary replacement, child selection or send cleanup.
+  const footerMatch = /(?:\r?\n){1,2}接下来请继续/.exec(afterHeader);
   if (!footerMatch || footerMatch.index <= 0) return null;
   const footerIdx = headerIdx + footerMatch.index;
 
@@ -797,7 +799,7 @@ export function resolveHandoffTargetDraftKey(
 
 export function isHandoffDraft(currentDraft: string, entry: PendingHandoffSession): boolean {
   return currentDraft.includes(`承接上一会话「${entry.sourceTitle}」（${entry.sourceEngine}/${entry.sourceSessionId.slice(0, 8)}）：`)
-    && /(?:^|\r?\n)接下来请继续(?:[：:]|(?=\r?\n|$))/.test(currentDraft);
+    && handoffSummarySection(currentDraft) !== null;
 }
 
 function applyHandoffModeDraft(
@@ -903,7 +905,22 @@ export const useHandoffStore = create<HandoffStoreState>((set, get) => {
     if (!entry || entry.id !== handoffId || entry.mode !== "grok" || entry.sending || entry.childrenStatus === "loading" || nativeFlights.has(sourceIdentity(entry))) return;
     const draftKey = resolveHandoffTargetDraftKey(workspacePath, entry.sourceEngine);
     const initialDraft = useChatStore.getState().drafts[draftKey] ?? "";
-    if (!isHandoffDraft(initialDraft, entry)) return;
+    if (!isHandoffDraft(initialDraft, entry)) {
+      set((s) => ({
+        byWorkspace: {
+          ...s.byWorkspace,
+          [workspacePath]: {
+            ...entry,
+            compressionRunning: false,
+            grokStatus: "error",
+            grokError: i18n.t("chat.handoffDraftStructureChanged"),
+            grokStartedAt: null,
+            grokProgress: null,
+          },
+        },
+      }));
+      return;
+    }
     const expectedChildren = handoffChildrenBlock(initialDraft, entry.children?.heading);
     // Only the untouched generated block can use the longer source excerpt.
     // Explicit re-distillation after an edit uses exactly the visible child text.

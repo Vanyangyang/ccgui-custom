@@ -1136,13 +1136,13 @@ export const RunStatusStrip = memo(function RunStatusStrip({
   );
   const nativeTasks = useChatStore((s) => sessionKey ? s.bySession[sessionKey]?.nativeTasks : undefined);
   const nativeRunId = useChatStore((s) => sessionKey ? s.bySession[sessionKey]?.nativeTaskRunId : undefined);
-  const native = supportsNativeTasks(engine) && nativeTasks !== undefined;
+  const native = supportsNativeTasks(engine) && (nativeTasks !== undefined || Boolean(nativeRunId));
   const allHistory = useMemo(
     () => (subagentHistory.length ? [...subagentHistory, ...messages] : messages),
     [subagentHistory, messages],
   );
   const steps = useMemo(
-    () => native ? deriveNativeTaskSteps(nativeTasks!, nativeRunId ?? "") : deriveAgentTaskSteps(allHistory, streaming, engine),
+    () => native ? deriveNativeTaskSteps(nativeTasks ?? [], nativeRunId ?? "") : deriveAgentTaskSteps(allHistory, streaming, engine),
     [allHistory, streaming, engine, native, nativeTasks, nativeRunId],
   );
   const hasRunningNativeTask = useMemo(

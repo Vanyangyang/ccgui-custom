@@ -31,6 +31,14 @@ When the user asks to organize existing saved chats and the host exposes the too
 
 This changes sidebar placement only. Managed children follow their root visually; original history, execution directory, model, permissions and task ownership remain unchanged. Do not report execution migration or transfer of control, restart old tasks, or rewrite transcripts to accomplish sidebar organization. Tools absent from an older running host require the supported update workflow before use.
 
+## Independent chats
+
+When the human explicitly asks to start a new, independent chat/task in a workspace (not a supervised child), call `session_create(workspace_path, engine, message, request_id, model?, effort?, title?)`. It starts an ordinary root chat in that registered local workspace: no parent relation, no deadline, and it is not listed by `task_list`. Use `task_spawn` instead when you need to supervise and collect the work. The message is all the new chat receives; it arrives wrapped as `[Message from CC GUI {...,"origin":"session_create"}]`.
+
+Calling `session_create` again with the same `request_id` and identical arguments creates nothing and returns the current `status` (`starting`, `running`, `idle`, `failed`, `unknown`), the session identity and, once idle, a bounded `resultPreview` of its latest reply. After an uncertain outcome, call again with the same `request_id`; never retry with a new one.
+
+The host enforces provenance natively: only human-origin root chats may create chats. A chat started by `session_create`, together with its managed task tree, cannot call `session_create` or `send_message` until the human sends a message in it (`SPAWN_ORIGIN_NOT_HUMAN`, `SPAWN_ORIGIN_RESTRICTED`); it reports in normal assistant output instead. Per-chat limits (`SPAWN_RATE_LIMITED`, `SPAWN_ACTIVE_LIMIT`), managed task chats (`SPAWN_CALLER_NOT_ROOT`) and the user's Settings switch (`SESSION_CREATE_DISABLED`) are refusals: report them, never work around them.
+
 ## Child tasks
 
 The host exposes `task_spawn`, `task_list`, `task_wait`, `task_send`, `task_renew`, and `task_stop` in ordinary conversations. No Leader mode is required. Create a new Claude Code, Codex, AGY or Cursor child with `task_spawn`; use the task tools to manage only your actual direct children. A directly launched CLI is not a managed child, and saved-chat activity does not establish its process status.

@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { HostChatReceipt, HostChatTarget } from "@ccgui/plugin-sdk";
 import { approveCrossSessionMessage, cancelCrossSessionMessage, createCrossSessionHandler, crossSessionParticipantKey, sendCrossSessionMessageNow, crossSessionRecordMatchesParticipant, guardClaudeProcess, isCrossSessionRecordUnread, startCrossSessionRuntime, useCrossSessionActivityStore, type CrossSessionCommunicationRecord, type CrossSessionRequest } from "./cross-session";
 import { createHostChatBridge, type HostChatFacade } from "@/features/plugins/runtime/chat-bridge";
+import * as sessionCreate from "./session-create";
 import { EMPTY_SESSION } from "./store/stream";
 import { sessionKey } from "./store/persistence";
 import type { ChatStore } from "./store/types";
@@ -651,6 +652,20 @@ describe("cross-session request subscription lifecycle", () => {
     expect(transport.invoke).not.toHaveBeenCalled();
     await vi.waitFor(() => expect(transport.invoke).toHaveBeenCalledWith("host_chat_ready", { ready: true }));
     dispose(); await vi.waitFor(() => expect(transport.invoke).toHaveBeenCalledWith("host_chat_ready", { ready: false })); expect(off).toHaveBeenCalledTimes(1);
+  });
+  it("synchronously disposes the session creation handler during runtime cleanup", () => {
+    const disposeSessionCreate = vi.fn();
+    const factory = vi.spyOn(sessionCreate, "createSessionCreateHandler").mockReturnValue(
+      Object.assign(vi.fn<ReturnType<typeof sessionCreate.createSessionCreateHandler>>(), { dispose: disposeSessionCreate }),
+    );
+    try {
+      const dispose = startCrossSessionRuntime();
+      expect(factory).toHaveBeenCalledTimes(1);
+      dispose();
+      expect(disposeSessionCreate).toHaveBeenCalledTimes(1);
+    } finally {
+      factory.mockRestore();
+    }
   });
   it("cleans up a subscription resolving after disposal without announcing ready", async () => {
     let resolve!: (off: () => void) => void; transport.listen.mockImplementationOnce(() => new Promise((r) => { resolve = r; }));

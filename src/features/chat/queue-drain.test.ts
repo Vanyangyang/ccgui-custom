@@ -184,7 +184,9 @@ describe("queued messages after a turn settles", () => {
     const engine = "omp";
     const tab = { engine, sessionId: "s-1", workspacePath: WS };
     const key = sessionKey(engine, tab.sessionId, WS);
-    const session = useChatStore.getState().bySession[KEY];
+    // OMP has no native task activity channel; do not carry the Claude-only
+    // native run identity from this suite's shared fixture into its timeline.
+    const session = { ...useChatStore.getState().bySession[KEY], nativeTaskRunId: undefined, nativeActivity: undefined };
     runRouting.clear();
     runRouting.set(runId, key);
     useChatStore.setState({

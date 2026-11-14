@@ -15,7 +15,7 @@ use std::sync::Arc;
 pub(super) static SCAN_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 /// Bump when title derivation changes so unchanged files still re-title.
-const TITLE_VERSION: &str = "15";
+const TITLE_VERSION: &str = "16";
 
 /// Titles matching these prefixes were derived before envelope stripping
 /// existed; one migration pass re-derives them even when files are unchanged.
@@ -820,7 +820,7 @@ pub(crate) mod tests {
 
     #[test]
     fn cursor_auxiliary_migration_reparses_unchanged_files_and_preserves_user_state() -> Result<(), String> {
-        for (old_version, kind) in [("8", "cursor_do"), ("9", "cursor_do"), ("14", "cursor_cce")] {
+        for (old_version, kind) in [("8", "cursor_do"), ("9", "cursor_do"), ("14", "cursor_cce"), ("15", "cursor_cce")] {
         let home = scratch_dir("cursor-auxiliary-migration");
         std::fs::create_dir_all(&home).unwrap();
         let path = home.join("session.jsonl");

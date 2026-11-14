@@ -629,6 +629,15 @@ function onSession(
     // events that beat this session event to the native key — spreading it
     // last would silently drop a queue the user filled mid-flight. cur keeps
     // only what arrived under the native key: usage tails and settle records.
+    const curTasks = cur?.nativeTasks;
+    const prevTasks = prev.nativeTasks;
+    const curSeq = cur?.nativeTaskSeq ?? -1;
+    const prevSeq = prev.nativeTaskSeq ?? -1;
+    const preferCurNative =
+      curTasks !== undefined &&
+      (prevTasks === undefined ||
+        curSeq > prevSeq ||
+        (curSeq === prevSeq && curTasks.length >= prevTasks.length));
     const bySession = {
       ...s.bySession,
       [newKey]: {
@@ -638,9 +647,9 @@ function onSession(
         draftLaunching: undefined,
         messages,
         usage: cur?.usage ?? prev.usage,
-        nativeTasks: cur?.nativeTasks ?? prev.nativeTasks,
-        nativeTaskRunId: cur?.nativeTaskRunId ?? prev.nativeTaskRunId,
-        nativeTaskSeq: cur?.nativeTaskSeq ?? prev.nativeTaskSeq,
+        nativeTasks: preferCurNative ? curTasks : (prevTasks ?? curTasks),
+        nativeTaskRunId: (preferCurNative ? cur?.nativeTaskRunId : prev.nativeTaskRunId) ?? cur?.nativeTaskRunId ?? prev.nativeTaskRunId,
+        nativeTaskSeq: (preferCurNative ? cur?.nativeTaskSeq : prev.nativeTaskSeq) ?? cur?.nativeTaskSeq ?? prev.nativeTaskSeq,
         nativeActivity: cur?.nativeActivity ?? prev.nativeActivity,
         turnUsage: cur?.turnUsage ?? prev.turnUsage,
         throughput: ownsPlaceholder && throughput?.runId !== event.runId ? startThroughput(event.runId) : throughput,

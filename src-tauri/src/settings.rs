@@ -184,6 +184,10 @@ pub struct AppSettings {
     /// Auto-start the DSH host at app launch; None = on (`!= Some(false)`).
     #[serde(default)]
     pub dsh_auto_start: Option<bool>,
+    /// Allow agents to start independent root chats with the host
+    /// `session_create` tool; None = on (`!= Some(false)`).
+    #[serde(default)]
+    pub session_create_enabled: Option<bool>,
     /// Global network proxy switch; applied to this process's env so spawned
     /// children (engine CLIs, terminals, dsh host) inherit it. On by default.
     #[serde(default = "default_system_proxy_enabled")]
@@ -223,6 +227,10 @@ pub struct AppSettings {
     /// Independent naming effort. None = Claude xhigh, other engines low; unsupported models omit it.
     #[serde(default, deserialize_with = "crate::auto_title::config::optional_string")]
     pub auto_title_effort: Option<String>,
+    /// Independent Codex model for composer prediction. None follows native
+    /// Codex config, then the app's Codex default; never changes chat or naming.
+    #[serde(default, deserialize_with = "crate::composer_prediction::optional_model_setting")]
+    pub composer_prediction_model: Option<String>,
     /// Per-engine binary overrides. flatten keeps the legacy flat shape
     /// (`"claudeBin": …`) the frontend depends on; keys stay camelCase and
     /// unknown extra fields round-trip untouched.
@@ -443,6 +451,7 @@ impl Default for AppSettings {
             dsh_host: None,
             dsh_port: None,
             dsh_auto_start: None,
+            session_create_enabled: None,
             system_proxy_enabled: default_system_proxy_enabled(),
             system_proxy_url: default_system_proxy_url(),
             launch_proxy_protection_enabled: None,
@@ -454,6 +463,7 @@ impl Default for AppSettings {
             auto_title_engine: None,
             auto_title_model: None,
             auto_title_effort: None,
+            composer_prediction_model: None,
             bin_overrides: HashMap::new(),
         }
     }
@@ -964,6 +974,9 @@ fn persist_settings_to(
     normalize_pet_settings(settings);
     normalize_sidebar_chat_list_mode(settings);
     crate::auto_title::config::normalize(settings);
+    settings.composer_prediction_model = crate::composer_prediction::configured_prediction_model(
+        settings.composer_prediction_model.as_deref(),
+    )?;
     if settings.launch_proxy_protection_enabled.is_none()
         && crate::launch_protection::resolve_launch_proxy_protection_enabled(settings)
     {
@@ -1359,6 +1372,45 @@ mod tests {
         assert!(saved.get("agyAutoCompactOverrideEnabled").is_none());
         assert!(saved.get("agyAutoCompactOverride").is_none());
         assert_eq!(saved["futurePreference"], serde_json::json!({"keep": true}));
+    }
+
+    #[test]
+    fn composer_prediction_model_defaults_to_follow_and_round_trips_independently() {
+        let scratch = Scratch::new();
+        let path = scratch.path("settings.json");
+        let legacy: AppSettings = serde_json::from_str("{}").unwrap();
+        assert!(legacy.composer_prediction_model.is_none());
+        for selected in [Some(" prediction-model "), None, Some(" ")] {
+            let mut settings = AppSettings {
+                composer_prediction_model: selected.map(str::to_string),
+                auto_title_model: Some("opus".into()),
+                default_models: HashMap::from([("codex".into(), "chat-model".into())]),
+                ..Default::default()
+            };
+            persist_settings_to(&mut settings, &path).unwrap();
+            let reopened: AppSettings = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            let expected = selected.filter(|model| !model.trim().is_empty()).map(str::trim);
+            assert_eq!(reopened.composer_prediction_model.as_deref(), expected);
+            assert_eq!(reopened.auto_title_model.as_deref(), Some("opus"));
+            assert_eq!(reopened.default_models["codex"], "chat-model");
+        }
+        let malformed: AppSettings = serde_json::from_value(serde_json::json!({
+            "composerPredictionModel": {"bad": true}, "theme": "dark"
+        })).unwrap();
+        assert!(malformed.composer_prediction_model.is_none());
+        assert_eq!(malformed.theme, "dark");
+    }
+
+    #[test]
+    fn invalid_composer_prediction_model_does_not_overwrite_saved_settings() {
+        let scratch = Scratch::new();
+        let path = scratch.path("settings.json");
+        let mut settings = AppSettings { composer_prediction_model: Some("saved-model".into()), ..Default::default() };
+        persist_settings_to(&mut settings, &path).unwrap();
+        settings.composer_prediction_model = Some("bad model".into());
+        assert!(persist_settings_to(&mut settings, &path).is_err());
+        let reopened: AppSettings = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(reopened.composer_prediction_model.as_deref(), Some("saved-model"));
     }
 
     #[test]

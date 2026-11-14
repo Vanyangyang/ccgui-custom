@@ -55,6 +55,7 @@ mod plugin_memory;
 mod plugin_conversations;
 mod session_sidebar;
 mod session_sidebar_host;
+mod session_spawn;
 mod plugin_images;
 mod plugin_windows;
 mod host_confirmation;
@@ -364,6 +365,11 @@ pub fn run() {
             // Virtual cursor overlay + its loopback control channel: the
             // --computer-use-mcp child posts action targets here so the
             // blue pointer can follow the agent.
+            // session_create provenance is enforced by the relay; its schema
+            // must exist before any chat run can adopt a session id.
+            if let Err(error) = session_spawn::init(Arc::clone(&app.state::<AppState>().db)) {
+                eprintln!("[session-spawn] init failed (session_create unavailable): {error}");
+            }
             development_profile::run_automatic(|| {
             if let Err(error) = cu_overlay::init(app.handle()) {
                 eprintln!("[cu-overlay] init failed (overlay disabled): {error}");
@@ -625,6 +631,8 @@ pub fn run() {
             host_chat::host_chat_ledger_get,
             host_chat::host_chat_ledger_set,
             host_chat::host_chat_ledger_delete,
+            session_spawn::session_spawn_report,
+            session_spawn::session_origin_promote,
             leader::task_snapshot,
             leader::parent_wakeup::task_parent_wakeups,
             leader::parent_wakeup::task_claim_parent_wakeup,

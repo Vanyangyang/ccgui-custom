@@ -26,6 +26,7 @@ import { clearComposerPrediction } from "../composer-prediction";
 import { IMAGE_EXTENSIONS } from "./use-composer-images";
 import { isHandoffDraft, useHandoffStore } from "../session-cleanup";
 import { crossSessionCostReview, requiresSessionSendCostApproval, sameSessionCostWorkspace, useSessionSendCostGuardStore } from "../cross-session-cost";
+import { promoteHumanSession } from "../session-origin";
 
 /** Composer submit/draft/attach/stop handlers plus the pending-@mention
  * bridge, so ChatConversation stays a composition layer. */
@@ -198,6 +199,7 @@ export function useComposerActions({
                   const finalPrompt = latestDraft !== undefined && latestDraft.trim() ? latestDraft : prompt;
                   setDraft(liveKey, "");
                   clearImages();
+                  promoteHumanSession(liveActive.engine, liveActive.sessionId);
                   void send(finalPrompt, heldImages, computerUse ? { computerUse: true } : undefined, liveActive);
                 },
               });
@@ -207,6 +209,8 @@ export function useComposerActions({
         }
         useSessionSendCostGuardStore.getState().dismiss(liveKey);
         setDraft(liveKey, ""); clearImages();
+        // A human-typed message takes over a chat created by session_create.
+        promoteHumanSession(liveActive.engine, liveActive.sessionId);
         if (isStreaming && mode === "queue") queueMessage(prompt, images, computerUse ? { computerUse: true } : undefined, liveActive);
         else if (isStreaming) void sendWhileBusy(prompt, images, computerUse ? { computerUse: true } : undefined, liveActive);
         else void send(prompt, images, computerUse ? { computerUse: true } : undefined, liveActive);

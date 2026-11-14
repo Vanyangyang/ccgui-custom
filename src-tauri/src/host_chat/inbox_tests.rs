@@ -74,7 +74,7 @@ fn associated_messages_still_pass_the_parent_report_guard() {
         arguments["message_kind"] = json!("correction");
         let request = RequestEvent { request_id: uuid::Uuid::new_v4().to_string(),
             sender: Sender { run_id:"caller".into(),engine:"agy".into(),session_id:Some("saved".into()),workspace_path:"workspace".into() },
-            method:"send_message".into(), arguments:validate_arguments("send_message",arguments).unwrap(), managed_parent:None };
+            method:"send_message".into(), arguments:validate_arguments("send_message",arguments).unwrap(), managed_parent:None, session_spawn:None };
         let error = forward_saved_chat_message(&request, |sender,args| {
             assert_eq!(sender.session_id,"saved");
             assert!(args.intent.is_none());

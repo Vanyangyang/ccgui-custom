@@ -5,10 +5,11 @@ import type { AppSettings, AutoTitleModel } from "@/lib/ipc";
 
 // GeneralSection reads settings on mount; updateAppSettings is the
 // persistence assertion point.
-const { getAppSettings, updateAppSettings, autoTitleModels } = vi.hoisted(() => {
+const { getAppSettings, updateAppSettings, autoTitleModels, listEngineModels } = vi.hoisted(() => {
   const getAppSettings = vi.fn();
   return {
     getAppSettings,
+    listEngineModels: vi.fn(),
     updateAppSettings: vi.fn(async (settings: AppSettings) => {
       getAppSettings.mockResolvedValue(settings);
       return null;
@@ -23,7 +24,7 @@ const { getAppSettings, updateAppSettings, autoTitleModels } = vi.hoisted(() => 
 });
 vi.mock("@/lib/ipc", () => ({
   ipc: new Proxy(
-    { getAppSettings, updateAppSettings, autoTitleModels },
+    { getAppSettings, updateAppSettings, autoTitleModels, listEngineModels },
     {
       get: (target, prop) =>
         prop in target ? Reflect.get(target, prop) : async () => null,
@@ -106,7 +107,7 @@ async function pick(trigger: HTMLButtonElement, label: string) {
   await flush();
 }
 
-describe("General → 行为 auto-naming rows", () => {
+describe("General → 行为 naming and prediction rows", () => {
   let container: HTMLDivElement;
   let root: Root;
 
@@ -126,6 +127,13 @@ describe("General → 行为 auto-naming rows", () => {
     getAppSettings.mockReset();
     updateAppSettings.mockClear();
     autoTitleModels.mockClear();
+    listEngineModels.mockReset().mockResolvedValue({
+      models: [
+        { id: "gpt-6.1-sol", name: "GPT-6.1-Sol", provider: "OpenAI" },
+        { id: "gpt-6-astra", name: "GPT-6-Astra", provider: "OpenAI" },
+      ],
+      authoritative: true,
+    });
   });
 
   afterEach(async () => {
@@ -366,5 +374,87 @@ describe("General → 行为 auto-naming rows", () => {
     expect(effortTrigger().disabled).toBe(true);
     expect(autoTitleSwitch().checked).toBe(true);
     expect(updateAppSettings).not.toHaveBeenCalled();
+  });
+
+  const predictionTrigger = () => row("composerPredictionModel").querySelector("button")!;
+
+  it("places the independent prediction model after its toggle, defaulting to Codex config without saving", async () => {
+    await mount(SETTINGS);
+    expect(predictionTrigger().textContent).toContain(i18n.t("settings.composerPredictionModelDefault"));
+    expect(predictionTrigger().disabled).toBe(false);
+    expect(listEngineModels).toHaveBeenCalledWith("codex");
+    expect(row("composerPrediction").nextElementSibling).toBe(row("composerPredictionModel"));
+    expect(updateAppSettings).not.toHaveBeenCalled();
+  });
+
+  it("saves and restores a prediction model without changing chat or naming selections", async () => {
+    const settings = { ...SETTINGS, defaultModels: { codex: "chat-model" },
+      autoTitleEngine: "claude", autoTitleModel: "opus", autoTitleEffort: "high" };
+    await mount(settings);
+    await pick(predictionTrigger(), "GPT-6-Astra");
+    const saved = updateAppSettings.mock.calls.at(-1)![0];
+    expect(saved).toMatchObject({ ...settings, composerPredictionModel: "gpt-6-astra" });
+    expect(predictionTrigger().textContent).toContain("GPT-6-Astra");
+    await act(async () => root.unmount());
+    container.remove();
+    await mount(saved);
+    expect(predictionTrigger().textContent).toContain("GPT-6-Astra");
+    expect(updateAppSettings).toHaveBeenCalledTimes(1);
+    await pick(predictionTrigger(), i18n.t("settings.composerPredictionModelDefault"));
+    expect(updateAppSettings.mock.calls.at(-1)![0]).toMatchObject({ composerPredictionModel: null,
+      defaultModels: { codex: "chat-model" }, autoTitleModel: "opus", autoTitleEffort: "high" });
+  });
+
+  it("includes custom Codex models and display labels even when the native catalog is empty", async () => {
+    listEngineModels.mockResolvedValueOnce({ models: [], authoritative: true });
+    await mount({ ...SETTINGS, customModels: { codex: ["my-predictor"] },
+      customModelLabels: { codex: { "my-predictor": "My predictor" } } });
+    await pick(predictionTrigger(), "My predictor");
+    expect(updateAppSettings.mock.calls.at(-1)![0].composerPredictionModel).toBe("my-predictor");
+  });
+
+  it("disables the model selector while prediction is off and retains the selection", async () => {
+    localStorage.setItem("ccgui-next.composerPredictionEnabled", "0");
+    await mount({ ...SETTINGS, composerPredictionModel: "gpt-6-astra" });
+    expect(predictionTrigger().disabled).toBe(true);
+    expect(predictionTrigger().textContent).toContain("GPT-6-Astra");
+    await act(async () => row("composerPrediction").querySelector<HTMLInputElement>('input[role="switch"]')!.click());
+    expect(predictionTrigger().disabled).toBe(false);
+    expect(updateAppSettings).not.toHaveBeenCalled();
+  });
+
+  it("keeps a missing prediction model visible until an explicit replacement", async () => {
+    await mount({ ...SETTINGS, composerPredictionModel: "missing-predictor" });
+    expect(predictionTrigger().textContent).toContain("missing-predictor");
+    expect(predictionTrigger().textContent).toContain(i18n.t("settings.composerPredictionModelUnavailable"));
+    expect(row("composerPredictionModel").textContent).toContain(i18n.t("settings.composerPredictionModelUnavailableDesc"));
+    expect(updateAppSettings).not.toHaveBeenCalled();
+    await pick(predictionTrigger(), "GPT-6.1-Sol");
+    expect(updateAppSettings.mock.calls.at(-1)![0].composerPredictionModel).toBe("gpt-6.1-sol");
+  });
+
+  it("retains the prediction model when the directory fails", async () => {
+    listEngineModels.mockRejectedValueOnce(new Error("fixture catalog failure"));
+    await mount({ ...SETTINGS, composerPredictionModel: "saved-predictor" });
+    expect(predictionTrigger().disabled).toBe(true);
+    expect(predictionTrigger().textContent).toContain("saved-predictor");
+    expect(row("composerPredictionModel").textContent).toContain(i18n.t("settings.composerPredictionModelsFailed"));
+    expect(updateAppSettings).not.toHaveBeenCalled();
+  });
+
+  it("keeps the saved prediction model and shows the error if persistence fails", async () => {
+    await mount({ ...SETTINGS, composerPredictionModel: "gpt-6.1-sol" });
+    updateAppSettings.mockRejectedValueOnce(new Error("fixture prediction save failure"));
+    await pick(predictionTrigger(), "GPT-6-Astra");
+    expect(document.querySelector('[role="alert"]')?.textContent).toContain("fixture prediction save failure");
+    expect(predictionTrigger().textContent).toContain("GPT-6.1-Sol");
+  });
+
+  it("merges a prediction pick into freshly read settings", async () => {
+    await mount(SETTINGS);
+    getAppSettings.mockResolvedValue({ ...SETTINGS, autoTitleModel: "concurrent-naming", defaultModels: { codex: "concurrent-chat" } });
+    await pick(predictionTrigger(), "GPT-6-Astra");
+    expect(updateAppSettings.mock.calls.at(-1)![0]).toMatchObject({ composerPredictionModel: "gpt-6-astra",
+      autoTitleModel: "concurrent-naming", defaultModels: { codex: "concurrent-chat" } });
   });
 });

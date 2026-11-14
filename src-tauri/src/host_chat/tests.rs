@@ -3,6 +3,8 @@ use super::*;
 mod message_routing_tests;
 #[path = "session_sidebar_tests.rs"]
 mod session_sidebar_tests;
+#[path = "session_spawn_binding_tests.rs"]
+mod session_spawn_binding_tests;
 
 #[test]
 fn managed_plugin_ipc_rejects_unknown_relay_requests() {
@@ -278,6 +280,26 @@ fn tool_publication_and_guidance_follow_trusted_capabilities() {
             }
         }
     }
+}
+
+#[test]
+fn session_create_is_published_and_strictly_validated() {
+    let server = mcp::HostChatServer { session_sidebar_organization: false, self_update_only: false, workspace_organization: false, plugin_management: false, task_tools: false, self_update: false,
+        relay: RelayClient::new("http://127.0.0.1:12345/host-chat", uuid::Uuid::new_v4().to_string()).unwrap() };
+    assert!(server.visible_tools().list_all().iter().any(|tool| tool.name == "session_create"));
+    let sidechat = mcp::HostChatServer { self_update_only: true, self_update: true, ..server };
+    assert!(!sidechat.visible_tools().list_all().iter().any(|tool| tool.name == "session_create"));
+    let ok = json!({"workspace_path":"G:/target","engine":"codex","message":"fix","request_id":"req-1"});
+    assert_eq!(validate_arguments("session_create", ok.clone()).unwrap(), ok);
+    for bad in [
+        json!({"workspace_path":"G:/target","engine":"codex","message":"fix","request_id":"bad id"}),
+        json!({"workspace_path":"G:/target","engine":"other","message":"fix","request_id":"req-1"}),
+        json!({"workspace_path":"G:/target","engine":"codex","message":"  ","request_id":"req-1"}),
+        json!({"workspace_path":"G:/target","engine":"codex","message":"fix","request_id":"req-1","parent":"x"}),
+    ] {
+        assert!(validate_arguments("session_create", bad).is_err());
+    }
+    assert!(requires_saved_session("session_create"));
 }
 
 #[test]

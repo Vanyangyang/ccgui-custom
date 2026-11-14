@@ -952,6 +952,11 @@ export const zh = {
     handoffGrokStopped: "已停止压缩 · 保留本地摘要",
     handoffGrokDone: "模型压缩完成 ({{seconds}}s)",
     handoffGrokFailed: "模型压缩未生效 · 已保留本地摘要",
+    handoffDraftStructureChanged: "交接草稿的来源标记或“接下来请继续”行已删除，无法重新提炼。当前文字已保留；请恢复交接标记，或返回原会话重新发起交接。",
+    handoffVisibleHistoryChanged: "交接来源的可见历史在提炼期间改变，当前摘要未应用。请核对下方标明的主会话或子对话后重新提炼；原始草稿已保留。",
+    handoffSourceCheckFailed: "来源一致性校验未通过，当前摘要未应用。这不代表旧会话仍在运行，也可能涉及所选子对话或存储状态。原始草稿已保留，请核对下方来源信息。",
+    handoffAuthTokenChanged: "Codex 登录凭据在准备压缩时发生变化，重新核对后仍不一致。该分段尚未发送给模型，原始草稿已保留。请稍后重新提炼。",
+    handoffAuthAccountChanged: "Codex 账号信息在准备压缩时不一致，已停止该分段调用。该分段尚未发送给模型，原始草稿已保留。请确认当前登录账号后重新提炼。",
     handoffTimeout: "未在时限内收到完整的交接摘要{{wait}}，本次摘要不可用。原始草稿和任务已保留。供应商可能已产生费用，无法保证远端生成已经停止。你可以主动选择较低的推理强度或其他模型后重试。",
     handoffTimeoutWait: "（已等待 {{seconds}} 秒）",
     handoffIntermediateLength: "中间摘要超过旧版长度限制，尚未生成完整的交接摘要。原始历史、任务和草稿已保留。",
@@ -1316,6 +1321,9 @@ export const zh = {
     thinkingAutoCollapse: "思考结束后自动收起",
     thinkingAutoCollapseDesc:
       "关闭后，思考结束时思考过程保持展开（界面不再跳动），可点击标题手动收起",
+    sessionCreate: "允许智能体新建独立会话",
+    sessionCreateDesc:
+      "在你要求时，智能体可以在已注册的工作区新建一个根会话并交给它任务。被新建的会话在你亲自发消息之前，不能再新建会话，也不能给其他会话发消息。关闭后拒绝所有此类请求",
     autoTitle: "自动命名会话",
     autoTitleDesc:
       "每轮回复结束后，通过下方所选来源及其当前渠道，使用独立的模型与 effort 设置生成标题；消耗对应订阅额度或渠道用量，手动改过的标题不会被覆盖",
@@ -1330,6 +1338,12 @@ export const zh = {
     autoTitleModelSonnet: "Sonnet（默认）",
     autoTitleModelHaiku: "Haiku",
     composerPrediction: "输入框消息预测",
+    composerPredictionModel: "预测模型",
+    composerPredictionModelDefault: "跟随 Codex 配置",
+    composerPredictionModelDesc: "独立选择后续预测使用的 Codex 模型；思考强度固定为 low，消耗对应额度。",
+    composerPredictionModelUnavailable: "不可用",
+    composerPredictionModelUnavailableDesc: "已保存的模型不在当前目录中；保留选择，可改选其他模型或跟随 Codex 配置。",
+    composerPredictionModelsFailed: "无法读取预测模型目录；保留现有设置，请重开设置页再试。",
     composerPredictionDesc:
       "每轮回复结束后，统一通过 Codex GPT 为所有渠道预测下一条可能发送的消息；输入框为空时以灰字显示，按 Tab 填入输入框（不自动发送），按 Esc 隐藏",
     promptHistory: "历史输入补全",

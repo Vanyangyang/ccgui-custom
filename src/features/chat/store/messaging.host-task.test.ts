@@ -202,15 +202,53 @@ describe("independent host first turn", () => {
   });
   it("stops a private run before ACK and repeats the stop after late native registration", async () => {
     const f = independent(), response = Promise.withResolvers<{ runId: string; sessionId: string | null }>();
+    mocks.ipc.interruptSession.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
     mocks.ipc.sendMessage.mockReturnValueOnce(response.promise);
     const sending = f.actions.send("stop this", [], f.options, f.target);
     await vi.waitFor(() => expect(mocks.ipc.sendMessage).toHaveBeenCalledOnce());
     await f.actions.interrupt(undefined, f.runId);
     expect(mocks.ipc.interruptSession).toHaveBeenCalledWith(f.runId);
     response.resolve({ runId: f.runId, sessionId: f.nativeId }); await sending;
-    expect(mocks.ipc.interruptSession).toHaveBeenCalledWith(f.nativeId);
-    expect(f.get().bySession[sessionKey("agy", f.nativeId, "")].interrupted).toBe(true);
+    expect(mocks.ipc.interruptSession).toHaveBeenNthCalledWith(2, f.runId);
+    const nativeKey = sessionKey("agy", f.nativeId, "");
+    expect(f.get().bySession[nativeKey]).toMatchObject({ streaming: true, queueParked: true });
+    expect(runRouting.get(f.runId)).toBe(nativeKey);
+    handleEngineEvents([f.event("done", 2, { usage: null, interrupted: true }, f.nativeId)], f.deps);
+    expect(f.get().bySession[nativeKey].streaming).toBe(false);
     expect(runRouting.has(f.runId)).toBe(false); f.protectedState();
+  });
+  it("settles a private run when both pre-registration and registered cancellation return false", async () => {
+    const f = independent(), response = Promise.withResolvers<{ runId: string; sessionId: string | null }>();
+    mocks.ipc.interruptSession.mockResolvedValueOnce(false).mockResolvedValueOnce(false);
+    mocks.ipc.sendMessage.mockReturnValueOnce(response.promise);
+    const sending = f.actions.send("stop missing run", [], f.options, f.target);
+    await vi.waitFor(() => expect(mocks.ipc.sendMessage).toHaveBeenCalledOnce());
+    await f.actions.interrupt(undefined, f.runId);
+    expect(f.get().bySession[f.privateKey]).toMatchObject({ streaming: true, queueParked: true });
+    response.resolve({ runId: f.runId, sessionId: f.nativeId });
+    await sending;
+    expect(mocks.ipc.interruptSession).toHaveBeenCalledTimes(2);
+    expect(mocks.ipc.interruptSession).toHaveBeenNthCalledWith(2, f.runId);
+    expect(f.get().bySession[sessionKey("agy", f.nativeId, "")]).toMatchObject({ streaming: false, interrupted: true });
+    expect(runRouting.has(f.runId)).toBe(false);
+    f.protectedState();
+  });
+  it("does not retry the same run ID when registration wins against an in-flight false cancellation", async () => {
+    const f = independent(), response = Promise.withResolvers<{ runId: string; sessionId: string | null }>();
+    const cancellation = Promise.withResolvers<boolean>();
+    mocks.ipc.interruptSession.mockReturnValueOnce(cancellation.promise);
+    mocks.ipc.sendMessage.mockReturnValueOnce(response.promise);
+    const sending = f.actions.send("stop racing registration", [], f.options, f.target);
+    await vi.waitFor(() => expect(mocks.ipc.sendMessage).toHaveBeenCalledOnce());
+    const stopping = f.actions.interrupt(undefined, f.runId);
+    response.resolve({ runId: f.runId, sessionId: f.nativeId });
+    await sending;
+    cancellation.resolve(false);
+    await stopping;
+    expect(mocks.ipc.interruptSession).toHaveBeenCalledExactlyOnceWith(f.runId);
+    expect(f.get().bySession[sessionKey("agy", f.nativeId, "")]).toMatchObject({ streaming: false, interrupted: true });
+    expect(runRouting.has(f.runId)).toBe(false);
+    f.protectedState();
   });
   it("does not use a concurrent user pending run as the origin of a mismatched task run", async () => {
     const f = independent(), response = Promise.withResolvers<{ runId: string; sessionId: string | null }>();

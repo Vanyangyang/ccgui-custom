@@ -16,6 +16,7 @@ import { handleWorkspaceOrganizationRequest, isWorkspaceOrganizationMethod } fro
 import { sameParticipant, targetParticipant, type CorrespondenceEnvelope, type CorrespondenceReceipt, type InboxCaller,
   type InboxMessageKind, type InboxReceiptState, type InboxSummary, type ManagedParentTarget } from "@/features/plugins/runtime/chat-inbox";
 import { createManagedParentDelivery } from "./managed-parent-delivery";
+import { createSessionCreateHandler, desktopSessionCreateDeps, type SessionSpawnGrant } from "./session-create";
 
 export interface CrossSessionRequest {
   requestId: string;
@@ -24,6 +25,8 @@ export interface CrossSessionRequest {
   arguments: Record<string, unknown>;
   /** Native-only proof; send_message arguments cannot select this route. */
   managedParent?: ManagedParentTarget;
+  /** Native-only session_create admission (reserved run, provenance checked). */
+  sessionSpawn?: SessionSpawnGrant;
 }
 
 export type CrossSessionCommunicationStatus = "preparing" | "handed_off" | HostChatReceipt["status"];
@@ -720,6 +723,7 @@ export function startCrossSessionRuntime(): () => void {
       return { sessions, archived, workspaces };
     },
   });
+  const sessionCreate = createSessionCreateHandler(desktopSessionCreateDeps(() => !disposed));
   const ready = (value: boolean) => {
     readinessChain = readinessChain.catch(() => {}).then(async () => {
       if (readinessOwner === owner && (!value || !disposed)) await invoke("host_chat_ready", { ready: value });
@@ -732,6 +736,8 @@ export function startCrossSessionRuntime(): () => void {
       ? handleWorkspaceOrganizationRequest(payload, () => !disposed)
       : isPluginManagementMethod(payload.method)
       ? handlePluginManagementRequest(payload, () => !disposed)
+      : payload.method === "session_create"
+      ? sessionCreate(payload)
       : handler(payload);
     void response.then((result) => invoke("host_chat_respond", { requestId: payload.requestId, result, error: null }),
       (error: unknown) => invoke("host_chat_respond", { requestId: payload.requestId, result: null, error: String(error) }))
@@ -748,6 +754,7 @@ export function startCrossSessionRuntime(): () => void {
   }).catch((error: unknown) => { initialized.reject(error); if (!disposed) console.error("[host-chat] request subscription unavailable"); });
   return () => {
     disposed = true;
+    sessionCreate.dispose();
     if (queueControls === bridge) queueControls = undefined;
     initialized.reject(new Error("Host chat runtime has been disposed"));
     off?.();

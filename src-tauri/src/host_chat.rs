@@ -240,6 +240,9 @@ struct RequestEvent {
     arguments: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     managed_parent: Option<crate::leader::ManagedParent>,
+    /// Native-only session_create admission; arguments cannot supply it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_spawn: Option<crate::session_spawn::Grant>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -474,6 +477,32 @@ impl Relay {
         }, run.worker))
     }
 
+    /// session_create authority comes only from the live authenticated
+    /// admission, never from the event sender or tool arguments.
+    fn session_create_origin(&self, request_id: &str) -> Result<crate::session_spawn::Caller, String> {
+        let inner = self.inner.lock();
+        let pending = inner.pending.get(request_id).filter(|pending| {
+            pending.method == "session_create" && !inner.shutdown && inner.ready && pending.epoch == inner.epoch
+                && pending.deadline > Instant::now()
+                && inner.tokens.get(&pending.token) == Some(&pending.run_id)
+        }).ok_or("session_create request is no longer live")?;
+        let run = inner.runs.get(&pending.run_id).ok_or("session_create originating run is unavailable")?;
+        if run.self_update_only() {
+            return Err("SPAWN_CALLER_NOT_ROOT: sidechats cannot create independent chats".into());
+        }
+        let session_id = run.sender.session_id.clone()
+            .ok_or("The originating chat has no saved session id yet; no request was dispatched")?;
+        Ok(crate::session_spawn::Caller {
+            run_id: run.sender.run_id.clone(), engine: run.sender.engine.clone(), session_id,
+            workspace_path: run.sender.workspace_path.clone(),
+        })
+    }
+
+    fn run_is_live(&self, run_id: &str) -> bool {
+        let inner = self.inner.lock();
+        !inner.shutdown && inner.runs.contains_key(run_id)
+    }
+
     fn request_is_live(&self, request_id: &str) -> bool {
         let inner = self.inner.lock();
         inner.pending.get(request_id).is_some_and(|pending| {
@@ -488,7 +517,8 @@ impl Relay {
         // separate task-ledger check has released its lock.
         let inner = self.inner.lock();
         let live = inner.pending.get(&request.request_id).is_some_and(|pending| {
-            pending.method == "send_message" && pending.arguments == request.arguments
+            pending.method == request.method && matches!(pending.method.as_str(), "send_message" | "session_create")
+                && pending.arguments == request.arguments
                 && pending.run_id == request.sender.run_id
                 && !inner.shutdown && inner.ready && pending.epoch == inner.epoch
                 && pending.deadline > Instant::now()
@@ -864,6 +894,7 @@ impl Relay {
                 method,
                 arguments,
                 managed_parent: None,
+                session_spawn: None,
             }))
             .map_err(|_| {
                 Failure::unknown(
@@ -1378,6 +1409,39 @@ fn init_with_checkpoint(app: &tauri::AppHandle, checkpoint: Option<HostCheckpoin
                     });
                     return Ok(());
                 }
+                if request.method == "session_create" {
+                    let request = request.clone();
+                    let app = app.clone();
+                    // Relay emission holds its mutex; admit in a separate turn.
+                    tauri::async_runtime::spawn(async move {
+                        let Some(relay) = MANAGER.get() else { return; };
+                        if !relay.request_is_live(&request.request_id) { return; }
+                        let mut started = None;
+                        let result = (|| {
+                            let caller = relay.session_create_origin(&request.request_id)?;
+                            let args: crate::session_spawn::SessionCreateArgs = serde_json::from_value(request.arguments.clone())
+                                .map_err(|_| "Invalid session_create arguments".to_string())?;
+                            let grant = crate::session_spawn::admit(&caller, &args, &|run_id| relay.run_is_live(run_id))?;
+                            if grant.mode == "start" { started = Some(grant.run_id.clone()); }
+                            let mut routed = request.clone();
+                            routed.session_spawn = Some(grant);
+                            relay.forward_live_message(&routed, || {
+                                app.get_webview_window("main")
+                                    .ok_or_else(|| "Main chat window is unavailable".to_string())?
+                                    .emit(REQUEST_EVENT, &routed)
+                                    .map_err(|_| "Emit host chat event failed".to_string())
+                            })
+                        })();
+                        if let Err(error) = result {
+                            // A reservation that never reached the desktop host launched nothing.
+                            if let Some(run_id) = started {
+                                crate::session_spawn::report(&run_id, "failed", None, Some("The request was not delivered to the desktop host; nothing was sent"));
+                            }
+                            let _ = relay.respond(&request.request_id, None, Some(error));
+                        }
+                    });
+                    return Ok(());
+                }
                 if request.method == "send_message" {
                     let request = request.clone();
                     let app = app.clone();
@@ -1387,6 +1451,7 @@ fn init_with_checkpoint(app: &tauri::AppHandle, checkpoint: Option<HostCheckpoin
                         let Some(relay) = MANAGER.get() else { return; };
                         if !relay.request_is_live(&request.request_id) { return; }
                         let result = forward_saved_chat_message(&request, |sender, args| {
+                            crate::session_spawn::check_send_message(&sender.engine, &sender.session_id)?;
                             crate::leader::validate_parent_message(sender, &args.session_id,
                                 args.engine.as_deref(), args.workspace_path.as_deref(),
                                 args.intent == Some(MessageIntent::Question))?;
@@ -1493,9 +1558,29 @@ pub fn server_for_run(
 }
 
 pub fn adopt_session(run_id: &str, session_id: &str) {
-    if let Some(relay) = MANAGER.get() {
-        relay.adopt(run_id, session_id);
+    if adopt_session_with(MANAGER.get().map(AsRef::as_ref), run_id, session_id,
+        crate::session_spawn::bind).is_err() {
+        // The engine may already be running. Retain its reservation and report
+        // uncertainty; never retry the launch or remove the saved conversation.
+        const ERROR: &str = "SESSION_ORIGIN_BIND_FAILED: the run started but its session provenance could not be persisted; host chat capability was revoked";
+        crate::session_spawn::report(run_id, "unknown", None, Some(ERROR));
+        eprintln!("[session-spawn] {ERROR}");
     }
+}
+
+fn adopt_session_with(
+    relay: Option<&Relay>, run_id: &str, session_id: &str,
+    bind: impl FnOnce(&str, &str) -> Result<bool, String>,
+) -> Result<(), String> {
+    // Worker processes use the parent's relay and have no local provenance
+    // store. The parent binds when worker_host receives the session event.
+    let Some(relay) = relay else { return Ok(()); };
+    if let Err(error) = bind(run_id, session_id) {
+        relay.finish(run_id);
+        return Err(error);
+    }
+    relay.adopt(run_id, session_id);
+    Ok(())
 }
 
 pub(crate) fn active_sessions_for_restart(include_workers: bool) -> Vec<(String, String, String)> {
@@ -2072,6 +2157,12 @@ fn validate_arguments(method: &str, arguments: Value) -> Result<Value, String> {
     }
     match method {
         "get_host_capabilities" if arguments == serde_json::json!({}) => Ok(arguments),
+        "session_create" => {
+            let args: crate::session_spawn::SessionCreateArgs = serde_json::from_value(arguments)
+                .map_err(|_| "Invalid session_create arguments")?;
+            args.validate()?;
+            serde_json::to_value(args).map_err(|e| e.to_string())
+        }
         "get_workspace_organization" | "get_session_sidebar_workspaces" => {
             let args: crate::workspace_projects::management::ReadArgs = serde_json::from_value(arguments)
                 .map_err(|_| "Invalid get_workspace_organization arguments")?;
@@ -2510,6 +2601,9 @@ mod mcp {
                 Err(error) if method == "assign_session_sidebar_workspaces" && error.contains("outcome is unknown") => {
                     Ok(CallToolResult::error(vec![ContentBlock::text("Sidebar assignment outcome is unknown. Read get_session_sidebar_workspaces and reconcile current assignments. Reuse the original requestId only with the exact same operation; never infer that execution directories or task ownership moved.")]))
                 }
+                Err(error) if method == "session_create" && error.contains("outcome is unknown") => {
+                    Ok(CallToolResult::error(vec![ContentBlock::text("session_create outcome is unknown. Call session_create again with the same request_id and identical arguments to read its status; it never creates a second chat for that id. Do not retry with a new request_id.")]))
+                }
                 Err(error) => Ok(CallToolResult::error(vec![ContentBlock::text(error)])),
             }
         }
@@ -2636,6 +2730,11 @@ mod mcp {
         #[tool(description = "Delegate work within the user's authorized task to a new real Claude Code, Codex, AGY or Cursor child chat. Omitted workspace_path inherits this workspace. All four engines may dispatch across projects to any registered, available, unarchived local workspace without a source-to-target grant. Project membership and member roles do not restrict dispatch. The target must still exist and be local; remote and WSL workspaces are unsupported. The host verifies the launch reservation, engine and selected cwd before starting or continuing a child. Available in ordinary local chats without enabling a separate mode. The child cannot see this conversation: the task text is all it receives. Children in the same workspace share files; cross-workspace children execute in their own selected cwd. Cross-workspace dispatch preserves inherited permissions and cost approval rules. Choose delegation to suit the task. Omitted model uses the host's default for the selected engine. Choose a valid engine effort autonomously or omit effort to use the user's default. Omitted ttl_seconds uses the child engine's default: Claude Code 3600 seconds (60 minutes), Codex, AGY and Cursor 1800 seconds (30 minutes). Explicit TTL must be 60-86400 seconds. Expiry only prompts inspection and never automatically stops, reassigns, deletes or compresses work. The host binds the parent identity and inherits permission; arguments cannot impersonate a parent or elevate permission. Use a stable request_id for idempotency. On uncertainty inspect task_list and reuse the same id; do not create duplicate work. Completed children retain their conversation and results. The human manages archive, restore and confirmed permanent deletion of the task group in the local GUI.")]
         async fn task_spawn(&self, Parameters(args): Parameters<crate::leader::SpawnArgs>) -> Result<CallToolResult, McpError> {
             self.result("task_spawn", serde_json::to_value(args).map_err(|_| McpError::internal_error("Encode task spawn arguments failed", None))?).await
+        }
+
+        #[tool(description = "Start a NEW independent root chat in a registered local workspace and give it a first task, only when the human explicitly asks to create a new independent chat/task there. It is not a supervised delegated task: no ownership link and no deadline. The new chat runs with the user's normal permissions and appears as an ordinary root chat in that workspace's sidebar. The host records which chat created it: only human-origin root chats may call this; a created chat (and the delegated work under it) cannot call session_create or send_message until the human sends a message in it, and per-chat rate/active limits apply. Refusals return codes such as SESSION_CREATE_DISABLED, SPAWN_ORIGIN_NOT_HUMAN, SPAWN_CALLER_NOT_ROOT, SPAWN_RATE_LIMITED, SPAWN_ACTIVE_LIMIT or REQUEST_ID_CONFLICT; never work around them. The task text is all the new chat receives. Use a stable request_id: calling again with the same request_id and identical arguments creates nothing and returns the current status (starting, running, idle, failed or unknown) with session identity and, once idle, a bounded preview of its latest reply. After an uncertain outcome, call again with the same request_id; never retry with a new one.")]
+        async fn session_create(&self, Parameters(args): Parameters<crate::session_spawn::SessionCreateArgs>) -> Result<CallToolResult, McpError> {
+            self.result("session_create", serde_json::to_value(args).map_err(|_| McpError::internal_error("Encode session create arguments failed", None))?).await
         }
 
         #[tool(description = "Read this chat's direct child branches. Compact by default: taskPreview up to 160 characters unless include_task=true, and result previews up to 500 characters for all states, including completed tasks. Use task_wait with selected branch_ids or include_result=true here for bounded terminal bodies. When the branch and delegation share a long result, only delegation.result carries the full body; the branch keeps a preview with resultSource=delegation.result. Preview-only reads do not consume unread completion notices. When present, delegation contains your latest assignment's requestId, execution runId, state and bounded result; use delegation.state/result to assess that assignment. The branch's top-level state/result describe the child's current conversation activity, which may be a later human follow-up. A completed delegation is not reopened by that follow-up. Available in an authenticated ordinary local chat, including its host-registered worker; no separate mode is required. Completed, failed, waiting and expired are distinct; expiry does not delete a branch. A human handoff marks the old child handed_off and creates a successor under the same parent; handed_off is not task completion. Legacy unknown delegation results require inspecting the child history, not assuming success. Identity comes from this native chat, never a claimed parent in arguments.")]

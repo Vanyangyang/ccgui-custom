@@ -26,7 +26,8 @@ function readPreferences(): Preferences {
 
 /** Managed trees take precedence over display classification. */
 export function canClassifyAuxiliary(thread: AiChatThread): boolean {
-  return !!thread.id && (thread.auxiliaryKind === "cursor_cce" || thread.auxiliaryKind === "cursor_do")
+  return !!thread.id && (thread.auxiliaryKind === "cursor_cce" || thread.auxiliaryKind === "cursor_do"
+    || thread.auxiliaryKind === "agy_workflow" || thread.auxiliaryKind === "agy_probe")
     && !thread.isDraft && !thread.isLeader && !thread.leaderBranch
     && !thread.leaderParentFallback && !thread.children?.length && !thread.protectedFromDeletion;
 }

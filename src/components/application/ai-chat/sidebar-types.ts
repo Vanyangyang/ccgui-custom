@@ -1,7 +1,7 @@
 export type ThreadAction = "pin" | "rename" | "archive" | "delete";
 
 export interface AiChatThread {
-  auxiliaryKind?: "cursor_cce" | "cursor_do" | null;
+  auxiliaryKind?: "cursor_cce" | "cursor_do" | "agy_workflow" | "agy_probe" | null;
   id?: string;
   label: string;
   /** CLI engine id — brand mark rendered left of the label. */

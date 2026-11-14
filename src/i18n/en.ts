@@ -971,6 +971,11 @@ export const en: Messages = {
     handoffGrokStopped: "Compression stopped · Local summary kept",
     handoffGrokDone: "Model summary completed ({{seconds}}s)",
     handoffGrokFailed: "Model compression failed · Using local summary",
+    handoffDraftStructureChanged: "The handoff source marker or next-task line was removed, so re-distillation could not start. Your text is preserved; restore the handoff markers or start a new handoff from the source session.",
+    handoffVisibleHistoryChanged: "Visible history changed during compression, so the summary was not applied. Check the main session or selected child identified below before re-distilling. Your original draft is preserved.",
+    handoffSourceCheckFailed: "Source consistency could not be verified, so the summary was not applied. This does not mean the old session is still running; a selected child or storage state may be involved. Your original draft is preserved. Check the source details below.",
+    handoffAuthTokenChanged: "Codex credentials changed during compression preparation and still did not match after rechecking. This segment was not sent to the model, and your draft is preserved. Try re-distilling later.",
+    handoffAuthAccountChanged: "Codex account details did not match during compression preparation, so this segment was stopped before being sent to the model. Your draft is preserved. Confirm the signed-in account before re-distilling.",
     handoffTimeout: "No complete handoff summary was received within the time limit{{wait}}; the summary is unavailable. Your original draft and task are preserved. The provider may have incurred charges, and remote generation is not guaranteed to have stopped. You can explicitly retry with lower effort or a different model.",
     handoffTimeoutWait: " (waited {{seconds}}s)",
     handoffIntermediateLength: "An intermediate summary exceeded the older length limit; no complete handoff summary was produced. The original history, task and draft are preserved.",
@@ -1349,6 +1354,9 @@ export const en: Messages = {
     thinkingAutoCollapse: "Fold thinking when it finishes",
     thinkingAutoCollapseDesc:
       "Turn off to keep the thinking process expanded after thinking settles (no layout jump); click the header to fold it manually",
+    sessionCreate: "Let agents start independent chats",
+    sessionCreateDesc:
+      "When you ask, an agent can start a new root chat in a registered workspace and hand it a task. Chats it creates cannot start further chats or message other chats until you send a message in them. Turn off to refuse all such requests",
     autoTitle: "Auto-name sessions",
     autoTitleDesc:
       "After each reply, titles are generated through the selected source and its current channel using the independent model and effort settings below. This uses the corresponding subscription quota or channel usage; titles you set by hand are never overwritten",
@@ -1363,6 +1371,12 @@ export const en: Messages = {
     autoTitleModelSonnet: "Sonnet (default)",
     autoTitleModelHaiku: "Haiku",
     composerPrediction: "Composer prompt prediction",
+    composerPredictionModel: "Prediction model",
+    composerPredictionModelDefault: "Follow Codex configuration",
+    composerPredictionModelDesc: "Choose a Codex model for future predictions. Reasoning effort stays at low and uses the corresponding quota.",
+    composerPredictionModelUnavailable: "Unavailable",
+    composerPredictionModelUnavailableDesc: "The saved model is missing from the current catalog. Keep it, choose another model, or follow Codex configuration.",
+    composerPredictionModelsFailed: "Cannot load prediction models. Settings are retained; reopen this page to retry.",
     composerPredictionDesc:
       "After each reply finishes, Codex GPT predicts your next likely prompt across all channels; shown as ghost text when the input is empty — press Tab to accept into the input box without sending, or Esc to dismiss",
     promptHistory: "History completion",

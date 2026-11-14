@@ -67,7 +67,11 @@ fn valid_model_selector(model: &str) -> Option<String> {
 pub(crate) fn resolve_codex_model_from(
     config_toml: Option<&str>,
     settings_model: Option<&str>,
-) -> String {
+    prediction_model: Option<&str>,
+) -> Result<String, String> {
+    if let Some(model) = configured_prediction_model(prediction_model)? {
+        return Ok(model);
+    }
     if let Some(content) = config_toml {
         if let Ok(config) = toml::from_str::<toml::Value>(content) {
             if let Some(model) = config
@@ -75,22 +79,41 @@ pub(crate) fn resolve_codex_model_from(
                 .and_then(toml::Value::as_str)
                 .and_then(valid_model_selector)
             {
-                return model;
+                return Ok(model);
             }
         }
     }
-    settings_model
+    Ok(settings_model
         .and_then(valid_model_selector)
-        .unwrap_or_default()
+        .unwrap_or_default())
 }
 
-fn resolve_codex_model() -> String {
+/// Ignore a malformed JSON type without discarding unrelated app settings.
+pub(crate) fn optional_model_setting<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<String>, D::Error> {
+    let value = Value::deserialize(d)?;
+    Ok(value.as_str().map(str::to_string))
+}
+
+pub(crate) fn configured_prediction_model(model: Option<&str>) -> Result<Option<String>, String> {
+    let Some(model) = model.map(str::trim).filter(|model| !model.is_empty()) else {
+        return Ok(None);
+    };
+    valid_model_selector(model)
+        .map(Some)
+        .ok_or_else(|| "Invalid composer prediction model".to_string())
+}
+
+fn resolve_codex_model() -> Result<String, String> {
     let home = crate::engine::codex_home();
     let config_toml = std::fs::read_to_string(home.join("config.toml")).ok();
-    let settings_model = crate::settings::read_settings()
-        .ok()
-        .and_then(|s| s.default_models.get("codex").cloned());
-    resolve_codex_model_from(config_toml.as_deref(), settings_model.as_deref())
+    let settings = crate::settings::read_settings()?;
+    resolve_codex_model_from(
+        config_toml.as_deref(),
+        settings.default_models.get("codex").map(String::as_str),
+        settings.composer_prediction_model.as_deref(),
+    )
 }
 
 #[tauri::command]
@@ -101,7 +124,7 @@ pub async fn predict_next_prompt(turns: Vec<PredictionTurn>) -> Result<Option<St
     let Ok(_permit) = PERMITS.acquire().await else {
         return Ok(None);
     };
-    let model = resolve_codex_model();
+    let model = resolve_codex_model()?;
     let schema = prediction_schema();
     let call = StructuredCall {
         system_prompt: SYSTEM_PROMPT,
@@ -394,14 +417,34 @@ mod tests {
         assert_eq!(
             resolve_codex_model_from(
                 Some("model = \"gpt-6.1-sol\"\nmodel_reasoning_effort = \"xhigh\""),
-                Some("gpt-6-astra")
-            ),
+                Some("gpt-6-astra"),
+                None,
+            ).unwrap(),
             "gpt-6.1-sol"
         );
         assert_eq!(
-            resolve_codex_model_from(Some("model_reasoning_effort = \"xhigh\""), Some("gpt-6-astra")),
+            resolve_codex_model_from(Some("model_reasoning_effort = \"xhigh\""), Some("gpt-6-astra"), None).unwrap(),
             "gpt-6-astra"
         );
-        assert_eq!(resolve_codex_model_from(None, Some("   ")), "");
+        assert_eq!(resolve_codex_model_from(None, Some("   "), None).unwrap(), "");
+    }
+
+    #[test]
+    fn prediction_model_overrides_defaults_and_empty_choice_keeps_legacy_resolution() {
+        let config = Some("model = \"native-model\"");
+        assert_eq!(
+            resolve_codex_model_from(config, Some("chat-model"), Some("  prediction-model  ")).unwrap(),
+            "prediction-model"
+        );
+        for inherited in [None, Some(""), Some("   ")] {
+            assert_eq!(resolve_codex_model_from(config, Some("chat-model"), inherited).unwrap(), "native-model");
+        }
+    }
+
+    #[test]
+    fn invalid_explicit_prediction_model_does_not_fall_back_to_another_model() {
+        for invalid in ["-bad", "model with spaces", "model\nname", &"x".repeat(257)] {
+            assert!(resolve_codex_model_from(Some("model = \"native-model\""), Some("chat-model"), Some(invalid)).is_err());
+        }
     }
 }

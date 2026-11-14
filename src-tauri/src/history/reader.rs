@@ -418,21 +418,37 @@ struct CachedSession {
     fold: SubagentFold,
 }
 
-/// A request-local fresh AGY parse. The shared timeline cache only keys the
-/// database, whereas full reads also depend on history.jsonl, including absence.
-pub(crate) struct FullAgyHistory {
+/// A request-local fresh parse. Full-history input and its final verification
+/// must not reuse a timeline cache keyed only by file size and millisecond mtime.
+pub(crate) struct FullSessionHistory {
     cached: CachedSession,
 }
 
-impl FullAgyHistory {
+impl FullSessionHistory {
     pub(crate) fn page(&self, before_seq: Option<i64>) -> SessionPage {
         page_from_cached(&self.cached, Some(500), before_seq)
     }
 }
 
-pub(crate) fn load_full_agy_history_blocking(path: &Path) -> Result<FullAgyHistory, String> {
-    let parsed = super::agy::parse_agy_session_strict(path)?;
-    Ok(FullAgyHistory { cached: CachedSession { parsed, fold: Vec::new() } })
+pub(crate) fn load_full_history_blocking(
+    db: &crate::db::Db,
+    engine: &str,
+    session_id: &str,
+    path: &Path,
+) -> Result<FullSessionHistory, String> {
+    let parsed = if engine == "agy" {
+        // Includes this conversation's shared prompt history and propagates
+        // database read failures instead of returning a partial fallback.
+        super::agy::parse_agy_session_strict(path)?
+    } else {
+        let handed = if engine == "codex" {
+            db.codex_desktop_prompts(session_id)?
+        } else {
+            HashSet::new()
+        };
+        parse_session_file_with_handoffs(engine, path, handed)?
+    };
+    Ok(FullSessionHistory { cached: CachedSession { parsed, fold: Vec::new() } })
 }
 
 /// Parsed sessions keyed by (path, size, mtime_ms): paging re-slices a cached

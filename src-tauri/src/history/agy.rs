@@ -413,6 +413,13 @@ fn find_varint_field(buf: &[u8], target_field: u64) -> Option<u64> {
 
 pub(super) fn scan_agy_summary(path: &Path) -> ScanSummary {
     let parsed = parse_agy_session_inner(path, false);
+    let probe = parsed.messages.iter().find(|message| message.role == "user")
+        .is_some_and(|message| runtime_probe_body(&message.text).is_some());
+    let auxiliary_kind = if probe {
+        Some("agy_probe".to_string())
+    } else {
+        native_workflow_parent(path).map(|_| "agy_workflow".to_string())
+    };
     let mut first_ts = None;
     let mut last_ts = None;
     let mut title = String::new();
@@ -426,10 +433,10 @@ pub(super) fn scan_agy_summary(path: &Path) -> ScanSummary {
             last_ts = ts;
         }
         if title.is_empty() && msg.role == "user" && !msg.text.trim().is_empty() {
-            title = msg.text.chars().take(80).collect();
+            title = runtime_probe_body(&msg.text).unwrap_or(&msg.text).chars().take(80).collect();
         }
         if !msg.text.trim().is_empty() && (msg.role == "assistant" || msg.role == "user") {
-            preview = msg.text.chars().take(160).collect();
+            preview = runtime_probe_body(&msg.text).unwrap_or(&msg.text).chars().take(160).collect();
         }
     }
 
@@ -453,13 +460,46 @@ pub(super) fn scan_agy_summary(path: &Path) -> ScanSummary {
 
     ScanSummary {
         prompt_cache: read_cache_reference(path),
-        auxiliary_kind: None,
+        auxiliary_kind,
         title,
         preview,
         first_ts,
         last_ts,
         message_count,
     }
+}
+
+const RUNTIME_PROBE_START: &str = "[ccgui:agy-runtime-probe:v1]\n";
+const RUNTIME_PROBE_END: &str = "\n[/ccgui:agy-runtime-probe:v1]";
+
+fn runtime_probe_body(text: &str) -> Option<&str> {
+    text.strip_prefix(RUNTIME_PROBE_START)?.strip_suffix(RUNTIME_PROBE_END)
+        .filter(|body| !body.trim().is_empty())
+}
+
+fn native_workflow_parent(path: &Path) -> Option<String> {
+    // AGY 1.5.9 native descriptors: CortexTrajectoryMetadata.source_metadata=12;
+    // SourceMetadata.hide_from_conversation_list=3, tool=1;
+    // ToolSourceMetadata.conversation_id=1, tool_call=3; ChatToolCall.name=2.
+    // `agent_name=self`, titles, and prompts are not workflow provenance.
+    const LIMIT: usize = 2 * 1024 * 1024;
+    let conn = rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    conn.busy_timeout(std::time::Duration::from_millis(25)).ok()?;
+    let metadata: Vec<u8> = conn.query_row(
+        "SELECT substr(CAST(data AS BLOB),1,?1) FROM trajectory_metadata_blob WHERE id='main'",
+        [LIMIT + 1], |row| row.get(0),
+    ).ok()?;
+    if metadata.len() > LIMIT || !is_valid_proto_message(&metadata) { return None; }
+    let source = find_length_delimited_field(&metadata, 12)?;
+    if !is_valid_proto_message(source) || find_varint_field(source, 3) != Some(1) { return None; }
+    let tool = find_length_delimited_field(source, 1)?;
+    if !is_valid_proto_message(tool) { return None; }
+    let call = find_length_delimited_field(tool, 3)?;
+    if !is_valid_proto_message(call) || find_length_delimited_field(call, 2)? != b"run_workflow" { return None; }
+    let parent = std::str::from_utf8(find_length_delimited_field(tool, 1)?).ok()?;
+    uuid::Uuid::parse_str(parent).ok()?;
+    if conversation_id(path).as_deref() == Some(parent) { return None; }
+    Some(parent.to_owned())
 }
 
 /// The latest completed model step supplies request timing and actual cache
@@ -1188,6 +1228,66 @@ mod tests {
 
     fn timeline(path: &Path) -> Result<ParsedSession, String> {
         super::super::extract::parse_session_file_with_handoffs("agy", path, Default::default())
+    }
+
+    #[test]
+    fn workflow_auxiliary_requires_native_hidden_tool_provenance() {
+        let fixture = FullHistoryFixture::new();
+        let conn = rusqlite::Connection::open(&fixture.session).unwrap();
+        conn.execute_batch("CREATE TABLE trajectory_metadata_blob(id TEXT PRIMARY KEY,data BLOB)").unwrap();
+        let parent = "909d6b75-d55b-4039-ab29-5db14d887006";
+        let make = |hidden, name: &str, parent: &str| {
+            let call = encode_string_field(2, name);
+            let mut tool = encode_string_field(1, parent);
+            tool.extend(encode_bytes_field(3, &call));
+            let mut source = encode_bytes_field(1, &tool);
+            source.extend(encode_varint_field(3, hidden));
+            encode_bytes_field(12, &source)
+        };
+        for (metadata, expected) in [
+            (make(1, "run_workflow", parent), Some("agy_workflow")),
+            (make(0, "run_workflow", parent), None),
+            (make(1, "read_file", parent), None),
+            (make(1, "run_workflow", ""), None),
+            (encode_string_field(4, "run_workflow self hidden"), None),
+            (vec![0x62, 0xff], None),
+            ({let mut data = make(1, "run_workflow", parent); data.push(0xff); data}, None),
+        ] {
+            conn.execute("INSERT OR REPLACE INTO trajectory_metadata_blob VALUES('main',?1)", [metadata]).unwrap();
+            assert_eq!(scan_agy_summary(&fixture.session).auxiliary_kind.as_deref(), expected);
+        }
+        conn.execute_batch("DROP TABLE trajectory_metadata_blob").unwrap();
+        assert_eq!(scan_agy_summary(&fixture.session).auxiliary_kind, None);
+    }
+
+    #[test]
+    fn runtime_probe_auxiliary_requires_the_complete_first_user_envelope() {
+        for (first, second, expected) in [
+            (format!("{RUNTIME_PROBE_START}Verify a workflow{RUNTIME_PROBE_END}"), None, Some("agy_probe")),
+            ("Please discuss run_workflow".into(), None, None),
+            (format!("{RUNTIME_PROBE_START}Verify a workflow"), None, None),
+            ("ordinary conversation".into(), Some(format!("{RUNTIME_PROBE_START}Verify a workflow{RUNTIME_PROBE_END}")), None),
+        ] {
+            let fixture = FullHistoryFixture::new();
+            let conn = rusqlite::Connection::open(&fixture.session).unwrap();
+            for (idx, text) in std::iter::once(first).chain(second).enumerate() {
+                let payload = encode_bytes_field(19, &encode_string_field(2, &text));
+                conn.execute("INSERT INTO steps VALUES(?1,?2,?3)", rusqlite::params![idx, STEP_USER, payload]).unwrap();
+            }
+            let summary = scan_agy_summary(&fixture.session);
+            assert_eq!(summary.auxiliary_kind.as_deref(), expected);
+            if expected.is_some() { assert_eq!(summary.title, "Verify a workflow"); }
+        }
+    }
+
+    #[test]
+    #[ignore = "explicit real native metadata path required"]
+    fn agy_auxiliary_real_metadata() {
+        let file = std::env::var("CCGUI_AGY_AUX_REAL_DB").expect("explicit native fixture path");
+        let expected = std::env::var("CCGUI_AGY_AUX_EXPECTED").unwrap_or_default();
+        let summary = scan_agy_summary(Path::new(&file));
+        assert_eq!(summary.auxiliary_kind.as_deref().unwrap_or(""), expected);
+        eprintln!("native AGY auxiliary classification verified: {:?}", summary.auxiliary_kind);
     }
 
     #[test]

@@ -1451,4 +1451,51 @@ describe("native task stall detection", () => {
     expect(setIntervalSpy).not.toHaveBeenCalled();
     expect(container.querySelector("[data-testid='run-status-stalled-badge']")).toBeNull();
   });
+
+  it("keeps native mode across new turns without falling back to subagent heuristics on pwsh tool rows", async () => {
+    const { beginNativeRun } = await import("../store/native-tasks");
+    const pwshTool = msg(
+      2,
+      "tool",
+      "\"C:\\Program Files\\PowerShell\\7\\pwsh.exe\" -Command \"python 'C:\\Projects\\sample-app\\subagent_check.py'\"",
+    );
+    const completedTask: NativeTask = {
+      id: "task-1",
+      kind: "command",
+      description: "Build",
+      status: "completed",
+    };
+    const prevSession = {
+      ...EMPTY_SESSION,
+      messages: [msg(1, "user", "hi"), pwshTool],
+      nativeTaskRunId: "run-1",
+      nativeTasks: [completedTask],
+    };
+    useChatStore.setState({
+      bySession: {
+        [KEY]: {
+          ...prevSession,
+          ...beginNativeRun(prevSession, "run-2"),
+        },
+      },
+    });
+
+    await renderNativeStrip(KEY, "agy");
+    expect(container.querySelector("[data-testid='run-status-tasks-pill']")).toBeNull();
+    expect(container.textContent).not.toContain("子代理");
+
+    // Cold disk-loaded history (nativeTasks undefined, nativeTaskRunId undefined) also ignores pwsh subagent tool rows.
+    useChatStore.setState({
+      bySession: {
+        [KEY]: {
+          ...EMPTY_SESSION,
+          messages: [msg(1, "user", "hi"), pwshTool, msg(3, "tool", "manage_subagents")],
+          nativeTaskRunId: undefined,
+          nativeTasks: undefined,
+        },
+      },
+    });
+    await renderNativeStrip(KEY, "agy");
+    expect(container.textContent).not.toContain("子代理");
+  });
 });

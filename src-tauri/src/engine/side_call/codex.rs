@@ -19,7 +19,7 @@ use std::path::Path;
 use std::process::Stdio;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 const OPENAI_BASE: &str = "https://api.openai.com/v1";
 const CHATGPT_BASE: &str = "https://chatgpt.com/backend-api/codex";
@@ -43,6 +43,13 @@ struct AuthSnapshot {
     token: String,
     user_agent: String,
     workspace_routing: Option<Value>,
+    oauth: Option<VerifiedOauth>,
+}
+
+struct VerifiedOauth {
+    account: String,
+    fedramp: bool,
+    file_hash: [u8; 32],
 }
 
 struct CachedPreparedRoute {
@@ -60,6 +67,18 @@ fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(bytes);
     hash.finalize().into()
+}
+
+// This read only enables caching; it is not the authoritative auth check.
+// Missing/unreadable bytes must bypass reuse instead of failing before the CLI
+// and the strict OAuth snapshot validation have had a chance to run.
+async fn optional_auth_file_hash(
+    read: impl std::future::Future<Output = Result<Option<String>, SideCallError>>,
+) -> Option<[u8; 32]> {
+    read.await
+        .ok()
+        .flatten()
+        .map(|text| sha256_bytes(text.as_bytes()))
 }
 
 fn hash_len_bytes(hash: &mut Sha256, bytes: &[u8]) {
@@ -342,9 +361,7 @@ async fn prepare(call: &StructuredCall<'_>) -> Result<(String, HeaderMap), SideC
         |key| std::env::var(key).ok(),
     )?;
     let pre_auth_hash = if needs_auth {
-        read_optional(&home.join("auth.json"))
-            .await?
-            .map(|text| sha256_bytes(text.as_bytes()))
+        optional_auth_file_hash(read_optional(&home.join("auth.json"))).await
     } else {
         None
     };
@@ -391,25 +408,18 @@ async fn prepare(call: &StructuredCall<'_>) -> Result<(String, HeaderMap), SideC
         }
         if auth.mode == "apikey" {
             set_bearer(&mut headers, &auth.token)?;
-            cache_auth_hash = read_optional(&home.join("auth.json"))
-                .await?
-                .map(|text| sha256_bytes(text.as_bytes()));
+            // The RPC key has no verified file snapshot. Do not bind it to a
+            // later file hash and accidentally cache old headers as new auth.
             (route.base.unwrap_or_else(|| OPENAI_BASE.into()), headers)
         } else {
-            let latest = read_optional(&home.join("auth.json"))
-                .await?
-                .ok_or(SideCallError::Unavailable)?;
-            let post_auth_hash = sha256_bytes(latest.as_bytes());
-            let latest: Value =
-                serde_json::from_str(&latest).map_err(|_| SideCallError::Unavailable)?;
-            ensure_file_oauth(&config, &latest)?;
-            let (account, fedramp) = oauth_metadata(&latest, &auth.token)?;
+            let oauth = traced("oauth_snapshot", auth.oauth.ok_or(SideCallError::Unavailable))?;
+            let account = oauth.account.as_str();
             set_bearer(&mut headers, &auth.token)?;
             headers.insert(
                 "chatgpt-account-id",
                 HeaderValue::from_str(account).map_err(|_| SideCallError::Unavailable)?,
             );
-            if fedramp {
+            if oauth.fedramp {
                 headers.insert("x-openai-fedramp", HeaderValue::from_static("true"));
             }
             let base = oauth_route(
@@ -420,7 +430,7 @@ async fn prepare(call: &StructuredCall<'_>) -> Result<(String, HeaderMap), SideC
                 account,
                 &mut headers,
             )?;
-            cache_auth_hash = Some(post_auth_hash);
+            cache_auth_hash = Some(oauth.file_hash);
             (base, headers)
         }
     };
@@ -433,6 +443,10 @@ async fn prepare(call: &StructuredCall<'_>) -> Result<(String, HeaderMap), SideC
 #[cfg(test)]
 #[path = "codex_concurrency_tests.rs"]
 mod concurrency_tests;
+
+#[cfg(test)]
+#[path = "codex_auth_snapshot_tests.rs"]
+mod auth_snapshot_tests;
 
 fn routing_snapshot(
     command: &tokio::process::Command,
@@ -943,20 +957,10 @@ async fn stock_snapshot(
             let effective = traced("rpc_config_read", rpc_reply(&mut stdout, 2).await)?;
             traced("routing_config", validate_effective_routing(candidate, &effective, |key| explicit_env.get(key).cloned().or_else(|| std::env::var(key).ok())))?;
             if !needs_auth { return Ok(None); }
-            traced("rpc_auth_status_write", rpc_write(&mut stdin, json!({"id":3,"method":"getAuthStatus","params":{"includeToken":true,"refreshToken":true}})).await)?;
-            let auth = traced("rpc_auth_status", rpc_reply(&mut stdout, 3).await)?;
-            let mode = auth.get("authMethod").and_then(Value::as_str).ok_or(SideCallError::Unavailable)?;
-            if !matches!(mode, "apikey" | "chatgpt") {
-                return Err(SideCallError::Unavailable);
-            }
-            let token = auth.get("authToken").and_then(Value::as_str).filter(|token| !token.is_empty()).ok_or(SideCallError::Unavailable)?;
-            let workspace_routing = if mode == "chatgpt" {
-                traced("rpc_account_read_write", rpc_write(&mut stdin, json!({"id":4,"method":"account/read","params":{"refreshToken":false}})).await)?;
-                let account = traced("rpc_account_read", rpc_reply(&mut stdout, 4).await)?;
-                if account.pointer("/account/type").and_then(Value::as_str) != Some("chatgpt") { return Err(SideCallError::Unavailable); }
-                Some(account.get("workspaceRouting").filter(|routing| routing.is_object()).cloned().ok_or(SideCallError::Unavailable)?)
-            } else { None };
-            Ok(Some(AuthSnapshot { mode: mode.to_owned(), token: token.to_owned(), user_agent: user_agent.to_owned(), workspace_routing }))
+            let route = resolve_route(candidate, |key| explicit_env.get(key).cloned().or_else(|| std::env::var(key).ok()))?;
+            read_stock_auth(&mut stdin, &mut stdout, candidate, route.base.as_deref(), user_agent, || async {
+                read_optional(&home.join("auth.json")).await?.ok_or(SideCallError::Unavailable)
+            }).await.map(Some)
         } => result,
         _ = drain_stderr(stderr) => Err(SideCallError::Failed),
     };
@@ -964,6 +968,136 @@ async fn stock_snapshot(
     // Drop is the abort backstop. The enclosing total timeout includes reaping.
     let _ = guard.child.wait().await;
     result
+}
+
+// Keep RPC identity, routing and file metadata in one verified snapshot while
+// the auth owner is alive. An external refresh may rotate the file between RPCs;
+// only a same-account token mismatch permits one non-refreshing reread.
+async fn read_stock_auth<W, R, F, Fut>(
+    stdin: &mut W,
+    stdout: &mut BufReader<R>,
+    config: &toml::Table,
+    base: Option<&str>,
+    user_agent: &str,
+    mut read_file: F,
+) -> Result<AuthSnapshot, SideCallError>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<String, SideCallError>>,
+{
+    let mut account_anchor: Option<String> = None;
+    for attempt in 0..2u64 {
+        let auth_id = 3 + attempt * 2;
+        let account_id = auth_id + 1;
+        super::diagnostics::active_phase("rpc_auth_status");
+        traced(
+            "rpc_auth_status_write",
+            rpc_write(stdin, json!({
+                "id": auth_id,
+                "method": "getAuthStatus",
+                "params": {"includeToken": true, "refreshToken": attempt == 0}
+            })).await,
+        )?;
+        let auth = traced("rpc_auth_status", rpc_reply(stdout, auth_id).await)?;
+        let mode = traced(
+            "auth_mode",
+            auth.get("authMethod")
+                .and_then(Value::as_str)
+                .filter(|mode| *mode == "chatgpt" || (attempt == 0 && *mode == "apikey"))
+                .ok_or(SideCallError::Unavailable),
+        )?;
+        let token = traced(
+            "auth_token",
+            auth.get("authToken")
+                .and_then(Value::as_str)
+                .filter(|token| !token.is_empty())
+                .ok_or(SideCallError::Unavailable),
+        )?;
+        if mode == "apikey" {
+            return Ok(AuthSnapshot {
+                mode: mode.into(),
+                token: token.into(),
+                user_agent: user_agent.into(),
+                workspace_routing: None,
+                oauth: None,
+            });
+        }
+        super::diagnostics::active_phase("rpc_account_read");
+        traced(
+            "rpc_account_read_write",
+            rpc_write(stdin, json!({
+                "id": account_id,
+                "method": "account/read",
+                "params": {"refreshToken": false}
+            })).await,
+        )?;
+        let account = traced("rpc_account_read", rpc_reply(stdout, account_id).await)?;
+        traced(
+            "oauth_account_type",
+            if account.pointer("/account/type").and_then(Value::as_str) == Some("chatgpt") {
+                Ok(())
+            } else {
+                Err(SideCallError::Unavailable)
+            },
+        )?;
+        let routing = traced(
+            "oauth_routing",
+            account.get("workspaceRouting")
+                .filter(|routing| routing.is_object())
+                .ok_or(SideCallError::Unavailable),
+        )?;
+        let selected = traced(
+            "oauth_account",
+            routing.get("chatgptAccountId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty() && id.trim() == *id)
+                .ok_or(SideCallError::Unavailable),
+        )?;
+        if account_anchor.as_deref().is_some_and(|anchor| anchor != selected) {
+            return traced("oauth_account_changed", Err(SideCallError::Unavailable));
+        }
+        account_anchor.get_or_insert_with(|| selected.to_owned());
+        super::diagnostics::active_phase("oauth_file_read");
+        let text = traced("oauth_file_read", read_file().await)?;
+        let file: Value = traced(
+            "oauth_file_json",
+            serde_json::from_str(&text).map_err(|_| SideCallError::Unavailable),
+        )?;
+        traced("oauth_file_identity", ensure_file_oauth(config, &file))?;
+        let file_token = file.pointer("/tokens/access_token")
+            .and_then(Value::as_str)
+            .ok_or(SideCallError::Unavailable)?;
+        // Validate all metadata and routing even on mismatch: a malformed or
+        // changed identity must never become a reason to retry authentication.
+        let (file_account, fedramp) = traced(
+            "oauth_file_metadata",
+            oauth_metadata(&file, file_token),
+        )?;
+        if file_account != selected {
+            return traced("oauth_account_changed", Err(SideCallError::Unavailable));
+        }
+        traced(
+            "oauth_routing",
+            oauth_route(base, routing, file_account, &mut HeaderMap::new()),
+        )?;
+        if file_token == token {
+            return Ok(AuthSnapshot {
+                mode: mode.into(),
+                token: token.into(),
+                user_agent: user_agent.into(),
+                workspace_routing: Some(routing.clone()),
+                oauth: Some(VerifiedOauth {
+                    account: file_account.into(),
+                    fedramp,
+                    file_hash: sha256_bytes(text.as_bytes()),
+                }),
+            });
+        }
+        // Do not record a recoverable mismatch as the call's first failure.
+    }
+    traced("oauth_token_mismatch", Err(SideCallError::Unavailable))
 }
 
 async fn drain_stderr(mut pipe: impl AsyncRead + Unpin) {
@@ -981,7 +1115,7 @@ async fn drain_stderr(mut pipe: impl AsyncRead + Unpin) {
 }
 
 async fn rpc_write(
-    pipe: &mut tokio::process::ChildStdin,
+    pipe: &mut (impl AsyncWrite + Unpin),
     value: Value,
 ) -> Result<(), SideCallError> {
     let mut bytes = serde_json::to_vec(&value).map_err(|_| SideCallError::Failed)?;
@@ -993,7 +1127,7 @@ async fn rpc_write(
 }
 
 async fn rpc_reply(
-    pipe: &mut BufReader<tokio::process::ChildStdout>,
+    pipe: &mut BufReader<impl AsyncRead + Unpin>,
     id: u64,
 ) -> Result<Value, SideCallError> {
     let mut total = 0usize;

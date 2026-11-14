@@ -552,7 +552,8 @@ pub async fn summarize_session_handoff(
                     let db = Arc::clone(&state.db);
                     send_handoff_progress(progress.as_ref(), run.observe(HandoffProgress::stage(HandoffPhase::Verifying)));
                     tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
-                        full_handoff::ensure_saved_history_unchanged(&db, &engine, &session_id, &source_stamp)?;
+                        full_handoff::ensure_saved_history_unchanged(&db, &engine, &session_id, &source_stamp)
+                            .map_err(|error| format!("handoff main session {engine}/{session_id}: {error}"))?;
                         handoff_selected_children::verify_selected_child_stamps(&db, &child_stamps)
                     }).await.map_err(|e| format!("full handoff source verification failed: {e}"))??;
                     Ok(summary)

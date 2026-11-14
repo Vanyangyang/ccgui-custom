@@ -342,7 +342,8 @@ pub(super) fn verify_selected_child_stamps(
     stamps: &[VerifiedChildStamp],
 ) -> Result<(), String> {
     for item in stamps {
-        full_handoff::ensure_saved_history_unchanged(db, &item.engine, &item.session_id, &item.stamp)?;
+        full_handoff::ensure_saved_history_unchanged(db, &item.engine, &item.session_id, &item.stamp)
+            .map_err(|error| format!("selected handoff child {}/{}: {error}", item.engine, item.session_id))?;
     }
     Ok(())
 }
@@ -502,9 +503,17 @@ mod tests {
         assert!(resolved.contains("Ledger report for b-fallback"));
         verify_selected_child_stamps(&db, &stamps).unwrap();
 
+        // Usage/bookkeeping appends do not change the selected child's input.
+        use std::io::Write;
+        let mut append = std::fs::OpenOptions::new().append(true).open(&child_file).unwrap();
+        writeln!(append, "{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\"}}}}").unwrap();
+        drop(append);
+        verify_selected_child_stamps(&db, &stamps).unwrap();
+
         // Mutating the saved child session invalidates stamp verification
         std::fs::write(&child_file, "{}\n").unwrap();
-        assert!(verify_selected_child_stamps(&db, &stamps).is_err());
+        let error = verify_selected_child_stamps(&db, &stamps).unwrap_err();
+        assert!(error.contains("selected handoff child codex/child-saved"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

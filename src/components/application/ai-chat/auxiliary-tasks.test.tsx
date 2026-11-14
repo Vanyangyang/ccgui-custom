@@ -3,7 +3,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { AiChatSidebar } from "./ai-chat-sidebar";
 import { AUXILIARY_TASKS_KEY, partitionAuxiliaryRepos } from "./auxiliary-tasks";
-import type { AiChatRepo } from "./sidebar-types";
+import type { AiChatRepo, AiChatThread } from "./sidebar-types";
 
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({ t: (key: string, options?: { count?: number }) => options?.count === undefined ? key : `${key} (${options.count})` }),
@@ -62,6 +62,42 @@ it("manual classification persists across scans and remounts and can move back",
   expect(section()).not.toBeNull();
   expect(header().getAttribute("aria-expanded")).toBe("true");
   expect(JSON.parse(localStorage.getItem(AUXILIARY_TASKS_KEY)!).overrides["cursor/helper"]).toBe(true);
+});
+
+it.each(["agy_workflow", "agy_probe"] as const)("%s supports persistent ordinary overrides and disclosure", async (auxiliaryKind) => {
+  const id = `agy/${auxiliaryKind}`;
+  const agyRepos: AiChatRepo[] = [{ label: "AGY workspace", defaultOpen: true, threads: [
+    { id, label: "AGY helper", engine: "agy", time: "", auxiliaryKind },
+  ] }];
+  await act(async () => root.render(<AiChatSidebar repos={agyRepos} activeThreadId={id} />));
+  expect(header().getAttribute("aria-expanded")).toBe("true");
+  await act(async () => header().click());
+  await act(async () => root.render(<AiChatSidebar repos={structuredClone(agyRepos)} activeThreadId={id} />));
+  expect(header().getAttribute("aria-expanded")).toBe("false");
+  await act(async () => header().click());
+  await act(async () => button("AGY helper", section()).dispatchEvent(new MouseEvent("contextmenu", { bubbles: true })));
+  await act(async () => button("chat.moveToOrdinarySessions", document.body).click());
+  expect(section()).toBeNull();
+  expect(JSON.parse(localStorage.getItem(AUXILIARY_TASKS_KEY)!).overrides[id]).toBe(false);
+  await act(async () => root.unmount()); root = createRoot(node);
+  await act(async () => root.render(<AiChatSidebar repos={structuredClone(agyRepos)} activeThreadId={id} />));
+  expect(section()).toBeNull();
+  expect(button("AGY helper")).toBeDefined();
+});
+
+it("classifies AGY metadata while preserving ordinary workflow chats and managed children", () => {
+  const workflow: AiChatThread = { id: "agy/agent", label: "Agent", engine: "agy", time: "", auxiliaryKind: "agy_workflow" };
+  const probe: AiChatThread = { ...workflow, id: "agy/probe", auxiliaryKind: "agy_probe" };
+  const ordinary: AiChatThread = { id: "agy/main", label: "run_workflow acceptance probe", engine: "agy", time: "" };
+  const managed = { ...workflow, id: "agy/managed", isLeader: true, children: [probe] };
+  const protectedChat = { ...probe, id: "agy/protected", protectedFromDeletion: true };
+  const fallback = { ...workflow, id: "agy/fallback", leaderParentFallback: true };
+  const input: AiChatRepo[] = [{ label: "AGY workspace", threads: [workflow, probe, ordinary, managed, protectedChat, fallback] }];
+  const result = partitionAuxiliaryRepos(input, { "agy/main": true, "agy/managed": true });
+  expect(result.auxiliaryThreads.map((thread) => thread.id).sort()).toEqual(["agy/agent", "agy/probe"]);
+  expect(result.mainRepos[0].threads).toEqual([ordinary, managed, protectedChat, fallback]);
+  expect(result.mainRepos[0].threads[1]).toBe(managed);
+  expect(result.mainRepos[0].threads[1].children![0]).toBe(probe);
 });
 
 it("reveals an active auxiliary once without overriding subsequent collapse", async () => {
