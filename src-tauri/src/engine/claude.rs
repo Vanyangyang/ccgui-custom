@@ -8,9 +8,12 @@ use std::sync::Mutex;
 
 #[path = "claude_throughput.rs"]
 mod throughput;
+#[path = "claude_context.rs"]
+mod context;
 
 pub struct ClaudeEngine {
     throughput: Mutex<throughput::ClaudeThroughput>,
+    context: Mutex<context::ClaudeContext>,
     lifecycle: Mutex<super::claude_lifecycle::ClaudeLifecycle>,
     /// Per-block partial JSON for tool_use inputs. Streamed as
     /// `input_json_delta` after a name-only `content_block_start`.
@@ -48,6 +51,7 @@ impl ClaudeEngine {
     pub fn new() -> Self {
         Self {
             throughput: Mutex::new(throughput::ClaudeThroughput::default()),
+            context: Mutex::new(context::ClaudeContext::default()),
             lifecycle: Mutex::new(super::claude_lifecycle::ClaudeLifecycle::default()),
             pending_tool_json: Mutex::new(HashMap::new()),
             tool_names: Mutex::new(HashMap::new()),
@@ -101,8 +105,10 @@ impl Engine for ClaudeEngine {
         if host_chat_server.is_some() && req.allowed_tools.is_some() {
             return Err("tool-constrained runs cannot mount the host chat bridge".into());
         }
-        *self.throughput.lock().unwrap_or_else(|p| p.into_inner()) =
-            throughput::ClaudeThroughput::default();
+        self.throughput
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .arm(std::time::Instant::now());
         // 【对话额度】原生 Claude 渠道的每段对话都记标记。setup-token 用令牌哈希，
         // 这样响应头带回的 rate_limit_event 不会因为登录摘要为空被丢掉。
         *self.quota_stamp.lock().unwrap_or_else(|p| p.into_inner()) =
@@ -115,6 +121,7 @@ impl Engine for ClaudeEngine {
                 None
             };
         let mut cmd = command_for_binary(bin);
+        cmd.env("CLAUDE_CODE_ENTRYPOINT", "ccgui");
         // The native Agent SDK's run-over signal. `result` alone is only a
         // response boundary and can precede background notification turns.
         cmd.env("CLAUDE_CODE_SDK_READS_SESSION_STATE", "1");
@@ -279,6 +286,11 @@ impl Engine for ClaudeEngine {
             return;
         };
         let event_type = value.get("type").and_then(Value::as_str).unwrap_or("");
+        if let Some(usage) = self.context.lock().unwrap_or_else(|p| p.into_inner()).observe(&value) {
+            // A new request after compaction supersedes the boundary snapshot.
+            *self.compact_post_tokens.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            out.push(EngineEvent::Usage(usage));
+        }
         // Independent telemetry must precede result's terminal events. It
         // reads the raw CLI accounting, never compacted context-window usage.
         if let Some(snapshot) = self
@@ -628,6 +640,17 @@ impl Engine for ClaudeEngine {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn finish_telemetry(&self, _interrupted: bool, out: &mut Vec<EngineEvent>) {
+        if let Some(snapshot) = self
+            .throughput
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .finish_eof(std::time::Instant::now())
+        {
+            out.push(EngineEvent::Throughput(snapshot));
         }
     }
 }

@@ -14,6 +14,9 @@ use tauri::Manager;
 
 static HOST: LazyLock<Mutex<Option<Arc<Host>>>> = LazyLock::new(|| Mutex::new(None));
 mod diagnostics;
+mod recovery;
+mod maintenance;
+pub(crate) use maintenance::run_stdio as run_recovery_stdio;
 pub(crate) use diagnostics::{blocker_snapshot, BlockerSnapshot};
 static PAUSED: AtomicBool = AtomicBool::new(false);
 const MAX_SOURCES: usize = 4096;
@@ -32,6 +35,8 @@ struct Host {
 }
 struct Route {
     client: WorkerClient,
+    // A validated orphan may become archive-only without projecting its tail.
+    replay_only: AtomicBool,
     engine: Option<String>,
     binding: Mutex<()>,
     session_id: Mutex<Option<String>>,
@@ -94,17 +99,49 @@ pub(crate) async fn initialize(
         let route = owner.install(client, session.clone(), status["engine"].as_str().map(str::to_owned))?;
         // Restore before replay even if the native process finished while the
         // desktop was away: its final journal tail still owns the task result.
-        let restored = crate::host_chat::restore_worker_tasks(
-            &route.client.manifest().run_id,
-            status["engine"].as_str(), status["workspacePath"].as_str(), session.as_deref(),
-        )?;
-        if status["managedTask"] == true && !restored && status["nativeComplete"] != true {
-            return Err("Managed worker has no trusted coordinator checkpoint".into());
-        }
-        if status["nativeComplete"] != true {
-            if let Some(session) = session.as_deref() {
-                owner.bind_session(&route, session)?;
+        let recovery = (|| -> Result<Option<recovery::RecoveryIdentity>, String> {
+            let restored = crate::host_chat::restore_worker_tasks(
+                &route.client.manifest().run_id,
+                status["engine"].as_str(), status["workspacePath"].as_str(), session.as_deref(),
+            )?;
+            if !restored && status["managedTask"] == false {
+                if let (Some(engine), Some(session), Some(workspace)) = (status["engine"].as_str(), session.as_deref(), status["workspacePath"].as_str()) {
+                    let db = &app.state::<crate::AppState>().db;
+                    if recovery::owns_children(db, engine, session, workspace)? {
+                        if let Some(identity) = recovery::orphan_root(&status, &route.client.manifest().run_id, true) {
+                            return Ok(Some(identity));
+                        }
+                    }
+                }
             }
+            if status["managedTask"] == true && !restored && status["nativeComplete"] != true {
+                return Err("Managed worker has no trusted coordinator checkpoint".into());
+            }
+            if status["nativeComplete"] != true {
+                if let Some(session) = session.as_deref() {
+                    owner.bind_session(&route, session)?;
+                }
+            }
+            Ok(None)
+        })();
+        if let Ok(Some(identity)) = &recovery {
+            // An uncheckpointed coordinator is not an isolated agent. Keep it
+            // fenced while independently validating its finished, durable tail;
+            // never recreate its task or host-chat authority from discovery.
+            route.observation_fault.store(true, Ordering::SeqCst);
+            revoke_task_authority(&route.client.manifest().run_id);
+            owner.poll_orphan(route, identity.clone());
+            continue;
+        }
+        if let Err(cause) = recovery {
+            // Discovery proves a live worker, not permission to recreate its
+            // coordinator. Keep its proxy/aliases to fence duplicate sends and
+            // leave its process/journal intact, but publish no unvalidated tail.
+            // A single missing crash-recovery capability must not kill the GUI.
+            route.observation_fault.store(true, Ordering::SeqCst);
+            revoke_task_authority(&route.client.manifest().run_id);
+            eprintln!("[worker-host] task recovery failed (worker retained): {cause}");
+            continue;
         }
         owner.poll(route);
     }
@@ -301,6 +338,7 @@ impl Host {
         let aliases = HashSet::from([manifest.run_id.clone()]);
         let route = Arc::new(Route {
             client,
+            replay_only: AtomicBool::new(false),
             engine,
             binding: Mutex::new(()),
             session_id: Mutex::new(session),
@@ -317,6 +355,85 @@ impl Host {
             .unwrap_or_else(|p| p.into_inner())
             .insert(worker_id, route.clone());
         Ok(route)
+    }
+
+    /// Recover only the durable result of an uncheckpointed root. No native
+    /// event is projected into Leader and no host-chat capability is restored.
+    fn poll_orphan(self: &Arc<Self>, route: Arc<Route>, identity: recovery::RecoveryIdentity) {
+        let owner = self.clone();
+        tauri::async_runtime::spawn(async move {
+            let stream = route.client.manifest().worker_id.clone();
+            let mut retired: Option<(u64, &'static str, String)> = None;
+            while !owner.stopped.load(Ordering::SeqCst) {
+                if owner.observers_paused.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+                if let Some((head, terminal, request_id)) = &retired {
+                    let observation = owner.controls.read().await;
+                    if owner.observers_paused.load(Ordering::SeqCst) {
+                        drop(observation);
+                        continue;
+                    }
+                    if let Ok(saved) = archive(&stream).await {
+                        if saved.head() == *head && saved.terminal_outcome(&identity.run_id, &identity.engine, &identity.session_id)
+                            .ok().flatten().is_some_and(|proof| proof.status == *terminal)
+                        {
+                            // The immutable archive is verified before removing
+                            // the registry alias or advertising a replay source.
+                            owner.finish_native(&route);
+                            route.head.store(*head, Ordering::SeqCst);
+                            route.observed.store(*head, Ordering::SeqCst);
+                            route.replay_only.store(true, Ordering::SeqCst);
+                            route.physically_complete.store(true, Ordering::SeqCst);
+                            route.archived.store(true, Ordering::SeqCst);
+                            route.observation_fault.store(false, Ordering::SeqCst);
+                            return;
+                        }
+                    }
+                    // A lost retirement ACK is reconciled by the same command
+                    // identity. Retirement is idempotent and never re-executes.
+                    let result = route.client.request(request_id, Command::Retire { stream_id: stream.clone(), through: *head }).await;
+                    if result.as_ref().err().is_some_and(|error| !error.outcome_unknown) { retired = None; }
+                    drop(observation);
+                } else if let Ok(status) = route.client.request(&uuid::Uuid::new_v4().to_string(), Command::Status).await {
+                    if let Some(head) = recovery::finished_head(&status, &identity) {
+                        let mut audit = recovery::OrphanAudit::new(&stream, &identity);
+                        let mut cursor = 0;
+                        let mut valid = true;
+                        while cursor < head && !owner.stopped.load(Ordering::SeqCst) && !owner.observers_paused.load(Ordering::SeqCst) {
+                            match route.client.events_after(cursor, 128).await {
+                                Ok(page) if page.head == head && page.durable_through == head && !page.events.is_empty() && page.through > cursor && page.through <= head => {
+                                    for event in &page.events {
+                                        if let Err(cause) = audit.observe(event) {
+                                            // A completed, immutable tail with inconsistent
+                                            // identity must remain fenced, not retry forever.
+                                            eprintln!("[worker-host] orphan recovery refused: {cause}");
+                                            return;
+                                        }
+                                    }
+                                    cursor = page.through;
+                                }
+                                _ => { valid = false; break; }
+                            }
+                        }
+                        if valid && cursor == head && !owner.observers_paused.load(Ordering::SeqCst) {
+                            let Some(terminal) = audit.finish(head) else {
+                                eprintln!("[worker-host] orphan recovery refused: completed journal has no exact terminal");
+                                return;
+                            };
+                            if let Ok(fresh) = route.client.request(&uuid::Uuid::new_v4().to_string(), Command::Status).await {
+                                if recovery::finished_head(&fresh, &identity) == Some(head) {
+                                    retired = Some((head, terminal, uuid::Uuid::new_v4().to_string()));
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
     }
 
     fn poll(self: &Arc<Self>, route: Arc<Route>) {
@@ -595,6 +712,7 @@ pub(crate) async fn ensure_sources(cursors: &HashMap<String, u64>) -> Result<(),
         }
         let route = Arc::new(Route {
             client: WorkerClient::new(saved.manifest().clone()),
+            replay_only: AtomicBool::new(true),
             engine: None,
             binding: Mutex::new(()),
             session_id: Mutex::new(saved.session_id()),
@@ -607,8 +725,12 @@ pub(crate) async fn ensure_sources(cursors: &HashMap<String, u64>) -> Result<(),
             archived: AtomicBool::new(true),
         });
         let mut routes = owner.workers.lock().unwrap_or_else(|p| p.into_inner());
-        if routes.len() >= MAX_SOURCES && !routes.contains_key(id) { return Err("Worker source retention capacity reached".into()); }
-        routes.insert(id.clone(), route);
+        let at_capacity = routes.len() >= MAX_SOURCES;
+        // Archive I/O yielded; preserve a worker installed in the meantime.
+        if let std::collections::hash_map::Entry::Vacant(entry) = routes.entry(id.clone()) {
+            if at_capacity { return Err("Worker source retention capacity reached".into()); }
+            entry.insert(route);
+        }
     }
     Ok(())
 }
@@ -886,6 +1008,9 @@ pub(crate) async fn control(
     let _memory_foreground = matches!(command, Command::Followup { .. }).then(crate::plugin_memory::foreground);
     let owner = host()?;
     let route = owner.route(key)?;
+    if route.observation_fault.load(Ordering::SeqCst) && !recovery_control_allowed(&command) {
+        return Some(Err("Worker recovery failed; only status, receipts and interrupt are available".into()));
+    }
     let _control = loop {
         let guard = owner.controls.read().await;
         if !owner.paused.load(Ordering::SeqCst) {
@@ -906,6 +1031,10 @@ pub(crate) async fn control(
     Some(route_request(&route, request_id, command).await)
 }
 
+fn recovery_control_allowed(command: &Command) -> bool {
+    matches!(command, Command::Status | Command::Receipt { .. } | Command::Interrupt)
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Source {
@@ -913,7 +1042,22 @@ pub(crate) struct Source {
     run_id: String,
     head: u64,
     active: bool,
+    replay_only: bool,
     session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery_error: Option<&'static str>,
+}
+
+#[tauri::command]
+pub(crate) async fn runtime_worker_terminal_outcome(
+    run_id: String,
+    engine: String,
+    session_id: String,
+    workspace_path: String,
+) -> Result<Option<crate::worker_archive::TerminalOutcome>, String> {
+    tokio::task::spawn_blocking(move || crate::worker_archive::terminal_outcome(
+        &crate::paths::app_home(), &run_id, &engine, &session_id, &workspace_path,
+    )).await.map_err(|_| "Read worker terminal archive task failed".to_string())?
 }
 
 #[tauri::command]
@@ -934,6 +1078,9 @@ pub(crate) async fn runtime_worker_sources(
                     run_id: route.client.manifest().run_id.clone(),
                     head: route.observed.load(Ordering::SeqCst),
                     active: !route.physically_complete.load(Ordering::SeqCst),
+                    replay_only: route.replay_only.load(Ordering::SeqCst),
+                    recovery_error: route.observation_fault.load(Ordering::SeqCst)
+                        .then_some("worker-recovery-failed"),
                     session_id: route
                         .session_id
                         .lock()
@@ -960,6 +1107,9 @@ pub(crate) async fn runtime_worker_events(
         .get(&stream_id)
         .cloned()
         .ok_or("Unknown worker stream")?;
+    if route.observation_fault.load(Ordering::SeqCst) {
+        return Err("Worker recovery failed; its event journal has not been validated".into());
+    }
     if route.archived.load(Ordering::SeqCst) {
         return archive(&stream_id).await?.replay(after, limit);
     }
@@ -1045,6 +1195,29 @@ pub(crate) async fn shutdown(preserve: bool) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn failed_recovery_allows_inspection_and_stop_but_no_new_work_or_replay() {
+        for command in [
+            json!({"op":"status"}),
+            json!({"op":"receipt","request_id":"original-request"}),
+            json!({"op":"interrupt"}),
+        ] {
+            assert!(super::recovery_control_allowed(&serde_json::from_value(command).unwrap()));
+        }
+        for command in [
+            json!({"op":"followup","prompt":"continue","image_paths":null}),
+            json!({"op":"interrupt_turn"}),
+            json!({"op":"stop_task","task_id":"child"}),
+            json!({"op":"answer_question","question_id":"question","answers":null}),
+            json!({"op":"plan","plan_id":"plan","expected_revision":1,"decision":"approve","feedback":null}),
+            json!({"op":"events","stream_id":"stream","after":0,"limit":10}),
+            json!({"op":"retire","stream_id":"stream","through":10}),
+            json!({"op":"shutdown"}),
+        ] {
+            assert!(!super::recovery_control_allowed(&serde_json::from_value(command).unwrap()));
+        }
+    }
+
     use super::*;
     #[test]
     fn replay_exposes_only_validated_events_and_preserves_their_original_payload() {
@@ -1094,6 +1267,7 @@ mod tests {
                 schema_hash: String::new(),
             }),
             engine: Some("claude".into()),
+            replay_only: AtomicBool::new(false),
             binding: Mutex::new(()),
             session_id: Mutex::new(Some("same-session".into())),
             run_aliases: Mutex::new(HashSet::from([id.into(), format!("{id}-c1")])),

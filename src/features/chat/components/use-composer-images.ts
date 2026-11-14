@@ -56,6 +56,38 @@ interface ImageCheckpointOwner { key?: string; paths: () => string[]; pending: (
 const imageOwners = new Map<string, ImageCheckpointOwner>();
 const restoredImages = new Map<string, string[]>();
 const imageReadyWaiters = new Set<() => void>();
+const imageDraftListeners = new Set<() => void>();
+let occupiedImageDraftKeys = new Set<string>();
+let imageOccupationNotificationPending = false;
+
+function occupiedImageDrafts(): Set<string> {
+  const keys = new Set([...restoredImages].filter(([, paths]) => paths.length > 0).map(([key]) => key));
+  for (const owner of imageOwners.values()) {
+    if (owner.key && (owner.paths().length > 0 || owner.pending() > 0)) keys.add(owner.key);
+  }
+  return keys;
+}
+
+/** No attachment identities leave this module. Observe only occupied-key transitions. */
+export function subscribeComposerImageDraftOccupation(listener: () => void): () => void {
+  if (!imageDraftListeners.size) occupiedImageDraftKeys = occupiedImageDrafts();
+  imageDraftListeners.add(listener);
+  return () => { imageDraftListeners.delete(listener); };
+}
+
+function notifyImageDraftOccupation() {
+  if (!imageDraftListeners.size || imageOccupationNotificationPending) return;
+  imageOccupationNotificationPending = true;
+  // A React effect cleanup/setup or checkpoint claim transfers an owner in one
+  // commit. Observe the resulting occupation, not a transient ownerless gap.
+  queueMicrotask(() => {
+    imageOccupationNotificationPending = false;
+    const next = occupiedImageDrafts();
+    const changed = next.size !== occupiedImageDraftKeys.size || [...next].some(key => !occupiedImageDraftKeys.has(key));
+    occupiedImageDraftKeys = next;
+    if (changed) for (const listener of imageDraftListeners) listener();
+  });
+}
 /** Draft moves cannot transfer component-local attachments or pending imports. */
 export function hasComposerImageDraft(key: string): boolean {
   return !!restoredImages.get(key)?.length || [...imageOwners.values()].some(
@@ -78,6 +110,7 @@ const unregisterImageCheckpoint = registerRuntimeCheckpointParticipant({
     if (entries.some(([key, paths]) => !key || !Array.isArray(paths) || paths.some((path) => typeof path !== "string"))) throw new Error("Invalid composer image identity");
     restoredImages.clear();
     for (const [key, paths] of entries) if ((paths as string[]).length) restoredImages.set(key, paths as string[]);
+    notifyImageDraftOccupation();
   },
   readiness() {
     const reasons: string[] = [];
@@ -111,11 +144,13 @@ export function useComposerImages(draftKey?: string, draft?: ComposerImageDraft)
         const previous = paths.map((path) => ({ path }));
         return (typeof next === "function" ? next(previous) : next).map((entry) => entry.path);
       });
+      notifyImageDraftOccupation();
       return;
     }
     const value = typeof next === "function" ? next(attachmentRef.current) : next;
     attachmentRef.current = value;
     setAttachmentState(value);
+    notifyImageDraftOccupation();
   }, [draft]);
   useEffect(() => {
     const restored = !draft && draftKey ? restoredImages.get(draftKey) : undefined;
@@ -124,8 +159,16 @@ export function useComposerImages(draftKey?: string, draft?: ComposerImageDraft)
     imageOwners.set(checkpointId, owner);
     if (draftKey) restoredImages.delete(draftKey);
     imagesClaimed();
-    return () => { if (imageOwners.get(checkpointId) === owner) imageOwners.delete(checkpointId); };
+    notifyImageDraftOccupation();
+    return () => {
+      if (imageOwners.get(checkpointId) === owner) {
+        imageOwners.delete(checkpointId);
+        notifyImageDraftOccupation();
+      }
+    };
   }, [checkpointId, draftKey, draft, setAttachments]);
+  // Durable owners can change their paths outside this hook's local setters.
+  useEffect(notifyImageDraftOccupation, [effectiveAttachments]);
   const images = useMemo(() => effectiveAttachments.map((entry) => entry.path), [effectiveAttachments]);
   const [previews, setPreviews] = useState<Record<string, AttachmentPreview>>({});
   const [imageError, setImageError] = useState<string | null>(null);
@@ -141,7 +184,10 @@ export function useComposerImages(draftKey?: string, draft?: ComposerImageDraft)
   const captureImageSubmission = useCallback((paths: readonly string[]) => {
     if (draft) {
       const submitted = new Set(paths);
-      return () => draft.update((previous) => previous.filter((path) => !submitted.has(path)));
+      return () => {
+        draft.update((previous) => previous.filter((path) => !submitted.has(path)));
+        notifyImageDraftOccupation();
+      };
     }
     const submitted = new Set(attachments.filter((entry) => paths.includes(entry.path)));
     return () => setAttachments((prev) => {
@@ -204,8 +250,16 @@ export function useComposerImages(draftKey?: string, draft?: ComposerImageDraft)
         const reader = new FileReader();
         pendingImports.current++;
         setImportingImages(true);
+        notifyImageDraftOccupation();
         let finished = false;
-        const finish = () => { if (!finished) { finished = true; pendingImports.current--; setImportingImages(pendingImports.current > 0); } };
+        const finish = () => {
+          if (!finished) {
+            finished = true;
+            pendingImports.current--;
+            setImportingImages(pendingImports.current > 0);
+            notifyImageDraftOccupation();
+          }
+        };
         reader.onerror = () => { setImageError(t("chat.imagePasteFailed", { message: String(reader.error ?? "Image read failed") })); finish(); };
         reader.onabort = finish;
         reader.onload = () => {
@@ -242,6 +296,7 @@ export function useComposerImages(draftKey?: string, draft?: ComposerImageDraft)
       }
       pendingImports.current++;
       setImportingImages(true);
+      notifyImageDraftOccupation();
       ipc
         .importAttachments(paths)
         .then((imported) => {
@@ -256,7 +311,11 @@ export function useComposerImages(draftKey?: string, draft?: ComposerImageDraft)
         })
         .catch((err) => {
           setImageError(t("chat.imageImportFailed", { message: String(err) }));
-        }).finally(() => { pendingImports.current--; setImportingImages(pendingImports.current > 0); });
+        }).finally(() => {
+          pendingImports.current--;
+          setImportingImages(pendingImports.current > 0);
+          notifyImageDraftOccupation();
+        });
     },
     [t, loadPreview, setAttachments],
   );

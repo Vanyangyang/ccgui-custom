@@ -38,7 +38,7 @@ describe("project memory extraction boundary", () => {
       await expect(f.api.extract(request)).resolves.toMatchObject({ status: "deferred", reason: "source_not_settled" });
     }
     expect(f.invoke).not.toHaveBeenCalled();
-    await expect(f.api.extract({ ...request, source: { kind: "coordination", id: "owned-task" } })).rejects.toThrow(/identity/);
+    await expect(f.api.extract({ ...request, source: { kind: "coordination", id: "owned-task" } })).resolves.toMatchObject({ status: "deferred", reason: "request_outcome_unknown" });
     expect(f.coordination).toHaveBeenCalledWith("owned-task");
   });
 
@@ -70,7 +70,7 @@ describe("project memory extraction boundary", () => {
     f.api.dispose();
     expect(f.invoke).toHaveBeenLastCalledWith("plugin_memory_cancel", { pluginId: "owner", requestId: request.requestId });
     hold.resolve({ status: "completed", batch: batch() });
-    await expect(work).resolves.toMatchObject({ status: "deferred", reason: "cancelled" });
+    await expect(work).resolves.toMatchObject({ status: "deferred", reason: "request_outcome_unknown" });
     await expect(f.api.status()).rejects.toThrow(/disposed/);
     const g = fixture(); g.paused.mockReturnValue(true);
     await expect(g.api.extract(request)).resolves.toMatchObject({ status: "deferred", reason: "maintenance" });
@@ -92,7 +92,7 @@ describe("project memory extraction boundary", () => {
     for (const bad of [{ ...batch(), projectId: "foreign" }, { ...batch(), nextCursor: { ...nextCursor, sessionId: "foreign" } },
       { ...batch(), notes: [{ kind: "decision", title: "t", text: "t", conditions: [], relatedIds: ["foreign-memory"], evidence: [{ seq: 1, role: "user", quote: "q" }] }] }]) {
       f.invoke.mockResolvedValueOnce({ status: "completed", batch: bad } as never);
-      await expect(f.api.extract(request)).rejects.toThrow();
+      await expect(f.api.extract(request)).resolves.toMatchObject({ status: "deferred", reason: "request_outcome_unknown" });
     }
   });
 
@@ -102,7 +102,7 @@ describe("project memory extraction boundary", () => {
     f.invoke.mockResolvedValueOnce({ status: "completed", batch: { ...batch(), fromCursor: { sessionId: "native-id", seq: 4, offset: 2, rowDigest: hash } } } as never);
     await expect(f.api.extract({ ...request, cursor: current })).resolves.toMatchObject({ status: "completed" });
     f.invoke.mockResolvedValueOnce({ status: "completed", batch: { ...batch(), fromCursor: nextCursor } } as never);
-    await expect(f.api.extract({ ...request, cursor: nextCursor })).rejects.toThrow(/advance/);
+    await expect(f.api.extract({ ...request, cursor: nextCursor })).resolves.toEqual({ status: "deferred", reason: "request_outcome_unknown", retryAfterMs: 30000 });
   });
 
   it("prepares bounded local retrieval without inference and rejects cursor substitution", async () => {
@@ -141,9 +141,26 @@ describe("project memory extraction boundary", () => {
     for (const changed of [{ ...note, conditions: ["困难难度"] }, { ...note, relations: [{ ...note.relations[0], targetRevision: 1 }] },
       { ...note, evidence: [{ seq: 3, role: "assistant", quote: "取消二阶段" }] }]) {
       f.invoke.mockResolvedValueOnce({ ...response, batch: { ...response.batch, notes: [changed] } } as never);
-      await expect(f.api.extract(v2)).rejects.toThrow();
+      await expect(f.api.extract(v2)).resolves.toEqual({ status: "deferred", reason: "request_outcome_unknown", retryAfterMs: 30000 });
     }
     f.invoke.mockResolvedValueOnce(response as never);
-    await expect(f.api.extract({ ...v2, context: [{ ...context[0], authority: "user_confirmed" }] })).rejects.toThrow(/replacement/);
+    await expect(f.api.extract({ ...v2, context: [{ ...context[0], authority: "user_confirmed" }] })).resolves.toEqual({ status: "deferred", reason: "request_outcome_unknown", retryAfterMs: 30000 });
+  });
+  it("passes exact receipt-only lookup through for an owned source without requiring a new completed turn", async () => {
+    const f = fixture(); f.conversation.mockResolvedValue({ status: "running" });
+    const input = { ...request, reconcileOnly: true };
+    await expect(f.api.extract(input)).resolves.toMatchObject({ status: "completed" });
+    expect(f.invoke).toHaveBeenCalledExactlyOnceWith("plugin_memory_extract", { pluginId: "owner", request: input });
+    const g = fixture(); g.conversation.mockResolvedValue({ status: "running", error: "not owned" } as never);
+    await expect(g.api.extract(input)).resolves.toMatchObject({ reason: "source_not_settled" });
+    expect(g.invoke).not.toHaveBeenCalled();
+    await expect(g.api.extract({ ...input, reconcileOnly: "yes" } as never)).rejects.toThrow(/flag/);
+  });
+  it("preserves the explicit native automation capability and treats transport loss after IPC as unknown", async () => {
+    const f = fixture(); f.invoke.mockResolvedValueOnce({ available: true, busy: false, retryAfterMs: 0, automationVersion: 1 } as never);
+    await expect(f.api.status()).resolves.toMatchObject({ automationVersion: 1 });
+    f.invoke.mockRejectedValueOnce(new Error("lost IPC reply"));
+    await expect(f.api.extract(request)).resolves.toEqual({ status: "deferred", reason: "request_outcome_unknown", retryAfterMs: 30000 });
+    expect(f.invoke.mock.calls.filter(c => c[0] === "plugin_memory_extract")).toHaveLength(1);
   });
 });

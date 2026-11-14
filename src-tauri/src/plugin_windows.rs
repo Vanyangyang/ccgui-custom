@@ -11,6 +11,9 @@ use std::{
 use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 use tokio::sync::watch;
 mod persistence;
+mod delta;
+mod delta_commands;
+pub use delta_commands::*;
 use persistence::{Intent, Presentation};
 
 const PREFIX: &str = "plugin-window-";
@@ -20,7 +23,13 @@ const MAX_PENDING: usize = 64;
 const MAX_RECEIPTS: usize = 128;
 const MAX_RECEIPT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_WINDOWS: usize = 16;
-const MAX_STATE: usize = 8 * 1024 * 1024;
+// Snapshot state may include long native transcripts; actions and results keep
+// their separate budgets and must not grow with the display-state allowance.
+const MAX_STATE: usize = 64 * 1024 * 1024;
+const MAX_RESULT: usize = 8 * 1024 * 1024;
+// The legacy wire format retains a full snapshot in each receipt. One valid
+// maximum-sized snapshot plus its maximum result must remain recoverable.
+const MAX_LEGACY_RECEIPT_BYTES: usize = MAX_STATE + MAX_RESULT + 16 * 1024;
 static REGISTRY: LazyLock<Mutex<Registry>> = LazyLock::new(|| Mutex::new(Registry::default()));
 // Serialize opens without holding the registry across native UI operations.
 static OPEN_GATE: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync::Mutex::new(()));
@@ -55,6 +64,8 @@ pub struct OpenRequest {
     pub labels: Labels,
     #[serde(default = "default_focus")]
     pub focus: bool,
+    #[serde(default)]
+    pub incremental: bool,
 }
 fn default_focus() -> bool {
     true
@@ -92,6 +103,7 @@ pub struct InitInfo {
     pub labels: Labels,
     pub next_sequence: u64,
     pub unresolved_sequences: Vec<u64>,
+    pub incremental: bool,
 }
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -121,6 +133,13 @@ pub struct ActionRequest {
 pub struct ChildRequest {
     pub window_id: String,
     pub registration_id: String,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FocusOwnerRequest {
+    pub window_id: String,
+    pub registration_id: String,
+    pub owner_token: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -221,7 +240,7 @@ pub struct Status {
 }
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct SnapshotEvent {
+pub struct SnapshotEvent {
     window_id: String,
     registration_id: String,
     snapshot: Snapshot,
@@ -264,6 +283,7 @@ struct Entry {
     slots: HashMap<u64, Slot>,
     completed: VecDeque<u64>,
     receipt_bytes: usize,
+    delta: delta::DeltaState,
 }
 impl Entry {
     fn request_close(&mut self, reason: ReturnReason) -> ReturnReason {
@@ -272,6 +292,7 @@ impl Entry {
     }
     fn new(request: OpenRequest) -> Self {
         let window_id = uuid::Uuid::new_v4().to_string();
+        let delta = delta::DeltaState::new(&request.snapshot.state);
         Self {
             identity: WindowIdentity {
                 label: format!("{PREFIX}{window_id}"),
@@ -287,6 +308,7 @@ impl Entry {
             slots: HashMap::new(),
             completed: VecDeque::new(),
             receipt_bytes: 0,
+            delta,
         }
     }
     fn owner(&self, registration: &str, token: &str) -> Result<(), String> {
@@ -317,7 +339,15 @@ impl Entry {
             };
         }
         self.request.snapshot = snapshot.clone();
+        self.delta = delta::DeltaState::new(&snapshot.state);
         Ok(true)
+    }
+    fn mode(&self, incremental: bool) -> Result<(), String> {
+        if self.request.incremental == incremental { Ok(()) } else { Err("plugin_window_snapshot_mode_mismatch".into()) }
+    }
+    fn receipt_snapshot(&self) -> Snapshot {
+        if self.request.incremental { Snapshot { revision: self.request.snapshot.revision, state: Value::Null } }
+        else { self.request.snapshot.clone() }
     }
     fn snapshot_event(&self) -> SnapshotEvent {
         SnapshotEvent {
@@ -404,12 +434,11 @@ impl Entry {
             self.completed.push_back(receipt.sequence);
         }
         self.receipt_bytes -= slot.bytes;
-        slot.bytes = serde_json::to_vec(&receipt)
-            .map(|bytes| bytes.len())
-            .unwrap_or(MAX_RECEIPT_BYTES);
+        slot.bytes = delta::bytes(&receipt);
         self.receipt_bytes += slot.bytes;
         slot.channel.send_replace(Some(receipt));
-        while self.completed.len() > MAX_RECEIPTS || self.receipt_bytes > MAX_RECEIPT_BYTES {
+        let budget = if self.request.incremental { MAX_RECEIPT_BYTES } else { MAX_LEGACY_RECEIPT_BYTES };
+        while self.completed.len() > MAX_RECEIPTS || self.receipt_bytes > budget {
             if let Some(sequence) = self.completed.pop_front() {
                 if let Some(slot) = self.slots.remove(&sequence) {
                     self.receipt_bytes -= slot.bytes;
@@ -427,7 +456,7 @@ impl Entry {
                 unknown: true,
                 value: Value::Null,
                 error: Some(error.into()),
-                snapshot: self.request.snapshot.clone(),
+                snapshot: self.receipt_snapshot(),
             },
             false,
         );
@@ -475,6 +504,7 @@ impl Entry {
             labels: self.request.labels.clone(),
             next_sequence: self.next_sequence,
             unresolved_sequences,
+            incremental: self.request.incremental,
         }
     }
 }
@@ -486,9 +516,30 @@ struct Registry {
     presentations: HashMap<(String, String), (String, String)>,
 }
 impl Registry {
+    fn authorize_focus_owner(&self, label: &str, request: &FocusOwnerRequest) -> Result<(), String> {
+        let entry = self.entries.get(&request.window_id).ok_or("plugin_window_unavailable")?;
+        if label == "main" {
+            let token = request.owner_token.as_deref().ok_or("plugin_window_owner_mismatch")?;
+            entry.owner(&request.registration_id, token)?;
+        } else {
+            if request.owner_token.is_some() { return Err("plugin_window_owner_mismatch".into()); }
+            entry.child(label, &request.registration_id)?;
+        }
+        if entry.closing { return Err("plugin_window_closing".into()); }
+        Ok(())
+    }
+    fn focus_label(&self, id: &str) -> Option<String> {
+        self.entries.get(id).filter(|entry| !entry.closing).map(|entry| entry.identity.label.clone())
+    }
+    fn cost_dialog_label(&self, id: &str, plugin_id: &str) -> Result<String, String> {
+        let entry = self.entries.get(id).ok_or("plugin_window_unavailable")?;
+        if entry.closing || entry.request.plugin_id != plugin_id || !entry.available(true, Instant::now()) { return Err("plugin_window_owner_mismatch".into()); }
+        Ok(entry.identity.label.clone())
+    }
     fn inspect_receipt(&self, label: &str, request: &ReceiptRequest) -> Result<ReceiptInspection, String> {
         let entry = self.entries.get(&request.window_id).ok_or("plugin_window_unavailable")?;
         entry.child(label, &request.registration_id)?;
+        entry.mode(false)?;
         entry.inspect_receipt(request.sequence)
     }
     fn get_mut(&mut self, id: &str) -> Result<&mut Entry, String> {
@@ -525,6 +576,7 @@ impl Registry {
             let entry = self.get_mut(&id)?;
             if entry.request.registration_id == request.registration_id {
                 entry.owner(&request.registration_id, &request.owner_token)?;
+                entry.mode(request.incremental)?;
                 if entry.request.code != request.code
                     || entry.request.css != request.css
                     || entry.request.renderer_export != request.renderer_export
@@ -551,6 +603,58 @@ impl Registry {
         Ok((identity, None, false))
     }
 }
+
+/// Notice acknowledgement accepts only a currently registered, actually
+/// focused plugin window. A stale window id cannot stand in for the main UI.
+pub(crate) fn notice_window_focused(app: &AppHandle, window_id: &str) -> bool {
+    let label = REGISTRY.lock().focus_label(window_id);
+    label.and_then(|label| app.get_webview_window(&label))
+        .is_some_and(|window| window.is_focused().unwrap_or(false))
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CostDialogRequest {
+    plugin_id: String,
+    window_id: Option<String>,
+    #[serde(default)]
+    content: Option<crate::host_confirmation::ConfirmationContent>,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    confirm_label: String,
+    #[serde(default)]
+    dismiss_label: String,
+}
+
+/// Only the isolated host document can answer; the owner rechecks the request.
+#[tauri::command]
+pub async fn plugin_window_confirm_cost_review(window: WebviewWindow, app: AppHandle, request: CostDialogRequest) -> Result<bool, String> {
+    main_only(&window)?;
+    if request.plugin_id.is_empty() || request.plugin_id.len() > 256 { return Err("plugin_window_invalid_cost_dialog".into()); }
+    let parent = if let Some(id) = request.window_id.as_deref() {
+        let label = REGISTRY.lock().cost_dialog_label(id, &request.plugin_id)?;
+        app.get_webview_window(&label).ok_or("plugin_window_unavailable")?
+    } else { window };
+    let content = request.content.unwrap_or(crate::host_confirmation::ConfirmationContent {
+        title: request.title, message: request.message, fields: vec![], sections: vec![],
+        confirm_label: request.confirm_label, dismiss_label: request.dismiss_label,
+        dark: false, language: String::new(),
+    });
+    let accepted = crate::host_confirmation::show_owned(&app, &parent, content, &request.plugin_id).await?;
+    if accepted {
+        if !main_exists(&app) { return Ok(false); }
+        if let Some(id) = request.window_id.as_deref() {
+            let registry = REGISTRY.lock();
+            let label = registry.cost_dialog_label(id, &request.plugin_id)?;
+            let entry = registry.for_label(&label)?;
+            if label != parent.label() || !entry.available(true, Instant::now()) { return Ok(false); }
+        }
+    }
+    Ok(accepted)
+}
+
 fn main_only(window: &WebviewWindow) -> Result<(), String> {
     if window.label() == "main" {
         Ok(())
@@ -559,16 +663,13 @@ fn main_only(window: &WebviewWindow) -> Result<(), String> {
     }
 }
 fn validate_snapshot(snapshot: &Snapshot) -> Result<(), String> {
-    if serde_json::to_vec(&snapshot.state)
-        .map_err(|e| e.to_string())?
-        .len()
-        > MAX_STATE
-    {
+    if delta::bytes(&snapshot.state) > MAX_STATE {
         return Err("plugin_window_state_too_large".into());
     }
     Ok(())
 }
 fn validate_open(request: &OpenRequest) -> Result<(), String> {
+    if request.incremental { delta::validate_full(&request.snapshot)?; }
     let id = request.plugin_id.as_bytes();
     if !(2..=64).contains(&id.len())
         || !id
@@ -680,6 +781,7 @@ fn emit_snapshot(app: &AppHandle, label: &str, event: SnapshotEvent) -> Result<(
         .map_err(|e| e.to_string())
 }
 fn retired(app: &AppHandle, entry: Entry, reason: Option<&'static str>) {
+    crate::host_confirmation::cancel_parent(app, &entry.identity.label);
     if let Some(window) = app.get_webview_window(&entry.identity.label) {
         if let Err(error) = persistence::capture(
             app,
@@ -810,11 +912,7 @@ pub async fn plugin_window_open(
         let target = app
             .get_webview_window(&identity.label)
             .ok_or("plugin_window_unavailable")?;
-        let event = REGISTRY
-            .lock()
-            .get_mut(&identity.window_id)?
-            .snapshot_event();
-        emit_snapshot(&app, &identity.label, event)?;
+        delta_commands::emit_current(&app, &identity.window_id)?;
         if focus {
             target.unminimize().map_err(|e| e.to_string())?;
             target.show().map_err(|e| e.to_string())?;
@@ -1004,12 +1102,8 @@ pub fn plugin_window_inspect_action(window: WebviewWindow, request: ReceiptReque
 }
 
 #[tauri::command]
-pub fn plugin_window_focus_owner(window: WebviewWindow, app: AppHandle, request: ChildRequest) -> Result<(), String> {
-    {
-        let registry = REGISTRY.lock();
-        let entry = registry.entries.get(&request.window_id).ok_or("plugin_window_unavailable")?;
-        entry.child(window.label(), &request.registration_id)?;
-    }
+pub fn plugin_window_focus_owner(window: WebviewWindow, app: AppHandle, request: FocusOwnerRequest) -> Result<(), String> {
+    REGISTRY.lock().authorize_focus_owner(window.label(), &request)?;
     let main = app.get_webview_window("main").ok_or("plugin_window_owner_unavailable")?;
     main.unminimize().map_err(|e| e.to_string())?;
     main.show().map_err(|e| e.to_string())?;
@@ -1027,6 +1121,7 @@ pub fn plugin_window_publish(
         let mut registry = REGISTRY.lock();
         let entry = registry.get_mut(&request.window_id)?;
         entry.owner(&request.registration_id, &request.owner_token)?;
+        entry.mode(false)?;
         entry.snapshot(&request.snapshot)?;
         entry.request.dark = request.dark;
         (entry.identity.label.clone(), entry.snapshot_event())
@@ -1055,6 +1150,7 @@ pub async fn plugin_window_action(
         let mut registry = REGISTRY.lock();
         let entry = registry.get_mut(&request.window_id)?;
         entry.child(window.label(), &request.registration_id)?;
+        entry.mode(false)?;
         if !entry.available(exists, Instant::now()) {
             entry.cancel("plugin_window_owner_unavailable");
             return Err("plugin_window_owner_unavailable".into());
@@ -1122,7 +1218,7 @@ pub fn plugin_window_respond(
     if serde_json::to_vec(&request.value)
         .map_err(|e| e.to_string())?
         .len()
-        > MAX_STATE
+        > MAX_RESULT
     {
         return Err("plugin_window_result_too_large".into());
     }
@@ -1130,6 +1226,7 @@ pub fn plugin_window_respond(
         let mut registry = REGISTRY.lock();
         let entry = registry.get_mut(&request.window_id)?;
         entry.owner(&request.registration_id, &request.owner_token)?;
+        entry.mode(false)?;
         if !entry.respond(request)? {
             return Ok(());
         }
@@ -1220,6 +1317,7 @@ pub fn plugin_window_request_return(
             serde_json::json!({"windowId":request.window_id,"registrationId":request.registration_id,"reason":reason}),
         )
     };
+    crate::host_confirmation::cancel_parent(&app, &label);
     app.emit_to(&label, "plugin-window://close-requested", payload)
         .map_err(|e| e.to_string())
 }
@@ -1309,6 +1407,7 @@ pub fn plugin_window_status(window: WebviewWindow, app: AppHandle) -> Result<Sta
     let owner_available = entry.available(exists, Instant::now());
     if !owner_available {
         entry.cancel("plugin_window_owner_unavailable");
+        crate::host_confirmation::cancel_parent(&app, window.label());
     }
     Ok(Status {
         owner_available,
@@ -1318,6 +1417,7 @@ pub fn plugin_window_status(window: WebviewWindow, app: AppHandle) -> Result<Sta
 }
 
 pub fn shutdown(app: &AppHandle) {
+    crate::host_confirmation::cancel_all(app);
     let entries = {
         let mut registry = REGISTRY.lock();
         registry.stopped = true;
@@ -1338,6 +1438,7 @@ pub fn shutdown(app: &AppHandle) {
 /// Backend disable/uninstall/reload/quarantine must retire views even if the
 /// main document has not processed its plugin invalidation event yet.
 pub(crate) fn dispose_plugin(app: &AppHandle, plugin_id: &str) {
+    crate::host_confirmation::cancel_owner(app, plugin_id);
     let entries = {
         let mut registry = REGISTRY.lock();
         registry.lifecycle_epoch = registry.lifecycle_epoch.wrapping_add(1);

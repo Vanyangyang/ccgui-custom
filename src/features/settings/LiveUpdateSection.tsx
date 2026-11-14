@@ -9,7 +9,7 @@ import { ActionFeedbackIcon, useActionFeedback } from "@/components/base/action-
 import { SettingsCard, SettingsRow, SettingsSectionLabel } from "@/components/application/settings/settings-rows";
 import { pickDirectory } from "@/lib/platform";
 import { IS_CUSTOM_DISTRIBUTION } from "@/version/distribution";
-import { canRequestSelfUpdate, useLiveUpdateStore, type LiveUpdateBlocker } from "@/features/update/live-update";
+import { canRequestSelfUpdate, requiresPluginUpdateRetry, useLiveUpdateStore, type LiveUpdateBlocker } from "@/features/update/live-update";
 import {
   extractChannelSourceRoot,
   useStoredSelfDevWorkspacePath,
@@ -86,7 +86,12 @@ export function LiveUpdateSection() {
       <SettingsSectionLabel>{t("settings.liveUpdateTitle")}</SettingsSectionLabel>
       <SettingsCard>
         <SettingsRow anchor="liveUpdate" label={t("settings.liveUpdateDetailsTitle")}>
-          {state.support !== "web" && (
+          {state.support !== "web" && requiresPluginUpdateRetry(state.blockers) ? (
+            <Button size="small" variant="secondary" disabled={busy || state.checking}
+              onClick={() => void state.retrySwitch()}>
+              {t("settings.liveUpdateRetrySwitch")}
+            </Button>
+          ) : state.support !== "web" && (
             <Button size="small" variant="secondary" disabled={busy || state.checking || refreshFeedback.feedback === "running"}
               onClick={() => void refreshFeedback.start(() => state.refresh(), () => useLiveUpdateStore.getState().support !== "supported" || !!useLiveUpdateStore.getState().errorCode)}>
               <ActionFeedbackIcon icon={RefreshCw} feedback={refreshFeedback.feedback} spin />
@@ -171,7 +176,7 @@ export function LiveUpdateSection() {
           </p>}
           {state.stage === "waiting" && state.blockers.length > 0 && (
             <div className="text-body-2-regular text-text-secondary">
-              <p>{t("settings.liveUpdateWaitingReasons")}</p>
+              <p>{t(requiresPluginUpdateRetry(state.blockers) ? "settings.liveUpdateRetryReasons" : "settings.liveUpdateWaitingReasons")}</p>
               <ul className="list-disc space-y-1 pl-5">{state.blockers.map((blocker, index) => <Blocker key={`${blocker.participant ?? "native"}:${blocker.reason}:${index}`} blocker={blocker} />)}</ul>
             </div>
           )}

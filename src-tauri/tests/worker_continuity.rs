@@ -70,6 +70,7 @@ fn start_args(root: &Path, managed: bool) -> StartArgs {
         computer_use: Some(false),
         claude_ultracode: Some(false),
         claude_haiku_assist: Some(false),
+        codex_service_tier_override: None,
         require_host_chat: true,
         require_leader: false,
     }

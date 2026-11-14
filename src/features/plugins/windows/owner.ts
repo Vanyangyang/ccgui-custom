@@ -1,9 +1,10 @@
 import {
-  copyAction, copyJson, defaultDetachedTransport, EVENTS, jsonKey, sameWindow,
+  copyAction, copyJson, defaultDetachedTransport, equalJson, EVENTS, jsonKey, MAX_RESULT_BYTES, sameWindow,
   type ActionEvent, type ActionReceipt, type DetachedAction, type DetachedLabels,
   type DetachedSnapshot, type DetachedStatus, type DetachedTransport, type JsonValue,
   type OwnerIdentity, type ReturnedEvent, type ReturnBlockedEvent,
 } from "./protocol";
+import { createSnapshotReader, createSnapshotUpdate } from "./json-snapshot";
 import { assertRuntimeSubmissionAllowed, registerRuntimeCheckpointBlocker } from "@/lib/runtime-checkpoint";
 import { registerPluginTabLifecycle } from "../runtime/center-tabs";
 
@@ -13,7 +14,8 @@ interface PresentationState { presentation: Presentation; wasOpen: boolean }
 export interface DetachedSurfaceOwnerOptions {
   pluginId: string; tabId: string; title: () => string; rendererExport: string;
   assets: { code: string; css: string };
-  getSnapshot: () => JsonValue;
+  /** Untrusted plugin state; every read is validated and detached by copyJson. */
+  getSnapshot: () => unknown;
   subscribe: (listener: () => void) => () => void;
   dispatch: (action: DetachedAction) => JsonValue | void | Promise<JsonValue | void>;
   onReturn: (reason: "return" | "closed") => void;
@@ -22,13 +24,16 @@ export interface DetachedSurfaceOwnerOptions {
   defaultPresentation?: Presentation;
 }
 
-class ReturnBlockedError extends Error {}
+class ReturnBlockedError extends Error {
+  readonly code = "DETACHED_RETURN_BLOCKED";
+}
 export interface DetachedSurfaceOwner {
   readonly checkpointParticipant: string;
   open(): Promise<void>; returnToMain(reason?: "return" | "maintenance", options?: { force?: boolean }): Promise<void>; dispose(): void;
   present(): Promise<Presentation>;
   restore(): Promise<Presentation | null>;
   flushPresentation(): Promise<void>;
+  focusMain(): Promise<void>;
   cancelRestore?(): void;
   getStatus(): DetachedStatus; subscribeStatus(listener: () => void): () => void;
 }
@@ -45,8 +50,10 @@ export function createDetachedSurfaceOwner(options: DetachedSurfaceOwnerOptions)
   let disposed = false;
   let identity: OwnerIdentity | undefined;
   let status: DetachedStatus = { phase: "docked" };
-  let snapshot: DetachedSnapshot = { revision: 0, state: copyJson(options.getSnapshot()) };
-  let serializedState = jsonKey(snapshot.state);
+  const snapshotReader = createSnapshotReader();
+  let snapshot: DetachedSnapshot = { revision: 0, state: snapshotReader.read(options.getSnapshot()) };
+  let incremental = false;
+  let nativeSnapshot: DetachedSnapshot | undefined;
   const statusListeners = new Set<() => void>();
   const unlisteners: (() => void)[] = [];
   let listenFailed = false;
@@ -68,7 +75,7 @@ export function createDetachedSurfaceOwner(options: DetachedSurfaceOwnerOptions)
   let published: { target: OwnerIdentity; revision: number; dark: boolean } | undefined;
   function retirePublication() {
     publicationRetirement.retire(); publicationRetirement = retirementSignal(); publicationEpoch++;
-    publication = Promise.resolve(); publicationQueued = false; publicationNeeded = false; published = undefined;
+    publication = Promise.resolve(); publicationQueued = false; publicationNeeded = false; published = undefined; nativeSnapshot = undefined;
   }
   let execution = Promise.resolve();
   let nextSequence = 1;
@@ -82,12 +89,17 @@ export function createDetachedSurfaceOwner(options: DetachedSurfaceOwnerOptions)
   function openRequest(focus = true) {
     return { pluginId: options.pluginId, tabId: options.tabId, registrationId, ownerToken,
       title: options.title(), rendererExport: options.rendererExport, code: options.assets.code, css: options.assets.css,
-      snapshot, dark: options.dark?.() ?? false, labels: options.labels, focus };
+      snapshot, dark: options.dark?.() ?? false, labels: options.labels, focus, ...(incremental ? { incremental: true } : {}) };
   }
   function ensureRegistered(): Promise<void> {
     if (registration) return registration;
     const work = (async () => {
       await ready;
+      if (disposed) throw new Error("Owner disposed");
+      // Old native hosts do not expose this command. Their full-snapshot path
+      // remains usable; a plugin never negotiates its own transport privileges.
+      try { incremental = (await transport.invoke<{ snapshotDelta?: number }>("plugin_window_capabilities"))?.snapshotDelta === 1; }
+      catch { incremental = false; }
       if (disposed) throw new Error("Owner disposed");
       const saved = await transport.invoke<PresentationState | null>("plugin_window_presentation_register", { request: openRequest(false) });
       if (disposed) {
@@ -160,21 +172,39 @@ export function createDetachedSurfaceOwner(options: DetachedSurfaceOwnerOptions)
     } catch (error) { if (revision === intentRevision) fail("Unable to restore plugin view presentation"); throw error; }
   }
   function refreshSnapshot() {
-    const state = copyJson(options.getSnapshot());
-    const serialized = jsonKey(state);
-    if (serialized !== serializedState) {
+    const state = snapshotReader.read(options.getSnapshot());
+    if (!equalJson(state, snapshot.state)) {
       if (snapshot.revision === Number.MAX_SAFE_INTEGER) throw new Error("Snapshot revision exhausted");
-      snapshot = { revision: snapshot.revision + 1, state }; serializedState = serialized;
+      snapshot = { revision: snapshot.revision + 1, state };
     }
     return snapshot;
+  }
+  async function sendSnapshotUpdate(command: "plugin_window_publish_update" | "plugin_window_respond_update", target: OwnerIdentity,
+    current: DetachedSnapshot, fields: Record<string, unknown>) {
+    const update = createSnapshotUpdate(nativeSnapshot, current);
+    let acknowledged: { revision: number };
+    try { acknowledged = await transport.invoke(command, { request: { ...target, ...fields, update } }); }
+    catch (error) {
+      if (error !== "plugin_window_snapshot_base_mismatch" || disposed || identity !== target) throw error;
+      // Repair only the encoding baseline. Never dispatch the action again.
+      acknowledged = await transport.invoke(command, { request: { ...target, ...fields, update: { kind: "full", snapshot: current } } });
+    }
+    if (!acknowledged || !Number.isSafeInteger(acknowledged.revision) || acknowledged.revision < current.revision) {
+      throw new Error("Invalid detached snapshot acknowledgement");
+    }
+    // Publications and receipts can finish out of order. Only an exact native
+    // acknowledgement proves which immutable state can be the next delta base.
+    if (!disposed && identity === target && acknowledged.revision === current.revision &&
+      (!nativeSnapshot || current.revision > nativeSnapshot.revision)) nativeSnapshot = current;
   }
   async function publishSnapshot(target: OwnerIdentity, force = false) {
     if (disposed || identity !== target) return;
     const current = refreshSnapshot();
     const dark = options.dark?.() ?? false;
     if (!force && published?.target === target && published.revision === current.revision && published.dark === dark) return;
-    await transport.invoke("plugin_window_publish", { request: { ...target, snapshot: current, dark } });
-    if (!disposed && identity === target) published = { target, revision: current.revision, dark };
+    if (incremental) await sendSnapshotUpdate("plugin_window_publish_update", target, current, { dark });
+    else await transport.invoke("plugin_window_publish", { request: { ...target, snapshot: current, dark } });
+    if (!disposed && identity === target && (!published || current.revision >= published.revision)) published = { target, revision: current.revision, dark };
   }
   function schedulePublication() {
     if (disposed || !identity || publicationQueued) return;
@@ -206,7 +236,13 @@ export function createDetachedSurfaceOwner(options: DetachedSurfaceOwnerOptions)
   function stopHeartbeat() { if (heartbeat) clearInterval(heartbeat); heartbeat = undefined; }
   async function respond(event: Pick<ActionEvent, "windowId" | "registrationId" | "sequence">, receipt: ActionReceipt, report = true): Promise<"accepted" | "expired" | "retry"> {
     if (disposed || !sameWindow(identity, event)) return "retry";
-    try { await transport.invoke("plugin_window_respond", { request: { ...identity, ...receipt, value: receipt.value ?? null } }); return "accepted"; }
+    try {
+      if (incremental) {
+        const { snapshot: current, ...result } = receipt;
+        await sendSnapshotUpdate("plugin_window_respond_update", identity!, current, { ...result, value: receipt.value ?? null });
+      } else await transport.invoke("plugin_window_respond", { request: { ...identity, ...receipt, value: receipt.value ?? null } });
+      return "accepted";
+    }
     catch (error) {
       if (disposed || !sameWindow(identity, event)) return "retry";
       const reason = typeof error === "string" && /^plugin_window_[a-z_]+$/.test(error) ? error : "transport_error";
@@ -254,7 +290,7 @@ export function createDetachedSurfaceOwner(options: DetachedSurfaceOwnerOptions)
         assertRuntimeSubmissionAllowed();
         const value = await options.dispatch(action);
         refreshSnapshot();
-        return { sequence: event.sequence, ok: true, value: copyJson(value === undefined ? null : value), snapshot };
+        return { sequence: event.sequence, ok: true, value: copyJson(value === undefined ? null : value, MAX_RESULT_BYTES), snapshot };
       } catch {
         try { refreshSnapshot(); } catch { /* Keep the last valid snapshot. */ }
         return { sequence: event.sequence, ok: false, error: "Detached action failed", snapshot };
@@ -320,16 +356,15 @@ export function createDetachedSurfaceOwner(options: DetachedSurfaceOwnerOptions)
       if (stillCurrent && !stillCurrent()) return;
       assertOpenAllowed();
       refreshSnapshot();
-      const opened = await transport.invoke<{ windowId: string; label: string; registrationId: string }>("plugin_window_open", {
-        request: openRequest(focus),
-      });
+      const request = openRequest(focus);
+      const opened = await transport.invoke<{ windowId: string; label: string; registrationId: string }>("plugin_window_open", { request });
       if (disposed) {
         await transport.invoke("plugin_window_dispose", { request: { registrationId, ownerToken } });
         return;
       }
       if (opened.registrationId !== registrationId) throw new Error("Detached registration mismatch");
       intent = { presentation: "detached", wasOpen: true };
-      if (identity?.windowId !== opened.windowId) { receipts.clear(); clearConfirmations(); nextSequence = 1; }
+      if (identity?.windowId !== opened.windowId) { receipts.clear(); clearConfirmations(); nextSequence = 1; nativeSnapshot = incremental ? request.snapshot : undefined; }
       if (identity?.windowId !== opened.windowId) identity = { windowId: opened.windowId, registrationId, ownerToken };
       for (const event of earlyReturns.splice(0)) if (sameWindow(identity, event)) receiveReturned(event);
       if (!identity) return;
@@ -358,6 +393,11 @@ export function createDetachedSurfaceOwner(options: DetachedSurfaceOwnerOptions)
     })().catch(error => { if (publicationEpoch === epoch) fail("Unable to open detached window"); throw error; }).finally(() => { if (openPromise === opening) openPromise = undefined; });
     openPromise = opening;
     return opening;
+  }
+  async function focusMain(): Promise<void> {
+    if (disposed) throw new Error("Owner disposed");
+    if (!identity) throw new Error("Detached window unavailable");
+    await transport.invoke("plugin_window_focus_owner", { request: { ...identity } });
   }
   function returnToMain(reason: "return" | "maintenance" = "return", returnOptions?: { force?: boolean }): Promise<void> {
     intentRevision++;
@@ -408,5 +448,5 @@ export function createDetachedSurfaceOwner(options: DetachedSurfaceOwnerOptions)
   // the floating view was active. This blocker has no checkpoint payload.
   const unregisterRuntimeBlocker = registerRuntimeCheckpointBlocker(`plugin-window-owner:${registrationId}`, () =>
     !disposed && (identity || openPromise || returnPromise) ? ["plugin-window-without-checkpoint"] : []);
-  return { checkpointParticipant: `plugin-window-owner:${registrationId}`, open, present, restore, flushPresentation, cancelRestore: () => { intentRevision++; }, returnToMain, dispose, getStatus: () => status, subscribeStatus(listener) { statusListeners.add(listener); return () => { statusListeners.delete(listener); }; } };
+  return { checkpointParticipant: `plugin-window-owner:${registrationId}`, open, present, restore, flushPresentation, focusMain, cancelRestore: () => { intentRevision++; }, returnToMain, dispose, getStatus: () => status, subscribeStatus(listener) { statusListeners.add(listener); return () => { statusListeners.delete(listener); }; } };
 }

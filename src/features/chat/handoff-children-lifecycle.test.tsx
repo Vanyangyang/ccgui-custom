@@ -59,6 +59,7 @@ beforeEach(async () => {
     sessions: [], bySession: {}, streamingByKey: {}, retryingByKey: {},
     workspaces: [{ path: destination } as Workspace] });
   vi.spyOn(ipc, "taskSnapshot").mockResolvedValue(snapshot);
+  vi.spyOn(ipc, "handoffFullHistorySupported").mockResolvedValue(true);
   vi.spyOn(ipc, "summarizeSessionHandoff").mockResolvedValue("model merged summary");
 });
 afterEach(async () => {
@@ -90,9 +91,11 @@ describe("handoff child snapshot lifecycle", () => {
     expect(draft()).toContain("接下来请继续：user next task");
     expect(ipc.taskSnapshot).toHaveBeenCalledTimes(1);
     if (mode === "grok") {
+      await vi.waitFor(() => expect(entry().grokStatus).toBe("done"));
       expect(ipc.summarizeSessionHandoff).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
-        childContext: children.context, transcriptExcerpt: expect.not.stringContaining("child-only evidence"),
+        childContext: children.context, historyScope: "full",
       }));
+      expect(vi.mocked(ipc.summarizeSessionHandoff).mock.calls[0][0]).not.toHaveProperty("transcriptExcerpt");
       expect(children.context.length).toBeGreaterThan(children.block.length);
       expect(draft()).toContain("model merged summary");
       expect(draft()).not.toContain("> parent conclusion");
@@ -151,7 +154,7 @@ describe("handoff child snapshot lifecycle", () => {
     expect(entry().childrenStatus).toBe("error");
     expect(ipc.summarizeSessionHandoff).toHaveBeenCalledTimes(1);
     expect(vi.mocked(ipc.summarizeSessionHandoff).mock.calls[0][0]).not.toHaveProperty("childContext");
-    expect(draft()).toContain("model merged summary");
+    await vi.waitFor(() => expect(draft()).toContain("model merged summary"));
   });
 
   it("keeps the exact old draft for an empty snapshot", async () => {
@@ -296,11 +299,385 @@ describe("handoff child snapshot lifecycle", () => {
     expect(entry()).toBeUndefined();
     expect(entry(destination)).toMatchObject({ workspacePath, children: { total: 1 } });
     expect(draft(destination, "claude")).toContain("child-only evidence");
-    expect(draft(destination, "claude")).toContain("model merged summary");
+    await vi.waitFor(() => expect(draft(destination, "claude")).toContain("model merged summary"));
     expect(draft(workspacePath)).not.toContain("child-only evidence");
     expect(useChatStore.getState().drafts[otherKey]).toBe("unrelated draft");
     expect(ipc.summarizeSessionHandoff).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
       engine: "codex", sessionId: args.sourceSessionId, childContext: entry(destination).children!.context,
     }));
+  });
+
+  it("lets users filter, toggle, clear, and select all child chats with live draft splicing", async () => {
+    const multiBranches: LeaderBranch[] = [
+      { ...snapshot.branches[0], id: "c-done-1", sessionId: "sid-done-1", title: "Auth module audit", state: "completed", result: "auth report ok", updatedAt: 50 },
+      { ...snapshot.branches[0], id: "c-done-2", sessionId: "sid-done-2", title: "Billing schema check", state: "completed", result: "billing report ok", updatedAt: 40 },
+      { ...snapshot.branches[0], id: "c-fail-1", sessionId: "sid-fail-1", title: "Payment webhook retry", state: "failed", error: "timeout", result: "webhook partial", updatedAt: 30 },
+      { ...snapshot.branches[0], id: "c-wait-1", sessionId: "sid-wait-1", title: "Cache warmup worker", state: "waiting", result: "waiting input", updatedAt: 20 },
+      { ...snapshot.branches[0], id: "c-done-3", sessionId: "sid-done-3", title: "Search index migration", state: "completed", result: "search report ok", updatedAt: 10 },
+    ];
+    vi.mocked(ipc.taskSnapshot).mockResolvedValue({ leaders: [], branches: multiBranches });
+    useChatStore.setState({
+      sessions: [
+        { engine: "claude", sessionId: "sid-fail-1", workspacePath, title: '[Message from CC GUI {"engine":"claude","session_id":"trunc' } as never,
+      ],
+    });
+
+    useHandoffStore.getState().startHandoff({ ...args, initialMode: "local" });
+    await flush();
+    await mountCard();
+
+    expect(entry().selectedChildIds).toHaveLength(5);
+    expect(draft()).toContain("auth report ok");
+    expect(draft()).toContain("webhook partial");
+
+    // Expand picker
+    const toggleBtn = container!.querySelector('[data-testid="handoff-children-toggle"]') as HTMLButtonElement;
+    expect(toggleBtn).toBeTruthy();
+    await act(async () => { toggleBtn.click(); });
+    expect(container!.querySelector('[data-testid="handoff-children-picker"]')).toBeTruthy();
+    expect(container!.querySelector('[data-testid="handoff-child-item-c-fail-1"]')!.textContent).toContain("Payment webhook retry");
+    expect(container!.querySelector('[data-testid="handoff-child-item-c-fail-1"]')!.textContent).not.toContain("[Message from CC GUI");
+
+    // Filter via search input (rendered when candidates >= 5)
+    const searchInput = container!.querySelector('[data-testid="handoff-children-search"]') as HTMLInputElement;
+    expect(searchInput).toBeTruthy();
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
+      setter.call(searchInput, "Billing");
+      searchInput.dispatchEvent(new Event("input", { bubbles: true }));
+      searchInput.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    expect(container!.querySelector('[data-testid="handoff-child-item-c-done-2"]')).toBeTruthy();
+    expect(container!.querySelector('[data-testid="handoff-child-item-c-done-1"]')).toBeNull();
+
+    // Select only completed (3 items)
+    const completedBtn = container!.querySelector('[data-testid="handoff-children-select-completed"]') as HTMLButtonElement;
+    await act(async () => { completedBtn.click(); });
+    expect(entry().selectedChildIds).toEqual(["c-done-1", "c-done-2", "c-done-3"]);
+    expect(draft()).toContain("auth report ok");
+    expect(draft()).not.toContain("webhook partial");
+    expect(draft()).toContain("接下来请继续：user next task");
+
+    // Clear all -> removes child block cleanly while keeping summary & user prompt
+    const clearBtn = container!.querySelector('[data-testid="handoff-children-clear"]') as HTMLButtonElement;
+    await act(async () => { clearBtn.click(); });
+    expect(entry().selectedChildIds).toEqual([]);
+    expect(draft()).not.toContain(i18n.t("chat.handoffChildrenHeading"));
+    expect(draft()).toContain("parent conclusion");
+    expect(draft()).toContain("接下来请继续：user next task");
+
+    // Select all -> re-inserts child block before "接下来请继续："
+    const allBtn = container!.querySelector('[data-testid="handoff-children-select-all"]') as HTMLButtonElement;
+    expect(allBtn.textContent).toBe(i18n.t("chat.handoffChildrenSelectAll", { count: 5 }));
+    await act(async () => { allBtn.click(); });
+    expect(entry().selectedChildIds).toHaveLength(5);
+    expect(draft().indexOf(i18n.t("chat.handoffChildrenHeading"))).toBeLessThan(draft().indexOf("接下来请继续：user next task"));
+
+    // Clicking "取消全选" (same select-all button when all are selected) toggles off all items
+    expect(allBtn.disabled).toBe(false);
+    expect(allBtn.getAttribute("aria-pressed")).toBe("true");
+    expect(allBtn.textContent).toBe(i18n.t("chat.handoffChildrenDeselectAll", { count: 5 }));
+    await act(async () => { allBtn.click(); });
+    expect(entry().selectedChildIds).toEqual([]);
+    expect(allBtn.getAttribute("aria-pressed")).toBe("false");
+    expect(allBtn.textContent).toBe(i18n.t("chat.handoffChildrenSelectAll", { count: 5 }));
+    expect(draft()).not.toContain(i18n.t("chat.handoffChildrenHeading"));
+  });
+
+  it("discovers same-group siblings unselected from a child chat and compresses selected childBranchIds on demand", async () => {
+    const groupBranches: LeaderBranch[] = [
+      { ...snapshot.branches[0], engine: "codex", id: "b-self", sessionId: "child-self", title: "Current Child", result: "self report" },
+      { ...snapshot.branches[0], engine: "codex", id: "b-peer-1", sessionId: "child-peer-1", title: "Sibling API", result: "sibling api findings" },
+      { ...snapshot.branches[0], engine: "codex", id: "b-peer-2", sessionId: "child-peer-2", title: "Sibling UI", result: "sibling ui findings" },
+    ];
+    vi.mocked(ipc.taskSnapshot).mockResolvedValue({ leaders: [], branches: groupBranches });
+    const cancelSpy = vi.spyOn(ipc, "cancelSessionHandoff").mockResolvedValue(true);
+    const first = deferred<string>();
+    const second = deferred<string>();
+    vi.mocked(ipc.summarizeSessionHandoff)
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise);
+
+    useHandoffStore.getState().startHandoff({
+      ...args,
+      sourceSessionId: "child-self",
+      sourceMeta: { engine: "codex", sessionId: "child-self", workspacePath } as Parameters<typeof ipc.archiveSession>[0],
+      initialMode: "grok",
+    });
+    await flush();
+    await mountCard();
+
+    // Initially 0 siblings selected, first model compression runs without childBranchIds
+    expect(entry().selectedChildIds).toEqual([]);
+    expect(draft()).not.toContain("sibling api findings");
+    const firstReq = vi.mocked(ipc.summarizeSessionHandoff).mock.calls[0][0];
+    expect(firstReq).not.toHaveProperty("childBranchIds");
+    expect(firstReq.requestId).toEqual(expect.any(String));
+
+    // While first model compression is still running, user selects b-peer-1
+    await act(async () => {
+      (container!.querySelector('[data-testid="handoff-children-toggle"]') as HTMLButtonElement).click();
+    });
+    expect(container!.textContent).toContain(i18n.t("chat.handoffChildrenSiblingBadge"));
+    const peerCheckbox = container!.querySelector('[data-testid="handoff-child-item-b-peer-1"] input[type="checkbox"]') as HTMLInputElement;
+    await act(async () => { peerCheckbox.click(); });
+
+    // Selection change immediately cancels obsolete flight and keeps "压缩所选" enabled!
+    expect(cancelSpy).toHaveBeenCalledWith(firstReq.requestId);
+    expect(entry().selectedChildIds).toEqual(["b-peer-1"]);
+    expect(draft()).toContain("sibling api findings");
+    expect(container!.textContent).toContain(i18n.t("chat.handoffChildrenSelectionStale"));
+    const compressBtn = container!.querySelector('[data-testid="handoff-children-compress-btn"]') as HTMLButtonElement;
+    expect(compressBtn.disabled).toBe(false);
+
+    // User clicks "压缩所选" right away (even before cancelled first flight finishes IPC teardown)
+    await act(async () => { compressBtn.click(); });
+    expect(entry().grokStatus).toBe("running");
+
+    // Once cancelled first flight rejects/settles, queued second compression starts automatically
+    await act(async () => {
+      first.reject(new Error("handoff compression cancelled"));
+      await first.promise.catch(() => {});
+      await flush();
+    });
+    await vi.waitFor(() => expect(vi.mocked(ipc.summarizeSessionHandoff)).toHaveBeenCalledTimes(2));
+    expect(vi.mocked(ipc.summarizeSessionHandoff).mock.calls[1][0]).toMatchObject({
+      engine: "codex",
+      sessionId: "child-self",
+      historyScope: "full",
+      sourceWorkspacePath: workspacePath,
+      childBranchIds: ["b-peer-1"],
+    });
+
+    await act(async () => { second.resolve("merged summary with sibling api"); await flush(); });
+    expect(entry().grokStatus).toBe("done");
+    expect(entry().childrenSelectionModified).toBe(false);
+    expect(draft()).toContain("merged summary with sibling api");
+    expect(draft()).toContain("sibling api findings");
+  });
+
+  it("allows stopping an active compression without closing handoff, then unchecking children and re-distilling", async () => {
+    const first = deferred<string>();
+    const second = deferred<string>();
+    const cancelSpy = vi.spyOn(ipc, "cancelSessionHandoff").mockImplementation(async () => {
+      first.reject(new Error("handoff compression cancelled"));
+      return true;
+    });
+    vi.mocked(ipc.summarizeSessionHandoff)
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise);
+
+    useHandoffStore.getState().startHandoff({ ...args, initialMode: "grok" });
+    await flush();
+    await mountCard();
+
+    await vi.waitFor(() => expect(vi.mocked(ipc.summarizeSessionHandoff)).toHaveBeenCalledTimes(1));
+    const stopBtn = container!.querySelector('[data-testid="handoff-grok-stop-btn"]') as HTMLButtonElement;
+    expect(stopBtn).toBeTruthy();
+
+    // Clicking "停止" cancels the native flight, keeps handoff panel & draft open
+    await act(async () => {
+      stopBtn.click();
+      await first.promise.catch(() => {});
+      await flush();
+    });
+    expect(cancelSpy).toHaveBeenCalledTimes(1);
+    expect(entry()).toBeDefined();
+    expect(entry().grokStatus).toBe("idle");
+    expect(entry().compressionRunning).toBe(false);
+    expect(container!.querySelector('[data-testid="handoff-overlay-card"]')).toBeTruthy();
+    expect(container!.textContent).toContain(i18n.t("chat.handoffGrokStopped"));
+    expect(draft()).toContain("parent conclusion");
+
+    // Uncheck all children and click re-distill -> compresses main chat only (no childContext / childBranchIds)
+    await act(async () => {
+      (container!.querySelector('[data-testid="handoff-children-toggle"]') as HTMLButtonElement).click();
+    });
+    await act(async () => {
+      (container!.querySelector('[data-testid="handoff-children-select-all"]') as HTMLButtonElement).click();
+    });
+    expect(entry().selectedChildIds).toEqual([]);
+    const recompressBtn = container!.querySelector('[data-testid="handoff-children-compress-btn"]') as HTMLButtonElement;
+    expect(recompressBtn.textContent).toBe(i18n.t("chat.handoffGrokRetry"));
+    await act(async () => { recompressBtn.click(); await flush(); });
+
+    await vi.waitFor(() => expect(vi.mocked(ipc.summarizeSessionHandoff)).toHaveBeenCalledTimes(2));
+    const secondReq = vi.mocked(ipc.summarizeSessionHandoff).mock.calls[1][0];
+    expect(secondReq).not.toHaveProperty("childBranchIds");
+    expect(secondReq).not.toHaveProperty("childContext");
+
+    await act(async () => { second.resolve("parent-only compressed summary"); await flush(); });
+    expect(entry().grokStatus).toBe("done");
+    expect(draft()).toContain("parent-only compressed summary");
+    expect(draft()).not.toContain("child-only evidence");
+  });
+
+  it("displays live compression progress stages, enforces monotonic order, and allows lowering high effort mid-run", async () => {
+    localStorage.setItem(
+      HANDOFF_PREFERENCES_KEY,
+      JSON.stringify({
+        enabled: true,
+        model: "gpt-6.1-terra",
+        selection: { engine: "codex", model: "gpt-6.1-terra", effort: "xhigh" },
+      }),
+    );
+    const first = deferred<string>();
+    const second = deferred<string>();
+    let calls = 0;
+    let latestOnProgress: Parameters<typeof ipc.summarizeSessionHandoff>[0]["onProgress"];
+    vi.spyOn(ipc, "taskSnapshot").mockResolvedValue(emptySnapshot);
+    vi.spyOn(ipc, "cancelSessionHandoff").mockResolvedValue(true);
+    vi.spyOn(ipc, "summarizeSessionHandoff").mockImplementation((req) => {
+      calls += 1;
+      latestOnProgress = req.onProgress;
+      return calls === 1 ? first.promise : second.promise;
+    });
+
+    useHandoffStore.getState().startHandoff({ ...args, initialMode: "grok" });
+    await flush();
+    await mountCard();
+
+    await vi.waitFor(() => expect(calls).toBe(1));
+    const hint = container!.querySelector('[data-testid="handoff-high-effort-hint"]');
+    expect(hint?.textContent).toContain(i18n.t("chat.effortXhigh"));
+    const lowerBtn = container!.querySelector('[data-testid="handoff-lower-effort-btn"]') as HTMLButtonElement;
+    expect(lowerBtn.textContent).toBe(i18n.t("chat.handoffUseMediumEffort"));
+
+    await act(async () => {
+      latestOnProgress?.({ phase: "reading" });
+      await flush();
+    });
+    expect(container!.querySelector('[data-testid="handoff-grok-status"]')?.textContent).toContain(
+      i18n.t("chat.handoffProgressReading"),
+    );
+
+    const segTiming = {
+      elapsedMs: 1200,
+      readingMs: 200,
+      segmentsMs: 1000,
+      mergingMs: 0,
+      verifyingMs: 0,
+      modelCalls: 4,
+      completedModelCalls: 2,
+      activeModelCalls: 2,
+      modelElapsedMs: 1800,
+      lastModelCallMs: 900,
+      longestModelCallMs: 900,
+    };
+    await act(async () => {
+      latestOnProgress?.({ phase: "segments", completed: 2, total: 5, timing: segTiming });
+      await flush();
+    });
+    expect(container!.querySelector('[data-testid="handoff-grok-status"]')?.textContent).toContain(
+      i18n.t("chat.handoffProgressSegments", { completed: 2, total: 5 }),
+    );
+    expect(
+      container!.querySelector('[data-testid="handoff-grok-status"] span[title]')?.getAttribute("title"),
+    ).toBe(i18n.t("chat.handoffProgressCallsTooltip", { completed: 2, started: 4, active: 2 }));
+
+    // Out-of-order regression must be ignored.
+    await act(async () => {
+      latestOnProgress?.({ phase: "segments", completed: 1, total: 5, timing: segTiming });
+      await flush();
+    });
+    expect(entry().grokProgress?.completed).toBe(2);
+
+    const mergeTiming = {
+      ...segTiming,
+      elapsedMs: 2200,
+      segmentsMs: 1500,
+      mergingMs: 500,
+      modelCalls: 6,
+      completedModelCalls: 5,
+      activeModelCalls: 1,
+      modelElapsedMs: 3000,
+      lastModelCallMs: 500,
+    };
+    await act(async () => {
+      latestOnProgress?.({ phase: "merging", round: 1, completed: 1, total: 2, timing: mergeTiming });
+      await flush();
+    });
+    expect(container!.querySelector('[data-testid="handoff-grok-status"]')?.textContent).toContain(
+      i18n.t("chat.handoffProgressMerging", { round: 1, completed: 1, total: 2 }),
+    );
+
+    await act(async () => {
+      latestOnProgress?.({
+        phase: "verifying",
+        timing: { ...mergeTiming, elapsedMs: 2500, mergingMs: 800, verifyingMs: 100, completedModelCalls: 6, activeModelCalls: 0 },
+      });
+      await flush();
+    });
+    expect(container!.querySelector('[data-testid="handoff-grok-status"]')?.textContent).toContain(
+      i18n.t("chat.handoffProgressVerifying"),
+    );
+
+    // Clicking lower effort cancels xhigh run, updates effort to medium, and re-distills when the flight ends.
+    await act(async () => {
+      lowerBtn.click();
+      await flush();
+    });
+    expect(ipc.cancelSessionHandoff).toHaveBeenCalledTimes(1);
+    expect(entry().compressionSelection?.effort).toBe("medium");
+    expect(container!.querySelector('[data-testid="handoff-high-effort-hint"]')).toBeNull();
+
+    await act(async () => {
+      first.resolve("stale xhigh summary");
+      await flush();
+    });
+    await vi.waitFor(() => expect(calls).toBe(2));
+    expect(vi.mocked(ipc.summarizeSessionHandoff).mock.calls[1][0]).toEqual(
+      expect.objectContaining({
+        compressionSelection: expect.objectContaining({
+          engine: "codex",
+          model: "gpt-6.1-terra",
+          effort: "medium",
+        }),
+      }),
+    );
+
+    await act(async () => {
+      second.resolve("medium effort summary");
+      await flush();
+    });
+    expect(entry().grokStatus).toBe("done");
+    expect(draft()).toContain("medium effort summary");
+  });
+
+  it("skips trailing CLI rate-limit banners in local and detailed summaries when real replies exist", async () => {
+    vi.spyOn(ipc, "taskSnapshot").mockResolvedValue(emptySnapshot);
+    const rateLimitedState = {
+      ...EMPTY_SESSION,
+      messages: [
+        { seq: 1, ts: "1", role: "user" as const, text: "fix slow handoff" },
+        { seq: 2, ts: "2", role: "assistant" as const, text: "Increased CHUNK_CHARS to 64k and enabled 4x Codex concurrency." },
+        { seq: 3, ts: "3", role: "assistant" as const, text: "> You've hit your 5-hour limit · resets 7:20am (Asia/Singapore)" },
+      ],
+    };
+    useHandoffStore.getState().startHandoff({ ...args, sourceState: rateLimitedState, initialMode: "local" });
+    await flush();
+    expect(draft()).toContain("Increased CHUNK_CHARS to 64k");
+    expect(draft()).not.toContain("You've hit your 5-hour limit");
+
+    useHandoffStore.getState().setCompressionMode(workspacePath, "detailed");
+    expect(draft()).toContain("Increased CHUNK_CHARS to 64k");
+    expect(draft()).not.toContain("You've hit your 5-hour limit");
+
+    // Falls back to the banner only when no real assistant reply exists in the session.
+    const bannerOnlyState = {
+      ...EMPTY_SESSION,
+      messages: [
+        { seq: 1, ts: "1", role: "user" as const, text: "only banner" },
+        { seq: 2, ts: "2", role: "assistant" as const, text: "> You've hit your 5-hour limit · resets 7:20am (Asia/Singapore)" },
+      ],
+    };
+    useHandoffStore.getState().startHandoff({
+      ...args,
+      workspacePath: destination,
+      sourceState: bannerOnlyState,
+      initialMode: "local",
+    });
+    await flush();
+    expect(draft(destination)).toContain("You've hit your 5-hour limit");
   });
 });

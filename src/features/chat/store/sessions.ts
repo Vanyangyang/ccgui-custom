@@ -6,7 +6,7 @@ import {
   type Workspace,
 } from "@/lib/ipc";
 import type { EffortLevel } from "@/components/application/ai-chat/cli-menu";
-import { encodedModelEffort } from "@/components/application/ai-chat/model-effort";
+import { supportsIndependentModelEffort } from "@/components/application/ai-chat/model-effort";
 import { listenEngineEvents, listenSessionsChanged, listenComputerUseEscape } from "@/lib/events";
 import { errorText } from "@/lib/errors";
 import { writeStored } from "@/lib/storage";
@@ -24,7 +24,7 @@ import {
   sessionKey,
   type ActiveSession,
 } from "./persistence";
-import { EMPTY_SESSION, patchSession } from "./stream";
+import { isUnloadedHistory, patchSession } from "./stream";
 import { claudeUltracodeWriteVersion, pendingClaudeUltracode, snapshotPendingClaudeUltracode } from "./claude-ultracode";
 import { handleEngineEvents, upsertSessionMetaInto } from "./engine-events";
 import { needsLeaderHistory, leaderHistoryLoaded, isReclaimedLeaderSession } from "@/features/leader/event-state";
@@ -42,7 +42,8 @@ import {
 } from "./session-utils";
 import type { ChatStore } from "./types";
 import type { LoadHistoryPage, StoreGet, StoreSet, StoreSubscribe } from "./context";
-import { hasReadableUsage, latestMessageUsage, mergeUsage } from "../usage";
+import { hasAcpContextUsage, hasReadableUsage, latestMessageUsage, mergeUsage } from "../usage";
+import { hasReloadableHistory, markReloadableHistory } from "./session-memory-cache";
 
 function omitKey(rec: Record<string, boolean>, key: string) {
   const next = { ...rec };
@@ -131,6 +132,9 @@ export function createSessionActions(
   interface RefreshNeeded {
     engine: string; sessionId: string; workspacePath: string;
     failed: boolean; preserveUsage: boolean; error?: string; nativeBusy?: boolean;
+    /** An unloaded cache shell must stay unavailable to senders while native
+     * history/retirement is pending; this flag lets its own refresh continue. */
+    loadingShell?: boolean;
   }
   const refreshNeeded = new Map<string, RefreshNeeded>();
   const activeReadOffs = new Set<() => void>();
@@ -159,10 +163,11 @@ export function createSessionActions(
   const isStable = (key: string) => {
     const session = get().bySession[key];
     const refresh = refreshNeeded.get(key);
+    const historyError = session?.historyReloadRequired ? session.historyReloadError : refresh?.error;
     // Failed optimistic prompts may never have reached the native file.
     // Keep them available to resend; only our own history-read error is retryable here.
-    return session && !session.loading && !session.streaming && !session.queue.length &&
-      (!session.error || session.error === refresh?.error) && !session.messages.some((m) =>
+    return session && (!session.loading || refresh?.loadingShell) && !session.streaming && !session.queue.length &&
+      (!session.error || session.error === historyError) && !session.messages.some((m) =>
       m.question?.status === "pending" || m.grant?.status === "pending" ||
       ["awaiting_review", "deferred", "submitting"].includes(m.planReview?.status ?? ""));
   };
@@ -175,7 +180,16 @@ export function createSessionActions(
       if (get().archivedSessionKeys[key] || !get().bySession[key]) {
         refreshNeeded.delete(key);
         loadedHistory.delete(key);
-      } else if (!target.failed && isOpen(target)) watch = true;
+      } else {
+        const open = isOpen(target);
+        if (!open && target.loadingShell && !historyLoads.has(key) && get().bySession[key]?.loading) {
+          // A closed empty shell has no sender/UI consumer. Do not let a
+          // deferred native-retirement wait block every future checkpoint.
+          target.loadingShell = false;
+          patchSession(set, key, { loading: false });
+        }
+        if (!target.failed && open) watch = true;
+      }
     }
     if (!watch || disposed) { refreshOff?.(); refreshOff = undefined; return; }
     if (!refreshOff && deps.subscribe) refreshOff = deps.subscribe(() => { watchRefreshes(); scheduleRefresh(); });
@@ -208,6 +222,9 @@ export function createSessionActions(
     // Closed-tab cache eviction can happen after its observer was detached.
     // Reopening that key needs a fresh cold load rather than waiting on absent state.
     if (!existing) { refreshNeeded.delete(key); loadedHistory.delete(key); }
+    if (existing?.historyReloadRequired && !refreshNeeded.has(key)) {
+      refreshNeeded.set(key, { engine, sessionId, workspacePath, failed: false, preserveUsage: true, error: existing.historyReloadError });
+    }
     const refresh = refreshNeeded.get(key);
     if (refresh && explicit) refresh.failed = false;
     if (refresh && (!isStable(key) || !isOpen(refresh))) {
@@ -227,9 +244,12 @@ export function createSessionActions(
     }
     // A deferred read observes an already live timeline. Keep it reachable
     // to normal sends; a new turn invalidates this read instead of blocking it.
-    if (!refresh) patchSession(set, key, { loading: true });
+    const emptyShell = !!refresh && isUnloadedHistory(existing);
+    if (emptyShell) refresh.loadingShell = true;
+    if (!refresh || emptyShell) patchSession(set, key, { loading: true });
     const originalMessages = get().bySession[key].messages;
     const originalUsage = get().bySession[key].usage;
+    const originalError = get().bySession[key].error;
     let sawActivity = false;
     let readOff: (() => void) | undefined;
     const stopReadObserver = () => { readOff?.(); readOff = undefined; activeReadOffs.delete(stopReadObserver); };
@@ -267,9 +287,11 @@ export function createSessionActions(
         if (!current || get().archivedSessionKeys[key]) throw new Error("Session became unavailable during history load");
         const interactive = current.messages.some((m) => m.question?.status === "pending" || m.grant?.status === "pending" ||
           ["awaiting_review", "deferred", "submitting"].includes(m.planReview?.status ?? ""));
-        const failedPrompt = !!current.error && current.error !== refresh?.error;
+        const historyError = current.historyReloadRequired ? current.historyReloadError : refresh?.error;
+        const failedPrompt = !!current.error && current.error !== historyError;
         if (!sawActivity && (!refresh || isOpen(refresh)) && current.messages === originalMessages && !current.streaming && !current.queue.length && !interactive && !failedPrompt) {
           const messages = plans?.length ? mergePlanReviewHistory(page.messages, plans) ?? page.messages : page.messages;
+          markReloadableHistory(messages, page.subagentHistory);
           const preserveUsage = refresh?.preserveUsage || current.usage !== originalUsage;
           const pageUsage = latestMessageUsage(page.messages);
           refreshNeeded.delete(key);
@@ -277,8 +299,13 @@ export function createSessionActions(
           leaderHistoryLoaded(key);
           patchSession(set, key, {
             messages, subagentHistory: page.subagentHistory,
+            historyReloadRequired: undefined,
+            historyReloadError: undefined,
             nextBefore: page.nextBefore, loading: false,
-            usage: preserveUsage && current.usage != null ? mergeUsage(current.usage, pageUsage) : pageUsage,
+            usage: current.usage === originalUsage && (current.usage as Record<string, unknown> | null)?.context_usage_stale === true
+              ? mergeUsage(pageUsage, current.usage)
+              : preserveUsage && current.usage != null ? mergeUsage(current.usage, pageUsage)
+              : hasAcpContextUsage(current.usage) ? mergeUsage(pageUsage, current.usage) : pageUsage,
             error: refresh?.error === current.error ? null : current.error,
           });
         } else {
@@ -291,12 +318,20 @@ export function createSessionActions(
         watchRefreshes();
       } catch (error) {
         if (disposed) throw error;
-        refreshNeeded.set(key, { engine, sessionId, workspacePath, failed: true, preserveUsage: !!refresh?.preserveUsage || get().bySession[key]?.usage !== originalUsage, error: String(error) });
+        const current = get().bySession[key];
+        const invalidated = sawActivity || current?.messages !== originalMessages || current?.streaming ||
+          (!!current?.error && current.error !== originalError && current.error !== refresh?.error);
+        refreshNeeded.set(key, { engine, sessionId, workspacePath, failed: !invalidated,
+          preserveUsage: !!refresh?.preserveUsage || current?.usage !== originalUsage,
+          error: invalidated ? refresh?.error : String(error) });
         loadedHistory.delete(key);
-        watchRefreshes();
-        if (get().bySession[key] && !get().archivedSessionKeys[key]) {
-          patchSession(set, key, { loading: false, error: String(error) });
+        if (current && !get().archivedSessionKeys[key]) {
+          // A stale read failure has no authority over a newer user send or
+          // its error. Retry only after that activity reaches a safe boundary.
+          patchSession(set, key, { loading: false, ...(!invalidated ? { error: String(error),
+            ...(current.historyReloadRequired ? { historyReloadError: String(error) } : {}) } : {}) });
         }
+        watchRefreshes();
         throw error;
       }
     })();
@@ -488,13 +523,13 @@ export function createSessionActions(
           s.engines,
         );
         const bySession = { ...s.bySession };
-        const drafts = { ...s.drafts };
+        const drafts = s.drafts;
         const unseen = { ...s.unseen };
         const streamingByKey = { ...s.streamingByKey };
         const retryingByKey = { ...s.retryingByKey };
         for (const key of Object.keys(archivedSessionKeys)) {
           delete bySession[key];
-          delete drafts[key];
+          // Archived chats can be restored; keep their unsent drafts for this runtime.
           delete unseen[key];
           delete streamingByKey[key];
           delete retryingByKey[key];
@@ -505,7 +540,7 @@ export function createSessionActions(
           if (!current) continue;
           const activeModel = meta.model ?? current.activeModel;
           const activeEffort =
-            activeModel && encodedModelEffort(meta.engine, activeModel)
+            activeModel && !supportsIndependentModelEffort(meta.engine, activeModel)
               ? null
               : (meta.effort ?? current.activeEffort);
           bySession[key] = {
@@ -588,6 +623,9 @@ export function createSessionActions(
 
     selectSession: async (engine, sessionId, workspacePath, options) => {
       const key = sessionKey(engine, sessionId, workspacePath);
+      // Background observation has no authority to restore an archived chat.
+      // Reject before creating a tab, metadata cache or loading placeholder.
+      if (options?.background && get().archivedSessionKeys[key]) throw new Error("Archived session is unavailable for background loading");
       if (isReclaimedLeaderSession(key)) return;
       // Metadata patches below recreate an empty cache entry. Retire proof
       // from an evicted cache lifetime before those patches can hide eviction.
@@ -610,9 +648,9 @@ export function createSessionActions(
       // Same for the reasoning level: the picker and the next send follow the
       // session, so an unset level adopts the one this session last ran.
       const effectiveModel = get().bySession[key]?.activeModel ?? remembered;
-      const modelEncodesEffort = Boolean(effectiveModel && encodedModelEffort(engine, effectiveModel));
-      const rememberedEffort = modelEncodesEffort ? undefined : meta?.effort;
-      if (modelEncodesEffort && get().bySession[key]?.activeEffort) {
+      const hideIndependentEffort = Boolean(effectiveModel && !supportsIndependentModelEffort(engine, effectiveModel));
+      const rememberedEffort = hideIndependentEffort ? undefined : meta?.effort;
+      if (hideIndependentEffort && get().bySession[key]?.activeEffort) {
         patchSession(set, key, { activeEffort: null });
       } else if (rememberedEffort && !get().bySession[key]?.activeEffort) {
         patchSession(set, key, { activeEffort: rememberedEffort });
@@ -680,17 +718,22 @@ export function createSessionActions(
           100,
           state.nextBefore,
         );
+        const current = get().bySession[targetKey];
+        // A late page must not recreate a deleted/archived cache. New live
+        // content remains intact without inheriting source-backed evidence.
+        if (!current || get().archivedSessionKeys[targetKey]) return;
+        const messages = [...page.messages, ...current.messages];
+        if (current.messages === state.messages && current.subagentHistory === state.subagentHistory && hasReloadableHistory(current)) {
+          markReloadableHistory(messages, page.subagentHistory);
+        }
         patchSession(set, targetKey, {
-          messages: [
-            ...page.messages,
-            ...(get().bySession[targetKey] ?? EMPTY_SESSION).messages,
-          ],
+          messages,
           nextBefore: page.nextBefore,
           subagentHistory: page.subagentHistory,
           loading: false,
         });
       } catch {
-        patchSession(set, targetKey, { loading: false });
+        if (get().bySession[targetKey]) patchSession(set, targetKey, { loading: false });
       }
     },
 

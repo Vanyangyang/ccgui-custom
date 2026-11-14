@@ -15,7 +15,7 @@ use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 #[cfg(test)]
 use tokio::process::Command;
 use tokio::process::{Child, ChildStderr, ChildStdout};
@@ -104,17 +104,53 @@ pub(crate) fn spawn_stderr_capture(stderr: ChildStderr) -> Arc<Mutex<String>> {
     let buf = Arc::new(Mutex::new(String::new()));
     let target = Arc::clone(&buf);
     tokio::spawn(async move {
-        let mut reader = BufReader::new(stderr);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match reader.read_line(&mut line).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) => ring_push(&target, &line),
-            }
-        }
+        capture_stderr(stderr, &target).await;
     });
     buf
+}
+
+async fn capture_stderr(mut stderr: impl tokio::io::AsyncRead + Unpin, target: &Arc<Mutex<String>>) {
+    // A read never depends on a newline. Only an incomplete UTF-8 suffix
+    // (at most three bytes) survives into the next fixed-size read.
+    let mut bytes = [0u8; 4096 + 3];
+    let mut pending = 0;
+    loop {
+        let count = match stderr.read(&mut bytes[pending..pending + 4096]).await {
+            Ok(0) | Err(_) => break,
+            Ok(count) => count,
+        };
+        let end = pending + count;
+        let mut start = 0;
+        while start < end {
+            match std::str::from_utf8(&bytes[start..end]) {
+                Ok(text) => {
+                    ring_push(target, text);
+                    start = end;
+                }
+                Err(error) => {
+                    let valid_end = start + error.valid_up_to();
+                    // The prefix was validated above; no lossy conversion of
+                    // a split CJK/emoji sequence is needed.
+                    ring_push(
+                        target,
+                        std::str::from_utf8(&bytes[start..valid_end]).unwrap(),
+                    );
+                    start = valid_end;
+                    if let Some(invalid_len) = error.error_len() {
+                        ring_push(target, "\u{fffd}");
+                        start += invalid_len;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        pending = end - start;
+        bytes.copy_within(start..end, 0);
+    }
+    if pending > 0 {
+        ring_push(target, "\u{fffd}");
+    }
 }
 // ==================== stderr redaction ====================
 
@@ -194,6 +230,7 @@ pub(crate) struct TurnState {
     request_started_at: Option<i64>,
     seq: u64,
     pub(crate) native_session_id: Option<String>,
+    pub(crate) current_model: Option<String>,
     pub(crate) saw_done: bool,
     pub(crate) saw_error: bool,
     attempt_error: Option<String>,
@@ -223,7 +260,7 @@ pub(crate) struct TurnState {
     source_run_id: Option<String>,
     /// When the current turn reported Done; arms the linger check.
     done_at: Option<Instant>,
-    tasks: Vec<NativeTask>,
+    pub(crate) tasks: Vec<NativeTask>,
     expects_native_settle: bool,
     /// The run has reported native session-state activity at least once.
     /// Sticky (unlike `expects_native_settle`, which Done clears): it tells the
@@ -237,6 +274,7 @@ impl TurnState {
             request_started_at: None,
             seq: 0,
             native_session_id: preassigned,
+            current_model: None,
             saw_done: false,
             saw_error: false,
             attempt_error: None,
@@ -400,9 +438,14 @@ pub(crate) fn expire_parked_plans(core: &TurnCore, state: &mut TurnState, key: &
 }
 
 impl TurnCore {
-    fn settle_tasks(&self, state: &mut TurnState, status: &str) {
+    fn settle_tasks(&self, state: &mut TurnState, status: &str, preserve_ambient: bool) {
         let mut changed = false;
         for task in &mut state.tasks {
+            // ACP closes a completed prompt while native daemon jobs remain
+            // alive. Keep their ambient status; explicit Stop still settles all.
+            if preserve_ambient && task.ambient == Some(true) {
+                continue;
+            }
             if matches!(task.status.as_str(), "running" | "paused") {
                 task.status = status.to_string();
                 changed = true;
@@ -575,7 +618,19 @@ impl TurnCore {
         }
         let run_id = self.current_run_id(state);
         match event {
-            EngineEvent::Throughput(sample) => {
+            EngineEvent::Throughput(mut sample) => {
+                if sample.get("model").is_none_or(Value::is_null) {
+                    if let Some(model) = state
+                        .current_model
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|m| !m.is_empty() && *m != "<synthetic>")
+                    {
+                        if let Some(obj) = sample.as_object_mut() {
+                            obj.insert("model".to_string(), Value::String(model.to_string()));
+                        }
+                    }
+                }
                 // The host writes terminal observations once, independently of
                 // UI delivery. Running reports never acquire the database lock.
                 if matches!(sample.get("status").and_then(Value::as_str), Some("complete" | "partial")) {
@@ -688,7 +743,7 @@ impl TurnCore {
             }
             EngineEvent::Error(error) => {
                 crate::leader::reject_first_root_binding(&self.run_id);
-                self.settle_tasks(state, "unknown");
+                self.settle_tasks(state, "unknown", false);
                 state.gen_end();
                 state.saw_error = true;
                 crate::mcp::mark_run_ended(&self.run_id);
@@ -984,6 +1039,10 @@ impl TurnCore {
                 });
             }
             EngineEvent::Model(model) => {
+                let trimmed = model.trim();
+                if !trimmed.is_empty() && trimmed != "<synthetic>" {
+                    state.current_model = Some(trimmed.to_string());
+                }
                 state.push(
                     &self.sink,
                     &run_id,
@@ -1074,7 +1133,7 @@ impl TurnCore {
                         crate::history::reader::refresh_session_prompt_cache(db, &self.engine_id, sid);
                     }
                 }
-                self.settle_tasks(state, "unknown");
+                self.settle_tasks(state, "unknown", self.engine_id == "agy");
                 // Done is the native run's settle: only an Activity seen after
                 // it can make a later exit unsettled. Left set, a CLI that
                 // outlives LINGER_GRACE (continuation resets saw_done) would
@@ -1212,6 +1271,7 @@ impl VirtualRunGuard {
 
 impl Drop for VirtualRunGuard {
     fn drop(&mut self) {
+        crate::mcp::mark_run_ended(&self.run_id);
         super::sidechat::abort_run(&self.run_id);
         self.registry
             .remove_run_if_pid(&self.run_id, self.virtual_pid);
@@ -1230,6 +1290,7 @@ pub fn sweep_staging_dirs() {
         "grok-staging",
         "codex-plan-staging",
         "agy-host-staging",
+        "agy-acp-slots",
         "cursor-host-staging",
         super::host_instructions::STAGING_DIRECTORY,
     ] {
@@ -1543,7 +1604,7 @@ pub(crate) async fn run_reader(stdout: ChildStdout, ctx: RunContext) {
     let killed = ctx.killed.load(std::sync::atomic::Ordering::SeqCst);
     finish_child_telemetry(ctx.engine_impl.as_ref(), &ctx.core, &mut state, killed || failed);
     let unfinished_tasks = state.tasks.iter().any(|task| matches!(task.status.as_str(), "running" | "paused") && task.ambient != Some(true));
-    ctx.core.settle_tasks(&mut state, if killed { "stopped" } else { "unknown" });
+    ctx.core.settle_tasks(&mut state, if killed { "stopped" } else { "unknown" }, false);
     let run_id = ctx.core.current_run_id(&state);
     if ctx.core.engine_id == "agy" && (!killed || state.saw_error) {
         for warning in agy_stderr_warnings(&stderr_text) {
@@ -1667,6 +1728,95 @@ mod staging_tests {
     use super::*;
     use crate::engine::ChildEntry;
     use std::collections::HashMap;
+
+    async fn capture_stderr_one_byte_at_a_time(bytes: Vec<u8>) -> String {
+        let (mut writer, reader) = tokio::io::duplex(1);
+        let buf = Arc::new(Mutex::new(String::new()));
+        let target = Arc::clone(&buf);
+        let capture = tokio::spawn(async move { capture_stderr(reader, &target).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            writer.write_all(&bytes).await.unwrap();
+            drop(writer);
+            capture.await.unwrap();
+        })
+        .await
+        .unwrap();
+        let tail = buf.lock().unwrap().clone();
+        tail
+    }
+
+    #[tokio::test]
+    async fn stderr_capture_preserves_split_unicode_and_replaces_invalid_sequences() {
+        let text = "中文🙂".repeat(1000);
+        let tail = capture_stderr_one_byte_at_a_time(text.as_bytes().to_vec()).await;
+        let mut start = text.len() - 4096;
+        while !text.is_char_boundary(start) {
+            start += 1;
+        }
+        assert_eq!(tail, text[start..]);
+        let tail = capture_stderr_one_byte_at_a_time(b"a\xff\xe4\xb8\xad\xf0\x9f".to_vec()).await;
+        assert_eq!(tail, "a\u{fffd}中\u{fffd}");
+    }
+
+    #[tokio::test]
+    async fn stderr_capture_preserves_agy_structured_diagnostics() {
+        let text = b"startup\nAGY_ERROR: {\"code\":429,\"retryable\":false,\"error_id\":\"quota-1\",\"message\":\"bearer private-token\"}\n";
+        let tail = capture_stderr_one_byte_at_a_time(text.to_vec()).await;
+        assert_eq!(tail.as_bytes(), text);
+        let diagnostic = agy_stderr_diagnostic(&tail).unwrap();
+        let value: Value =
+            serde_json::from_str(diagnostic.strip_prefix("AGY_ERROR: ").unwrap()).unwrap();
+        assert_eq!(value["code"], 429);
+        assert_eq!(value["retryable"], false);
+        assert_eq!(value["error_id"], "quota-1");
+        assert!(!diagnostic.contains("private-token"));
+    }
+
+    #[tokio::test]
+    async fn stderr_capture_drains_invalid_bytes_and_large_unterminated_output() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let buf = Arc::new(Mutex::new(String::new()));
+        let target = Arc::clone(&buf);
+        let capture = tokio::spawn(async move { capture_stderr(reader, &target).await });
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            writer.write_all(b"\xff\n").await.unwrap();
+            for _ in 0..256 {
+                writer.write_all(&[b'x'; 4096]).await.unwrap();
+            }
+            writer.write_all(b"END-MARKER").await.unwrap();
+            drop(writer);
+            capture.await.unwrap();
+        })
+        .await;
+        assert!(result.is_ok(), "stderr must keep draining");
+        let tail = buf.lock().unwrap();
+        assert_eq!(tail.len(), 4096);
+        assert!(tail.ends_with("END-MARKER"));
+    }
+
+    #[tokio::test]
+    async fn stderr_capture_publishes_without_waiting_for_newline_or_eof() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let buf = Arc::new(Mutex::new(String::new()));
+        let target = Arc::clone(&buf);
+        let capture = tokio::spawn(async move { capture_stderr(reader, &target).await });
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for _ in 0..256 {
+                writer.write_all(&[b'x'; 4096]).await.unwrap();
+                assert!(buf.lock().unwrap().len() <= 4096);
+            }
+            loop {
+                if buf.lock().unwrap().len() == 4096 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        drop(writer);
+        capture.await.unwrap();
+        assert!(result.is_ok(), "unterminated stderr must be published before EOF");
+    }
 
     #[test]
     fn agy_structured_stderr_keeps_failure_metadata_and_redacts_secrets() {

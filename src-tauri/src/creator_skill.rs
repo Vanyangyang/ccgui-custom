@@ -396,7 +396,49 @@ pub(crate) fn sync_self_update_skill_for_workspace(
     )
 }
 
-fn registered_self_update_workspace(profile_root: &Path) -> Result<Option<PathBuf>, String> {
+/// Read the exact trusted registration, without guessing a repository ancestor.
+/// A profile without registration files must remain untouched by this lookup.
+pub(crate) fn registered_self_update_source_root(profile_root: &Path) -> Result<Option<PathBuf>, String> {
+    registered_self_update_source_root_inner(profile_root, true)
+}
+
+fn registered_self_update_source_root_inner(profile_root: &Path, strict: bool) -> Result<Option<PathBuf>, String> {
+    let registration = profile_root.join("runtime-updates");
+    match std::fs::symlink_metadata(&registration) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("could not read local self-update registration".into()),
+        Ok(metadata) => {
+            #[cfg(windows)]
+            let linked = {
+                use std::os::windows::fs::MetadataExt;
+                metadata.file_attributes() & 0x400 != 0 // FILE_ATTRIBUTE_REPARSE_POINT
+            };
+            #[cfg(not(windows))]
+            let linked = metadata.file_type().is_symlink();
+            if !metadata.is_dir() || linked {
+                return Err("could not read local self-update registration".into());
+            }
+        }
+    }
+    let mut configured = false;
+    for file in ["channel.json", "default-source-root.txt"] {
+        match std::fs::symlink_metadata(registration.join(file)) {
+            Ok(metadata) => {
+                if file == "channel.json" && (!metadata.is_file() || metadata.file_type().is_symlink()) {
+                    return Err("could not read local self-update registration".into());
+                }
+                configured = true;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            // Defer legacy hint errors until we know whether the authoritative
+            // channel already has a source root and therefore ignores the hint.
+            Err(_) if file == "default-source-root.txt" => configured = true,
+            Err(_) => return Err("could not read local self-update registration".into()),
+        }
+    }
+    if !configured {
+        return Ok(None);
+    }
     let store = crate::live_update::UpdateStore::open(
         profile_root,
         crate::live_update::Limits::default(),
@@ -405,13 +447,36 @@ fn registered_self_update_workspace(profile_root: &Path) -> Result<Option<PathBu
     let channel = store
         .channel_status()
         .map_err(|_| "could not read local self-update registration".to_string())?;
-    Ok(channel.default_source_root.and_then(|source| {
+    if let Some(source) = channel.default_source_root {
         let path = Path::new(&source);
         if !path.is_absolute() || !path.is_dir() {
-            return None;
+            return if strict { Err("invalid local self-update source root".into()) } else { Ok(None) };
         }
-        self_update_workspace_root(path)
-    }))
+        return Ok(Some(path.to_path_buf()));
+    }
+    if strict {
+        // channel_status intentionally ignores an absent/invalid legacy hint.
+        // Authorization must distinguish explicit damage from no registration.
+        use std::io::Read;
+        match std::fs::File::open(registration.join("default-source-root.txt")) {
+            Ok(input) => {
+                let mut value = String::new();
+                input.take(65_537).read_to_string(&mut value)
+                    .map_err(|_| "could not read local self-update registration")?;
+                if value.len() > 65_536 || !value.trim().is_empty() {
+                    return Err("invalid local self-update source root".into());
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err("could not read local self-update registration".into()),
+        }
+    }
+    Ok(None)
+}
+
+fn registered_self_update_workspace(profile_root: &Path) -> Result<Option<PathBuf>, String> {
+    Ok(registered_self_update_source_root_inner(profile_root, false)?
+        .and_then(|path| self_update_workspace_root(&path)))
 }
 
 /// 启动时逐个同步全局内置 skill，清理旧版遗留在全局 CLI 目录的 `ccgui-self-update`，
@@ -859,6 +924,7 @@ mod tests {
     fn startup_workspace_is_absent_for_a_fresh_profile() {
         let scratch = Scratch::new("startup-fresh-profile");
         assert_eq!(registered_self_update_workspace(&scratch.dir).unwrap(), None);
+        assert!(!scratch.dir.join("runtime-updates").exists());
         assert!(!scratch.dir.join(".claude").exists());
         assert!(!scratch.dir.join(".agents").exists());
     }
@@ -874,6 +940,7 @@ mod tests {
         let profile = scratch.dir.join("profile");
         std::fs::create_dir_all(&profile).unwrap();
         assert_eq!(registered_self_update_workspace(&profile).unwrap(), None);
+        std::fs::create_dir_all(profile.join("runtime-updates")).unwrap();
         std::fs::write(
             profile.join("runtime-updates/default-source-root.txt"),
             workspace.to_string_lossy().as_bytes(),
@@ -888,6 +955,7 @@ mod tests {
     fn startup_workspace_ignores_invalid_missing_and_relative_registrations() {
         let scratch = Scratch::new("startup-invalid-registration");
         assert_eq!(registered_self_update_workspace(&scratch.dir).unwrap(), None);
+        std::fs::create_dir_all(scratch.dir.join("runtime-updates")).unwrap();
         let unrecognized = scratch.dir.join("other-project");
         std::fs::create_dir_all(unrecognized.join("src-tauri")).unwrap();
         std::fs::write(unrecognized.join("src-tauri/tauri.conf.json"), b"{}").unwrap();
@@ -922,6 +990,7 @@ mod tests {
     fn startup_workspace_registration_errors_do_not_expose_paths() {
         let scratch = Scratch::new("startup-registration-error");
         assert_eq!(registered_self_update_workspace(&scratch.dir).unwrap(), None);
+        std::fs::create_dir_all(scratch.dir.join("runtime-updates")).unwrap();
         std::fs::write(scratch.dir.join("runtime-updates/channel.json"), b"invalid json").unwrap();
         assert_eq!(
             registered_self_update_workspace(&scratch.dir).unwrap_err(),

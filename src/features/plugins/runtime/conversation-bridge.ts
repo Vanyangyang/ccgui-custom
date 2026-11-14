@@ -23,7 +23,8 @@ function object(value: unknown, fields: string[]): asserts value is Record<strin
 }
 function selection(value: unknown): asserts value is ConversationSelection {
   object(value, ["engine", "model", "effort", "providerId"]);
-  if (value.engine !== "claude" && value.engine !== "codex") throw new Error("Unsupported conversation engine");
+  if (value.engine !== "claude" && value.engine !== "codex" && value.engine !== "agy") throw new Error("Unsupported conversation engine");
+  if (value.engine === "agy" && value.effort !== undefined) throw new Error("AGY effort is selected through its model");
   for (const field of ["model", "effort", "providerId"]) {
     if (value[field] !== undefined && (typeof value[field] !== "string" || !value[field] ||
       (value[field] as string).length > 256 || /[\u0000-\u001f]/.test(value[field] as string))) throw new Error(`Invalid ${field}`);
@@ -45,9 +46,10 @@ interface Entry {
    * Set on failed/cancelled turns; never removes or edits transcript rows. */
   memoryFloorSeq?: number;
 }
-function explicitSelection(value: unknown): asserts value is Required<ConversationSelection> {
+type ExplicitSelection = ConversationSelection & { model: string; providerId: string };
+function explicitSelection(value: unknown): asserts value is ExplicitSelection {
   selection(value);
-  if (!value.model?.trim() || !value.effort?.trim() || !value.providerId?.trim()) throw new Error("Explicit launch selection required");
+  if (!value.model?.trim() || (value.engine !== "agy" && !value.effort?.trim()) || !value.providerId?.trim()) throw new Error("Explicit launch selection required");
 }
 function messages(value: unknown): asserts value is Message[] {
   if (!Array.isArray(value) || value.some((m) => !m || typeof m !== "object" || Array.isArray(m) ||
@@ -122,6 +124,8 @@ export interface ConversationBridgeDependencies {
   facade(): Promise<HostConversationFacade>;
   /** Tests can supply an isolated coordinator. */
   checkpoint?: Pick<typeof runtimeCheckpoint, "assertAllowed" | "registerBlocker">;
+  /** Private test seam; production bounds cover idle copies, never live tasks. */
+  idleCacheLimits?: { entries: number; bytes: number };
 }
 
 /** Document singleton survives plugin reload; only SDK listeners are disposed.
@@ -161,6 +165,11 @@ function createController(pluginId: string, storage: PluginStorageBackend, deps:
   const active = new Map<string, { runId: string; observed: boolean }>();
   const terminal = new Map<string, { error: string | null }>();
   const writers = new Map<string, { dirty: boolean; saving?: Promise<void>; timer?: ReturnType<typeof setTimeout>; saved?: string }>();
+  const leases = new Map<string, number>();
+  const recency = new Map<string, number>();
+  let access = 0;
+  let pruningQueued = false;
+  const limits = deps.idleCacheLimits ?? { entries: 8, bytes: 32 * 1024 * 1024 };
   let host: HostConversationFacade;
   let ready: Promise<HostConversationFacade> | undefined;
   const key = (id: string) => HOST_CONVERSATIONS_KEY_PREFIX + pluginId + ":" + id;
@@ -169,6 +178,47 @@ function createController(pluginId: string, storage: PluginStorageBackend, deps:
     if (!value) { value = { dirty: false }; writers.set(id, value); }
     return value;
   };
+  function pruneIdleCopies() {
+    // A successful durable record is the authority. A run's terminal event,
+    // elapsed time or a plugin dropping its view is not a persistence proof.
+    const candidates = [...entries].filter(([id, e]) => {
+      const w = writers.get(id), state = host?.read(key(id));
+      return !leases.has(id) && !preparing.has(id) && !active.has(id) && !opens.has(id) && !loads.has(id) && !submissions.has(id)
+        && !e.runId && !e.pendingUser && !["starting", "running", "unknown"].includes(e.snapshot.status)
+        && !state?.streaming && !state?.runId && !state?.draft && !state?.draftImages?.length
+        && state === e.state && (!state || !!host.release) && !!w?.saved && !w.dirty && !w.saving && !w.timer;
+    }).sort(([a], [b]) => (recency.get(a) ?? 0) - (recency.get(b) ?? 0));
+    // JSON characters estimate both the persisted comparison string and the
+    // resident object graph. This is a cache target, not a process RSS limit.
+    let bytes = candidates.reduce((sum, [id]) => sum + writers.get(id)!.saved!.length * 4, 0);
+    let count = candidates.length;
+    for (const [id, e] of candidates) {
+      if (count <= limits.entries && bytes <= limits.bytes) break;
+      const saved = writers.get(id)!.saved!;
+      // Keep any local change which has not yet been durably acknowledged,
+      // including failed prompts, extraction fences and immutable selection.
+      if (JSON.stringify({ ...e, snapshot: { ...e.snapshot, messages: [] } }) !== saved) continue;
+      if (e.state && !host.release!(key(id), e.state)) continue;
+      entries.delete(id); writers.delete(id); terminal.delete(id); recency.delete(id);
+      bytes -= saved.length * 4; count--;
+    }
+  }
+  function schedulePrune() {
+    if (pruningQueued) return;
+    pruningQueued = true;
+    queueMicrotask(() => { pruningQueued = false; pruneIdleCopies(); });
+  }
+  async function retain<T>(id: string, operation: () => Promise<T>): Promise<T> {
+    leases.set(id, (leases.get(id) ?? 0) + 1);
+    recency.set(id, ++access);
+    try { return await operation(); }
+    finally {
+      const remaining = (leases.get(id) ?? 1) - 1;
+      if (remaining) leases.set(id, remaining); else leases.delete(id);
+      if (!entries.has(id) && !leases.has(id)) recency.delete(id);
+      schedulePrune();
+    }
+  }
   const capture = (e: Entry, requireLive = false) => {
     const state = host.read(key(e.snapshot.threadId));
     if (!state) {
@@ -247,6 +297,7 @@ function createController(pluginId: string, storage: PluginStorageBackend, deps:
       // event will publish the status finalized by the dirty-write loop. Notify
       // subscribers after it drains, with the write blocker already released.
       if (terminal.has(e.snapshot.threadId) && ["completed", "failed", "cancelled"].includes(e.snapshot.status)) emit(e);
+      schedulePrune();
     });
     return w.saving;
   };
@@ -331,7 +382,11 @@ function createController(pluginId: string, storage: PluginStorageBackend, deps:
         const raw = await storage.get(pluginId, HOST_CONVERSATIONS_KEY_PREFIX + id);
         if (raw == null) return undefined;
         const e = validateEntry(raw, id);
-        await host.workspace(e.snapshot.workspacePath);
+        const saved = JSON.stringify(e);
+        // Reading this plugin's validated durable record is not a new workspace
+        // operation. Archived/removed workspaces remain readable after eviction,
+        // just as on a warm hit. Open/send/openFile still validate availability
+        // before starting native work or opening a project file.
         if (e.runId || e.snapshot.status === "starting" || e.snapshot.status === "running" || e.state?.streaming) {
           e.snapshot.status = "unknown";
           e.snapshot.error = "Previous native run has no confirmed terminal outcome";
@@ -343,6 +398,7 @@ function createController(pluginId: string, storage: PluginStorageBackend, deps:
           e.state = restored;
         }
         entries.set(id, e);
+        writer(id).saved = saved;
         return e;
       })().finally(() => { loads.delete(id); });
       loads.set(id, promise);
@@ -361,7 +417,7 @@ function createController(pluginId: string, storage: PluginStorageBackend, deps:
     }
     return copy(result);
   };
-  return {
+  const api: HostConversationsApi = {
     async catalog() { return copy(await (await ensure()).catalog()); },
     async open(request) {
       object(request, ["threadId", "workspacePath", "selection"]);
@@ -384,7 +440,7 @@ function createController(pluginId: string, storage: PluginStorageBackend, deps:
         if (!engine) throw new Error("Conversation engine is unavailable");
         const launch: ConversationSelection = { ...input.selection,
           model: input.selection.model ?? engine.defaultModel ?? undefined,
-          effort: input.selection.effort ?? engine.defaultEffort ?? undefined,
+          ...(input.selection.engine === "agy" ? {} : { effort: input.selection.effort ?? engine.defaultEffort ?? undefined }),
           providerId: input.selection.providerId ?? engine.defaultProviderId };
         explicitSelection(launch);
         if (!engine.models.some((m) => m.id === launch.model)) throw new Error("Unknown conversation model");
@@ -435,8 +491,8 @@ function createController(pluginId: string, storage: PluginStorageBackend, deps:
       try {
         await host.workspace(e.snapshot.workspacePath);
         const catalog = await host.catalog();
-        if ((input.fixedInstructions || e.fixedInstructions) && catalog.capabilities?.fixedInstructions !== true) throw new Error("Native fixed instructions are unavailable");
         const engine = catalog.engines.find((candidate) => candidate.id === e.launchSelection.engine && candidate.available);
+        if ((input.fixedInstructions || e.fixedInstructions) && engine?.supportsFixedInstructions !== true) throw new Error("Native fixed instructions are unavailable for this engine");
         if (!engine || !engine.models.some((m) => m.id === e.launchSelection.model) ||
           !engine.providers.some((p) => p.id === e.launchSelection.providerId)) throw new Error("Conversation selection is no longer available");
         if (imageIds.length > 0 && engine.supportsImages !== true) throw new Error("Selected conversation engine does not support image attachments");
@@ -520,5 +576,15 @@ function createController(pluginId: string, storage: PluginStorageBackend, deps:
       if (typeof callback !== "function") throw new Error("Conversation callback required");
       listeners.add(callback); return () => { listeners.delete(callback); };
     },
+  };
+  // A read/send can await native validation while other conversations finish.
+  // Keep that exact entry resident until its entire operation settles.
+  return {
+    ...api,
+    open: request => retain(request.threadId, () => api.open(request)),
+    inspect: id => retain(id, () => api.inspect(id)),
+    send: request => retain(request.threadId, () => api.send(request)),
+    stop: id => retain(id, () => api.stop(id)),
+    openFile: (id, path) => retain(id, () => api.openFile(id, path)),
   };
 }

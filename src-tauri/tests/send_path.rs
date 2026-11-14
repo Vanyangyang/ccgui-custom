@@ -14,6 +14,9 @@ use serde_json::Value;
 use std::sync::{Arc, Mutex, Weak};
 use tauri::{Listener, Manager};
 
+#[path = "send_path_managed_images.rs"]
+mod managed_images;
+
 // Managed AppState must not retain its owning AppHandle through its sinks:
 // that cycle keeps the SQLite connection open after the mock App is dropped.
 // The fixture owns the strong handle, while delivery still uses the actual
@@ -97,7 +100,7 @@ async fn fixed_instructions_claude_are_staged_on_fresh_and_resumed_turns() {
             state.db.plugin_kv_set("workbench", "__host_tasks_v1:index", &ledger).unwrap();
         }
         engine::send_message(app.state::<AppState>(), "claude".into(), workspace.clone(), session.map(str::to_owned), "user-original".into(),
-            None, Some("opus".into()), None, Some("manual".into()), None, Some(run.into()), None, None, None).await.unwrap();
+            None, Some("opus".into()), None, Some("manual".into()), None, Some(run.into()), None, None, None, None,).await.unwrap();
         wait_for_settlement(&app, &events).await;
         let system = std::fs::read_to_string(fixture.root().join("ws/claude-system.txt")).unwrap();
         assert_eq!(system.matches("KEEP_FIXED_POLICY_中文😀").count(), 1);
@@ -148,7 +151,7 @@ async fn haiku_assist_disabled_ignores_legacy_choices_without_changing_launch() 
     for (index, (enabled, session)) in [(None, "session-a"), (Some(true), "session-a"), (None, "session-b"), (Some(false), "session-a")].into_iter().enumerate() {
         events.lock().unwrap().clear();
         engine::send_message(app.state::<AppState>(), "claude".into(), workspace.clone(), Some(session.into()), "fake task".into(),
-            None, Some("opus".into()), Some("high".into()), Some("manual".into()), None, Some(format!("haiku-{index}")), None, None, enabled).await.unwrap();
+            None, Some("opus".into()), Some("high".into()), Some("manual".into()), None, Some(format!("haiku-{index}")), None, None, enabled, None,).await.unwrap();
         wait_for_settlement(&app, &events).await;
         let mut args = haiku_cli_args(&fixture);
         let prompt_positions: Vec<_> = args.iter().enumerate()
@@ -189,12 +192,12 @@ async fn haiku_assist_disabled_does_not_probe_or_reject_an_unsupported_cli() {
     let workspace = fixture.root().join("ws").to_string_lossy().to_string();
     let (app, events) = build_app(&fixture);
     engine::send_message(app.state::<AppState>(), "claude".into(), workspace.clone(), None, "fake task".into(),
-        None, Some("opus".into()), None, Some("manual".into()), None, Some("haiku-unsupported".into()), None, None, Some(true)).await.unwrap();
+        None, Some("opus".into()), None, Some("manual".into()), None, Some("haiku-unsupported".into()), None, None, Some(true), None,).await.unwrap();
     wait_for_settlement(&app, &events).await;
     assert!(!haiku_cli_args(&fixture).iter().any(|arg| arg == "--agents"));
     events.lock().unwrap().clear();
     engine::send_message(app.state::<AppState>(), "claude".into(), workspace, None, "fake recovery".into(),
-        None, Some("opus".into()), None, Some("manual".into()), None, Some("haiku-off-recovery".into()), None, None, Some(false)).await.unwrap();
+        None, Some("opus".into()), None, Some("manual".into()), None, Some("haiku-off-recovery".into()), None, None, Some(false), None,).await.unwrap();
     wait_for_settlement(&app, &events).await;
     assert!(!haiku_cli_args(&fixture).iter().any(|arg| arg == "--agents"));
     assert!(!fixture.root().join("help-probes.txt").exists(), "disabled assistance must not probe the CLI");
@@ -455,6 +458,7 @@ fn build_app(
         web: ccgui_next_lib::web::WebAccessState::default(),
         relay: ccgui_next_lib::relay::RelayState::default(),
         dsh_host: Arc::new(ccgui_next_lib::dsh_host::DshHostState::default()),
+        agy_acp: Arc::new(ccgui_next_lib::engine::agy_acp::AgyAcpState::default()),
         opencode_server: std::sync::Arc::new(
             ccgui_next_lib::engine::opencode_server::OpencodeServerState::default(),
         ),
@@ -615,7 +619,7 @@ async fn own_transport_isolated_agents_do_not_emit_chat_events() {
     engine::send_message(
         app.state::<AppState>(), "codex".into(), workspace, None, "ordinary fixture".into(),
         None, None, None, None, None, Some("ordinary-own-chat".into()), None,
-        None, None,
+        None, None, None,
     ).await.unwrap_or_else(|error| panic!("ordinary fake app-server launch failed: {error}"));
     wait_for_settlement(&app, &chat_events).await;
     assert!(chat_events.lock().unwrap().iter().any(|event| event["runId"] == "ordinary-own-chat" && event["kind"] == "delta"));
@@ -750,7 +754,7 @@ async fn fixed_instructions_codex_resume_after_compaction_preserves_user_config_
             }]})).unwrap();
         }
         engine::send_message(app.state::<AppState>(), "codex".into(), workspace.clone(), session.map(str::to_owned), "user-original".into(),
-            None, None, None, None, None, Some(run.into()), None, None, None).await.unwrap();
+            None, None, None, None, None, Some(run.into()), None, None, None, None,).await.unwrap();
         wait_for_settlement(&app, &events).await;
         assert!(events.lock().unwrap().iter().any(|e| e["runId"] == run && e["kind"] == "compaction"));
     }
@@ -794,7 +798,7 @@ async fn codex_auto_review_unavailable_stops_before_task_and_drains_run() {
     let (app, events) = build_app(&fixture);
     let run = "auto-review-disabled";
     engine::send_message(app.state::<AppState>(), "codex".into(), workspace, None, "must not reach model".into(),
-        None, None, None, Some("auto".into()), None, Some(run.into()), None, None, None).await.unwrap();
+        None, None, None, Some("auto".into()), None, Some(run.into()), None, None, None, None,).await.unwrap();
     wait_until("failed reviewer preflight", || count(&events, run, &["error"]) == 1).await;
     wait_until("failed reviewer process drain", || app.state::<AppState>().processes.0.lock().unwrap().is_empty()).await;
     assert_eq!(count(&events, run, &["done", "delta"]), 0);
@@ -822,7 +826,7 @@ async fn codex_steer_keeps_one_native_turn_and_waits_for_ack() {
     let run = "codex-steer-live";
     engine::send_message(
         app.state::<AppState>(), "codex".into(), workspace.clone(), None, "initial task".into(),
-        None, None, None, None, None, Some(run.into()), None, None, None,
+        None, None, None, None, None, Some(run.into()), None, None, None, None,
     ).await.unwrap();
     wait_until("initial Codex delta", || count(&events, run, &["delta"]) == 1).await;
     assert_eq!(count(&events, run, &["done", "error"]), 0);
@@ -881,7 +885,7 @@ async fn codex_child_completion_keeps_parent_available_for_steering() {
     let (app, events) = build_app(&fixture);
     let run = "codex-child-isolation";
     engine::send_message(app.state::<AppState>(), "codex".into(), workspace.clone(), None, "parent task".into(),
-        None, None, None, None, None, Some(run.into()), None, None, None).await.unwrap();
+        None, None, None, None, None, Some(run.into()), None, None, None, None,).await.unwrap();
     wait_until("parent continued after child completion", || count(&events, run, &["delta"]) == 2).await;
     assert_eq!(count(&events, run, &["done", "error"]), 0);
     assert!(app.state::<AppState>().processes.0.lock().unwrap().contains_key(run));
@@ -918,7 +922,7 @@ async fn codex_steer_protocol_error_mismatch_and_terminal_never_report_success()
         let (app, events) = build_app(&fixture);
         let run = "codex-steer-rejected";
         engine::send_message(app.state::<AppState>(), "codex".into(), workspace.clone(), None, "initial task".into(),
-            None, None, None, None, None, Some(run.into()), None, None, None).await.unwrap();
+            None, None, None, None, None, Some(run.into()), None, None, None, None,).await.unwrap();
         wait_until("initial Codex delta", || count(&events, run, &["delta"]) == 1).await;
         assert!(engine::send_follow_up(app.state::<AppState>(), run.into(), "codex".into(), workspace,
             "adjust task".into(), None).await.is_err());
@@ -944,7 +948,7 @@ async fn codex_steer_cancel_wakes_pending_acknowledgement() {
     let (app, events) = build_app(&fixture);
     let run = "codex-steer-cancel";
     engine::send_message(app.state::<AppState>(), "codex".into(), workspace.clone(), None, "initial task".into(),
-        None, None, None, None, None, Some(run.into()), None, None, None).await.unwrap();
+        None, None, None, None, None, Some(run.into()), None, None, None, None,).await.unwrap();
     wait_until("initial Codex delta", || count(&events, run, &["delta"]) == 1).await;
     let (steered, ()) = tokio::join!(
         engine::send_follow_up(app.state::<AppState>(), run.into(), "codex".into(), workspace, "adjust task".into(), None),
@@ -1535,10 +1539,10 @@ async fn coordinator_marks_only_managed_child_processes() {
     let mut settings = ccgui_next_lib::settings::read_settings().unwrap();
     settings.codex_service_tier = None;
     ccgui_next_lib::settings::update_app_settings(app.handle().clone(), settings.clone()).unwrap();
-    engine::send_message_inner(
-        state.inner(), "codex".into(), workspace.clone(), Some("fake-codex-thread".into()),
+    engine::send_message(
+        app.state(), "codex".into(), workspace.clone(), Some("fake-codex-thread".into()),
         "child follow-up".into(), None, None, None, Some("auto".into()), None,
-        Some("codex-child-tab".into()), None, None,
+        Some("codex-child-tab".into()), None, None, None, Some("priority".into()),
     ).await.unwrap();
     wait_until("Codex child tab retirement", || retired("codex-child-tab") == Some(true)).await;
     assert_codex_service_tier(&fixture, "default");
@@ -1567,6 +1571,37 @@ async fn coordinator_marks_only_managed_child_processes() {
     assert_codex_service_tier(&fixture, "priority");
     assert_eq!(leader_marks(&fixture).last().unwrap(), "codex:[]");
     assert_eq!(fake_requests(&fixture).iter().rev().find(|frame| frame["method"] == "thread/start").unwrap()["params"]["config"]["service_tier"], "priority");
+}
+
+#[tokio::test]
+async fn codex_service_tier_override_is_per_launch_and_validated() {
+    let fixture = TestHarness::new().unwrap();
+    write_fake_codex_app_server(&fixture);
+    let (app, events) = build_app(&fixture);
+    let workspace = fixture.root().join("ws").to_string_lossy().to_string();
+    for (index, (global, requested, expected)) in [
+        (Some("default"), Some("priority"), "priority"),
+        (Some("priority"), Some("default"), "default"),
+        (Some("priority"), None, "priority"),
+    ].into_iter().enumerate() {
+        let mut settings = ccgui_next_lib::settings::read_settings().unwrap();
+        settings.codex_service_tier = global.map(str::to_owned);
+        ccgui_next_lib::settings::update_app_settings(app.handle().clone(), settings).unwrap();
+        let run = format!("tier-override-{index}");
+        engine::send_message(app.state(), "codex".into(), workspace.clone(), None, "fixture".into(),
+            None, None, None, Some("auto".into()), None, Some(run.clone()), None, None, None,
+            requested.map(str::to_owned)).await.unwrap();
+        wait_until(&run, || count(&events, &run, &["done"]) == 1).await;
+        wait_until("process drain", || app.state::<AppState>().processes.0.lock().unwrap().is_empty()).await;
+        assert_codex_service_tier(&fixture, expected);
+        assert_eq!(fake_requests(&fixture).iter().rev().find(|frame| frame["method"] == "thread/start").unwrap()["params"]["config"]["service_tier"], expected);
+        assert_eq!(ccgui_next_lib::settings::read_settings().unwrap().codex_service_tier.as_deref(), global);
+    }
+    for (engine_id, tier) in [("codex", "fast"), ("codex", ""), ("claude", "priority")] {
+        let error = engine::send_message(app.state(), engine_id.into(), workspace.clone(), None, "must not launch".into(),
+            None, None, None, None, None, None, None, None, None, Some(tier.into())).await.err().expect("invalid tier must fail");
+        assert!(error.contains("codexServiceTierOverride"), "{error}");
+    }
 }
 
 fn assert_codex_service_tier(fixture: &TestHarness, expected: &str) {
@@ -1625,6 +1660,10 @@ async fn completed_delegation_remains_readable_while_human_continues_child() {
     let branch_id = spawned["branch"]["id"].as_str().unwrap().to_string();
     let delegated_run = spawned["branch"]["runId"].as_str().unwrap().to_string();
     wait_until("delegated turn initial output", || count(&events, &delegated_run, &["delta"]) == 1).await;
+    let delegated_input = fake_requests(&fixture).into_iter().find(|request| request["method"] == "turn/start").unwrap()["params"]["input"][0]["text"].as_str().unwrap().to_string();
+    assert!(delegated_input.contains("[Message from CC GUI "));
+    assert!(delegated_input.contains("\"session_id\":\"delegating-parent\""));
+    assert!(delegated_input.contains("original parent assignment"));
     // Human guidance stays in the active delegated turn and releases its parent's wait.
     let (waited, guided) = tokio::join!(
         ccgui_next_lib::leader::dispatch(state.inner(), caller.clone(), "task_wait",
@@ -1655,6 +1694,8 @@ async fn completed_delegation_remains_readable_while_human_continues_child() {
     wait_until("human child output", || events.lock().unwrap().iter().any(|event|
         event["runId"] == "human-child-run" && event["kind"] == "delta"
         && event["data"] == "human-only follow-up")).await;
+    let human_input = fake_requests(&fixture).into_iter().filter(|request| request["method"] == "turn/start").last().unwrap()["params"]["input"][0]["text"].as_str().unwrap().to_string();
+    assert_eq!(human_input, "independent human follow-up");
     let waited = ccgui_next_lib::leader::dispatch(state.inner(), caller.clone(), "task_wait",
         serde_json::json!({"branch_ids":[branch_id],"timeout_seconds":1})).await.unwrap();
     assert_eq!(waited["timedOut"], false, "human work must not keep the original parent waiting: {waited}");
@@ -1665,7 +1706,8 @@ async fn completed_delegation_remains_readable_while_human_continues_child() {
     assert_eq!(branch["delegation"]["runId"], delegated_run);
     assert_eq!(branch["delegation"]["state"], "completed");
     assert_eq!(branch["delegation"]["result"], "delegated reply after guidance");
-    assert_eq!(branch["delegation"]["task"], "original parent assignment");
+    assert_eq!(branch["delegation"]["taskPreview"], "original parent assignment");
+    assert!(branch["delegation"].get("task").is_none());
 
     let processes = Arc::clone(&state.processes);
     assert!(tokio::task::spawn_blocking(move || processes.kill("human-child-run")).await.unwrap());
@@ -1711,7 +1753,7 @@ async fn send_message_streams_events_end_to_end() {
         None,
         None,
         None,
-        None, None,
+        None, None, None,
     )
     .await
     .expect("send_message must succeed");
@@ -1793,7 +1835,7 @@ async fn auto_title_origin_local_send_adopts_native_identity_and_retires_after_e
     let result = engine::send_message(
         state, "claude".into(), workspace_path.clone(), None, "fixture turn".into(),
         None, None, None, None, None, Some(run.into()), None,
-        None, None,
+        None, None, None,
     ).await.unwrap();
     assert_eq!(result.run_id, run);
 
@@ -1919,7 +1961,7 @@ async fn interrupt_kills_running_child() {
         None,
         None,
         None,
-        None, None,
+        None, None, None,
     )
     .await
     .unwrap();
@@ -2082,7 +2124,7 @@ async fn omp_send_uses_persisted_tier_and_model_without_touching_cli_config() {
             None,
             None,
             None,
-            None, None,
+            None, None, None,
         )
         .await
         .unwrap();
@@ -2151,7 +2193,7 @@ async fn missing_fake_cli_never_falls_back_to_installed_or_external_binaries() {
             None,
             None,
             None,
-            None, None,
+            None, None, None,
         )
         .await
         .err()
@@ -2336,7 +2378,7 @@ async fn a_thread_held_by_codex_desktop_continues_there() {
         engine::send_message(
             app.state::<AppState>(), "codex".into(), workspace.clone(), Some(THREAD.into()),
             "好的 🧭".into(), images, None, None, Some("bypass".into()), None, Some(run.into()), None,
-            None, None,
+            None, None, None,
         )
     };
 
@@ -2443,7 +2485,7 @@ async fn a_thread_held_by_another_client_is_not_handed_to_desktop() {
     engine::send_message(
         app.state::<AppState>(), "codex".into(), workspace, Some(THREAD.into()), "继续".into(),
         None, None, None, Some("bypass".into()), None, Some("held-elsewhere".into()), None,
-        None, None,
+        None, None, None,
     )
     .await
     .unwrap();

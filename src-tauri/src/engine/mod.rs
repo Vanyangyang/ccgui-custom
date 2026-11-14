@@ -1,4 +1,5 @@
 pub mod agy;
+pub mod agy_acp;
 mod agy_throughput;
 pub(crate) mod agy_vertex;
 pub mod claude;
@@ -11,12 +12,14 @@ mod claude_live_input_tests;
 mod claude_channel;
 pub mod codex;
 pub mod cursor;
+mod cursor_throughput;
 pub mod cursor_picker;
 pub(crate) mod cursor_context;
 pub(crate) mod codex_app;
 mod codex_auto_review;
 mod codex_control;
 mod codex_throughput;
+mod throughput_common;
 mod codex_desktop;
 pub(crate) mod codex_provider_env;
 mod codex_read_only;
@@ -597,6 +600,17 @@ struct Launch {
     built: BuiltCommand,
     engine_impl: Box<dyn Engine>,
 }
+fn validate_codex_service_tier_override(engine: &str, tier: Option<&str>) -> Result<(), String> {
+    match tier {
+        None => Ok(()),
+        Some("default" | "priority") if engine == "codex" => Ok(()),
+        Some(_) => Err("codexServiceTierOverride requires Codex and must be default or priority".into()),
+    }
+}
+
+#[tauri::command]
+pub fn codex_service_tier_override_supported() -> bool { true }
+
 fn prepare_launch(
     engine: &str,
     workspace_path: &str,
@@ -613,7 +627,9 @@ fn prepare_launch(
     wsl: bool,
     host_chat_server: Option<&Value>,
     claude_ultracode: Option<bool>,
+    codex_service_tier_override: Option<String>,
 ) -> Result<Launch, String> {
+    validate_codex_service_tier_override(engine, codex_service_tier_override.as_deref())?;
     let engine_impl = engine_by_id(engine).ok_or_else(|| format!("unknown engine: {engine}"))?;
     // 停用 still gates sending. Channel settings apply to this child below;
     // native CLI files remain the official configuration.
@@ -702,7 +718,7 @@ fn prepare_launch(
         effort,
         service_tier: match engine {
             "omp" => settings.omp_openai_service_tier.clone(),
-            "codex" => settings.codex_service_tier.clone(),
+            "codex" => codex_service_tier_override.or_else(|| settings.codex_service_tier.clone()),
             _ => None,
         },
         permission: permission.filter(|p| !p.trim().is_empty()),
@@ -805,6 +821,7 @@ pub async fn send_message(
     computer_use: Option<bool>,
     claude_ultracode: Option<bool>,
     claude_haiku_assist: Option<bool>,
+    codex_service_tier_override: Option<String>,
 ) -> Result<SendResult, String> {
     send_message_inner_with_sink(
         &state,
@@ -822,7 +839,7 @@ pub async fn send_message(
         computer_use,
         None,
         claude_ultracode,
-        claude_haiku_assist,
+        claude_haiku_assist, codex_service_tier_override,
     )
     .await
 }
@@ -868,7 +885,7 @@ pub(crate) async fn plugin_agent_send(
         None,
         allowed_tools,
         None,
-        None,
+        None, None,
     )
     .await
 }
@@ -929,7 +946,7 @@ pub(crate) async fn mission_agent_send(
         None,
         allowed_tools,
         None,
-        None,
+        None, None,
     )
     .await
 }
@@ -958,7 +975,7 @@ pub mod isolated_send_test_support {
                 state, Arc::clone(&state.sink), engine, workspace, session, "fixture".into(),
                 None, None, None, None, None, Some(run), None, Some(vec!["Read".into()]),
                 None,
-                None,
+                None, None,
             ).await,
         }
     }
@@ -981,7 +998,7 @@ pub async fn ordinary_task_test_send(
     crate::leader::validate_first_root_workspace(&state.db, &engine, &workspace)?;
     send_message_inner_with_sink(state, Arc::clone(&state.sink), engine, workspace, None,
         "first root task".into(), None, None, None, None, None, Some(run), None,
-        None, None, None).await
+        None, None, None, None,).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1016,7 +1033,7 @@ pub async fn send_message_inner(
         computer_use,
         None,
         claude_ultracode,
-        None,
+        None, None,
     )
     .await
 }
@@ -1043,11 +1060,12 @@ pub(crate) async fn worker_send_message(
     computer_use: Option<bool>,
     claude_ultracode: Option<bool>,
     claude_haiku_assist: Option<bool>,
+    codex_service_tier_override: Option<String>,
 ) -> Result<SendResult, String> {
     DETACHED_WORKER_REQUEST.scope(true, send_message_inner_with_sink(
         state, Arc::clone(&state.sink), engine, workspace_path, session_id,
         prompt, image_paths, model, effort, permission, provider_id, run_id,
-        computer_use, None, claude_ultracode, claude_haiku_assist,
+        computer_use, None, claude_ultracode, claude_haiku_assist, codex_service_tier_override,
     )).await
 }
 
@@ -1069,7 +1087,9 @@ async fn send_message_inner_with_sink(
     allowed_tools: Option<Vec<String>>,
     claude_ultracode: Option<bool>,
     claude_haiku_assist: Option<bool>,
+    codex_service_tier_override: Option<String>,
 ) -> Result<SendResult, String> {
+    validate_codex_service_tier_override(&engine, codex_service_tier_override.as_deref())?;
     let _memory_foreground = crate::plugin_memory::foreground();
     let run_id = run_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     if run_id.is_empty()
@@ -1093,7 +1113,7 @@ async fn send_message_inner_with_sink(
     {
         return crate::worker_host::start(run_id, crate::task_worker::StartArgs {
             engine, workspace_path, session_id, prompt, image_paths, model, effort, permission,
-            provider_id, computer_use, claude_ultracode, claude_haiku_assist,
+            provider_id, computer_use, claude_ultracode, claude_haiku_assist, codex_service_tier_override,
             require_host_chat:true, require_leader:false,
         }).await;
     }
@@ -1162,7 +1182,7 @@ async fn send_message_inner_with_sink(
         &reservation.leader_registered,
         &reservation.completion_registered,
         claude_ultracode,
-        claude_haiku_assist,
+        claude_haiku_assist, codex_service_tier_override,
     )
     .await;
     reservation.committed = result.is_ok();
@@ -1226,6 +1246,7 @@ async fn send_reserved(
     completion_registered: &std::sync::atomic::AtomicBool,
     claude_ultracode: Option<bool>,
     claude_haiku_assist: Option<bool>,
+    codex_service_tier_override: Option<String>,
 ) -> Result<SendResult, String> {
     // WSL 远程工作区:引擎进程经 ssh 在发行版内执行(见 wsl_transport)。
     let wsl_tp = wsl_transport::transport_for_workspace(&state.db, &workspace_path);
@@ -1288,7 +1309,7 @@ async fn send_reserved(
         host_chat_server.as_ref(),
         // The read-only side branch installs one host-owned restrictions
         // overlay below. Do not create an earlier inline ultracode overlay.
-        if is_side_run && engine == "claude" && sidechat::is_read_only_run(&run_id) { None } else { claude_ultracode },
+        if is_side_run && engine == "claude" && sidechat::is_read_only_run(&run_id) { None } else { claude_ultracode }, codex_service_tier_override,
     )?;
     if is_side_run && engine == "claude" {
         let ephemeral = sidechat::is_ephemeral_run_id(&run_id);
@@ -1390,6 +1411,7 @@ async fn send_reserved(
     // 全文,见 omp_acp.rs);其余 omp/pi 请求保持既有子进程路径,不迁移。
     if launch.engine_impl.transport_for(wsl_tp.is_some()) == Transport::Own
         || (engine == "omp" && pi_family::acp_plan_requested(&launch.req))
+        || (engine == "agy" && agy::acp_turn_requested(&launch.req, wsl_tp.is_some()))
     {
         // 本机驱动没有远端路径:远程工作区显式拒绝(与旧行为一致),而不是
         // 静默起一个连不上远端工作区的本地会话。codex/grok 在上面退回 child。
@@ -1496,85 +1518,64 @@ async fn send_reserved(
 
     let request_started_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            // Never strand the staging files build_command wrote (grok).
-            cleanup_staged_files(&cleanup_files);
-            if let Some(restore) = &launch.built.mcp_restore {
-                restore.restore();
-            }
-            return Err(format!("failed to spawn {}: {error}", launch.bin));
-        }
-    };
-
-    let kept_stdin = spawn_stdin_writer(
-        &mut child,
-        launch.built.stdin_payload,
-        launch.built.keep_stdin_open,
-    );
-    let questions: Arc<Mutex<HashMap<String, Value>>> = Arc::new(Mutex::new(HashMap::new()));
-    let plans: Arc<Mutex<HashMap<String, Value>>> = Arc::new(Mutex::new(HashMap::new()));
-    let native_tasks = Arc::new(native_task_control::NativeTaskControl::default());
-
-    // The reserved caller id keys the real entry too: inserting under the
-    // same run_id replaces the placeholder, and the shared killed/reader_abort
-    // Arcs keep interrupts from the launch window routed to this child.
-    // Join a kill-on-close job before the run can settle: an orphaned
-    // grandchild (claude's pwsh.exe/conhost.exe) must die with the run's
-    // context, not accumulate outside every tree taskkill can still walk.
-    #[cfg(windows)]
-    let tree_guard = job::assign_kill_on_close(&child);
-    let pid = child.id().unwrap_or(0);
-    // Detach both pipes while we still own the child outright. A missing pipe
-    // after spawn is fatal: kill the child so it cannot run unobserved and
-    // unregistered.
-    let (stdout, stderr) = {
-        let pipes = child.stdout.take().zip(child.stderr.take());
-        match pipes {
+    if let Err(error) = crate::task_workspace_access::recheck_launch(&state.db, &run_id, &engine, &workspace_path) {
+        cleanup_staged_files(&cleanup_files);
+        if let Some(restore) = &launch.built.mcp_restore { restore.restore(); }
+        return Err(error);
+    }
+    let spawned = state.processes.spawn_reserved_child(&run_id, &killed, || {
+        let mut child = command.spawn()
+            .map_err(|error| format!("failed to spawn {}: {error}", launch.bin))?;
+        // Join the job and take the pipes before publishing a real entry. No
+        // await is permitted here: registry Stop is serialized with this
+        // synchronous spawn-to-registration interval.
+        #[cfg(windows)]
+        let tree_guard = job::assign_kill_on_close(&child);
+        #[cfg(not(windows))]
+        let tree_guard = ();
+        let pid = child.id().unwrap_or(0);
+        let (stdout, stderr) = match child.stdout.take().zip(child.stderr.take()) {
             Some(pair) => pair,
             None => {
                 let _ = child.start_kill();
-                cleanup_staged_files(&cleanup_files);
-                if let Some(restore) = &launch.built.mcp_restore {
-                    restore.restore();
-                }
                 return Err("missing stdout/stderr pipe after spawn".to_string());
             }
-        }
-    };
-    let child = Arc::new(TokioMutex::new(child));
-    state.processes.insert(
-        run_id.clone(),
-        ChildEntry {
-            child: Some(Arc::clone(&child)),
+        };
+        // A pre-launch Stop cannot reach this point or submit the initial
+        // payload. A later Stop sees the real child and shares these handles.
+        let kept_stdin = spawn_stdin_writer(
+            &mut child, launch.built.stdin_payload.take(), launch.built.keep_stdin_open,
+        );
+        let entry = ChildEntry {
+            child: Some(Arc::new(TokioMutex::new(child))),
             pid,
             run_id: run_id.clone(),
             killed: Arc::clone(&killed),
             reader_abort: Arc::clone(&reader_abort),
-            stdin: kept_stdin.clone(),
-            questions: Arc::clone(&questions),
-            plans: Arc::clone(&plans),
-            native_tasks: Arc::clone(&native_tasks),
+            stdin: kept_stdin,
+            questions: Arc::new(Mutex::new(HashMap::new())),
+            plans: Arc::new(Mutex::new(HashMap::new())),
+            native_tasks: Arc::new(native_task_control::NativeTaskControl::default()),
             codex_control: None,
-        },
-    );
+        };
+        Ok((entry, (stdout, stderr, tree_guard)))
+    });
+    let (entry, (stdout, stderr, _tree_guard)) = match spawned {
+        Ok(spawned) => spawned,
+        Err(error) => {
+            // Includes Stop winning the launch race, reservation loss and OS
+            // spawn failure. The SendReservation guard retires the pid-0 fence.
+            cleanup_staged_files(&cleanup_files);
+            if let Some(restore) = &launch.built.mcp_restore {
+                restore.restore();
+            }
+            return Err(error);
+        }
+    };
+    let pid = entry.pid;
+    let child = Arc::clone(entry.child.as_ref().expect("fallback launch registered a real child"));
     if let Some(session_id) = launch.built.preassigned_session_id.as_deref() {
-        state.processes.insert_alias(
-            session_id.to_string(),
-            ChildEntry {
-                child: Some(Arc::clone(&child)),
-                pid,
-                run_id: run_id.clone(),
-                killed: Arc::clone(&killed),
-                reader_abort: Arc::clone(&reader_abort),
-                stdin: kept_stdin.clone(),
-                questions: Arc::clone(&questions),
-                plans: Arc::clone(&plans),
-                native_tasks: Arc::clone(&native_tasks),
-                codex_control: None,
-            },
-        );
+        state.processes.insert_alias(session_id.to_string(), entry);
     }
 
     let stderr_buf = spawn_stderr_capture(stderr);
@@ -1621,7 +1622,7 @@ async fn send_reserved(
         stderr_buf,
         stdout_plain_buf: Arc::new(Mutex::new(String::new())),
         #[cfg(windows)]
-        _tree_guard: tree_guard,
+        _tree_guard,
     };
     let reader = tokio::spawn(run_reader(stdout, ctx));
     // Registration order is unchanged (entries land before the task can
@@ -1669,6 +1670,7 @@ async fn send_host_stream(
 
     // Plugin agents and mission nodes stream on their own sinks.
     let chat = Arc::ptr_eq(&sink, &state.sink) && !sidechat::is_side_run_id(&run_id);
+    crate::mcp::register_run(&run_id, &launch.req.workspace.to_string_lossy());
     let core = TurnCore {
         sink,
         registry: Arc::clone(&state.processes),
@@ -1678,6 +1680,15 @@ async fn send_host_stream(
     };
     let resume_session_id = launch.req.session_id.clone();
     let task = match engine.as_str() {
+        "agy" => tokio::spawn(agy_acp::run_acp_turn(
+            core,
+            launch.req,
+            launch.bin,
+            launch.built,
+            state.agy_acp.clone(),
+            killed,
+            pid,
+        )),
         "dsh" => tokio::spawn(dsh_session::run_host_turn(
             core,
             launch.req,
@@ -1737,12 +1748,12 @@ pub(crate) fn resolve_discussion_model(engine: &str, selected: &str, provider_id
 }
 
 fn resolve_discussion_model_with(engine: &str, selected: &str, provider: Option<&Value>, env: &std::collections::HashMap<String, String>) -> Result<String, String> {
-    if !matches!(engine, "claude" | "codex") || selected.trim().is_empty() { return Err("Unsupported discussion model selection".into()); }
+    if !matches!(engine, "claude" | "codex" | "agy") || selected.trim().is_empty() { return Err("Unsupported discussion model selection".into()); }
     let model = if engine == "claude" && provider.is_none() { Some(models::resolve_claude_discussion_model(selected)) }
         else if engine == "claude" { claude_channel::resolve_model(Some(selected), provider, env) } else { Some(selected.to_owned()) }
         .ok_or("Discussion model could not be resolved")?;
-    let base = model.strip_suffix("[1m]").unwrap_or(&model);
-    if matches!(base.to_lowercase().as_str(), "default" | "auto" | "automatic" | "latest" | "best") ||
+    let base = model.trim().strip_suffix("[1m]").unwrap_or(model.trim());
+    if matches!(base.trim().to_lowercase().as_str(), "default" | "auto" | "automatic" | "latest" | "best") ||
         (engine == "claude" && matches!(base.to_lowercase().as_str(), "opus" | "sonnet" | "haiku" | "fable" | "opusplan")) {
         return Err("Select an explicit model; this channel alias has no fixed launch identity".into());
     }
@@ -1752,6 +1763,20 @@ fn resolve_discussion_model_with(engine: &str, selected: &str, provider: Option<
 #[cfg(test)]
 mod discussion_model_tests {
     use super::*;
+    #[test]
+    fn agy_preserves_explicit_model_and_rejects_mutable_aliases() {
+        let provider = serde_json::json!({"settingsConfig":{"model":"default"}});
+        let before = provider.clone();
+        let env = std::collections::HashMap::from([("ANTHROPIC_DEFAULT_OPUS_MODEL".into(), "unrelated-model".into())]);
+        for provider in [None, Some(&provider)] {
+            assert_eq!(resolve_discussion_model_with("agy", "gemini-explicit-high", provider, &env).unwrap(), "gemini-explicit-high");
+            for alias in ["", " ", "auto", "DEFAULT", "automatic", "latest", "best", " auto ", "auto[1m]", " auto[1m] "] {
+                assert!(resolve_discussion_model_with("agy", alias, provider, &env).is_err(), "{alias}");
+            }
+        }
+        assert_eq!(provider, before);
+        assert!(resolve_discussion_model_with("cursor", "explicit-model", None, &env).is_err());
+    }
     #[test]
     fn resolves_channel_alias_without_changing_provider_data() {
         let provider = serde_json::json!({"settingsConfig":{"model":"opus"}});
@@ -1954,7 +1979,7 @@ pub(crate) async fn send_side_message_inner(
         Some(false),
         None,
         Some(false),
-        Some(false),
+        Some(false), None,
     )
     .await };
 
@@ -2346,6 +2371,14 @@ pub(crate) async fn answer_question_inner(
         .get(&request_id)
         .cloned()
         .ok_or_else(|| "question is no longer pending".to_string())?;
+    if let Some(context) = input.get("agyAcp") {
+        let frame = agy_acp::answer_frame(context, answers.as_ref())?;
+        agy_acp::send_run_frame(&entry.run_id, frame).await?;
+        if let Ok(mut questions) = entry.questions.lock() {
+            questions.remove(&request_id);
+        }
+        return Ok(());
+    }
     if let Some(context) = input.get("kimiAcp") {
         let frame = kimi_acp::answer_frame(context, answers.as_ref())?;
         state
@@ -4422,6 +4455,7 @@ mod plan_respond_tests {
             relay: crate::relay::RelayState::default(),
             dsh_host: Arc::new(crate::dsh_host::DshHostState::default()),
             opencode_server: Arc::new(opencode_server::OpencodeServerState::default()),
+            agy_acp: Arc::new(agy_acp::AgyAcpState::default()),
             worktree_creations: crate::git_worktree::CreationRegistry::default(),
         });
         (app, db)
@@ -4899,7 +4933,7 @@ mod cursor_model_admission_tests {
     }
     fn launch(model: Option<&str>) -> Result<Launch, String> {
         prepare_launch("cursor", "C:/fixture", None, "test".into(), None,
-            model.map(str::to_owned), None, None, vec![], None, None, None, false, None, None)
+            model.map(str::to_owned), None, None, vec![], None, None, None, false, None, None, None,)
     }
 
     #[test]

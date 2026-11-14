@@ -58,20 +58,25 @@ impl Record {
     }
 }
 
-fn read(path: &Path) -> Option<DiskCache> {
+fn read(path: &Path) -> std::io::Result<Option<DiskCache>> {
     // A failed replacement may leave old account data behind. The marker has
     // no identity data and revokes the whole file until a new write succeeds.
-    if invalidation_path(path).try_exists().ok()? { return None; }
+    if invalidation_path(path).try_exists()? { return Ok(None); }
     let mut bytes = Vec::new();
-    std::fs::File::open(path).ok()?.take((MAX_BYTES + 1) as u64).read_to_end(&mut bytes).ok()?;
-    if bytes.len() > MAX_BYTES { return None; }
-    let disk: DiskCache = serde_json::from_slice(&bytes).ok()?;
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    file.take((MAX_BYTES + 1) as u64).read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_BYTES { return Ok(None); }
+    let Ok(disk) = serde_json::from_slice::<DiskCache>(&bytes) else { return Ok(None); };
     let now = now_seconds();
     if disk.version != 1 || disk.records.len() > MAX_BINDINGS
-        || !disk.records.iter().all(|r| r.valid(now)) { return None; }
+        || !disk.records.iter().all(|r| r.valid(now)) { return Ok(None); }
     let mut stamps = std::collections::HashSet::new();
-    if !disk.records.iter().all(|r| stamps.insert(&r.stamp)) { return None; }
-    Some(disk)
+    if !disk.records.iter().all(|r| stamps.insert(&r.stamp)) { return Ok(None); }
+    Ok(Some(disk))
 }
 
 fn write(path: &Path, disk: &DiskCache) -> Result<(), ()> {
@@ -90,6 +95,11 @@ fn write(path: &Path, disk: &DiskCache) -> Result<(), ()> {
     let mut file = options.open(&temporary).map_err(|_| ())?;
     let result = file.write_all(&bytes).and_then(|_| file.sync_all());
     drop(file);
+    #[cfg(test)]
+    if result.is_ok() && std::env::var("CCGUI_QUOTA_PROCESS_FIXTURE_ACTION").as_deref() == Ok("interrupt-write") {
+        // The isolated subprocess test stops at the real pre-replacement boundary.
+        std::process::exit(23);
+    }
     let result = result.and_then(|_| std::fs::rename(&temporary, path));
     if result.is_err() { let _ = std::fs::remove_file(&temporary); }
     result.map_err(|_| ())?;
@@ -103,9 +113,23 @@ fn write(path: &Path, disk: &DiskCache) -> Result<(), ()> {
 impl CodexQuotaState {
     pub(super) fn restore(&self, cache: &mut HashMap<String, Entry>) {
         if !self.persistence_enabled.load(Ordering::Relaxed) { return; }
-        if self.persistence_loaded.swap(true, Ordering::Relaxed) { return; }
-        let Some(disk) = self.persistence_path.as_deref().and_then(read) else { return; };
-        for record in disk.records {
+        if self.persistence_loaded.load(Ordering::Relaxed) { return; }
+        let Some(path) = self.persistence_path.as_deref() else { return; };
+        // A sharing violation or temporary I/O error is not an empty cache.
+        // Retry on the next access instead of overwriting the unread file.
+        let disk = match read(path) {
+            Ok(disk) => disk,
+            Err(_) => {
+                if !self.persistence_warned.swap(true, Ordering::Relaxed) {
+                    eprintln!("[codex-quota] cache read failed; will retry");
+                }
+                return;
+            }
+        };
+        let pending_memory = cache.values().any(|entry| entry.snapshot.as_ref()
+            .is_some_and(|snapshot| snapshot.windows != QuotaWindows::default()));
+        self.persistence_loaded.store(true, Ordering::Relaxed);
+        for record in disk.into_iter().flat_map(|disk| disk.records) {
             cache.entry(record.stamp).or_insert_with(|| Entry {
                 snapshot: Some(CodexQuotaSnapshot {
                     status: "stale",
@@ -121,11 +145,26 @@ impl CodexQuotaState {
                 ..Default::default()
             });
         }
+        // A fresh observation may have arrived while the file was locked.
+        // Merge the other records first, then persist the in-memory update.
+        if pending_memory { self.persist(cache); }
     }
 
     pub(super) fn persist(&self, cache: &HashMap<String, Entry>) {
+        self.persist_with_policy(cache, false);
+    }
+
+    pub(super) fn persist_revocation(&self, cache: &HashMap<String, Entry>) {
+        self.persist_with_policy(cache, true);
+    }
+
+    fn persist_with_policy(&self, cache: &HashMap<String, Entry>, revoke: bool) {
         if !self.persistence_enabled.load(Ordering::Relaxed) { return; }
         let Some(path) = self.persistence_path.as_deref() else { return; };
+        if !revoke && !self.persistence_loaded.load(Ordering::Relaxed) {
+            self.persistence_dirty.store(true, Ordering::Relaxed);
+            return;
+        }
         let now = now_seconds();
         let mut records: Vec<_> = cache.iter().filter_map(|(stamp, entry)| {
             let snapshot = entry.snapshot.as_ref()?;
@@ -141,18 +180,22 @@ impl CodexQuotaState {
         records.sort_by(|a, b| b.collected_at.cmp(&a.collected_at).then_with(|| a.stamp.cmp(&b.stamp)));
         records.truncate(MAX_BINDINGS);
         if write(path, &DiskCache { version: 1, records }).is_err() {
-            // The directory can remain writable even when another process
-            // locks the main cache against both replacement and deletion.
-            let _ = std::fs::File::create(invalidation_path(path)).and_then(|mut file| {
-                file.write_all(b"invalidated\n")?;
-                file.sync_all()
-            });
-            // An older file may contain a now-invalidated identity. Prefer no
-            // restart cache when replacement fails; memory remains authoritative.
-            let _ = std::fs::remove_file(path);
+            self.persistence_dirty.store(true, Ordering::Relaxed);
+            if revoke {
+                // An old file must not resurrect a confirmed invalid identity.
+                let _ = std::fs::File::create(invalidation_path(path)).and_then(|mut file| {
+                    file.write_all(b"invalidated\n")?;
+                    file.sync_all()
+                });
+                let _ = std::fs::remove_file(path);
+            }
+            // A normal failed update leaves the previous complete snapshot in
+            // place; it is safer than discarding it on an incidental lock.
             if !self.persistence_warned.swap(true, Ordering::Relaxed) {
                 eprintln!("[codex-quota] cache persistence failed; using in-memory cache");
             }
+        } else {
+            self.persistence_dirty.store(false, Ordering::Relaxed);
         }
     }
 }

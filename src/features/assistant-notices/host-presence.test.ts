@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { expect, it, vi } from "vitest";
 import { chatHostVisible, publishChatHostPresence, subscribeChatHostPresence } from "./host-presence";
 it("tracks actual surfaces and an old pane cleanup cannot hide a newer pane", () => {

@@ -44,8 +44,6 @@ import { AgyQuotaControl } from "./AgyQuotaStatus";
 import { CursorQuotaStatus } from "./CursorQuotaStatus";
 import { useCursorQuota } from "./use-cursor-quota";
 import { selectAgyContext } from "./agy-context";
-import { useAgyContextWindow } from "./use-agy-context-window";
-import { AgyContextWindowEditor } from "./AgyContextWindowEditor";
 import type { ThroughputState } from "../throughput";
 import { InlineAside } from "@/features/assistant-notices/InlineAside";
 import { chatHostVisible, subscribeChatHostPresence } from "@/features/assistant-notices/host-presence";
@@ -181,7 +179,6 @@ function ConversationAside({ active }: { active: ActiveSession | null }) {
 /** Composer with its slot menus, disabled state, and image-paste wiring. */
 function FooterComposer({
   active,
-  draft,
   onDraftChange,
   onSubmit,
   onQueue,
@@ -198,7 +195,6 @@ function FooterComposer({
   onPasteImages,
 }: {
   active: ActiveSession | null;
-  draft: string;
   onDraftChange: (value: string) => void;
   onSubmit: (value: string) => void;
   onQueue?: (value: string) => void;
@@ -214,6 +210,10 @@ function FooterComposer({
   supportsImages: boolean;
   onPasteImages: (files: File[]) => void;
 }) {
+  // Draft notifications stay inside the editable boundary. The surrounding
+  // conversation, overlays and status controls do not depend on keystrokes.
+  const key = active ? sessionKey(active.engine, active.sessionId, active.workspacePath) : "";
+  const draft = useChatStore((s) => s.drafts[key] ?? "");
   return (
     <Composer
       className="mx-auto max-w-3xl"
@@ -234,6 +234,15 @@ function FooterComposer({
       sessionKey={active ? sessionKey(active.engine, active.sessionId, active.workspacePath) : undefined}
     />
   );
+}
+
+/** Keep plugin draft notifications alive even when a native question/plan
+ * temporarily replaces the editor. Store writes remain synchronous. */
+function ComposerDraftEvents({ active }: { active: ActiveSession | null }) {
+  const key = active ? sessionKey(active.engine, active.sessionId, active.workspacePath) : "";
+  const draft = useChatStore((s) => s.drafts[key] ?? "");
+  useEffect(() => { pluginBus.emit(COMPOSER_DRAFT_TOPIC, { text: draft }); }, [draft]);
+  return null;
 }
 
 /** Branch/folder/usage status bar under the composer. The quick-switch
@@ -313,8 +322,7 @@ function FooterStatusBar({
       tokens: category.tokens,
     }));
   }, [cursorContext, t]);
-  const agyContextWindow = useAgyContextWindow(displayEngine);
-  const agyContext = useMemo(() => displayEngine === "agy" ? selectAgyContext(sessionUsage, agyContextWindow.window, contextMaxKnown ? contextMax : undefined) : undefined, [displayEngine, sessionUsage, agyContextWindow.window, contextMax, contextMaxKnown]);
+  const agyContext = useMemo(() => displayEngine === "agy" ? selectAgyContext(sessionUsage, contextMaxKnown ? contextMax : undefined) : undefined, [displayEngine, sessionUsage, contextMax, contextMaxKnown]);
   const contextSegments: ContextSegment[] | undefined = useMemo(
     () =>
       (agyContext?.parts ?? usage?.parts)?.map((p) => ({
@@ -356,13 +364,13 @@ function FooterStatusBar({
     if (!active || refreshing) return;
     setRefreshing(true);
     try {
-      await Promise.all([refreshSessionUsage(sessionKeyValue), refreshContextWindow(), codexContextWindow.refresh(), agyContextWindow.refresh()]);
+      await Promise.all([refreshSessionUsage(sessionKeyValue), refreshContextWindow(), codexContextWindow.refresh()]);
     } finally {
       // No minimum-visible-busy delay here: the refresh button's feedback
       // finishes the spin lap (and checks) on its own.
       setRefreshing(false);
     }
-  }, [active, refreshing, refreshSessionUsage, refreshContextWindow, codexContextWindow.refresh, agyContextWindow.refresh, sessionKeyValue]);
+  }, [active, refreshing, refreshSessionUsage, refreshContextWindow, codexContextWindow.refresh, sessionKeyValue]);
 
   const visibleWorkspaces = useMemo(
     () => {
@@ -430,7 +438,7 @@ function FooterStatusBar({
         autoCompactWindow={autoCompactWindow}
         modelContextMax={agyContext ? agyContext.reportedMax : autoCompactWindow && contextMaxKnown ? contextMax : undefined}
         contextSegments={cursorSegments ?? (cursorBillingOnly ? [] : contextSegments)}
-        onContextOpen={() => { void refreshContextWindow(); void codexContextWindow.refresh(); void agyContextWindow.refresh(); }}
+        onContextOpen={() => { void refreshContextWindow(); void codexContextWindow.refresh(); }}
         quotaStatus={quota.enabled ? <ClaudeQuotaStatus snapshot={quota.snapshot} now={quota.now} loading={quota.loading} refresh={quota.refresh} /> : codexQuota.enabled ? <CodexQuotaStatus snapshot={codexQuota.snapshot} now={codexQuota.now} loading={codexQuota.loading} refresh={codexQuota.refresh} /> : displayEngine === "agy" ? <AgyQuotaControl engine={displayEngine} workspacePath={active?.workspacePath} model={model} /> : cursorQuota.enabled ? <CursorQuotaStatus snapshot={cursorQuota.snapshot} now={cursorQuota.now} loading={cursorQuota.loading} refresh={cursorQuota.refresh} /> : undefined}
         throughputStatus={active ? <ThroughputStatus key={sessionKeyValue} throughput={throughput} scope={{engine: active.engine, sessionId: active.sessionId ?? undefined, workspacePath: active.workspacePath}} /> : undefined}
         contextSettings={displayEngine === "claude" ? <ContextWindowEditor
@@ -438,8 +446,6 @@ function FooterStatusBar({
         /> : displayEngine === "codex" ? <CodexContextWindowEditor
           key={JSON.stringify([displayEngine, providerId, active?.workspacePath])}
           settings={codexContextWindow.settings} reportedWindow={contextMaxKnown ? contextMax : undefined} onSave={codexContextWindow.save}
-        /> : displayEngine === "agy" ? <AgyContextWindowEditor
-          window={agyContextWindow.window} reportedWindow={agyContext?.reportedMax} onSave={agyContextWindow.save}
         /> : undefined}
         onCompactContext={handleCompact}
         onRefreshUsage={handleRefresh}
@@ -489,7 +495,6 @@ export function ConversationFooter({
   images,
   previews,
   onRemoveImage,
-  draft,
   onDraftChange,
   onSubmit,
   onQueue,
@@ -532,7 +537,6 @@ export function ConversationFooter({
   images: string[];
   previews: Record<string, AttachmentPreview>;
   onRemoveImage: (path: string) => void;
-  draft: string;
   onDraftChange: (value: string) => void;
   onSubmit: (value: string) => void;
   onQueue?: (value: string) => void;
@@ -572,13 +576,6 @@ export function ConversationFooter({
   // A plan revision awaiting the user's decision takes the same slot; the
   // backend serializes native waiting points, so at most one is pending.
   const pendingPlan = usePendingPlanReview();
-
-  // The draft prop is the store's per-session value, so watching it covers
-  // every change source at once: typing, submit-clear, and session switches
-  // all re-emit with the latest text (empty string included).
-  useEffect(() => {
-    pluginBus.emit(COMPOSER_DRAFT_TOPIC, { text: draft });
-  }, [draft]);
 
   const { t } = useTranslation();
   // 文件拖放落在整列对话（消息区 + 输入区）。图片变附件，其他文件在光标处变成 @引用。
@@ -639,7 +636,6 @@ export function ConversationFooter({
         ) : (
           <FooterComposer
             active={active}
-            draft={draft}
             onDraftChange={onDraftChange}
             onSubmit={onSubmit}
             onQueue={onQueue}
@@ -676,6 +672,8 @@ export function ConversationFooter({
 
       </div>
       <AttachmentLightbox zoom={zoomImage} onClose={() => setZoomImage(null)} />
+      {/* Emit after composer slots mount, matching the previous footer effect. */}
+      <ComposerDraftEvents active={active} />
     </>
   );
 }

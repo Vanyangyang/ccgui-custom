@@ -12,9 +12,12 @@ import { worktreeMetaOf, type SessionMeta, type Workspace } from "@/lib/ipc";
 import { RenameSessionDialog } from "./RenameSessionDialog";
 import { useChatStore } from "./store";
 import { ProjectMemberNameDialog } from "@/features/projects/ProjectMemberNameDialog";
+import type { AiChatRepo } from "@/components/application/ai-chat/sidebar-types";
+import { NewSessionWorkspaceDialog } from "./NewSessionWorkspaceDialog";
 
 /** Modal dialogs owned by the chat page. */
 export type ChatPageDialog =
+  | { kind: "newSession"; workspaceId: string }
   | { kind: "rename"; session: SessionMeta }
   // anchor: pointer position of the delete click — the confirmation opens
   // next to the cursor (ConfirmPopover) instead of screen center; absent
@@ -36,9 +39,13 @@ export type ChatPageDialog =
 export function ChatPageDialogs({
   dialog,
   onClose,
+  newSessionRepos = [],
+  onNewSessionInWorkspace,
 }: {
   dialog: ChatPageDialog | null;
   onClose: () => void;
+  newSessionRepos?: AiChatRepo[];
+  onNewSessionInWorkspace?: (workspaceId: string) => void;
 }) {
   const { t } = useTranslation();
   const { renameSession, removeWorkspace, setWorkspaceAlias, setWorkspaceArchived } = useChatStore(
@@ -57,6 +64,10 @@ export function ChatPageDialogs({
 
   return (
     <>
+      {dialog?.kind === "newSession" && onNewSessionInWorkspace && (
+        <NewSessionWorkspaceDialog repos={newSessionRepos} workspaceId={dialog.workspaceId}
+          onSelect={onNewSessionInWorkspace} onClose={onClose} />
+      )}
       {dialog?.kind === "rename" && (
         <RenameSessionDialog
           // A rename opened for another session starts fresh (draft,

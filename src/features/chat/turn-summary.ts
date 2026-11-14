@@ -1,5 +1,14 @@
 import type { Message } from "@/lib/ipc";
+import { MAX_PLAUSIBLE_TPS, MIN_COMPLETE_WINDOW_MS } from "./throughput";
 import { parseUsage } from "./usage";
+
+export interface TurnSpeedBreakdown {
+  modelMs: number;
+  toolMs: number;
+  waitMs: number;
+  startupMs: number;
+  wallMs: number;
+}
 
 /** What one finished reply cost, in the numbers the engine actually reported.
  *  Nothing here is estimated: a field the engine did not report stays absent
@@ -18,20 +27,23 @@ export interface TurnSummary {
   reasoning: number | null;
   /** Tool calls the turn made. */
   tools: number;
-  /** Output tokens ÷ the whole turn's duration (waits, tools and thinking included),
-   *  so it is whole-turn throughput, not the model's generation speed. */
+  /** Active-time model inference speed when paired turn_throughput is present;
+   *  falls back to whole-turn wall speed only for older checkpointed records. */
   outputTps: number | null;
+  speedBasis?: "model" | "wall" | null;
+  breakdown?: TurnSpeedBreakdown | null;
 }
-
-/** Below this the quotient is dominated by timer noise. */
-const MIN_SPEED_WINDOW_MS = 1_000;
 
 interface TurnThroughputMeta {
   outputTokens: number;
   elapsedMs: number;
+  breakdown: TurnSpeedBreakdown | null;
 }
 
-/** 【Codex回合统计】读取附加在消息 usage JSON 上的可信终态吞吐样本，不改变通用 parseUsage 对上下文占用的解释。 */
+const nonNegativeMs = (value: unknown): number | null =>
+  typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+
+/** 读取附加在消息 usage JSON 上的可信终态吞吐样本（活跃模型耗时 + 可选阶段拆分），不改变通用 parseUsage 对上下文占用的解释。 */
 function readTurnThroughput(raw: Record<string, unknown> | null): TurnThroughputMeta | null {
   const candidate = raw?.turn_throughput;
   if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return null;
@@ -48,7 +60,21 @@ function readTurnThroughput(raw: Record<string, unknown> | null): TurnThroughput
   ) {
     return null;
   }
-  return { outputTokens, elapsedMs };
+  const wallMs = nonNegativeMs(rec.wall_ms ?? rec.wallMs);
+  const toolMs = nonNegativeMs(rec.tool_ms ?? rec.toolMs);
+  const waitMs = nonNegativeMs(rec.wait_ms ?? rec.waitMs);
+  const startupMs = nonNegativeMs(rec.startup_ms ?? rec.startupMs);
+  const breakdown =
+    wallMs !== null && wallMs > 0
+      ? {
+          modelMs: elapsedMs,
+          toolMs: toolMs ?? 0,
+          waitMs: waitMs ?? 0,
+          startupMs: startupMs ?? 0,
+          wallMs,
+        }
+      : null;
+  return { outputTokens, elapsedMs, breakdown };
 }
 
 /** Single-request history and interrupted replies are not complete turn totals. */
@@ -73,8 +99,9 @@ export function buildTurnSummary(
   const raw = message.usage && typeof message.usage === "object"
     ? message.usage as Record<string, unknown>
     : null;
-  // A partial terminal boundary overrides even previously attached paired data.
-  const turnThroughput = raw?.turn_status === "partial" ? null : readTurnThroughput(raw);
+  const turnExcluded = typeof raw?.turn_throughput_reason === "string" && raw.turn_throughput_reason.length > 0;
+  // A partial terminal boundary or explicit exclusion overrides paired data.
+  const turnThroughput = raw?.turn_status === "partial" || turnExcluded ? null : readTurnThroughput(raw);
   const incompleteScope = isIncompleteUsageScope(raw);
   const hasTurnUsage =
     raw?.usage_scope === "turn" ||
@@ -92,21 +119,35 @@ export function buildTurnSummary(
       ? message.durationMs
       : null;
   const input = usage ? usage.input + usage.cacheRead + usage.cacheWrite : 0;
-  // 【Codex整轮输出】有可信终态吞吐样本时展示该本轮 output，但不将 last input 伪装成整轮 input。
+  // 有可信终态吞吐样本时展示该本轮主对话 output（但不将 Codex last input 伪装成整轮 input）。
   const output = turnThroughput ? turnThroughput.outputTokens : (usage?.output ?? 0);
   const usageComplete = !incompleteScope;
   const toolCount = Number.isFinite(tools) && tools > 0 ? Math.floor(tools) : 0;
   if (durationMs == null && !input && !output && !toolCount) return null;
-  const sampleTps =
-    turnThroughput && turnThroughput.outputTokens > 0 && turnThroughput.elapsedMs >= MIN_SPEED_WINDOW_MS
+  const rawSampleTps =
+    turnThroughput && turnThroughput.outputTokens > 0 && turnThroughput.elapsedMs >= MIN_COMPLETE_WINDOW_MS
       ? turnThroughput.outputTokens / (turnThroughput.elapsedMs / 1000)
       : null;
-  const outputTps =
-    sampleTps != null && Number.isFinite(sampleTps)
-      ? sampleTps
-      : usageComplete && durationMs != null && durationMs >= MIN_SPEED_WINDOW_MS && output > 0
-        ? output / (durationMs / 1000)
-        : null;
+  const sampleTps =
+    rawSampleTps != null && Number.isFinite(rawSampleTps) && rawSampleTps <= MAX_PLAUSIBLE_TPS
+      ? rawSampleTps
+      : null;
+  const rawWallTps =
+    !turnExcluded &&
+    turnThroughput === null &&
+    usageComplete &&
+    durationMs != null &&
+    durationMs >= MIN_COMPLETE_WINDOW_MS &&
+    output > 0
+      ? output / (durationMs / 1000)
+      : null;
+  const wallTps =
+    rawWallTps != null && Number.isFinite(rawWallTps) && rawWallTps <= MAX_PLAUSIBLE_TPS
+      ? rawWallTps
+      : null;
+  const outputTps = sampleTps ?? wallTps;
+  const speedBasis = sampleTps != null ? "model" : wallTps != null ? "wall" : null;
+  const breakdown = sampleTps != null ? (turnThroughput?.breakdown ?? null) : null;
   return {
     durationMs,
     input,
@@ -118,5 +159,7 @@ export function buildTurnSummary(
     reasoning: usage?.reasoning != null && valid(usage.reasoning) ? usage.reasoning : null,
     tools: toolCount,
     outputTps,
+    speedBasis,
+    breakdown,
   };
 }

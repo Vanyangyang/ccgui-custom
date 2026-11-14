@@ -20,7 +20,11 @@ vi.mock("@/features/chat/components/use-engine-models", () => ({ useEngineModels
 }) }));
 vi.mock("@/features/chat/components/MessageTimeline", () => ({ MessageTimeline: () => <div data-testid="timeline">Normal history</div> }));
 vi.mock("@/features/chat/components/ConversationFooter", () => ({
-  ConversationFooter: ({ cliMenu, draft }: { cliMenu: ReactNode; draft: string }) => <div data-testid="footer">{cliMenu}<textarea data-testid="normal-composer" value={draft} readOnly /></div>,
+  ConversationFooter: ({ cliMenu, active }: { cliMenu: ReactNode; active: ActiveSession | null }) => {
+    const key = active ? sessionKey(active.engine, active.sessionId, active.workspacePath) : "";
+    const draft = useChatStore((state) => state.drafts[key] ?? "");
+    return <div data-testid="footer">{cliMenu}<textarea data-testid="normal-composer" value={draft} readOnly /></div>;
+  },
 }));
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -112,28 +116,40 @@ describe("ChatConversation mode integration", () => {
   it("replaces timeline and composer with exactly one plugin surface and restores unchanged normal state", () => {
     expect(container.querySelector('[data-testid="timeline"]')).not.toBeNull();
     expect(container.querySelector('[data-testid="footer"]')?.textContent).toContain("CLI selectorRelay");
+    expect(container.querySelector<HTMLTextAreaElement>('[data-testid="normal-composer"]')?.value).toBe("Untouched ordinary draft");
+    expect(useChatStore.getState().drafts[key]).toBe("Untouched ordinary draft");
     enter();
     expect(container.querySelector('[data-testid="timeline"]')).toBeNull();
     expect(container.querySelector('[data-testid="normal-composer"]')).toBeNull();
     expect(container.querySelectorAll("textarea")).toHaveLength(1);
+    expect(container.querySelector<HTMLTextAreaElement>('[data-testid="plugin-composer"]')?.value).toBe("Plugin transcript");
+    expect(useChatStore.getState().drafts[key]).toBe("Untouched ordinary draft");
     expect(modeProps.workspacePath).toBe("/workspace");
     expect(modeProps.conversationId).toContain(key);
     const identity = modeProps.conversationId;
     act(() => { modeProps.setExitBlocked!(true); modeProps.onExit(); });
     expect(container.querySelector('[data-testid="normal-composer"]')).toBeNull();
+    expect(container.querySelector<HTMLTextAreaElement>('[data-testid="plugin-composer"]')?.value).toBe("Plugin transcript");
+    expect(useChatStore.getState().drafts[key]).toBe("Untouched ordinary draft");
     expect(container.querySelector("button")!.disabled).toBe(true);
     act(() => container.querySelector("button")!.click());
     expect(container.querySelector('[data-testid="normal-composer"]')).toBeNull();
+    expect(container.querySelector<HTMLTextAreaElement>('[data-testid="plugin-composer"]')?.value).toBe("Plugin transcript");
+    expect(useChatStore.getState().drafts[key]).toBe("Untouched ordinary draft");
     act(() => modeProps.setExitBlocked!(false));
     act(() => modeProps.onExit());
     expect(container.querySelector('[data-testid="timeline"]')).not.toBeNull();
     expect(container.querySelector<HTMLTextAreaElement>('[data-testid="normal-composer"]')?.value).toBe("Untouched ordinary draft");
+    expect(useChatStore.getState().drafts[key]).toBe("Untouched ordinary draft");
     expect(container.querySelector('[data-testid="plugin-composer"]')).toBeNull();
     expect(useChatStore.getState().bySession[key]).toBe(session);
     enter();
     expect(modeProps.conversationId).toBe(identity);
+    expect(useChatStore.getState().drafts[key]).toBe("Untouched ordinary draft");
     act(dispose);
     expect(container.querySelector('[data-testid="normal-composer"]')).not.toBeNull();
+    expect(container.querySelector<HTMLTextAreaElement>('[data-testid="normal-composer"]')?.value).toBe("Untouched ordinary draft");
+    expect(useChatStore.getState().drafts[key]).toBe("Untouched ordinary draft");
     expect(container.querySelector('[data-testid="plugin-composer"]')).toBeNull();
   });
 

@@ -40,7 +40,10 @@ fn agy_models(models: Vec<crate::engine::models::EngineModel>) -> Vec<crate::aut
     models.into_iter().filter_map(|model| {
         if model.id.is_empty() || !config::valid_model(&model.id) { return None; }
         let encoded = crate::engine::agy::model_encodes_effort(&model.id);
-        let levels = if encoded {
+        let supports_effort = crate::engine::agy::model_supports_independent_effort(&model.id);
+        let levels = if crate::engine::agy::model_has_no_effort(&model.id) {
+            vec![]
+        } else if encoded {
             vec![model.id.rsplit('-').next()?.to_ascii_lowercase()]
         } else {
             vec!["low".into(), "medium".into(), "high".into()]
@@ -49,7 +52,7 @@ fn agy_models(models: Vec<crate::engine::models::EngineModel>) -> Vec<crate::aut
             engine: "agy".into(), provider: model.provider,
             name: model.name.unwrap_or_else(|| model.id.clone()),
             resolved_model: Some(model.id.clone()), id: model.id,
-            supports_effort: !encoded, effort_levels: Some(levels),
+            supports_effort, effort_levels: Some(levels),
         })
     }).collect()
 }
@@ -132,7 +135,9 @@ pub(super) fn selection(config: &Config) -> Result<Selection, SideCallError> {
     if !config::valid_model(&model) {
         return Err(SideCallError::Unavailable);
     }
-    let effort = if config.observer_engine == "agy" && crate::engine::agy::model_encodes_effort(&model) {
+    let effort = if config.observer_engine == "agy" && crate::engine::agy::model_has_no_effort(&model) {
+        String::new()
+    } else if config.observer_engine == "agy" && crate::engine::agy::model_encodes_effort(&model) {
         model.rsplit('-').next().unwrap_or("medium").to_ascii_lowercase()
     } else if config.observer_engine == "claude" && config.observer_effort == "ultra" {
         "max".to_string()
@@ -219,16 +224,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn agy_orchestrator_catalog_has_no_effort_levels() {
+        let entries = agy_models(vec![crate::engine::models::EngineModel {
+            id: "gemini-pro-orchestrator".into(), name: None, description: None,
+            provider: "google".into(), context_window: None,
+        }]);
+        assert_eq!(entries[0].id, "gemini-pro-orchestrator");
+        assert!(!entries[0].supports_effort);
+        assert_eq!(entries[0].effort_levels.as_deref(), Some([].as_slice()));
+    }
+
+    #[test]
     fn agy_catalog_keeps_only_real_ids_and_their_supported_effort_shape() {
         let model = |id: &str| crate::engine::models::EngineModel { id:id.into(), name:None, description:None, provider:"Google".into(), context_window:None };
-        let entries = agy_models(vec![model("gemini-3.8-flash-high"), model("gemini-custom"), model("bad model"), model("")]);
-        assert_eq!(entries.len(), 2);
+        let entries = agy_models(vec![model("gemini-3.8-flash-high"), model("gemini-custom"), model("gemini-4-hydrogen-xhigh"), model("bad model"), model("")]);
+        assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].engine, "agy");
         assert_eq!(entries[0].id, "gemini-3.8-flash-high");
         assert!(!entries[0].supports_effort);
         assert_eq!(entries[0].effort_levels.as_ref().unwrap(), &vec!["high".to_string()]);
         assert!(entries[1].supports_effort);
         assert_eq!(entries[1].effort_levels.as_ref().unwrap(), &vec!["low".to_string(),"medium".to_string(),"high".to_string()]);
+        assert_eq!(entries[2].id, "gemini-4-hydrogen-xhigh");
+        assert!(!entries[2].supports_effort);
+        assert_eq!(entries[2].effort_levels.as_ref().unwrap(), &vec!["xhigh".to_string()]);
     }
 
     #[test]

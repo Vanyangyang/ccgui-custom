@@ -3,7 +3,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 pub const MODEL: &str = "gemini-4-argon";
-pub const SOURCE_BYTES: usize = 24 * 1024;
+pub const SOURCE_BYTES: usize = 8 * 1024;
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Source {
@@ -92,7 +92,7 @@ pub struct PrepareRequest {
     #[serde(default)]
     pub cursor: Option<Cursor>,
 }
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ExtractRequest {
     pub request_id: String,
@@ -106,6 +106,8 @@ pub struct ExtractRequest {
     pub format_version: Option<u8>,
     #[serde(default)]
     pub expected_source_digest: Option<String>,
+    #[serde(default)]
+    pub reconcile_only: bool,
 }
 impl ExtractRequest {
     pub fn version(&self) -> u8 {
@@ -464,7 +466,14 @@ pub fn validate_output_version(
             }
         }
     }
-    Ok(parsed.notes)
+    // Validate the entire response before admission filtering: legacy known kinds
+    // are not retryable failures, but must not hide malformed or forged output.
+    // This affects automatic extraction only; old context remains readable.
+    Ok(parsed
+        .notes
+        .into_iter()
+        .filter(|note| matches!(note.kind.as_str(), "decision" | "observation" | "handoff"))
+        .collect())
 }
 pub fn response_text(value: &Value) -> Result<String, String> {
     let candidates = value
@@ -531,7 +540,7 @@ mod tests {
     }
     #[test]
     fn unicode_cursor_retains_remainder_and_rejects_rewrite() {
-        let rows = [row(0, "user", &"😀中文".repeat(4000))];
+        let rows = [row(0, "user", &"😀中文".repeat(1200))];
         let a = select(&rows, "s", None, false).unwrap();
         assert!(a.partial && a.has_more);
         let b = select(&rows, "s", Some(&a.next), false).unwrap();
@@ -590,6 +599,106 @@ mod tests {
         assert!(validate_output("{\"notes\":[],\"extra\":true}", &slices, &[]).is_err());
     }
     #[test]
+    fn automatic_admission_filters_legacy_suggestions_after_validation() {
+        let slices = vec![
+            Slice {
+                seq: 1,
+                role: "user".into(),
+                text: "使用三条生命".into(),
+            },
+            Slice {
+                seq: 2,
+                role: "assistant".into(),
+                text: "创角天赋页视觉改版建议与风格分支待用户选择".into(),
+            },
+        ];
+        let decision = serde_json::json!({"kind":"decision","title":"生命数","text":"使用三条生命","conditions":[],"relatedIds":[],"evidence":[{"seq":1,"role":"user","quote":"使用三条生命"}],"relations":[]});
+        let idea = serde_json::json!({"kind":"idea","title":"待选择建议","text":slices[1].text,"conditions":[],"relatedIds":[],"evidence":[{"seq":2,"role":"assistant","quote":slices[1].text}],"relations":[]});
+        let mut hypothesis = idea.clone();
+        hypothesis["kind"] = "hypothesis".into();
+        for version in [1, 2] {
+            let validate = |notes: Value| {
+                validate_output_version(
+                    &serde_json::json!({"notes":notes}).to_string(),
+                    &slices,
+                    &[],
+                    version,
+                )
+            };
+            let kept = validate(serde_json::json!([idea, decision, hypothesis])).unwrap();
+            assert_eq!(kept.len(), 1);
+            assert_eq!(kept[0].kind, "decision");
+            assert_eq!(kept[0].relations.is_some(), version == 2);
+            assert!(validate(serde_json::json!([idea, hypothesis]))
+                .unwrap()
+                .is_empty());
+            for kind in ["observation", "handoff"] {
+                let mut fact = decision.clone();
+                fact["kind"] = kind.into();
+                assert_eq!(
+                    validate(serde_json::json!([idea, fact])).unwrap()[0].kind,
+                    kind
+                );
+            }
+            for kind in ["idea", "hypothesis"] {
+                let mut invalid = idea.clone();
+                invalid["kind"] = kind.into();
+                invalid["evidence"][0]["quote"] = "伪造证据".into();
+                assert_eq!(
+                    validate(serde_json::json!([decision, invalid])).unwrap_err(),
+                    "unproven_evidence"
+                );
+                invalid = idea.clone();
+                invalid["kind"] = kind.into();
+                invalid["unexpected"] = true.into();
+                assert_eq!(
+                    validate(serde_json::json!([invalid])).unwrap_err(),
+                    "invalid_model_json"
+                );
+            }
+            let mut unknown = idea.clone();
+            unknown["kind"] = "unknown".into();
+            assert_eq!(
+                validate(serde_json::json!([unknown])).unwrap_err(),
+                "invalid_note"
+            );
+            let mut false_confirmation = idea.clone();
+            false_confirmation["kind"] = "decision".into();
+            assert_eq!(
+                validate(serde_json::json!([false_confirmation])).unwrap_err(),
+                "decision_without_user_evidence"
+            );
+            if version == 2 {
+                let mut missing = idea.clone();
+                missing.as_object_mut().unwrap().remove("relations");
+                assert_eq!(
+                    validate(serde_json::json!([missing])).unwrap_err(),
+                    "missing_relations"
+                );
+            }
+        }
+    }
+    #[test]
+    fn automatic_admission_assistant_claim_of_user_approval_is_not_user_evidence() {
+        let slices = [Slice {
+            seq: 1,
+            role: "assistant".into(),
+            text: "用户已同意创角天赋页采用暗黑风格".into(),
+        }];
+        for version in [1, 2] {
+            for (role, expected) in [
+                ("assistant", "decision_without_user_evidence"),
+                ("user", "unproven_evidence"),
+            ] {
+                let raw = serde_json::json!({"notes":[{"kind":"decision","title":"暗黑风格","text":slices[0].text,"conditions":[],"relatedIds":[],"relations":[],"evidence":[{"seq":1,"role":role,"quote":slices[0].text}]}]});
+                assert_eq!(
+                    validate_output_version(&raw.to_string(), &slices, &[], version).unwrap_err(),
+                    expected
+                );
+            }
+        }
+    }
+    #[test]
     fn transport_requires_single_stop_text() {
         let good = serde_json::json!({"candidates":[{"finishReason":"STOP","content":{"parts":[{"text":"{\"notes\":[]}"}]}}]});
         assert!(response_text(&good).is_ok());
@@ -615,7 +724,7 @@ mod tests {
     #[test]
     fn resumed_tail_is_still_partial_and_old_context_matches_sdk_limits() {
         let rows = [
-            row(0, "user", &"中".repeat(9000)),
+            row(0, "user", &"中".repeat(3000)),
             row(1, "assistant", "later complete row"),
         ];
         let first = select(&rows, "s", None, false).unwrap();
@@ -633,6 +742,8 @@ mod tests {
             authority: None,
             updated_at: None,
         };
+        assert!(validate_context(&[context.clone()]).is_ok());
+        context.kind = "hypothesis".into();
         assert!(validate_context(&[context.clone()]).is_ok());
         context.revision = 0;
         assert!(validate_context(&[context.clone()]).is_err());

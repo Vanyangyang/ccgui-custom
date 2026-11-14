@@ -4,7 +4,7 @@
 
 use crate::runtime_events::{EventEnvelope, ReplayBatch};
 use crate::task_worker::{Command, Outcome, WorkerError, WorkerManifest, PROTOCOL};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
@@ -24,6 +24,116 @@ const MAX_RUN_ALIASES: usize = 16384;
 // Every command writes accepted + completed; retirement legitimately repeats
 // its completed receipt after atomically retiring the manifest.
 const MAX_RECEIPT_RECORDS: usize = MAX_REQUESTS * 3;
+const MAX_WORKERS: usize = 4096;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TerminalOutcome {
+    pub status: &'static str,
+    pub run_id: String,
+    pub engine: String,
+    pub session_id: String,
+}
+
+fn belongs_to_run(original: &str, requested: &str) -> bool {
+    requested == original
+        || requested
+            .strip_prefix(original)
+            .and_then(|suffix| suffix.strip_prefix("-c"))
+            .is_some_and(|number| {
+                !number.starts_with('0')
+                    && number.bytes().all(|byte| byte.is_ascii_digit())
+                    && number.parse::<u64>().is_ok()
+            })
+}
+
+/// Old journals do not persist workspace identity. The caller must independently
+/// verify session ownership; this result attests only the identities it returns.
+pub(crate) fn terminal_outcome(
+    profile: &Path,
+    run_id: &str,
+    engine: &str,
+    session_id: &str,
+    workspace_path: &str,
+) -> Result<Option<TerminalOutcome>, String> {
+    if !valid_id(run_id)
+        || engine.is_empty()
+        || engine.len() > 64
+        || session_id.is_empty()
+        || session_id.len() > 256
+        || workspace_path.is_empty()
+        || workspace_path.len() > 32768
+        || [engine, session_id, workspace_path]
+            .iter()
+            .any(|value| value.contains('\0'))
+        || !plain_absolute(profile)
+    {
+        return Err("Invalid worker terminal identity".into());
+    }
+    for ancestor in profile.ancestors() {
+        checked_directory(ancestor)?;
+    }
+    let runtime = profile.join("runtime");
+    let workers = runtime.join("task-workers");
+    for directory in [&runtime, &workers] {
+        match std::fs::symlink_metadata(directory) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            _ => checked_directory(directory)?,
+        }
+    }
+    let mut candidate = None;
+    for (index, entry) in std::fs::read_dir(&workers)
+        .map_err(|_| "Read worker archive inventory failed")?
+        .enumerate()
+    {
+        if index >= MAX_WORKERS {
+            return Err("Worker archive inventory exceeds its limit".into());
+        }
+        let entry = entry.map_err(|_| "Read worker archive entry failed")?;
+        let Some(id) = entry
+            .file_name()
+            .to_str()
+            .map(str::to_owned)
+            .filter(|id| valid_id(id))
+        else {
+            continue;
+        };
+        checked_directory(&entry.path())?;
+        for filename in ["manifest.json", "manifest.retired.json"] {
+            let retired = entry.path().join(filename);
+            match std::fs::symlink_metadata(&retired) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                _ => {}
+            }
+            let (guard, mut file) = GuardedFile::open(retired)?;
+            if guard.stamp.length > MANIFEST_BYTES as u64 {
+                return Err("Retired worker manifest exceeds its size limit".into());
+            }
+            let mut bytes = Vec::new();
+            (&mut file)
+                .take(MANIFEST_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| "Read retired worker manifest failed")?;
+            let manifest: WorkerManifest =
+                serde_json::from_slice(&bytes).map_err(|_| "Retired worker manifest is invalid")?;
+            guard.verify()?;
+            if !belongs_to_run(&manifest.run_id, run_id) {
+                continue;
+            }
+            if filename == "manifest.json" {
+                return Ok(None);
+            }
+            if candidate.replace(id.clone()).is_some() {
+                return Err("Worker terminal run has ambiguous archives".into());
+            }
+        }
+    }
+    let Some(id) = candidate else {
+        return Ok(None);
+    };
+    let archive = open(profile, &id)?;
+    archive.terminal_outcome(run_id, engine, session_id)
+}
 
 fn valid_id(value: &str) -> bool {
     !value.is_empty()
@@ -356,6 +466,101 @@ pub fn open(profile: &Path, worker_id: &str) -> Result<Archive, String> {
 }
 
 impl Archive {
+    pub(crate) fn terminal_outcome(
+        &self,
+        run_id: &str,
+        engine: &str,
+        session_id: &str,
+    ) -> Result<Option<TerminalOutcome>, String> {
+        self.verify()?;
+        if !belongs_to_run(&self.manifest.run_id, run_id) {
+            return Ok(None);
+        }
+        let mut terminal = None;
+        let mut sequence = 0;
+        let mut identity_matches = true;
+        let mut after = 0;
+        while after < self.head() {
+            let page = self.replay(after, 512)?;
+            after = page.through;
+            for envelope in page.events {
+                if envelope.name != crate::event_sink::ENGINE_EVENT_NAME {
+                    continue;
+                }
+                let events = envelope
+                    .payload
+                    .as_array()
+                    .ok_or("Invalid archived engine event batch")?;
+                for event in events {
+                    if event.get("runId").and_then(Value::as_str) != Some(run_id) {
+                        continue;
+                    }
+                    let seq = event
+                        .get("seq")
+                        .and_then(Value::as_u64)
+                        .filter(|seq| *seq > sequence)
+                        .ok_or("Invalid archived native event sequence")?;
+                    sequence = seq;
+                    let source = event.get("sourceRunId");
+                    if source.is_some_and(|value| value.as_str() != Some(&self.manifest.run_id))
+                        || (run_id != self.manifest.run_id && source.is_none())
+                    {
+                        return Err(
+                            "Archived continuation source is not bound to its worker".into()
+                        );
+                    }
+                    identity_matches &= event.get("engine").and_then(Value::as_str) == Some(engine);
+                    if let Some(session) = event.get("sessionId").filter(|value| !value.is_null()) {
+                        identity_matches &= session.as_str() == Some(session_id);
+                    }
+                    let kind = event.get("kind").and_then(Value::as_str);
+                    if kind == Some("session") {
+                        identity_matches &=
+                            event.get("data").and_then(Value::as_str) == Some(session_id);
+                    }
+                    let status = match kind {
+                        Some("done") => {
+                            let data = event
+                                .get("data")
+                                .and_then(Value::as_object)
+                                .ok_or("Invalid archived done event")?;
+                            match data.get("interrupted") {
+                                Some(Value::Bool(true)) => "cancelled",
+                                None | Some(Value::Bool(false)) => "completed",
+                                _ => return Err("Invalid archived interruption flag".into()),
+                            }
+                        }
+                        Some("error") if event.get("data").and_then(Value::as_str).is_some() => {
+                            "failed"
+                        }
+                        Some("error") => return Err("Invalid archived error event".into()),
+                        _ => continue,
+                    };
+                    // Do not borrow a session from another turn or a later
+                    // session announcement to fill missing terminal identity.
+                    identity_matches &=
+                        event.get("sessionId").and_then(Value::as_str) == Some(session_id);
+                    if terminal.replace(status).is_some() {
+                        return Err("Worker run has multiple terminal events".into());
+                    }
+                }
+            }
+        }
+        self.verify()?;
+        match std::fs::symlink_metadata(self.directory.join("manifest.json")) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return Err("Worker archive still has a live manifest".into()),
+        }
+        Ok(terminal
+            .filter(|_| identity_matches)
+            .map(|status| TerminalOutcome {
+                status,
+                run_id: run_id.into(),
+                engine: engine.into(),
+                session_id: session_id.into(),
+            }))
+    }
+
     pub fn manifest(&self) -> &WorkerManifest {
         &self.manifest
     }
@@ -640,6 +845,177 @@ mod tests {
             let _ = std::fs::remove_dir(self.profile.join("runtime/task-workers"));
             let _ = std::fs::remove_dir(self.profile.join("runtime"));
             let _ = std::fs::remove_dir(&self.profile);
+        }
+    }
+
+    #[test]
+    fn terminal_query_matches_exact_native_identity_and_returns_metadata_only() {
+        let fixture = Fixture::new();
+        fixture.event(1, json!([
+            {"runId":"run-test","sourceRunId":"run-test","engine":"claude","seq":1,"sessionId":null,"kind":"model","data":"model"},
+            {"runId":"run-test","sourceRunId":"run-test","engine":"claude","seq":2,"sessionId":"session-test","kind":"done","data":{"usage":null}}
+        ]));
+        let query = |run, engine, session| {
+            terminal_outcome(
+                &fixture.profile,
+                run,
+                engine,
+                session,
+                "workspace-only-validated-by-caller",
+            )
+        };
+        let result = query("run-test", "claude", "session-test")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(result).unwrap(),
+            json!({"status":"completed","runId":"run-test","engine":"claude","sessionId":"session-test"})
+        );
+        assert_eq!(query("run-other", "claude", "session-test").unwrap(), None);
+        assert_eq!(query("run-test", "codex", "session-test").unwrap(), None);
+        assert_eq!(query("run-test", "claude", "other-session").unwrap(), None);
+    }
+
+    #[test]
+    fn terminal_query_distinguishes_failure_cancellation_and_nonterminal_records() {
+        for (kind, data, expected) in [
+            ("done", json!({"interrupted":true}), Some("cancelled")),
+            ("error", json!("private error text"), Some("failed")),
+            ("throughput", json!({"status":"complete"}), None),
+            ("turn_complete", json!({}), None),
+        ] {
+            let fixture = Fixture::new();
+            fixture.event(1, json!([{"runId":"run-test","engine":"claude","seq":1,"sessionId":"session-test","kind":kind,"data":data}]));
+            let result = terminal_outcome(
+                &fixture.profile,
+                "run-test",
+                "claude",
+                "session-test",
+                "workspace",
+            )
+            .unwrap();
+            assert_eq!(result.map(|outcome| outcome.status), expected);
+        }
+    }
+
+    #[test]
+    fn terminal_query_never_substitutes_continuation_for_original_or_unbound_alias() {
+        for source in [None, Some("foreign"), Some("run-test")] {
+            let fixture = Fixture::new();
+            let mut event = json!({"runId":"run-test-c1","engine":"claude","seq":2,"sessionId":"session-test","kind":"done","data":{"usage":null}});
+            if let Some(source) = source {
+                event["sourceRunId"] = json!(source);
+            }
+            fixture.event(1, json!([event]));
+            assert_eq!(
+                terminal_outcome(
+                    &fixture.profile,
+                    "run-test",
+                    "claude",
+                    "session-test",
+                    "workspace"
+                )
+                .unwrap(),
+                None
+            );
+            let result = terminal_outcome(
+                &fixture.profile,
+                "run-test-c1",
+                "claude",
+                "session-test",
+                "workspace",
+            );
+            if source == Some("run-test") {
+                assert_eq!(result.unwrap().unwrap().status, "completed");
+            } else {
+                assert!(result.is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_query_rejects_missing_conflicting_or_duplicate_terminal_identity() {
+        for mutation in [
+            "missing-session",
+            "foreign-source",
+            "duplicate",
+            "bad-sequence",
+            "bad-interrupted",
+            "changed-session",
+        ] {
+            let fixture = Fixture::new();
+            let mut event = json!({"runId":"run-test","sourceRunId":"run-test","engine":"claude","seq":1,"sessionId":"session-test","kind":"done","data":{"usage":null}});
+            match mutation {
+                "missing-session" => event["sessionId"] = Value::Null,
+                "foreign-source" => event["sourceRunId"] = json!("foreign"),
+                "bad-sequence" => event["seq"] = json!(0),
+                "bad-interrupted" => event["data"]["interrupted"] = json!("true"),
+                _ => {}
+            }
+            fixture.event(1, json!([event.clone()]));
+            if mutation == "duplicate" {
+                event["seq"] = json!(2);
+                fixture.event(2, json!([event]));
+            }
+            if mutation == "changed-session" {
+                fixture.event(2, json!([{"runId":"run-test","engine":"claude","seq":2,"sessionId":"foreign","kind":"session","data":"foreign"}]));
+            }
+            let result = terminal_outcome(
+                &fixture.profile,
+                "run-test",
+                "claude",
+                "session-test",
+                "workspace",
+            );
+            assert!(matches!(result, Ok(None) | Err(_)), "{mutation}");
+        }
+    }
+
+    #[test]
+    fn terminal_query_requires_full_archive_validation_and_no_live_manifest() {
+        for mutation in [
+            "active",
+            "corrupt-events",
+            "corrupt-receipts",
+            "duplicate-archive",
+        ] {
+            let fixture = Fixture::new();
+            fixture.event(1, json!([{"runId":"run-test","engine":"claude","seq":1,"sessionId":"session-test","kind":"done","data":{}}]));
+            match mutation {
+                "active" => {
+                    std::fs::copy(
+                        fixture.directory.join("manifest.retired.json"),
+                        fixture.directory.join("manifest.json"),
+                    )
+                    .unwrap();
+                }
+                "corrupt-events" => fixture.event(3, json!([])),
+                "corrupt-receipts" => {
+                    std::fs::write(fixture.directory.join("receipts.jsonl"), b"partial").unwrap();
+                }
+                "duplicate-archive" => {
+                    let duplicate = fixture.directory.parent().unwrap().join("worker-duplicate");
+                    std::fs::create_dir(&duplicate).unwrap();
+                    std::fs::copy(
+                        fixture.directory.join("manifest.retired.json"),
+                        duplicate.join("manifest.retired.json"),
+                    )
+                    .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let result = terminal_outcome(
+                &fixture.profile,
+                "run-test",
+                "claude",
+                "session-test",
+                "workspace",
+            );
+            assert!(matches!(result, Ok(None) | Err(_)), "{mutation}");
+            let _ = std::fs::remove_file(fixture.directory.join("manifest.json"));
+            let duplicate = fixture.directory.parent().unwrap().join("worker-duplicate");
+            let _ = std::fs::remove_file(duplicate.join("manifest.retired.json"));
+            let _ = std::fs::remove_dir(duplicate);
         }
     }
 

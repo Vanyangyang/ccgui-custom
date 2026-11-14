@@ -31,6 +31,68 @@ fn age(state: &CodexQuotaState, stamp: &str) -> u64 {
     at
 }
 
+fn local_auth_stamp(path: &Path, account: &str, subject: &str, token: &str) -> String {
+    use base64::Engine;
+    let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(serde_json::to_vec(&serde_json::json!({"sub": subject})).unwrap());
+    std::fs::write(path, serde_json::to_vec(&serde_json::json!({
+        "auth_mode": "chatgpt",
+        "tokens": {"account_id": account, "access_token": token,
+            "id_token": format!("header.{claims}.signature")}
+    })).unwrap()).unwrap();
+    let mut fragment = String::new();
+    stamp_file(&mut fragment, path).unwrap();
+    format!("{:x}", Sha256::digest(fragment.as_bytes()))
+}
+
+#[tokio::test]
+async fn restart_after_token_refresh_restores_both_windows_only_for_the_same_identity() {
+    let fixture = Fixture::new();
+    std::fs::create_dir_all(&fixture.0).unwrap();
+    let auth = fixture.0.join("auth.json");
+    let original = local_auth_stamp(&auth, "workspace-a", "user-a", "old-token");
+    let state = fixture.state();
+    state.read_bound(&original, async { Ok(both(25.0)) }, || true).await;
+    let at = age(&state, &original);
+
+    let refreshed = local_auth_stamp(&auth, "workspace-a", "user-a", "longer-refreshed-token");
+    let restored = fixture.state().cached(&refreshed, || true);
+    assert_eq!(restored.status, "stale");
+    assert_eq!(restored.collected_at, Some(at));
+    assert_eq!(restored.windows.five_hour.unwrap().used_percentage, 25.0);
+    assert_eq!(restored.windows.seven_day.unwrap().used_percentage, 25.0);
+
+    for (account, subject) in [("workspace-b", "user-a"), ("workspace-a", "user-b")] {
+        let other = local_auth_stamp(&auth, account, subject, "another-token");
+        assert_eq!(fixture.state().cached(&other, || true).error_code, Some("not_loaded"));
+    }
+}
+
+#[tokio::test]
+async fn restart_migrates_only_the_exact_legacy_binding() {
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let legacy = format!("{:x}", Sha256::digest(b"old metadata"));
+    let unrelated = format!("{:x}", Sha256::digest(b"different metadata"));
+    state.read_bound(&legacy, async { Ok(both(15.0)) }, || true).await;
+    state.read_bound(&unrelated, async { Ok(both(70.0)) }, || true).await;
+
+    let mut binding = fixture_binding();
+    binding.legacy_stamp = Some(legacy.clone());
+    let restored = fixture.state();
+    restored.register_binding(&binding);
+    assert_eq!(restored.cached(&binding.stamp, || true).windows.five_hour.unwrap().used_percentage, 15.0);
+    assert_eq!(restored.cached(&unrelated, || true).windows.five_hour.unwrap().used_percentage, 70.0);
+    assert_eq!(restored.cached(&legacy, || true).error_code, Some("not_loaded"));
+    assert_eq!(fixture.state().cached(&binding.stamp, || true).windows.seven_day.unwrap().used_percentage, 15.0);
+
+    let mut other_binding = fixture_binding();
+    other_binding.stamp = format!("{:x}", Sha256::digest(b"other account"));
+    other_binding.legacy_stamp = Some(format!("{:x}", Sha256::digest(b"no matching metadata")));
+    restored.register_binding(&other_binding);
+    assert_eq!(restored.cached(&other_binding.stamp, || true).error_code, Some("not_loaded"));
+}
+
 #[tokio::test]
 async fn restart_restores_only_bound_stale_windows_without_verifying_identity() {
     let fixture = Fixture::new();
@@ -60,7 +122,7 @@ async fn restart_restores_only_bound_stale_windows_without_verifying_identity() 
     for forbidden in ["email", "fixture@example.test", "fixture-home", "workspace", "account", "balance", "credits", "token"] {
         assert!(!text.contains(forbidden), "unexpected persisted field: {forbidden}");
     }
-    let disk = read(&fixture.path()).unwrap();
+    let disk = read(&fixture.path()).unwrap().unwrap();
     assert_eq!(disk.records.len(), 1);
     assert!(disk.records[0].identity_hash.is_some());
 }
@@ -149,6 +211,126 @@ async fn disk_failure_preserves_memory() {
     assert_eq!(result.status, "ready");
     assert_eq!(state.cached(&stamp, || true), result);
     assert!(state.persistence_warned.load(Ordering::Relaxed));
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn failed_normal_write_keeps_the_last_persisted_snapshot_for_restart() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let stamp = fixture_binding().stamp;
+    state.read_bound(&stamp, async { Ok(both(10.0)) }, || true).await;
+    let locked = std::fs::OpenOptions::new().read(true).share_mode(0).open(fixture.path()).unwrap();
+    state.ingest(&stamp, both(50.0).windows, || true);
+    assert_eq!(state.cached(&stamp, || true).windows.five_hour.unwrap().used_percentage, 50.0);
+    drop(locked);
+    assert!(!invalidation_path(&fixture.path()).exists());
+    let restored = fixture.state().cached(&stamp, || true);
+    assert_eq!(restored.windows.five_hour.unwrap().used_percentage, 10.0);
+    assert_eq!(restored.windows.seven_day.unwrap().used_percentage, 10.0);
+    // A later passive read retries the pending write without a new quota event.
+    assert_eq!(state.cached(&stamp, || true).windows.five_hour.unwrap().used_percentage, 50.0);
+    assert_eq!(fixture.state().cached(&stamp, || true).windows.five_hour.unwrap().used_percentage, 50.0);
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn restart_retries_a_temporarily_locked_cache_without_overwriting_it() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let stamp = fixture_binding().stamp;
+    let other = format!("{:x}", Sha256::digest(b"another binding"));
+    state.read_bound(&stamp, async { Ok(both(10.0)) }, || true).await;
+    state.read_bound(&other, async { Ok(both(20.0)) }, || true).await;
+    let locked = std::fs::OpenOptions::new().read(true).share_mode(0).open(fixture.path()).unwrap();
+
+    let restarted = fixture.state();
+    assert_eq!(restarted.cached(&stamp, || true).error_code, Some("not_loaded"));
+    assert!(!restarted.persistence_loaded.load(Ordering::Relaxed));
+    // A successful query while locked may update memory but must not replace
+    // the unread disk file or discard another binding.
+    restarted.read_bound(&stamp, async { Ok(both(50.0)) }, || true).await;
+    drop(locked);
+    assert_eq!(restarted.cached(&stamp, || true).windows.five_hour.unwrap().used_percentage, 50.0);
+    let next_restart = fixture.state();
+    assert_eq!(next_restart.cached(&stamp, || true).windows.five_hour.unwrap().used_percentage, 50.0);
+    assert_eq!(next_restart.cached(&other, || true).windows.five_hour.unwrap().used_percentage, 20.0);
+}
+
+#[tokio::test]
+async fn temporary_auth_unavailability_hides_but_does_not_delete_the_saved_sample() {
+    use std::sync::atomic::AtomicBool;
+    let fixture = Fixture::new();
+    let state = fixture.state();
+    let stamp = fixture_binding().stamp;
+    state.read_bound(&stamp, async { Ok(both(10.0)) }, || true).await;
+    age(&state, &stamp);
+
+    let hidden = state.cached(&stamp, || BindingStatus::Unavailable);
+    assert_eq!(hidden.error_code, Some("auth_metadata_unavailable"));
+    assert_eq!(hidden.windows, QuotaWindows::default());
+    assert_eq!(fixture.state().cached(&stamp, || true).windows.five_hour.unwrap().used_percentage, 10.0);
+
+    let available = AtomicBool::new(true);
+    let result = state.read_bound(&stamp, async {
+        available.store(false, Ordering::SeqCst);
+        Ok(both(80.0))
+    }, || if available.load(Ordering::SeqCst) { BindingStatus::Current } else { BindingStatus::Unavailable }).await;
+    assert_eq!(result.error_code, Some("auth_metadata_unavailable"));
+    assert_eq!(fixture.state().cached(&stamp, || true).windows.seven_day.unwrap().used_percentage, 10.0);
+    let recovered = state.read_bound(&stamp, async { Ok(both(30.0)) }, || BindingStatus::Current).await;
+    assert_eq!(recovered.windows.seven_day.unwrap().used_percentage, 30.0);
+}
+
+// This helper is run in a separate test process against an isolated directory.
+// Exiting directly skips Rust destructors, as with an unexpectedly closed app.
+#[tokio::test]
+#[ignore = "launched only by abrupt_exit_preserves_the_committed_disk_snapshot"]
+async fn abrupt_exit_process_helper() {
+    let Ok(path) = std::env::var("CCGUI_QUOTA_PROCESS_FIXTURE_PATH") else { return; };
+    let action = std::env::var("CCGUI_QUOTA_PROCESS_FIXTURE_ACTION").unwrap();
+    let state = CodexQuotaState {
+        persistence_path: Some(PathBuf::from(&path)),
+        persistence_enabled: true.into(),
+        ..Default::default()
+    };
+    let stamp = fixture_binding().stamp;
+    match action.as_str() {
+        "write" => {
+            state.read_bound(&stamp, async { Ok(both(25.0)) }, || true).await;
+            std::process::exit(0);
+        }
+        "interrupt-write" => {
+            state.read_bound(&stamp, async { Ok(both(80.0)) }, || true).await;
+            panic!("the test-only write interruption did not run");
+        }
+        "verify" => {
+            let snapshot = state.cached(&stamp, || true);
+            assert_eq!(snapshot.status, "stale");
+            assert_eq!(snapshot.windows.five_hour.unwrap().used_percentage, 25.0);
+            assert_eq!(snapshot.windows.seven_day.unwrap().used_percentage, 25.0);
+        }
+        _ => panic!("unknown isolated fixture action"),
+    }
+}
+
+#[test]
+fn abrupt_exit_preserves_the_committed_disk_snapshot() {
+    let fixture = Fixture::new();
+    let exe = std::env::current_exe().unwrap();
+    let run = |action: &str| {
+        std::process::Command::new(&exe)
+            .args(["--exact", "codex_quota::persistence::tests::abrupt_exit_process_helper", "--ignored"])
+            .env("CCGUI_QUOTA_PROCESS_FIXTURE_PATH", fixture.path())
+            .env("CCGUI_QUOTA_PROCESS_FIXTURE_ACTION", action)
+            .output().unwrap().status.code()
+    };
+    assert_eq!(run("write"), Some(0));
+    assert_eq!(run("verify"), Some(0));
+    assert_eq!(run("interrupt-write"), Some(23));
+    assert_eq!(run("verify"), Some(0));
 }
 
 #[tokio::test]

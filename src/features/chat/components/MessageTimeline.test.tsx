@@ -3,8 +3,10 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { formatDuration } from "./format-duration";
 import { MessageRow, MessageTimeline } from "./MessageTimeline";
-import type { Message } from "@/lib/ipc";
+import type { Message, SessionMeta } from "@/lib/ipc";
 import { EMPTY_SESSION } from "../store/stream";
+import { useChatStore } from "../store";
+import { buildAgentBlock } from "./agent-block";
 import i18n from "@/lib/i18n";
 
 const searchHarness = vi.hoisted(() => ({ handlers: new Map<string, () => void>(), scrollToIndex: vi.fn() }));
@@ -205,7 +207,7 @@ describe("timeline search within bounded process history", () => {
     const summary = summaries()[0];
     expect(summary.textContent).toContain("↑1k ↓200");
     expect(summary.textContent).toContain("90%");
-    expect(summary.textContent).toContain("整轮效率 20 tok/s");
+    expect(summary.textContent).toContain("20 tok/s");
     const content = summary.textContent;
 
     // A new prompt makes the timeline live before any assistant row arrives.
@@ -311,6 +313,137 @@ describe("formatDuration", () => {
   });
 });
 
+describe("internal cross-session messages", () => {
+  let container: HTMLDivElement;
+  let root: Root;
+  let originalSessions: SessionMeta[];
+  const source = { engine: "agy", session_id: "source-session" };
+  const body = "请核对中文🙂与代码块\n```ts\nconst value = 1;\n```";
+  const incoming: Message = { seq: 1, role: "user", text: `[Message from CC GUI ${JSON.stringify(source)}]\n\n${body}`, ts: null };
+  const sender = (workspacePath = "/source", customTitle = "多渠道 TPS") => ({
+    engine: source.engine, sessionId: source.session_id, workspacePath, customTitle, title: "自动标题",
+  }) as SessionMeta;
+
+  beforeEach(async () => {
+    await i18n.changeLanguage("zh");
+    originalSessions = useChatStore.getState().sessions;
+    useChatStore.setState({ sessions: [sender()] });
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+  });
+
+  afterEach(async () => {
+    await act(async () => root.unmount());
+    useChatStore.setState({ sessions: originalSessions });
+    container.remove();
+  });
+
+  it("labels the sender separately from human input and preserves the full message", async () => {
+    await act(async () => root.render(<MessageRow message={incoming} workspacePath="/ws" turnFinal />));
+    expect(container.textContent).toContain("内部消息 · 来自「多渠道 TPS」");
+    expect(container.querySelector(".bg-bubble-user")).toBeNull();
+    expect(container.querySelector("[data-internal-message]")?.textContent).toContain(body);
+    expect(container.textContent).not.toContain("[Message from CC GUI");
+    expect(incoming.text).toBe(`[Message from CC GUI ${JSON.stringify(source)}]\n\n${body}`);
+
+    await act(async () => useChatStore.setState({ sessions: [sender("/source", "已改名")] }));
+    expect(container.textContent).toContain("内部消息 · 来自「已改名」");
+  });
+
+  it("uses an exact source identity when the title is missing or ambiguous", async () => {
+    useChatStore.setState({ sessions: [sender(), sender("/other", "另一同 ID 会话")] });
+    await act(async () => root.render(<MessageRow message={incoming} workspacePath="/ws" turnFinal />));
+    expect(container.textContent).toContain("agy · source-s");
+    expect(container.textContent).not.toContain("多渠道 TPS");
+    const badge = container.querySelector<HTMLElement>("[data-internal-message] [title]");
+    expect(badge?.title).toContain(source.session_id);
+  });
+
+  it("keeps images and the selected agent badge on internal input", async () => {
+    const image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==";
+    const text = incoming.text + buildAgentBlock({ name: "审查助手", icon: "🔍", prompt: "agent instructions" });
+    await act(async () => root.render(<MessageRow message={{ ...incoming, text, images: [image] }} workspacePath="/ws" turnFinal />));
+    expect(container.textContent).toContain("内部消息 · 来自「多渠道 TPS」");
+    expect(container.querySelector('[aria-label="智能体：审查助手"]')?.textContent).toContain("🔍审查助手");
+    expect(container.querySelector("img")?.getAttribute("src")).toBe(image);
+    expect(container.textContent).toContain(body);
+    expect(container.textContent).not.toContain("agent instructions");
+  });
+
+  it("shows host-attested parent input without changing its prompt text", async () => {
+    await act(async () => root.render(<MessageRow message={{ ...incoming, text: body,
+      internalSource: { engine: source.engine, sessionId: source.session_id, workspacePath: "/source" },
+    }} workspacePath="/ws" turnFinal />));
+    expect(container.textContent).toContain("内部消息 · 来自「多渠道 TPS」");
+    expect(container.querySelector(".bg-bubble-user")).toBeNull();
+    expect(container.querySelector("[data-internal-message]")?.textContent).toContain(body);
+  });
+
+  it("uses readable long-message controls and copies the complete displayed body", async () => {
+    const height = vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(600);
+    const originalClipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+    const writeText = vi.fn(async () => {});
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+    try {
+      await act(async () => root.render(<MessageRow message={incoming} workspacePath="/ws" turnFinal />));
+      const toggle = () => container.querySelector<HTMLButtonElement>("button[aria-expanded]")!;
+      expect(toggle().getAttribute("aria-expanded")).toBe("false");
+      expect(toggle().className).toContain("text-text-secondary");
+      const fade = container.querySelector("div[aria-hidden]")!;
+      expect(fade.className).toContain("from-background-secondary-default");
+      expect(fade.className).not.toContain("from-bubble-user");
+      await act(async () => toggle().click());
+      expect(toggle().getAttribute("aria-expanded")).toBe("true");
+      expect(toggle().className).toContain("text-text-secondary");
+      expect(container.textContent).toContain(body);
+      const copy = [...container.querySelectorAll<HTMLButtonElement>("button")].find(button => button.getAttribute("aria-label") === i18n.t("chat.copy"))!;
+      await act(async () => copy.click());
+      expect(writeText).toHaveBeenCalledWith(body);
+      await act(async () => toggle().click());
+      expect(toggle().getAttribute("aria-expanded")).toBe("false");
+      expect(container.textContent).toContain(body);
+    } finally {
+      height.mockRestore();
+      if (originalClipboard) Object.defineProperty(navigator, "clipboard", originalClipboard);
+      else Reflect.deleteProperty(navigator, "clipboard");
+    }
+  });
+
+  it.each(["普通用户消息", `引用示例：\n${incoming.text}`, "[Message from CC GUI {bad json}]\n\n原文", '[Message from CC GUI {"engine":"agy"}]\n\n缺少来源'])
+    ("keeps ordinary or malformed input as a human bubble: %s", async text => {
+      await act(async () => root.render(<MessageRow message={{ ...incoming, text }} workspacePath="/ws" turnFinal />));
+      expect(container.querySelector(".bg-bubble-user")?.textContent).toBe(text);
+      expect(container.querySelector("[data-internal-message]")).toBeNull();
+    });
+
+  it.each(["completed", "interrupted", "error"])("keeps incoming text, tools and assistant output visible while streaming and after %s", async outcome => {
+    const messages: Message[] = [incoming,
+      { seq: 2, role: "thinking", text: "检查内部通信过程", ts: null },
+      { seq: 3, role: "tool", text: "read_file", args: { path: "sample.ts" }, result: "读取结果🙂", ts: null },
+      { seq: 4, role: "assistant", text: "内部咨询的回复🙂", ts: null },
+    ];
+    const render = async (streaming: boolean) => act(async () => root.render(<MessageTimeline engine="agy"
+      session={{ ...EMPTY_SESSION, messages, streaming, interrupted: outcome === "interrupted", error: outcome === "error" ? "运行失败" : null }}
+      streaming={streaming} onLoadEarlier={() => {}} workspacePath="/ws" />));
+    await render(true);
+    expect(container.textContent).toContain("内部消息 · 来自「多渠道 TPS」");
+    expect(container.textContent).toContain(body);
+    expect(container.textContent).toContain("工具调用 1 次");
+    expect(container.textContent).toContain("检查内部通信过程");
+    expect(container.textContent).toContain("read_file");
+    expect(container.textContent).toContain("内部咨询的回复🙂");
+    await render(false);
+    expect(container.textContent).toContain(body);
+    expect(container.textContent).toContain("工具调用 1 次");
+    expect(container.textContent).toContain("内部咨询的回复🙂");
+    const payload = [...container.querySelectorAll<HTMLButtonElement>("button")].find(button => button.getAttribute("aria-label") === i18n.t("chat.toolCallExpand"));
+    expect(payload).toBeTruthy();
+    await act(async () => payload!.click());
+    expect(container.textContent).toContain("读取结果🙂");
+  });
+});
+
 describe("user bubble copy affordance", () => {
   let container: HTMLDivElement;
   let root: Root;
@@ -405,7 +538,7 @@ describe("user bubble copy affordance", () => {
     expect(shown).toContain("↓2.2k");
   });
 
-  it("hides independent effort readout when an Antigravity model already encodes its tier", async () => {
+  it.each(["gemini-4-argon-high", "gemini-4-hydrogen-xhigh", "gemini-pro-orchestrator"])("hides unsupported independent effort readout for %s", async (model) => {
     await i18n.changeLanguage("zh");
     const messages: Message[] = [
       { seq: 1, role: "user", text: "你好", ts: null },
@@ -414,7 +547,7 @@ describe("user bubble copy affordance", () => {
         role: "assistant",
         text: "已完成",
         ts: null,
-        model: "gemini-4-argon-high",
+        model,
         effort: "medium",
       },
     ];
@@ -426,7 +559,7 @@ describe("user bubble copy affordance", () => {
             ...EMPTY_SESSION,
             messages,
             streaming: true,
-            activeModel: "gemini-4-argon-high",
+            activeModel: model,
             activeEffort: "medium",
           }}
           streaming
@@ -436,7 +569,7 @@ describe("user bubble copy affordance", () => {
       );
     });
     const statusText = container.querySelector('[role="status"]')?.textContent ?? "";
-    expect(statusText).toContain("模型 gemini-4-argon-high");
+    expect(statusText).toContain(`模型 ${model}`);
     expect(statusText).not.toContain("推理档位");
 
     await act(async () => {
@@ -450,7 +583,7 @@ describe("user bubble copy affordance", () => {
       );
     });
     const rowText = container.textContent ?? "";
-    expect(rowText).toContain("模型 gemini-4-argon-high");
+    expect(rowText).toContain(`模型 ${model}`);
     expect(rowText).not.toContain("推理档位");
   });
 });

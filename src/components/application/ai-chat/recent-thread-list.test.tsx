@@ -22,7 +22,9 @@ afterEach(async () => { await act(async () => root.unmount()); node.remove(); })
 const tree: AiChatThread = { id: "parent", label: "parent", time: "", children: [
   { id: "child", label: "child", time: "", children: [{ id: "grandchild", label: "grandchild", time: "" }] },
 ] };
-const label = (value: string) => node.querySelector(`[title="${value}"]`);
+// Row tooltips include workspace/activity metadata after the complete title.
+const label = (value: string) => [...node.querySelectorAll<HTMLElement>("button[data-thread-select] > span[title]")]
+  .find((element) => element.title.split("\n")[0] === value) ?? null;
 
 it("keeps children collapsed until disclosure, with selection and context menu intact", async () => {
   const select = vi.fn();
@@ -77,7 +79,8 @@ it("shows the workspace label only on the root in all-session trees and formats 
   const spans = rootTitle!.querySelectorAll("span");
   expect(spans[0]?.textContent).toBe("🧩 对话 Git 分支");
   expect(spans[2]?.textContent).toBe("排查无法显示");
-  const labels = node.querySelectorAll('[title="ccgui-custom"]');
+  expect(rootTitle!.getAttribute("title")).toBe("🧩 对话 Git 分支 | 排查无法显示\nchat.sidebarWorkspace: ccgui-custom");
+  const labels = node.querySelectorAll('[title="chat.sidebarWorkspace: ccgui-custom"]');
   expect(labels).toHaveLength(1);
   expect(labels[0].className).toContain("max-w-28");
   expect(labels[0].parentElement).toBe(rootTitle!.closest("button")!.parentElement);

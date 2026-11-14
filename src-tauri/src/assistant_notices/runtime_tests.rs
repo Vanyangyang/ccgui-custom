@@ -476,6 +476,47 @@ fn admitted_completion(
 }
 
 #[test]
+fn empty_background_boundary_creates_no_inbox_or_audio_candidate_but_real_parent_reply_does() {
+    use std::sync::atomic::AtomicBool;
+    let outbox = Outbox::open(":memory:").unwrap();
+    outbox.set_ready(7, MAX_GENERATION).unwrap();
+    let recorder = completion_outbox::Recorder::new(outbox.clone());
+    let killed = Arc::new(AtomicBool::new(false));
+    assert!(recorder.register_run(
+        "run", "claude", "C:/workspace", Some("native-session"), "task", &killed,
+    ));
+    let store = inbox();
+    let mut state = inner();
+    let drain = |state: &mut Inner| {
+        Service::drain(state, &store, &outbox, now() + 1, &mut false, |_| Ok(false)).unwrap()
+    };
+    assert!(drain(&mut state).is_empty()); // Admission is not a completion.
+    for (seq, kind, data) in [
+        (1, "tasks", serde_json::json!({"tasks":[]})),
+        (2, "activity", serde_json::json!({"state":"running"})),
+        (3, "turn_complete", serde_json::json!({})),
+    ] {
+        recorder.observe_event(&serde_json::json!({"runId":"run", "engine":"claude", "sessionId":"native-session", "seq":seq, "kind":kind, "data":data})).unwrap();
+    }
+    assert!(drain(&mut state).is_empty());
+    assert!(store.unread(now()).unwrap().is_empty());
+
+    for (seq, kind, data) in [
+        (4, "delta", serde_json::json!("real parent result")),
+        (5, "turn_complete", serde_json::json!({})),
+    ] {
+        recorder.observe_event(&serde_json::json!({"runId":"run", "engine":"claude", "sessionId":"native-session", "seq":seq, "kind":kind, "data":data})).unwrap();
+    }
+    let candidates = drain(&mut state);
+    assert_eq!(candidates.len(), 1); // The only completion/audio candidate is real.
+    let notices = store.unread(now() + 1).unwrap();
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].body, "real parent result");
+    recorder.finish_run("run").unwrap();
+    assert!(drain(&mut state).is_empty());
+}
+
+#[test]
 fn managed_child_completions_are_acked_without_notices_or_candidates_while_root_survives() {
     let outbox = Outbox::open(":memory:").unwrap();
     outbox.set_ready(7, MAX_GENERATION).unwrap();

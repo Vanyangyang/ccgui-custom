@@ -91,6 +91,36 @@ pub(super) fn resolve(
     }
 }
 
+/// A human-confirmed handoff carries an already resolved fixed model. Resolve
+/// allowed selectors on that same provider, without changing task_spawn's exact
+/// selector policy or inferring equivalence from model names.
+pub(super) fn validate_handoff(
+    settings: &AppSettings, engine: &str, model: &str, provider_id: &str,
+) -> Result<(), String> {
+    validate_handoff_with(settings, engine, model, provider_id, crate::engine::resolve_discussion_model)
+}
+
+fn validate_handoff_with(
+    settings: &AppSettings, engine: &str, model: &str, provider_id: &str,
+    resolve_selector: impl Fn(&str, &str, &str) -> Result<String, String>,
+) -> Result<(), String> {
+    let denied = || "HANDOFF_TARGET_NOT_ALLOWED".to_owned();
+    let policy = snapshot(settings).map_err(|_| denied())?;
+    let allowed = match engine {
+        "claude" => policy.claude.allowed_models,
+        "codex" => policy.codex.allowed_models,
+        "agy" => policy.agy.allowed_models,
+        _ => return Err(denied()),
+    };
+    let Some(allowed) = allowed else { return Ok(()); };
+    if allowed.iter().any(|selector| selector == model ||
+        resolve_selector(engine, selector, provider_id).is_ok_and(|resolved| resolved == model)) {
+        Ok(())
+    } else {
+        Err(denied())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,6 +206,50 @@ mod tests {
             assert!(error.contains("not allowed"));
             assert!(error.contains("[\"sonnet\",\"claude-opus-4-6\"]"));
         }
+    }
+
+    #[test]
+    fn handoff_allowed_alias_matches_its_fixed_model_without_changing_spawn_policy() {
+        let settings = settings(json!({"claude":["opus"]}), json!({}));
+        let resolved = "claude-explicit-opus";
+        assert!(resolve(&settings, "claude", Some(resolved)).is_err(), "task_spawn remains exact");
+        assert!(validate_handoff_with(&settings, "claude", resolved, "channel-a", |engine, selector, provider| {
+            assert_eq!((engine, selector, provider), ("claude", "opus", "channel-a"));
+            Ok(resolved.into())
+        }).is_ok());
+    }
+
+    #[test]
+    fn handoff_policy_resolves_only_the_selected_provider_and_exact_model() {
+        let settings = settings(json!({"claude":["opus"]}), json!({}));
+        let resolver = |engine: &str, selector: &str, provider: &str| {
+            assert_eq!((engine, selector), ("claude", "opus"));
+            match provider {
+                "a" => Ok("fixed-a".into()),
+                "b" => Ok("fixed-b".into()),
+                _ => Err("private configuration detail".into()),
+            }
+        };
+        assert!(validate_handoff_with(&settings, "claude", "fixed-a", "a", resolver).is_ok());
+        assert!(validate_handoff_with(&settings, "claude", "fixed-b", "b", resolver).is_ok());
+        for (model, provider) in [("fixed-a", "b"), ("another-model", "a"), ("fixed-a", "unresolved")] {
+            assert_eq!(validate_handoff_with(&settings, "claude", model, provider, resolver).unwrap_err(),
+                "HANDOFF_TARGET_NOT_ALLOWED");
+        }
+    }
+
+    #[test]
+    fn handoff_policy_preserves_fixed_ids_unrestricted_and_disabled_policies() {
+        let no_resolution = |_: &str, _: &str, _: &str| -> Result<String, String> { panic!("exact/unrestricted policy must not resolve aliases") };
+        let fixed = settings(json!({"claude":["fixed-model"]}), json!({}));
+        assert!(validate_handoff_with(&fixed, "claude", "fixed-model", "channel", no_resolution).is_ok());
+        for policy in [json!({}), json!({"claude":null})] {
+            assert!(validate_handoff_with(&settings(policy, json!({})), "claude", "fixed-model", "channel", no_resolution).is_ok());
+        }
+        assert_eq!(validate_handoff_with(&settings(json!({"claude":[]}), json!({})), "claude", "fixed-model", "channel", no_resolution).unwrap_err(),
+            "HANDOFF_TARGET_NOT_ALLOWED");
+        assert_eq!(validate_handoff_with(&settings(json!({"claude":[""]}), json!({})), "claude", "fixed-model", "channel", no_resolution).unwrap_err(),
+            "HANDOFF_TARGET_NOT_ALLOWED");
     }
 
     #[test]

@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // bridgePluginAgentEvents 只订阅一次 plugin-agent://event；用可驱动的 listen 替身

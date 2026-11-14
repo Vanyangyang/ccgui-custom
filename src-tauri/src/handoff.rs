@@ -377,6 +377,11 @@ async fn blocker_snapshot(app: &tauri::AppHandle) -> crate::worker_host::Blocker
     if crate::auto_title::has_pending() {
         blockers.push("auto-title-pending".into());
     }
+    if state.agy_acp.has_active_turns() {
+        // Only an in-process fallback can increment the desktop counter. The
+        // independent ACP service and its task-worker leases survive handoff.
+        blockers.push("agy-acp-turn-active".into());
+    }
     blockers.extend(crate::plugin_windows::blocking_reasons());
     blockers.extend(activities.into_iter().map(str::to_owned));
     if !CURRENT
@@ -1474,7 +1479,7 @@ pub(crate) mod tests {
 
     #[test]
     fn offline_upgrade_requires_newer_external_launcher_and_no_workers() {
-        for schema in [crate::task_worker::SCHEMA_CONTRACT_V1_HASH, crate::task_worker::SCHEMA_CONTRACT_V2_HASH] {
+        for schema in [crate::task_worker::SCHEMA_CONTRACT_V1_HASH, crate::task_worker::SCHEMA_CONTRACT_V2_HASH, crate::task_worker::SCHEMA_CONTRACT_V3_HASH] {
             assert_offline_upgrade_requires_newer_external_launcher_and_no_workers(schema);
         }
     }
@@ -1528,7 +1533,7 @@ pub(crate) mod tests {
         let before = update.read_state().unwrap();
         assert!(reconcile_offline_upgrade_in(&update, &launcher, &state_path, false).is_err());
         std::thread::sleep(Duration::from_millis(25));
-        std::fs::write(&launcher, b"new standalone v3").unwrap();
+        std::fs::write(&launcher, b"new standalone v4").unwrap();
         assert!(reconcile_offline_upgrade_in(&update, &launcher, &state_path, true).is_err());
         let released = canonical(&update.release_path(&old).unwrap().join("ccgui-next.exe")).unwrap();
         assert!(reconcile_offline_upgrade_in(&update, &released, &state_path, false).is_err());

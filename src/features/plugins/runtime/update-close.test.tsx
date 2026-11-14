@@ -20,7 +20,7 @@ function fixture(id = "demo", prepare = vi.fn(async (_signal: AbortSignal) => {}
   return { key, prepare, resume, unregister };
 }
 function detached(id = "demo", returnToMain = vi.fn(async () => {}), onRestore?: () => void) {
-  const owner: DetachedSurfaceOwner = { checkpointParticipant: `plugin-window-owner:${id}`, getStatus: () => ({ phase: "detached", windowId: id }), returnToMain, open: vi.fn(async () => {}), present: vi.fn(async () => "detached" as const), restore: vi.fn(async () => "detached" as const), flushPresentation: vi.fn(async () => {}), dispose: vi.fn(), subscribeStatus: () => () => {} };
+  const owner: DetachedSurfaceOwner = { checkpointParticipant: `plugin-window-owner:${id}`, getStatus: () => ({ phase: "detached", windowId: id }), focusMain: vi.fn(async () => {}), returnToMain, open: vi.fn(async () => {}), present: vi.fn(async () => "detached" as const), restore: vi.fn(async () => "detached" as const), flushPresentation: vi.fn(async () => {}), dispose: vi.fn(), subscribeStatus: () => () => {} };
   const unregister = registerPluginDetachedOwner(id, owner, onRestore); cleanup.push(unregister);
   return { owner, unregister };
 }

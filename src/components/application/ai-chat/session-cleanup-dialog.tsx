@@ -21,6 +21,9 @@ import {
   type SessionCleanupItem,
   type SessionCleanupReason,
 } from "@/features/chat/session-cleanup";
+import { classifyCleanupGroup, classifyCleanupSubtree } from "@/features/chat/session-cleanup-groups";
+import { sameIdentity, type LeaderIdentity, type LeaderSnapshot } from "@/features/leader/types";
+import { errorText } from "@/lib/errors";
 import { ipc, type AppCacheSummary, type SessionMeta } from "@/lib/ipc";
 import { cx } from "@/utils/cx";
 
@@ -54,17 +57,71 @@ function CacheTimeBadge({ session, label }: { session: SessionMeta; label: strin
 const REASON_I18N_KEY: Record<SessionCleanupReason, string> = {
   settled_idle: "chat.cleanupReasonSettledIdle",
   settled_recent: "chat.cleanupReasonSettledRecent",
+  unknown_activity: "chat.cleanupReasonUnknownActivity",
   running: "chat.cleanupReasonRunning",
   awaiting_confirm: "chat.cleanupReasonAwaitingConfirm",
   last_error: "chat.cleanupReasonLastError",
   unsent_draft: "chat.cleanupReasonUnsentDraft",
   unseen: "chat.cleanupReasonUnseen",
   pinned: "chat.cleanupReasonPinned",
+  leader_group_idle: "chat.cleanupReasonLeaderGroupIdle",
+  leader_group_recent: "chat.cleanupReasonLeaderGroupRecent",
   leader_group: "chat.cleanupReasonLeaderGroup",
+  leader_child_idle: "chat.cleanupReasonLeaderChildIdle",
+  leader_child_recent: "chat.cleanupReasonLeaderChildRecent",
+  leader_child: "chat.cleanupReasonLeaderChild",
 };
 
 function pathBaseName(path: string): string {
   return path.split(/[\\/]/).filter(Boolean).at(-1) || path;
+}
+
+type CleanupChatState = Pick<ReturnType<typeof useChatStore.getState>,
+  "sessions" | "bySession" | "streamingByKey" | "retryingByKey" | "drafts" | "unseen">;
+type SelectionOverride = { selected: boolean; fingerprint: string };
+
+function selectionFingerprint(item: SessionCleanupItem): string {
+  return JSON.stringify([item.reason, item.session.updatedAt, item.group?.signature, item.group?.lastActivityAt]);
+}
+
+function selectedWithOverride(item: SessionCleanupItem, override?: SelectionOverride): boolean {
+  if (!item.selectable) return false;
+  if (!override) return item.defaultSelected;
+  return override.selected && override.fingerprint === selectionFingerprint(item);
+}
+
+function cleanupItem(session: SessionMeta, chat: CleanupChatState, leaderSnapshot: LeaderSnapshot, now: number): SessionCleanupItem {
+  const classify = (member: SessionMeta, includeGroup: boolean) => {
+    const fullKey = sessionKey(member.engine, member.sessionId, member.workspacePath);
+    const shortKey = `${member.engine}/${member.sessionId}`;
+    return classifySessionForCleanup({
+      session: member,
+      state: chat.bySession[fullKey] ?? chat.bySession[shortKey],
+      streaming: Boolean(chat.streamingByKey[fullKey] || chat.streamingByKey[shortKey]
+        || chat.retryingByKey[fullKey] || chat.retryingByKey[shortKey]),
+      unseen: Boolean(chat.unseen[fullKey] || chat.unseen[shortKey]),
+      draftText: chat.drafts[fullKey] ?? chat.drafts[shortKey],
+      leaderSnapshot: includeGroup ? leaderSnapshot : undefined,
+      now,
+    });
+  };
+  const item = classify(session, true);
+  const tree = { session, sessions: chat.sessions, leaderSnapshot, now, classifyMember: (member: SessionMeta) => classify(member, false) };
+  if (item.reason === "leader_group") return classifyCleanupGroup(tree) ?? item;
+  if (item.reason === "leader_child") return classifyCleanupSubtree(tree) ?? item;
+  return item;
+}
+
+/** Rows whose chat belongs to another selected tree are archived with it. */
+function coveredRows(items: SessionCleanupItem[], selected: SessionCleanupItem[]): Set<string> {
+  const covered = new Set<string>();
+  for (const tree of selected) {
+    if (!tree.group) continue;
+    for (const item of items) {
+      if (item !== tree && tree.group.expected.members.some((member) => sameIdentity(member, item.session))) covered.add(item.key);
+    }
+  }
+  return covered;
 }
 
 export function SessionCleanupDialog({
@@ -75,7 +132,7 @@ export function SessionCleanupDialog({
   onClose: () => void;
 }) {
   const { t } = useTranslation();
-  const { sessions, workspaces, workspaceAliases, archivedWorkspaces, bySession, streamingByKey, drafts, unseen } =
+  const { sessions, workspaces, workspaceAliases, archivedWorkspaces, bySession, streamingByKey, retryingByKey, drafts, unseen } =
     useChatStore(
       useShallow((s) => ({
         sessions: s.sessions,
@@ -84,6 +141,7 @@ export function SessionCleanupDialog({
         archivedWorkspaces: s.archivedWorkspaces,
         bySession: s.bySession,
         streamingByKey: s.streamingByKey,
+        retryingByKey: s.retryingByKey,
         drafts: s.drafts,
         unseen: s.unseen,
       })),
@@ -96,7 +154,9 @@ export function SessionCleanupDialog({
   const [busy, setBusy] = useState(false);
   const [lastArchived, setLastArchived] = useState<{
     sessions: SessionMeta[];
+    groups: LeaderIdentity[];
     skipped: number;
+    errors: string[];
   } | null>(null);
 
   const workspaceLabelByPath = useMemo(() => {
@@ -117,28 +177,16 @@ export function SessionCleanupDialog({
     const visible = sessions
       .filter((s) => visibleWorkspacePaths.size === 0 || visibleWorkspacePaths.has(s.workspacePath))
       .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
-    return visible.map((session) => {
-      const fullKey = sessionKey(session.engine, session.sessionId, session.workspacePath);
-      const shortKey = `${session.engine}/${session.sessionId}`;
-      return classifySessionForCleanup({
-        session,
-        state: bySession[fullKey] ?? bySession[shortKey],
-        streaming: Boolean(streamingByKey[fullKey] || streamingByKey[shortKey]),
-        unseen: Boolean(unseen[fullKey] || unseen[shortKey]),
-        draftText: drafts[fullKey] ?? drafts[shortKey],
-        leaderSnapshot,
-        now,
-      });
-    });
-  }, [sessions, visibleWorkspacePaths, bySession, streamingByKey, unseen, drafts, leaderSnapshot]);
+    const chat = { sessions, bySession, streamingByKey, retryingByKey, unseen, drafts };
+    return visible.map((session) => cleanupItem(session, chat, leaderSnapshot, now));
+  }, [sessions, visibleWorkspacePaths, bySession, streamingByKey, retryingByKey, unseen, drafts, leaderSnapshot, open]);
 
   // Selection state initialized lazily from defaultSelected recommendations.
-  const [selectedOverrides, setSelectedOverrides] = useState<Record<string, boolean>>({});
+  const [selectedOverrides, setSelectedOverrides] = useState<Record<string, SelectionOverride>>({});
 
   const isSelected = useCallback(
     (item: SessionCleanupItem) => {
-      if (!item.selectable) return false;
-      return selectedOverrides[item.key] ?? item.defaultSelected;
+      return selectedWithOverride(item, selectedOverrides[item.key]);
     },
     [selectedOverrides],
   );
@@ -146,42 +194,43 @@ export function SessionCleanupDialog({
   const toggleItem = useCallback((item: SessionCleanupItem) => {
     if (!item.selectable) return;
     setSelectedOverrides((prev) => {
-      const current = prev[item.key] ?? item.defaultSelected;
-      return { ...prev, [item.key]: !current };
+      const current = selectedWithOverride(item, prev[item.key]);
+      return { ...prev, [item.key]: { selected: !current, fingerprint: selectionFingerprint(item) } };
     });
   }, []);
 
   const selectRecommended = useCallback(() => {
-    const next: Record<string, boolean> = {};
+    const next: Record<string, SelectionOverride> = {};
     for (const item of items) {
       if (!item.selectable) continue;
-      next[item.key] = item.defaultSelected;
+      next[item.key] = { selected: item.defaultSelected, fingerprint: selectionFingerprint(item) };
     }
     setSelectedOverrides(next);
   }, [items]);
 
   const selectAllSettled = useCallback(() => {
-    const next: Record<string, boolean> = {};
+    const next: Record<string, SelectionOverride> = {};
     for (const item of items) {
       if (!item.selectable) continue;
-      next[item.key] = item.category === "recommend";
+      next[item.key] = { selected: item.category === "recommend", fingerprint: selectionFingerprint(item) };
     }
     setSelectedOverrides(next);
   }, [items]);
 
   const clearSelection = useCallback(() => {
-    const next: Record<string, boolean> = {};
+    const next: Record<string, SelectionOverride> = {};
     for (const item of items) {
       if (!item.selectable) continue;
-      next[item.key] = false;
+      next[item.key] = { selected: false, fingerprint: selectionFingerprint(item) };
     }
     setSelectedOverrides(next);
   }, [items]);
 
-  const selectedItems = useMemo(
-    () => items.filter((item) => isSelected(item)),
-    [items, isSelected],
-  );
+  const { selectedItems, covered } = useMemo(() => {
+    const chosen = items.filter((item) => isSelected(item));
+    const covered = coveredRows(items, chosen);
+    return { selectedItems: chosen.filter((item) => !covered.has(item.key)), covered };
+  }, [items, isSelected]);
 
   const filteredItems = useMemo(() => {
     if (tab === "recommend") return items.filter((item) => item.category === "recommend");
@@ -193,48 +242,99 @@ export function SessionCleanupDialog({
     if (busy || selectedItems.length === 0) return;
     setBusy(true);
     const archived: SessionMeta[] = [];
+    const groups: LeaderIdentity[] = [];
+    const errors: string[] = [];
     let skipped = 0;
     try {
-      const latestStore = useChatStore.getState();
-      const latestLeader = useLeaderStore.getState().snapshot;
       for (const item of selectedItems) {
+        if (item.group) {
+          await useLeaderStore.getState().refresh();
+          const refreshError = useLeaderStore.getState().error;
+          if (refreshError) {
+            skipped++;
+            errors.push(refreshError);
+            continue;
+          }
+        }
+        const latestStore = useChatStore.getState();
+        const latestLeader = useLeaderStore.getState().snapshot;
         const fullKey = sessionKey(item.session.engine, item.session.sessionId, item.session.workspacePath);
         const shortKey = `${item.session.engine}/${item.session.sessionId}`;
-        const fresh = classifySessionForCleanup({
-          session: item.session,
-          state: latestStore.bySession[fullKey] ?? latestStore.bySession[shortKey],
-          streaming: Boolean(latestStore.streamingByKey[fullKey] || latestStore.streamingByKey[shortKey]),
-          unseen: Boolean(latestStore.unseen[fullKey] || latestStore.unseen[shortKey]),
-          draftText: latestStore.drafts[fullKey] ?? latestStore.drafts[shortKey],
-          leaderSnapshot: latestLeader,
-        });
-        if (!fresh.selectable) {
+        const latestSession = latestStore.sessions.find((session) =>
+          sessionKey(session.engine, session.sessionId, session.workspacePath) === fullKey,
+        );
+        if (!latestSession) {
           skipped++;
           continue;
         }
-        await archiveSession(item.session);
+        const fresh = cleanupItem(latestSession, latestStore, latestLeader, Date.now());
+        // Do not reuse consent for a different attention/protection state that
+        // appeared after the user selected this item.
+        if (!fresh.selectable || (fresh.category !== "recommend" && fresh.reason !== item.reason)
+          || Boolean(item.group) !== Boolean(fresh.group)
+          || (item.group && (item.group.signature !== fresh.group?.signature
+            || item.group.lastActivityAt !== fresh.group?.lastActivityAt))) {
+          skipped++;
+          continue;
+        }
+        if (fresh.group) {
+          try {
+            const { parent, branchId } = fresh.group;
+            if (parent && branchId) await useLeaderStore.getState().archiveSubtree(parent, branchId, fresh.group.expected);
+            else await useLeaderStore.getState().groupAction(fresh.group.root, "archive", fresh.group.expected);
+            groups.push(fresh.group.root);
+          } catch (error) {
+            skipped++;
+            const message = errorText(error);
+            errors.push(message.includes("CLEANUP_GROUP_CHANGED") || message.includes("Leader group must be idle")
+              ? t("chat.cleanupGroupChanged")
+              : /task_(group|subtree)_archive_checked/.test(message) && /unknown|not found|not supported/i.test(message)
+                ? t("chat.cleanupGroupHostUpdateRequired") : message);
+          }
+          continue;
+        }
+        await archiveSession(latestSession);
         if (useChatStore.getState().archivedSessionKeys[fullKey] || useChatStore.getState().archivedSessionKeys[shortKey]) {
-          archived.push(item.session);
+          archived.push(latestSession);
         } else {
           skipped++;
+          const error = useChatStore.getState().actionError;
+          if (error) errors.push(error);
         }
       }
-      if (archived.length > 0) {
-        setLastArchived({ sessions: archived, skipped });
+      if (archived.length > 0 || groups.length > 0 || skipped > 0) {
+        setLastArchived({ sessions: archived, groups, skipped, errors });
       }
     } finally {
       setBusy(false);
     }
-  }, [busy, selectedItems, archiveSession]);
+  }, [busy, selectedItems, archiveSession, t]);
 
   const handleUndo = useCallback(async () => {
-    if (busy || !lastArchived || lastArchived.sessions.length === 0) return;
+    if (busy || !lastArchived || (lastArchived.sessions.length === 0 && lastArchived.groups.length === 0)) return;
     setBusy(true);
     try {
+      const sessions: SessionMeta[] = [];
+      const groups: LeaderIdentity[] = [];
+      const errors: string[] = [];
       for (const session of lastArchived.sessions) {
         await restoreSession(session);
+        const key = sessionKey(session.engine, session.sessionId, session.workspacePath);
+        if (useChatStore.getState().archivedSessionKeys[key]) {
+          sessions.push(session);
+          const error = useChatStore.getState().actionError;
+          if (error) errors.push(error);
+        }
       }
-      setLastArchived(null);
+      for (const group of lastArchived.groups) {
+        try {
+          await useLeaderStore.getState().groupAction(group, "restore");
+        } catch (error) {
+          groups.push(group);
+          errors.push(errorText(error));
+        }
+      }
+      setLastArchived(sessions.length || groups.length ? { sessions, groups, skipped: lastArchived.skipped, errors } : null);
     } finally {
       setBusy(false);
     }
@@ -312,23 +412,28 @@ export function SessionCleanupDialog({
           data-testid="cleanup-undo-banner"
           className="flex items-center justify-between gap-3 rounded-xl border border-border-button-default bg-background-secondary-default px-3 py-2 text-caption-1-regular text-text-secondary"
         >
-          <span>
-            {lastArchived.skipped > 0
-              ? t("chat.cleanupArchivedWithSkipped", {
-                  count: lastArchived.sessions.length,
-                  skipped: lastArchived.skipped,
-                })
-              : t("chat.cleanupArchivedDone", { count: lastArchived.sessions.length })}
-          </span>
-          <Button
-            size="xs"
-            variant="secondary"
-            leadingIcon={ArchiveRestore}
-            disabled={busy}
-            onClick={() => void handleUndo()}
-          >
-            {t("chat.cleanupUndo")}
-          </Button>
+          <div className="min-w-0 flex-1">
+            <div>
+              {lastArchived.skipped > 0
+                ? t("chat.cleanupArchivedWithSkipped", {
+                    count: lastArchived.sessions.length + lastArchived.groups.length,
+                    skipped: lastArchived.skipped,
+                  })
+                : t("chat.cleanupArchivedDone", { count: lastArchived.sessions.length + lastArchived.groups.length })}
+            </div>
+            {lastArchived.errors.length > 0 && <div className="break-words">{[...new Set(lastArchived.errors)].join(" · ")}</div>}
+          </div>
+          {(lastArchived.sessions.length > 0 || lastArchived.groups.length > 0) && (
+            <Button
+              size="xs"
+              variant="secondary"
+              leadingIcon={ArchiveRestore}
+              disabled={busy}
+              onClick={() => void handleUndo()}
+            >
+              {t("chat.cleanupUndo")}
+            </Button>
+          )}
         </div>
       )}
 
@@ -393,13 +498,16 @@ export function SessionCleanupDialog({
           </div>
         ) : (
           filteredItems.map((item) => {
-            const checked = isSelected(item);
+            const isCovered = covered.has(item.key);
+            const checked = isCovered || isSelected(item);
             const title =
               item.session.customTitle || item.session.title || item.session.sessionId.slice(0, 8);
             const wsName =
               workspaceLabelByPath.get(item.session.workspacePath) ||
               pathBaseName(item.session.workspacePath);
-            const timeLabel = relativeTime(item.session.updatedAt);
+            const updatedAt = item.session.updatedAt;
+            const timeLabel = typeof updatedAt === "number" && Number.isFinite(updatedAt) && updatedAt > 0
+              ? relativeTime(updatedAt) : "";
             const categoryTone: Record<SessionCleanupCategory, string> = {
               recommend: "bg-background-tertiary-default text-text-secondary",
               attention: "bg-background-tertiary-warning text-text-warning-primary",
@@ -410,10 +518,11 @@ export function SessionCleanupDialog({
                 key={item.key}
                 data-testid="cleanup-session-row"
                 data-cleanup-reason={item.reason}
-                onClick={() => toggleItem(item)}
+                data-cleanup-covered={isCovered || undefined}
+                onClick={() => { if (!isCovered) toggleItem(item); }}
                 className={cx(
                   "flex items-center gap-2.5 rounded-xl border px-3 py-2 transition-colors duration-150",
-                  item.selectable ? "cursor-pointer" : "cursor-default opacity-75",
+                  item.selectable && !isCovered ? "cursor-pointer" : "cursor-default opacity-75",
                   checked
                     ? "border-border-button-active bg-background-secondary-hover"
                     : "border-transparent hover:bg-background-secondary-default",
@@ -422,7 +531,7 @@ export function SessionCleanupDialog({
                 <input
                   type="checkbox"
                   checked={checked}
-                  disabled={!item.selectable || busy}
+                  disabled={!item.selectable || isCovered || busy}
                   onChange={() => toggleItem(item)}
                   onClick={(e) => e.stopPropagation()}
                   aria-label={title}
@@ -441,27 +550,33 @@ export function SessionCleanupDialog({
                     <span
                       className={cx(
                         "shrink-0 rounded px-1.5 py-px text-caption-2-medium whitespace-nowrap",
-                        categoryTone[item.category],
+                        categoryTone[isCovered ? "recommend" : item.category],
                       )}
                     >
-                      {t(REASON_I18N_KEY[item.reason])}
+                      {t(isCovered ? "chat.cleanupReasonCovered" : REASON_I18N_KEY[item.reason])}
                     </span>
                   </div>
                   <div className="flex items-center gap-2 text-caption-2-regular text-text-tertiary">
                     <span className="truncate">{wsName}</span>
-                    {timeLabel && (
+                    {item.group ? (
+                      <>
+                        <span>·</span>
+                        <span>{t(item.group.parent ? "chat.cleanupSubtreeActivity" : "chat.cleanupGroupActivity", { count: item.group.memberCount, time: relativeTime(item.group.lastActivityAt) })}</span>
+                      </>
+                    ) : timeLabel && (
                       <>
                         <span>·</span>
                         <CacheTimeBadge session={item.session} label={timeLabel} />
                       </>
                     )}
-                    {item.reason === "leader_group" && (
+                    {(item.reason === "leader_group" || item.reason === "leader_child" || item.group) && (
                       <button
                         type="button"
                         onClick={(e) => {
                           e.stopPropagation();
                           onClose();
-                          manageLeader({
+                          // A child is managed, and its expiry shown, by its direct parent.
+                          manageLeader(item.managedParent ?? {
                             engine: item.session.engine,
                             sessionId: item.session.sessionId,
                             workspacePath: item.session.workspacePath,

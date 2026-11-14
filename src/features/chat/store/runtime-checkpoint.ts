@@ -4,7 +4,9 @@ import { askLoops, type AskLoop } from "./ask-loop";
 import { captureEngineEventRuntime, restoreEngineEventRuntime, engineEventCheckpointBlockers } from "./engine-events";
 import { captureStreamRuntime, restoreStreamRuntime, flushPendingStreams, type StreamRuntimeCheckpoint } from "./stream";
 import { sessionKey } from "./persistence";
+import { hostPendingKey } from "./host-pending-chat";
 import { hasReadableUsage } from "../usage";
+import { hasReloadableHistory, markReloadableHistory } from "./session-memory-cache";
 
 const STATE_KEYS = [
   "workspaces", "sessions", "archivedSessionKeys", "engines", "active", "openTabs", "activeEngine", "permission",
@@ -15,10 +17,14 @@ const STATE_KEYS = [
 type ChatData = Pick<ChatStore, (typeof STATE_KEYS)[number]>;
 interface ChatCheckpoint {
   version: 1;
+  /** Distinguishes caches captured after historical-source discovery was fixed. */
+  archiveSourcesVersion?: 1;
   state: ChatData;
   stream: StreamRuntimeCheckpoint;
   events: ReturnType<typeof captureEngineEventRuntime>;
   asks: Array<[string, AskLoop]>;
+  /** Only exact history-backed arrays carry reloadability across a renderer. */
+  reloadableSessionKeys?: string[];
 }
 
 const restored = new WeakSet<() => ChatStore>();
@@ -55,12 +61,22 @@ function parseCheckpoint(value: unknown): ChatCheckpoint {
     throw new Error("Invalid chat runtime checkpoint");
   }
   const state = candidate.state;
+  if (candidate.reloadableSessionKeys !== undefined && (!Array.isArray(candidate.reloadableSessionKeys) ||
+    candidate.reloadableSessionKeys.some(key => typeof key !== "string"))) throw new Error("Invalid reloadable session evidence");
   if (!STATE_KEYS.every((key) => key in state) || !object(state.bySession) || !object(state.drafts) || !Array.isArray(state.openTabs) || !Array.isArray(state.sessions) || !Array.isArray(state.workspaces)) {
     throw new Error("Incomplete chat runtime checkpoint");
   }
-  for (const session of Object.values(state.bySession)) {
+  for (const [key, session] of Object.entries(state.bySession)) {
     if (!object(session) || !Array.isArray(session.messages) || !Array.isArray(session.queue) || typeof session.streaming !== "boolean" || typeof session.loading !== "boolean") {
       throw new Error("Invalid checkpoint session");
+    }
+    if (session.hostTaskOrigin !== undefined) {
+      const origin = session.hostTaskOrigin;
+      if (!object(origin) || !["engine", "runId", "workspacePath"].every(field =>
+        typeof origin[field] === "string" && (origin[field] as string).length > 0 && !(origin[field] as string).includes("\0")) ||
+        origin.sessionId !== undefined && (typeof origin.sessionId !== "string" || !origin.sessionId || /[\s\u0000-\u001f]/.test(origin.sessionId)) ||
+        key !== (origin.sessionId ? sessionKey(origin.engine as string, origin.sessionId as string, origin.workspacePath as string)
+          : hostPendingKey(origin.engine as string, origin.runId as string))) throw new Error("Invalid host task checkpoint identity");
     }
   }
   for (const key of ["routes", "activity", "pending"]) if (!Array.isArray(candidate.stream[key])) throw new Error("Invalid checkpoint stream");
@@ -96,13 +112,21 @@ export function createChatCheckpointParticipant(store: ChatCheckpointStore, get:
     capture(): ChatCheckpoint {
       flushPendingStreams(store.setState);
       const state = Object.fromEntries(STATE_KEYS.map((key) => [key, store.getState()[key]])) as ChatData;
-      return cloneCheckpointValue({ version: 1, state, stream: captureStreamRuntime(), events: captureEngineEventRuntime(), asks: [...askLoops] });
+      const reloadableSessionKeys = Object.keys(state.bySession).filter(key => hasReloadableHistory(state.bySession[key]));
+      return cloneCheckpointValue({ version: 1, archiveSourcesVersion: 1, state, stream: captureStreamRuntime(), events: captureEngineEventRuntime(), asks: [...askLoops], reloadableSessionKeys });
     },
     restore(value) {
       const snapshot = parseCheckpoint(value);
       // Select only data keys. A malformed checkpoint cannot replace actions.
       const data = Object.fromEntries(STATE_KEYS.map((key) => [key, snapshot.state[key]])) as ChatData;
       for (const [key, session] of Object.entries(data.bySession)) {
+        const sourceMessages = session.messages;
+        // Legacy tool rows have neither their original event identity nor time.
+        // Never guess where they belong; AGY's native history owns the saved
+        // text. Keep the cache intact until the normal guarded read succeeds.
+        if (snapshot.archiveSourcesVersion !== 1 && key.startsWith("agy/") && session.messages.some((m) => m.role === "tool")) {
+          session.historyReloadRequired = true;
+        }
         if (session.messages.some((m) => m.model === "<synthetic>")) {
           session.messages = session.messages.map((m) =>
             m.model === "<synthetic>" ? { ...m, model: undefined, usage: undefined } : m,
@@ -133,6 +157,9 @@ export function createChatCheckpointParticipant(store: ChatCheckpointStore, get:
           }
         }
         if (session.activeModel === "<synthetic>") session.activeModel = null;
+        if (!session.historyReloadRequired && session.messages === sourceMessages && snapshot.reloadableSessionKeys?.includes(key)) {
+          markReloadableHistory(session.messages, session.subagentHistory);
+        }
       }
       restoreStreamRuntime(snapshot.stream);
       restoreEngineEventRuntime(snapshot.events);

@@ -39,6 +39,7 @@ import { CrossSessionThreadIndicator, useCrossSessionThreadActivity } from "@/fe
 import Hourglass from "lucide-react/dist/esm/icons/hourglass";
 import { cacheWindowSummary, cacheWindowText, getPromptCacheHeatRatio, getSessionCacheHeat, isPromptCacheExpiringSoon, promptCacheForEngine, supportsPromptCacheExpiry, type CacheHeat } from "@/features/chat/prompt-cache";
 import type { PromptCacheWindow } from "@/lib/ipc";
+import { workspaceCatalogPathKey } from "@/lib/workspace-path";
 
 /** Streaming/unseen status dot on a thread row; renders nothing when the
  *  thread is neither streaming nor waiting to be seen. */
@@ -329,6 +330,9 @@ function ThreadItem({
   promptCache,
   workspaceLabel,
   workspacePath,
+  sidebarWorkspacePath,
+  workspace,
+  showWorkspaceLabel = false,
   pinned = false,
   isSelected = false,
   streaming = false,
@@ -345,6 +349,8 @@ function ThreadItem({
   onContextMenu,
   flat = false,
 }: AiChatThread & {
+  workspace?: Pick<AiChatRepo, "label" | "path">;
+  showWorkspaceLabel?: boolean;
   tabIndex?: number;
   onSelect?: (id: string) => void;
   onAction?: (id: string, action: ThreadAction) => void;
@@ -367,6 +373,16 @@ function ThreadItem({
   const branchTooltip = leaderBranch && branchDeadline ? [branchStatus,
     branchDeadline.known ? t(branchDeadline.expired ? "leader.expiredDeadline" : "leader.deadline", { time: new Date(leaderBranch.deadlineAt).toLocaleString() }) : t("leader.deadlineUnknown"),
     leaderBranch.error].filter(Boolean).join("\n") : "";
+  const sourcePath = workspacePath ?? leaderBranch?.workspacePath;
+  const groupPath = workspace?.path ?? sidebarWorkspacePath ?? sourcePath;
+  const groupLabel = workspace?.label ?? workspaceLabel;
+  const workspaceTooltip = [
+    groupLabel || groupPath ? `${t("chat.sidebarWorkspace")}: ${groupLabel ?? groupPath}` : undefined,
+    groupLabel && groupPath ? groupPath : undefined,
+    sourcePath && groupPath && workspaceCatalogPathKey(sourcePath) !== workspaceCatalogPathKey(groupPath)
+      ? t("chat.sidebarWorkspaceSource", { path: sourcePath }) : undefined,
+  ].filter(Boolean).join("\n");
+  const rowTooltip = [label, workspaceTooltip, time, comms.summary].filter(Boolean).join("\n");
   // 拖到中心区 = 分屏（边=切分到那一侧，中心=替换/互换）：会话在按下时才查，
   // 免得每一行都订阅整个会话列表。
   const startDrag = useDragSource(
@@ -401,7 +417,7 @@ function ThreadItem({
         type="button"
         tabIndex={tabIndex}
         data-thread-select=""
-        title={comms.active ? [label, workspaceLabel, time].filter(Boolean).join(" · ") : undefined}
+        title={rowTooltip}
         aria-current={isSelected ? "page" : undefined}
         disabled={!selectable}
         onPointerDown={selectable ? startDrag : undefined}
@@ -420,7 +436,7 @@ function ThreadItem({
             the row truncates it (same pattern as the repo row below). */}
         <span
           className={cx("min-w-0 flex-1 truncate text-body-2-medium", isSelected ? "text-text-primary" : "text-text-secondary")}
-          title={label}
+          title={rowTooltip}
         >
           {pinned && (
             <Pin
@@ -451,14 +467,14 @@ function ThreadItem({
       )}
       {leaderBranch && <span className="inline-flex max-w-28 shrink-0 items-center gap-1 rounded-sm bg-background-tertiary-default px-1 py-px text-caption-2-medium text-text-tertiary group-hover:hidden" title={branchTooltip}>
         <span className="max-w-full truncate">{branchStatus}</span>
-        {!["completed", "failed", "stopped"].includes(leaderBranch.state) && branchTTL && <span className="whitespace-nowrap">{branchTTL}</span>}
+        {!["completed", "failed", "stopped", "handed_off"].includes(leaderBranch.state) && branchTTL && <span className="whitespace-nowrap">{branchTTL}</span>}
       </span>}
-      {workspaceLabel && !comms.active ? (
+      {showWorkspaceLabel && groupLabel && !comms.active ? (
         <span
-          title={workspaceLabel}
+          title={workspaceTooltip}
           className="max-w-28 shrink-0 truncate rounded-sm bg-background-tertiary-default/60 px-1.5 py-px text-caption-2-regular text-text-tertiary group-hover:hidden"
         >
-          {workspaceLabel}
+          {groupLabel}
         </span>
       ) : null}
       {time && !comms.active ? (
@@ -901,6 +917,7 @@ function WorktreeGroup({
                 />
                 <div className="ml-4">
                   <RepoThreadList
+                    workspace={child}
                     expanded={expanded}
                     threads={child.threads}
                     threadLimit={child.threadLimit}
@@ -973,8 +990,9 @@ export function SidebarDisclosure({
 /** The collapsible thread area under a repo row, animated by
  *  `SidebarDisclosure` (height clips shut, no opacity fade). */
 /** Pagination operates on roots; descendants always travel with their parent. */
-function ThreadTreeItem({ thread, activeThreadId, onSelect, onAction, onContextMenu, workspaceKey, flat = false, nested = false }: {
+function ThreadTreeItem({ thread, workspace, activeThreadId, onSelect, onAction, onContextMenu, workspaceKey, flat = false, nested = false }: {
   thread: AiChatThread;
+  workspace?: Pick<AiChatRepo, "label" | "path">;
   activeThreadId?: string;
   onSelect?: (id: string) => void;
   onAction?: (id: string, action: ThreadAction) => void;
@@ -992,24 +1010,30 @@ function ThreadTreeItem({ thread, activeThreadId, onSelect, onAction, onContextM
   }, [activeThreadId, identity, containsSelectedDescendant]);
   const count = thread.children?.length ?? 0;
   return <div>
-    <ThreadItem {...thread} workspaceLabel={flat && nested ? undefined : thread.workspaceLabel}
+    {thread.handoffHistory ? <button type="button" aria-expanded={expanded}
+      className="flex w-full items-center gap-1.5 rounded-2lg px-2 py-[5px] text-left text-caption-2-medium text-text-tertiary hover:bg-background-secondary-hover"
+      onClick={() => useLeaderTreeUI.getState().toggle(identity)}>
+      <ChevronRight aria-hidden className={cx("size-3 transition-transform duration-300 motion-reduce:transition-none", expanded && "rotate-90")} />
+      <span>{t("leader.handoffHistory")}</span><span>{count}</span>
+    </button> : <ThreadItem {...thread} workspace={workspace} showWorkspaceLabel={flat && !nested}
       flat={flat} isSelected={thread.id ? thread.id === activeThreadId : thread.isSelected}
       onSelect={onSelect} onAction={onAction} onContextMenu={onContextMenu}
       disclosure={count ? <button type="button" aria-expanded={expanded} aria-label={t("leader.toggleChildren", { count })}
         className={cx("flex shrink-0 items-center gap-0.5 text-foreground-icon-secondary", flat ? "w-7" : "-ml-5")} onClick={() => useLeaderTreeUI.getState().toggle(identity)}>
         <ChevronRight aria-hidden className={cx("size-3 transition-transform duration-300 motion-reduce:transition-none", expanded && "rotate-90")} />
         <span className="text-caption-2-medium">{count}</span>
-      </button> : undefined} />
+      </button> : undefined} />}
     {!!count && <SidebarDisclosure expanded={expanded}>
       <div className="ml-7 border-l border-border-button-default pl-1">
         {thread.children!.map((child) => <ThreadTreeItem key={child.leaderBranch?.id ?? child.id} thread={child} activeThreadId={activeThreadId}
-          onSelect={onSelect} onAction={onAction} onContextMenu={onContextMenu} workspaceKey={workspaceKey} flat={flat} nested />)}
+          onSelect={onSelect} onAction={onAction} onContextMenu={onContextMenu} workspace={workspace} workspaceKey={workspaceKey} flat={flat} nested />)}
       </div>
     </SidebarDisclosure>}
   </div>;
 }
 
 function RepoThreadList({
+  workspace,
   expanded,
   threads,
   threadLimit,
@@ -1019,6 +1043,7 @@ function RepoThreadList({
   onThreadContextMenu,
   trailing,
 }: {
+  workspace: Pick<AiChatRepo, "label" | "path">;
   expanded: boolean;
   threads: AiChatThread[];
   threadLimit?: number;
@@ -1033,6 +1058,7 @@ function RepoThreadList({
   return (
     <SidebarDisclosure expanded={expanded}>
       <PagedThreadList
+        workspace={workspace}
         expanded={expanded}
         threads={threads}
         threadLimit={threadLimit}
@@ -1051,6 +1077,7 @@ function RepoThreadList({
  *  the close animation, then unmounts it; the next expand therefore starts
  *  at page 0 without changing page or connector height mid-collapse. */
 function PagedThreadList({
+  workspace,
   expanded,
   threads,
   threadLimit,
@@ -1059,6 +1086,7 @@ function PagedThreadList({
   onThreadAction,
   onThreadContextMenu,
 }: {
+  workspace: Pick<AiChatRepo, "label" | "path">;
   expanded: boolean;
   threads: AiChatThread[];
   threadLimit?: number;
@@ -1094,6 +1122,7 @@ function PagedThreadList({
         <ThreadTreeItem
           key={thread.id ?? thread.label}
           thread={thread}
+          workspace={workspace}
           activeThreadId={activeThreadId}
           workspaceKey={threadTreeWorkspaceKey(thread, threads)}
           onSelect={onThreadSelect}
@@ -1192,6 +1221,7 @@ export function RepoItem({
         onContextMenu={onContextMenu}
       />
       <RepoThreadList
+        workspace={repo}
         expanded={expanded}
         threads={repo.threads}
         threadLimit={repo.threadLimit}
@@ -1254,6 +1284,7 @@ export function RecentThreadList({
         <ThreadTreeItem
           key={thread.id ?? thread.label}
           thread={thread}
+          workspace={threads[index].workspace}
           flat
           activeThreadId={activeThreadId}
           workspaceKey={threads[index].treeWorkspaceKey ?? threadTreeWorkspaceKey(thread, threads)}

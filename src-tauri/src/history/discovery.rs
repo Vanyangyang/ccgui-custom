@@ -593,16 +593,36 @@ fn discover_grok_in(sessions_root: &Path, workspace: &Path) -> Vec<SessionFile> 
 }
 
 /// Antigravity conversations live under `~/.gemini/antigravity-cli/` as
-/// sqlite files, indexed by `conversation_summaries.db` (`workspace_uris`).
-pub(super) fn discover_agy(workspace: &Path) -> Vec<SessionFile> {
-    discover_agy_in(workspace, &crate::engine::agy::session_homes())
+/// sqlite files, indexed by `conversation_summaries.db` (`workspace_uris`)
+/// and/or `cache/last_conversations.json`.
+pub(super) fn discover_agy_workspaces(
+    workspaces: &[String],
+    pinned: &std::collections::HashMap<String, String>,
+) -> Vec<SessionFile> {
+    discover_agy_workspaces_in(workspaces, pinned, &crate::engine::agy::session_homes())
 }
 
+#[cfg(test)]
 fn discover_agy_in(workspace: &Path, homes: &[PathBuf]) -> Vec<SessionFile> {
+    discover_agy_workspaces_in(
+        &[workspace.to_string_lossy().to_string()],
+        &std::collections::HashMap::new(),
+        homes,
+    )
+}
+
+fn discover_agy_workspaces_in(
+    workspaces: &[String],
+    pinned: &std::collections::HashMap<String, String>,
+    homes: &[PathBuf],
+) -> Vec<SessionFile> {
+    if workspaces.is_empty() {
+        return Vec::new();
+    }
     let mut sessions = std::collections::HashMap::<String, SessionFile>::new();
     let mut ambiguous = std::collections::HashSet::new();
     for home in homes {
-        for session in discover_agy_home(workspace, home) {
+        for session in discover_agy_home_workspaces(workspaces, pinned, home) {
             if let Some(previous) = sessions.get(&session.session_id) {
                 if previous.file_path != session.file_path {
                     ambiguous.insert(session.session_id.clone());
@@ -612,18 +632,37 @@ fn discover_agy_in(workspace: &Path, homes: &[PathBuf]) -> Vec<SessionFile> {
             }
         }
     }
-    // Detect collisions even when only one store associates the ID with this
-    // workspace; a subsequent --conversation must remain unambiguous.
-    sessions.into_values().filter(|session| {
-        !ambiguous.contains(&session.session_id) && homes.iter().filter(|home|
-            home.join("conversations").join(format!("{}.db", session.session_id)).is_file()
-        ).count() == 1
-    }).collect()
+    // Detect collisions even when only one store associates the ID with a
+    // workspace; a subsequent --conversation / session/load must remain unambiguous.
+    let mut sessions: Vec<_> = sessions
+        .into_values()
+        .filter(|session| {
+            !ambiguous.contains(&session.session_id)
+                && homes
+                    .iter()
+                    .filter(|home| {
+                        home.join("conversations")
+                            .join(format!("{}.db", session.session_id))
+                            .is_file()
+                    })
+                    .count()
+                    == 1
+        })
+        .collect();
+    // The scanner hashes candidates in traversal order; HashMap iteration must
+    // not invalidate that cache when no session or workspace changed.
+    sessions.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+    sessions
 }
 
-fn discover_agy_home(workspace: &Path, home: &Path) -> Vec<SessionFile> {
+fn discover_agy_home_workspaces(
+    workspaces: &[String],
+    pinned: &std::collections::HashMap<String, String>,
+    home: &Path,
+) -> Vec<SessionFile> {
     let conv_dir = home.join("conversations");
-    let mut by_id: std::collections::HashMap<String, PathBuf> = std::collections::HashMap::new();
+    let mut summary_uris_by_id: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
 
     if let Ok(conn) = rusqlite::Connection::open_with_flags(
         home.join("conversation_summaries.db"),
@@ -635,58 +674,205 @@ fn discover_agy_home(workspace: &Path, home: &Path) -> Vec<SessionFile> {
             if let Ok(rows) = stmt.query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             }) {
-                for row in rows.flatten() {
-                    let (id, uris) = row;
-                    if id.trim().is_empty() {
-                        continue;
-                    }
-                    if agy_uris_match_workspace(&uris, workspace) {
-                        let path = conv_dir.join(format!("{id}.db"));
-                        by_id.entry(id).or_insert(path);
+                for (id, uris) in rows.flatten() {
+                    let id = id.trim();
+                    if !id.is_empty() {
+                        summary_uris_by_id.insert(id.to_string(), uris);
                     }
                 }
             }
         }
     }
 
+    let mut exact_cwds_by_id: std::collections::HashMap<String, Vec<PathBuf>> =
+        std::collections::HashMap::new();
     if let Ok(text) = std::fs::read_to_string(home.join("cache").join("last_conversations.json")) {
         if let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&text) {
             for (cwd, id) in map {
+                let cwd = cwd.trim();
                 let Some(id) = id.as_str().map(str::trim).filter(|s| !s.is_empty()) else {
                     continue;
                 };
-                if same_or_child(Path::new(&cwd), workspace) {
-                    by_id
+                if !cwd.is_empty() {
+                    exact_cwds_by_id
                         .entry(id.to_string())
-                        .or_insert_with(|| conv_dir.join(format!("{id}.db")));
+                        .or_default()
+                        .push(PathBuf::from(cwd));
                 }
             }
         }
     }
 
-    by_id
-        .into_iter()
-        .filter(|(_, path)| path.is_file())
-        .map(|(session_id, file_path)| SessionFile {
-            engine: "agy",
-            session_id,
-            workspace_path: workspace.to_string_lossy().to_string(),
-            file_path,
-        })
-        .collect()
+    let mut candidate_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    candidate_ids.extend(summary_uris_by_id.keys().cloned());
+    candidate_ids.extend(exact_cwds_by_id.keys().cloned());
+    for id in pinned.keys() {
+        let id = id.trim();
+        if !id.is_empty() {
+            candidate_ids.insert(id.to_string());
+        }
+    }
+
+    let mut out = Vec::new();
+    for session_id in candidate_ids {
+        let file_path = conv_dir.join(format!("{session_id}.db"));
+        if !file_path.is_file() {
+            continue;
+        }
+
+        // Priority 1: Authoritative workspace recorded by CCGUI (`meta`,
+        // `sessions`, `leader_branches`, or `usage_ledger`). If pinned to an
+        // unregistered workspace, do NOT fall through to `workspace_uris`
+        // (which contains all `--add-dir` / `granted_roots` directories).
+        if let Some(pinned_ws) = pinned.get(&session_id).map(|s| s.trim()).filter(|s| !s.is_empty())
+        {
+            if let Some(ws) = best_matching_agy_workspace(Path::new(pinned_ws), workspaces) {
+                out.push(SessionFile {
+                    engine: "agy",
+                    session_id,
+                    workspace_path: ws.to_string(),
+                    file_path,
+                });
+            }
+            continue;
+        }
+
+        // Priority 2: Exact `cwd` recorded by `--print` mode in
+        // `cache/last_conversations.json`.
+        if let Some(cwds) = exact_cwds_by_id.get(&session_id) {
+            if let Some(ws) = cwds
+                .iter()
+                .filter_map(|cwd| best_matching_agy_workspace(cwd, workspaces))
+                .max_by_key(|ws| (Path::new(ws).components().count(), ws.len()))
+            {
+                out.push(SessionFile {
+                    engine: "agy",
+                    session_id,
+                    workspace_path: ws.to_string(),
+                    file_path,
+                });
+            }
+            continue;
+        }
+
+        // Priority 3: `conversation_summaries.db` `workspace_uris` (for
+        // external CLI / ACP sessions not initiated through CCGUI).
+        if let Some(uris_json) = summary_uris_by_id.get(&session_id) {
+            if let Some(ws) = best_agy_workspace_from_uris(uris_json, workspaces) {
+                out.push(SessionFile {
+                    engine: "agy",
+                    session_id,
+                    workspace_path: ws.to_string(),
+                    file_path,
+                });
+            }
+        }
+    }
+    out
 }
 
-fn agy_uris_match_workspace(uris_json: &str, workspace: &Path) -> bool {
+fn best_agy_workspace_from_uris<'a>(uris_json: &str, workspaces: &'a [String]) -> Option<&'a str> {
     let Ok(uris) = serde_json::from_str::<Vec<String>>(uris_json) else {
-        return false;
+        return None;
     };
-    uris.iter()
-        .any(|uri| file_uri_path(uri).is_some_and(|path| same_or_child(&path, workspace)))
+    let uri_paths: Vec<PathBuf> = uris
+        .iter()
+        .filter_map(|uri| file_uri_path(uri))
+        .filter(|path| !is_ccgui_internal_agy_dir(path))
+        .collect();
+    if uri_paths.is_empty() {
+        return None;
+    }
+    let mut best: Option<(usize, usize, &'a str)> = None;
+    for (order_idx, ws) in workspaces.iter().enumerate() {
+        let ws_path = Path::new(ws);
+        if uri_paths
+            .iter()
+            .any(|candidate| agy_path_matches_workspace(candidate, ws_path))
+        {
+            let depth = ws_path.components().count();
+            let should_replace = match best {
+                None => true,
+                Some((best_depth, best_idx, _)) => {
+                    depth > best_depth || (depth == best_depth && order_idx < best_idx)
+                }
+            };
+            if should_replace {
+                best = Some((depth, order_idx, ws.as_str()));
+            }
+        }
+    }
+    best.map(|(_, _, ws)| ws)
 }
 
-fn file_uri_path(uri: &str) -> Option<PathBuf> {
+fn best_matching_agy_workspace<'a>(candidate: &Path, workspaces: &'a [String]) -> Option<&'a str> {
+    workspaces
+        .iter()
+        .filter(|ws| agy_path_matches_workspace(candidate, Path::new(ws)))
+        .max_by_key(|ws| (Path::new(ws.as_str()).components().count(), ws.len()))
+        .map(String::as_str)
+}
+
+fn is_ccgui_internal_agy_dir(path: &Path) -> bool {
+    path.components().any(|comp| {
+        comp.as_os_str().to_str().is_some_and(|name| {
+            matches!(
+                name,
+                "agy-acp-slots" | "agy-host-staging" | "pasted-images"
+            )
+        })
+    })
+}
+
+fn agy_path_matches_workspace(candidate: &Path, workspace: &Path) -> bool {
+    if same_or_child(candidate, workspace) {
+        return true;
+    }
+    let cand_norm = normalize_path_segments_lower(candidate);
+    let ws_norm = normalize_path_segments_lower(workspace);
+    !ws_norm.is_empty()
+        && cand_norm.len() >= ws_norm.len()
+        && cand_norm[..ws_norm.len()] == ws_norm[..]
+}
+
+fn normalize_path_segments_lower(path: &Path) -> Vec<String> {
+    let raw = path.to_string_lossy();
+    let trimmed = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
+    let mut out = Vec::new();
+    for seg in trimmed.split(['/', '\\']) {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        #[cfg(windows)]
+        out.push(seg.to_lowercase());
+        #[cfg(not(windows))]
+        out.push(seg.to_string());
+    }
+    out
+}
+
+pub(super) fn file_uri_path(uri: &str) -> Option<PathBuf> {
     let rest = uri.strip_prefix("file://")?;
-    Some(PathBuf::from(percent_decode_path(rest)))
+    let rest = rest
+        .strip_prefix("localhost/")
+        .map(|s| format!("/{s}"))
+        .unwrap_or_else(|| rest.to_string());
+    let decoded = percent_decode_path(&rest);
+    Some(PathBuf::from(strip_windows_file_uri_slash(&decoded)))
+}
+
+fn strip_windows_file_uri_slash(decoded: &str) -> &str {
+    let bytes = decoded.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0] == b'/'
+        && bytes[1].is_ascii_alphabetic()
+        && bytes[2] == b':'
+        && (bytes.len() == 3 || bytes[3] == b'/' || bytes[3] == b'\\')
+    {
+        &decoded[1..]
+    } else {
+        decoded
+    }
 }
 
 fn percent_decode_path(input: &str) -> String {
@@ -982,6 +1168,68 @@ pub(super) fn path_is_under(path: &str, home: &Path) -> bool {
 mod tests {
     use super::super::scanner::tests::{scratch_dir, write_zstd_jsonl, HomeGuard, HOME_LOCK};
     use super::*;
+
+    #[test]
+    fn file_uri_decodes_windows_drive_and_percent_encoded_paths() {
+        for (uri, path) in [
+            ("file:///C:/Projects/ccgui-custom", "C:/Projects/ccgui-custom"),
+            ("file:///C%3A/Projects/hello%20%E4%B8%AD%E6%96%87", "C:/Projects/hello 中文"),
+            ("file://localhost/C:/Projects/space%20dir", "C:/Projects/space dir"),
+            ("file:///tmp/space%20dir", "/tmp/space dir"),
+        ] {
+            assert_eq!(file_uri_path(uri), Some(PathBuf::from(path)));
+        }
+        assert!(file_uri_path("https://example.org/image.png").is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn agy_windows_workspace_matching_ignores_case_but_respects_segments() {
+        assert!(agy_path_matches_workspace(Path::new("c:/PROJECTS/ccgui-custom/src"), Path::new(r"C:\Projects\ccgui-custom")));
+        assert!(!agy_path_matches_workspace(Path::new("C:/Projects/ccgui-custom-other"), Path::new("c:/projects/ccgui-custom")));
+    }
+
+    #[test]
+    fn agy_workspace_pins_and_exact_cwd_override_granted_roots() {
+        let root = scratch_dir(&format!("agy-attribution-{}", uuid::Uuid::new_v4()));
+        let home = root.join("native");
+        let workspaces = vec![root.join("wrong/deeper/granted"), root.join("real"), root.join("agy-acp-slots/slot")]
+            .into_iter().map(|path| path.to_string_lossy().to_string()).collect::<Vec<_>>();
+        std::fs::create_dir_all(home.join("conversations")).unwrap();
+        std::fs::create_dir_all(home.join("cache")).unwrap();
+        for id in ["pinned", "exact", "fallback", "outside"] {
+            std::fs::write(home.join(format!("conversations/{id}.db")), "").unwrap();
+        }
+        let uri = |path: &str| {
+            let path = path.replace('\\', "/");
+            format!("file://{}{path}", if path.starts_with('/') { "" } else { "/" })
+        };
+        let conn = rusqlite::Connection::open(home.join("conversation_summaries.db")).unwrap();
+        conn.execute_batch("CREATE TABLE conversation_summaries(conversation_id TEXT, workspace_uris TEXT)").unwrap();
+        for id in ["pinned", "exact", "outside"] {
+            conn.execute("INSERT INTO conversation_summaries VALUES(?1, ?2)", rusqlite::params![id,
+                serde_json::json!([uri(&workspaces[0]), uri(&workspaces[2]), uri(&workspaces[1])]).to_string()]).unwrap();
+        }
+        conn.execute("INSERT INTO conversation_summaries VALUES('fallback', ?1)",
+            [serde_json::json!([uri(&workspaces[2]), uri(&workspaces[1])]).to_string()]).unwrap();
+        drop(conn);
+        let pinned = std::collections::HashMap::from([
+            ("pinned".into(), workspaces[1].clone()), ("outside".into(), root.join("unregistered").to_string_lossy().to_string()),
+        ]);
+        let homes = [home.clone()];
+        let sessions = discover_agy_workspaces_in(&workspaces, &pinned, &homes);
+        assert_eq!(sessions.iter().find(|s| s.session_id == "pinned").unwrap().workspace_path, workspaces[1]);
+        assert_eq!(sessions.iter().find(|s| s.session_id == "fallback").unwrap().workspace_path, workspaces[1]);
+        assert!(!sessions.iter().any(|s| s.session_id == "outside"));
+        // A cached cwd beats the deeper granted root; an explicit pin beats a conflicting cached cwd.
+        std::fs::write(home.join("cache/last_conversations.json"), serde_json::json!({
+            workspaces[1].clone(): "exact", workspaces[0].clone(): "pinned"
+        }).to_string()).unwrap();
+        let sessions = discover_agy_workspaces_in(&workspaces, &pinned, &homes);
+        assert_eq!(sessions.len(), 3);
+        assert!(sessions.iter().all(|session| session.workspace_path == workspaces[1]));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn agy_observer_temporary_session_stays_out_of_discovery_including_after_host_exit() {

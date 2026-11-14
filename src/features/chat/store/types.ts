@@ -40,6 +40,8 @@ export interface SendOptions {
   /** Host task launch: with requestedRunId, the target may be an open pending
    * chat (first turn). Pre-spawn refusals throw HostChatBusyError. */
   hostNewChat?: true;
+  /** Private first-turn state; never consumes a user-owned pending tab/draft. */
+  hostIndependentDraft?: true;
   /** Frozen model/effort/provider choices from task acceptance so queue waits cannot
    * silently pick up later global default changes. */
   hostLaunch?: HostLaunchChoices;
@@ -159,7 +161,7 @@ export interface ChatStore {
     workspacePath: string,
     toIndex: number,
   ) => void;
-  startNewChat: (workspacePath: string) => void;
+  startNewChat: (workspacePath: string, engine?: string) => void;
   /** Host task launch: open a pending chat without activating it or touching
    *  composer drafts. Returns false when the user already holds that pending
    *  chat (focused, typed, launching or carrying different starting choices). */
@@ -273,6 +275,9 @@ export interface ChatStore {
     options?: SendOptions,
     target?: ActiveSession | null,
   ) => Promise<void>;
+  /** Prepare an exact saved conversation for its existing host inbox message.
+   *  May request native Esc, but never sends, queues or focuses a message. */
+  prepareImmediateFollowUp: (target: ActiveSession, expectedRunId: string | null) => Promise<void>;
   /** Drop a queued message (default: the active session). */
   removeQueued: (id: string, key?: string) => void;
   /** Move a queued message one row up or down in the queue card; directions
@@ -286,7 +291,7 @@ export interface ChatStore {
   /** Stop the running turn (default: the active session). While a Claude run
    *  generates a reply and background tasks run, only the reply is interrupted
    *  and the tasks survive; otherwise the run and its tasks are killed. */
-  interrupt: (target?: ActiveSession | null) => Promise<void>;
+  interrupt: (target?: ActiveSession | null, hostPendingRunId?: string) => Promise<void>;
   archiveSession: (session: SessionMeta) => Promise<void>;
   restoreSession: (session: SessionMeta) => Promise<void>;
   deleteSession: (engine: string, sessionId: string) => Promise<void>;

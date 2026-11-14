@@ -91,6 +91,7 @@ function StatusIcon({ status, mailbox }: Pick<CrossSessionCommunicationRecord, "
     return <CircleAlert className={cx("size-3 shrink-0", status === "failed" ? "text-notification-error" : "text-text-warning-primary")} aria-hidden />;
   }
   if (status === "executing") return <span className="sidebar-thread-status sidebar-thread-status-processing" aria-hidden />;
+  if (status === "handed_off") return <ArrowRight className="size-3 shrink-0 text-text-tertiary" aria-hidden />;
   if (status === "completed") return <Check className="size-3 shrink-0 text-notification-success-foreground" aria-hidden />;
   return <Clock className="size-3 shrink-0 text-text-tertiary" aria-hidden />;
 }

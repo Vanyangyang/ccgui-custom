@@ -1,5 +1,13 @@
 import i18n from "@/lib/i18n";
-import { leaderGroupBranches, type LeaderBranch, type LeaderIdentity, type LeaderSnapshot } from "@/features/leader/types";
+import {
+  archivedGroupBranches,
+  leaderGroupBranches,
+  leaderGroupRoot,
+  sameIdentity,
+  type LeaderBranch,
+  type LeaderIdentity,
+  type LeaderSnapshot,
+} from "@/features/leader/types";
 
 export interface HandoffChildrenDigest {
   heading: string;
@@ -12,9 +20,24 @@ export interface HandoffChildrenDigest {
   omittedAttention: number;
 }
 
+export type HandoffChildRelation = "descendant" | "sibling";
+
+export interface HandoffChildCandidate {
+  branch: LeaderBranch;
+  relation: HandoffChildRelation;
+  defaultSelected: boolean;
+}
+
+export interface HandoffChildrenDiscovery {
+  candidates: HandoffChildCandidate[];
+  defaultSelectedIds: string[];
+  initialDigest: HandoffChildrenDigest;
+}
+
 const length = (text: string) => Array.from(text).length;
 const quote = (text: string) => text.split("\n").map((line) => `> ${line}`).join("\n");
-const needsAttention = (branch: LeaderBranch) => branch.expired || branch.state !== "completed";
+export const isHandoffChildAttention = (branch: LeaderBranch) => branch.expired || branch.state !== "completed";
+const needsAttention = isHandoffChildAttention;
 const omittedText = () => i18n.t("chat.handoffChildrenExcerptOmitted");
 const truncatedText = () => i18n.t("chat.handoffChildrenTruncated");
 // Preserve unusual identifiers losslessly without letting their newlines create
@@ -112,15 +135,20 @@ function minimum(branch: LeaderBranch): string {
   return `${metadata(branch)}${flags}\n${branch.result.trim() ? omittedText() : i18n.t("chat.handoffChildrenNoResult")}`;
 }
 
-export function buildHandoffChildren(snapshot: LeaderSnapshot, source: LeaderIdentity, observedAt: number): HandoffChildrenDigest {
-  const heading = i18n.t("chat.handoffChildrenHeading");
-  const branches = leaderGroupBranches(snapshot, source).sort((a, b) =>
+const sortForDigest = (branches: readonly LeaderBranch[]): LeaderBranch[] =>
+  [...branches].sort((a, b) =>
     Number(needsAttention(b)) - Number(needsAttention(a))
     || b.updatedAt - a.updatedAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+
+function renderDigestFromSorted(
+  branches: readonly LeaderBranch[],
+  observedAt: number,
+): { digest: HandoffChildrenDigest; selectedIds: string[] } {
+  const heading = i18n.t("chat.handoffChildrenHeading");
   const total = branches.length;
   const attention = branches.filter(needsAttention).length;
   const empty = { heading, block: "", context: "", total, included: 0, omitted: 0, attention, omittedAttention: 0 };
-  if (!total) return empty;
+  if (!total) return { digest: empty, selectedIds: [] };
   const asOf = i18n.t("chat.handoffChildrenAsOf", { time: new Date(observedAt).toISOString() });
   const control = i18n.t("chat.handoffChildrenControl");
   const omission = (count: number, pending: number) =>
@@ -153,5 +181,86 @@ export function buildHandoffChildren(snapshot: LeaderSnapshot, source: LeaderIde
     const body = [asOf, ...items, ...(omitted ? [omission(omitted, omittedAttention)] : []), control];
     return `${heading}\n\n${body.map(quote).join("\n")}`;
   }
-  return { heading, block: render(2400, 300), context: render(6000, 800), total, included: selected.length, omitted, attention, omittedAttention };
+  return {
+    digest: {
+      heading,
+      block: render(2400, 300),
+      context: render(6000, 800),
+      total,
+      included: selected.length,
+      omitted,
+      attention,
+      omittedAttention,
+    },
+    selectedIds: selected.map((branch) => branch.id),
+  };
+}
+
+function hiddenArchivedBranchIds(snapshot: LeaderSnapshot, source: LeaderIdentity): Set<string> {
+  const hidden = new Set<string>();
+  for (const group of snapshot.archivedGroups ?? []) {
+    if (sameIdentity(group.root, source) || group.members.some((member) => sameIdentity(member, source))) continue;
+    for (const branch of archivedGroupBranches(snapshot, group)) hidden.add(branch.id);
+  }
+  return hidden;
+}
+
+export function buildHandoffChildren(snapshot: LeaderSnapshot, source: LeaderIdentity, observedAt: number): HandoffChildrenDigest {
+  const hidden = hiddenArchivedBranchIds(snapshot, source);
+  const branches = sortForDigest(leaderGroupBranches(snapshot, source).filter((branch) => !hidden.has(branch.id)));
+  return renderDigestFromSorted(branches, observedAt).digest;
+}
+
+export function discoverHandoffChildren(
+  snapshot: LeaderSnapshot,
+  source: LeaderIdentity,
+  observedAt: number,
+): HandoffChildrenDiscovery {
+  const hidden = hiddenArchivedBranchIds(snapshot, source);
+  const descendants = sortForDigest(leaderGroupBranches(snapshot, source).filter((branch) => !hidden.has(branch.id)));
+  const { digest: initialDigest, selectedIds: defaultSelectedIds } = renderDigestFromSorted(descendants, observedAt);
+  const defaultSet = new Set(defaultSelectedIds);
+  const descendantIdSet = new Set(descendants.map((branch) => branch.id));
+
+  const root = leaderGroupRoot(snapshot, source);
+  const siblings = sameIdentity(root, source)
+    ? []
+    : sortForDigest(
+        leaderGroupBranches(snapshot, root).filter(
+          (branch) =>
+            !hidden.has(branch.id) &&
+            !descendantIdSet.has(branch.id) &&
+            !(
+              branch.sessionId !== null &&
+              sameIdentity({ engine: branch.engine, sessionId: branch.sessionId, workspacePath: branch.workspacePath }, source)
+            ),
+        ),
+      );
+
+  const candidates: HandoffChildCandidate[] = [
+    ...descendants.map((branch) => ({
+      branch,
+      relation: "descendant" as const,
+      defaultSelected: defaultSet.has(branch.id),
+    })),
+    ...siblings.map((branch) => ({
+      branch,
+      relation: "sibling" as const,
+      defaultSelected: false,
+    })),
+  ];
+
+  return { candidates, defaultSelectedIds, initialDigest };
+}
+
+export function buildHandoffChildrenForSelection(
+  candidates: readonly HandoffChildCandidate[],
+  selectedIds: readonly string[],
+  observedAt: number,
+): HandoffChildrenDigest {
+  const selectedSet = new Set(selectedIds);
+  const chosen = sortForDigest(
+    candidates.filter((candidate) => selectedSet.has(candidate.branch.id)).map((candidate) => candidate.branch),
+  );
+  return renderDigestFromSorted(chosen, observedAt).digest;
 }

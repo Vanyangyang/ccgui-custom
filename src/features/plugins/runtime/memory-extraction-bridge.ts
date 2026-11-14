@@ -30,7 +30,7 @@ function cursor(v: unknown): asserts v is MemoryExtractionCursor {
     (v.rowDigest !== undefined && (typeof v.rowDigest !== "string" || !HASH.test(v.rowDigest)))) throw new Error("Invalid memory extraction cursor");
 }
 function sourceRequest(v: unknown, mode: "source" | "extract" | "prepare" = "source"): asserts v is MemoryExtractionSourceRequest {
-  fields(v, mode === "extract" ? ["projectId", "source", "requestId", "cursor", "context", "formatVersion", "expectedSourceDigest"] : mode === "prepare" ? ["projectId", "source", "cursor"] : ["projectId", "source"]);
+  fields(v, mode === "extract" ? ["projectId", "source", "requestId", "cursor", "context", "formatVersion", "expectedSourceDigest", "reconcileOnly"] : mode === "prepare" ? ["projectId", "source", "cursor"] : ["projectId", "source"]);
   fields(v.source, ["kind", "id"]);
   if (!id(v.projectId) || !id(v.source.id) || !["conversation", "coordination"].includes(String(v.source.kind))) throw new Error("Invalid memory extraction source");
 }
@@ -38,6 +38,7 @@ function extractionRequest(v: unknown): asserts v is MemoryExtractionRequest {
   sourceRequest(v, "extract");
   const request = v as MemoryExtractionRequest;
   if (!id(request.requestId)) throw new Error("Invalid memory extraction request ID");
+  if (request.reconcileOnly !== undefined && typeof request.reconcileOnly !== "boolean") throw new Error("Invalid memory extraction reconciliation flag");
   if (request.formatVersion !== undefined && request.formatVersion !== 2 ||
     request.expectedSourceDigest !== undefined && (typeof request.expectedSourceDigest !== "string" || !HASH.test(request.expectedSourceDigest)) ||
     request.formatVersion === 2 && !request.expectedSourceDigest) throw new Error("Invalid memory extraction format or digest");
@@ -142,9 +143,9 @@ export function createMemoryExtractionBridge(pluginId: string, deps: MemoryExtra
   const pending = new Map<string, { cancelled: boolean }>();
   const alive = () => { if (disposed) throw new Error("Memory extraction facade disposed"); };
   const invoke = (command: string, args: Record<string, unknown> = {}) => deps.invoke(command, { ...args, pluginId });
-  const ready = async (request: MemoryExtractionSourceRequest) => {
+  const ready = async (request: MemoryExtractionSourceRequest, reconcileOnly = false) => {
     const state = await (request.source.kind === "conversation" ? deps.conversation(request.source.id) : deps.coordination(request.source.id));
-    return !state.error && state.status === (request.source.kind === "conversation" ? "completed" : "idle");
+    return !state.error && (reconcileOnly || state.status === (request.source.kind === "conversation" ? "completed" : "idle"));
   };
   return {
     async status(): Promise<MemoryExtractionStatus> {
@@ -155,6 +156,8 @@ export function createMemoryExtractionBridge(pluginId: string, deps: MemoryExtra
       if (!plain(value) || typeof value.available !== "boolean" || typeof value.busy !== "boolean" ||
         !Number.isSafeInteger(value.retryAfterMs) || Number(value.retryAfterMs) < 0 || Number(value.retryAfterMs) > 86400000 ||
         (value.reason !== undefined && !text(value.reason, 512))) throw new Error("Invalid memory extraction status");
+      if (value.automationVersion !== undefined && value.automationVersion !== 1) throw new Error("Invalid memory automation capability");
+      if (value.canReconcile !== undefined && typeof value.canReconcile !== "boolean") throw new Error("Invalid memory receipt availability");
       return value as unknown as MemoryExtractionStatus;
     },
     async checkpoint(input) {
@@ -185,15 +188,21 @@ export function createMemoryExtractionBridge(pluginId: string, deps: MemoryExtra
       if (pending.has(request.requestId)) throw new Error("Memory extraction request already pending");
       const entry = { cancelled: false };
       pending.set(request.requestId, entry);
+      let submitted = false;
       try {
         if (deps.paused()) return deferred("maintenance");
-        if (!await ready(request)) return deferred("source_not_settled");
+        if (!await ready(request, request.reconcileOnly === true)) return deferred("source_not_settled");
         if (entry.cancelled || disposed) return deferred("cancelled");
         if (deps.paused()) return deferred("maintenance");
-        const result = await invoke("plugin_memory_extract", { request });
-        if (entry.cancelled || disposed) return deferred("cancelled");
-        if (deps.paused()) return deferred("maintenance");
-        return extractionResponse(result, request);
+        submitted = true;
+        const result = extractionResponse(await invoke("plugin_memory_extract", { request }), request);
+        if (entry.cancelled || disposed || deps.paused()) return result.status === "completed" || result.status === "empty" ? deferred("request_outcome_unknown") : result;
+        return result;
+      } catch (error) {
+        // A lost IPC reply or invalid response does not prove a native call was
+        // never sent. Only exact-request reconciliation can resolve its outcome.
+        if (submitted) return deferred("request_outcome_unknown");
+        throw error;
       } finally { if (pending.get(request.requestId) === entry) pending.delete(request.requestId); }
     },
     async cancel(requestId) {

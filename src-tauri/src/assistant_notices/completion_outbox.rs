@@ -427,6 +427,10 @@ struct Run {
     admitted_at_ms: u64,
     summary: String,
     summary_chars: usize,
+    response_has_output: bool,
+    // A reply without displayable text is not a completion yet. Remember
+    // whether it had actual output so a final `done` can preserve tool-only work.
+    deferred_response: Option<bool>,
     terminal: Option<Terminal>,
     pending_start: Option<Pending>,
     progress: observer_progress::ProgressCapture,
@@ -539,6 +543,8 @@ impl Recorder {
                 admitted_at_ms: now,
                 summary: String::new(),
                 summary_chars: 0,
+                response_has_output: false,
+                deferred_response: None,
                 terminal: None,
                 pending_start: None,
                 progress: Default::default(),
@@ -704,16 +710,20 @@ impl Recorder {
         let mut progress_candidate = None;
         if output {
             // A late patch can update an existing display row but cannot start another turn.
-            if run.terminal.is_some() && data.get("patch").and_then(Value::as_bool) == Some(true) {
+            if (run.terminal.is_some() || run.deferred_response.is_some())
+                && data.get("patch").and_then(Value::as_bool) == Some(true)
+            {
                 return Ok(());
             }
-            if run.terminal.is_some() || ordinal > run.continuation {
+            if run.terminal.is_some() || run.deferred_response.is_some() || ordinal > run.continuation {
                 self.outbox.invalidate_checkpoint(&run.reservation);
                 run.progress = Default::default();
                 run.started_at_ms = stamp.max(run.started_at_ms.saturating_add(1)).min(MAX_MS);
                 run.terminal = None;
                 run.summary.clear();
                 run.summary_chars = 0;
+                run.response_has_output = false;
+                run.deferred_response = None;
                 if let Some(session) = &run.session {
                     run.pending_start = Some(Pending {
                         id: format!("start-{}", event_id(root, logical, seq)),
@@ -732,6 +742,11 @@ impl Recorder {
             }
             run.logical = logical.into();
             run.continuation = ordinal;
+            // A patch only updates an existing row; it is not evidence that
+            // this response produced a new assistant segment or tool call.
+            if data.get("patch").and_then(Value::as_bool) != Some(true) {
+                run.response_has_output = true;
+            }
             if kind == "thinking" || kind == "message" && matches!(role, Some("tool" | "thinking"))
             {
                 if data.get("patch").and_then(Value::as_bool) != Some(true) {
@@ -760,11 +775,22 @@ impl Recorder {
             self.outbox.invalidate_checkpoint(&run.reservation);
             run.logical = logical.into();
             run.continuation = ordinal;
-            run.terminal = Some(Terminal {
-                id: event_id(root, logical, seq),
-                completed_at_ms: stamp.max(run.started_at_ms),
-                cancel: false,
-            });
+            if kind == "turn_complete"
+                && (!run.response_has_output || run.summary.trim().is_empty())
+            {
+                // Claude may end a metadata-only or tool-only reply while its
+                // background work is still active. Delay it until a real final
+                // `done` and suppress metadata-only boundaries altogether.
+                run.deferred_response = Some(run.response_has_output);
+            } else if run.deferred_response != Some(false) {
+                // A standalone `done` remains authoritative for engines that
+                // complete without emitting a response boundary or text.
+                run.terminal = Some(Terminal {
+                    id: event_id(root, logical, seq),
+                    completed_at_ms: stamp.max(run.started_at_ms),
+                    cancel: false,
+                });
+            }
         }
         let persisted = self.persist(run);
         if persisted.is_ok() && run.terminal.is_none() {

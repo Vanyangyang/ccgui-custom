@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it } from "vitest";
 import { DEFAULT_PET_SCALE, PET_BASE_SCALE, PET_SCALE_OPTIONS, normalizePetScale } from "./pet-scale";
 

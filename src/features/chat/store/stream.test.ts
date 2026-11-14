@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it } from "vitest";
 import type { Message } from "@/lib/ipc";
 import { appendToolMessage, applyStreamParts, settleLiveRows, EMPTY_SESSION, type BySessionSlice } from "./stream";

@@ -372,8 +372,11 @@ fn route(core: &TurnCore, state: &mut TurnState, view: &mut TurnView, value: &Va
             view.quota_binding = None;
         }
         // Restored same-thread usage may seed throughput before turn/start,
-        // but a child thread must not replace that baseline during resume.
-        if belongs_to_thread(state, &params) {
+        // including during thread/resume or thread/fork before native_session_id
+        // is adopted; per-thread seed map prevents child threads from colliding.
+        if belongs_to_thread(state, &params)
+            || (state.native_session_id.is_none() && method == "thread/tokenUsage/updated")
+        {
             if let Some(payload) = view.throughput.observe(method, &params) {
                 // 【Codex整轮吞吐】仅在终态样本为 complete 且无排除原因时保存可信本轮输出与耗时。
                 if payload.get("status").and_then(Value::as_str) == Some("complete")
@@ -396,7 +399,13 @@ fn route(core: &TurnCore, state: &mut TurnState, view: &mut TurnView, value: &Va
         }
     }
     match value.get("id").filter(|id| !id.is_null()) {
-        Some(id) => handle_server_request(core, state, view, method, id, &params),
+        Some(id) => {
+            let handled = handle_server_request(core, state, view, method, id, &params);
+            if matches!(handled, Handled::Parked) {
+                view.throughput.park_wait(id);
+            }
+            handled
+        }
         None => handle_notification(core, state, view, method, &params),
     }
 }
@@ -1535,11 +1544,55 @@ pub(crate) async fn read_account_quota(
         let key = server.request("account/rateLimits/read", json!({})).await.map_err(|_| "query_failed")?;
         let limits = server.pump("quota limits", Expect::Reply(&key), Some(deadline), &killed, None, &mut reject_request)
             .await.map_err(|_| "query_failed")?.ok_or("query_failed")?;
-        if !binding.current() { return Err("auth_changed"); }
+        match binding.status() {
+            crate::codex_quota::BindingStatus::Current => {}
+            crate::codex_quota::BindingStatus::Changed => return Err("auth_changed"),
+            crate::codex_quota::BindingStatus::Unavailable => return Err("auth_metadata_unavailable"),
+        }
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
         let windows = crate::codex_quota::parse_limits(&limits, now).ok_or("quota_not_available")?;
         let (credits, reset_credits) = crate::codex_quota::parse_credits(&limits, now);
         Ok(crate::codex_quota::QueryResult { account, windows, credits, reset_credits })
+    }.await;
+    teardown(&mut spawned.child).await;
+    result
+}
+
+/// Discover the native hook configuration without opening a thread or running
+/// a model turn. Raw hook definitions remain in the host for sanitization.
+pub(crate) async fn read_hook_inventory(workspace: &std::path::Path) -> Result<Value, &'static str> {
+    let settings = crate::settings::read_settings().map_err(|_| "cli_unavailable")?;
+    let bin = super::engine_bin(&settings, "codex");
+    let mut command = super::command_for_binary(&bin);
+    command.arg("app-server");
+    for config in ["mcp_servers={}", "features.apps=false", "features.remote_plugin=false",
+        "features.memories=false", "features.goals=false", "cloud.skills.enabled=false", "notify=[]"] {
+        command.args(["-c", config]);
+    }
+    command.env("CODEX_HOME", super::codex_home()).env("PATH", super::resolve::cli_search_path());
+    crate::development_profile::enforce_homes(&mut command);
+    let mut spawned = spawn_app_server(&mut command, workspace).map_err(|_| "cli_unavailable")?;
+    let killed = AtomicBool::new(false);
+    let result = async {
+        let server = &mut spawned.server;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut reject_request = |value: &Value| {
+            if value.get("method").is_some() {
+                if let Some(id) = value.get("id").filter(|v| !v.is_null()) {
+                    return Handled::Answer(json!({"id":id,"error":{"code":-32601,"message":"Hook inventory does not execute tools"}}));
+                }
+            }
+            Handled::Ignore
+        };
+        let key = server.request("initialize", json!({"clientInfo": {
+            "name":"ccgui_hook_inventory", "version":env!("CARGO_PKG_VERSION")
+        }, "capabilities":{"experimentalApi":true}})).await.map_err(|_| "query_failed")?;
+        server.pump("hook initialize", Expect::Reply(&key), Some(deadline), &killed, None, &mut reject_request)
+            .await.map_err(|_| "query_failed")?.ok_or("query_failed")?;
+        server.write(&json!({"method":"initialized","params":{}})).await.map_err(|_| "query_failed")?;
+        let key = server.request("hooks/list", json!({"cwds":[workspace]})).await.map_err(|_| "query_failed")?;
+        server.pump("hook inventory", Expect::Reply(&key), Some(deadline), &killed, None, &mut reject_request)
+            .await.map_err(|_| "query_failed")?.ok_or("query_failed")
     }.await;
     teardown(&mut spawned.child).await;
     result
@@ -1722,6 +1775,7 @@ async fn drive(
     if !codex_read_only::requested(req) {
         view.quota_binding = crate::codex_quota::binding(req.provider_id.as_deref(), Some(&req.workspace)).ok();
     }
+    recheck_task_workspace(core, &req.workspace.to_string_lossy())?;
     let mut spawned = spawn_app_server(command, &req.workspace)?;
     view.exit_unconfirmed = true;
     // The answer command writes a parked question's response on this same pipe,
@@ -2327,6 +2381,7 @@ async fn handshake_and_start(
         .map(str::to_string)
         .or_else(|| req.session_id.clone())
         .ok_or_else(|| format!("{method} returned no thread id"))?;
+    view.throughput.seed_from_thread_reply(&thread_id, &result);
     if view.auto_review {
         verify_auto_review_feature(server, core, state, view, &thread_id, killed).await?;
     }
@@ -2411,7 +2466,9 @@ async fn handshake_and_start(
         return Err("Codex launch was stopped before turn/start".into());
     }
     view.turn_throughput = None;
-    view.throughput.begin(&thread_id, req.session_id.is_none());
+    let is_fork = method == "thread/fork";
+    view.throughput
+        .begin(&thread_id, !is_fork && req.session_id.is_none());
     if super::parse_compact_prompt(&req.prompt).is_some() {
         // Compaction inherits the resumed thread; it has no turn-level model override.
         if let Some(model) = thread_model.as_deref() {
@@ -2431,6 +2488,13 @@ async fn handshake_and_start(
     start_requested_turn(server, core, state, view, turn_params, ack_timeout, killed).await
 }
 
+fn recheck_task_workspace(core: &TurnCore, workspace: &str) -> Result<(), String> {
+    if let Some(db) = &core.db {
+        crate::task_workspace_access::recheck_launch(db, &core.run_id, &core.engine_id, workspace)?;
+    }
+    Ok(())
+}
+
 /// Start a manual context compaction turn via `thread/compact/start`.
 /// Unlike `turn/start`, `thread/compact/start` replies `{}` and announces the
 /// non-steerable compact turn's id via `turn/started` (and subsequent turn
@@ -2444,6 +2508,7 @@ async fn start_compact_turn(
     ack_timeout: Duration,
     killed: &AtomicBool,
 ) -> Result<Option<TurnStarted>, String> {
+    recheck_task_workspace(core, &view.workspace)?;
     let mut early = Vec::new();
     let mut early_bytes = 0usize;
     let mut overflow = false;
@@ -2557,6 +2622,7 @@ async fn start_requested_turn(
     let mut early = Vec::new();
     let mut early_bytes = 0usize;
     let mut overflow = false;
+    recheck_task_workspace(core, &view.workspace)?;
     let key = server.request("turn/start", turn_params).await?;
     let result = server
         .pump(
@@ -2905,7 +2971,8 @@ async fn start_decision_turn(
         ..
     } = built;
     let _staging_guard = codex_read_only::StagedHomeGuard(cleanup_files);
-    let mut spawned = match spawn_app_server(&mut command, &req.workspace) {
+    let mut spawned = match recheck_task_workspace(core, &req.workspace.to_string_lossy())
+        .and_then(|()| spawn_app_server(&mut command, &req.workspace)) {
         Ok(spawned) => spawned,
         Err(error) => {
             // Nothing was ever emitted for this run, so there is nothing to

@@ -12,6 +12,7 @@ import { errorText } from "@/lib/errors";
 import { ipc, type AppSettings, type EngineModel } from "@/lib/ipc";
 import { listenSettingsChanged } from "@/lib/events";
 import { useTauriEvent } from "@/hooks/use-tauri-event";
+import { TaskWorkspaceAccess } from "./TaskWorkspaceAccess";
 
 const ENGINES = ["claude", "codex", "agy", "cursor"] as const;
 type LeaderEngine = (typeof ENGINES)[number];
@@ -250,6 +251,7 @@ export function LeaderSection() {
   };
 
   return <div className="flex min-w-0 w-full flex-col gap-6">
+    <TaskWorkspaceAccess />
     <p className="px-3 text-body-2-regular text-text-secondary">{t("settings.leaderDesc")}</p>
     {loading && <p role="status" className="px-3 text-body-2-regular text-text-secondary">{t("common.loading")}</p>}
     {error && <div className="flex flex-wrap items-center gap-2 px-3">

@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it } from "vitest";
 import { buildPrReviewDemoFlow } from "../builtin/pr-review";
 import { countRunUnits, type MissionRun } from "../types";

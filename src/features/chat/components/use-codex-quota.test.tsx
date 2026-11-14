@@ -60,11 +60,48 @@ describe("Codex quota route isolation", () => {
     await act(async () => vi.advanceTimersByTimeAsync(60_000));
     expect(vi.mocked(ipc.codexQuotaRead).mock.calls.filter(([options]) => options?.cacheOnly === false)).toHaveLength(1);
   });
+  it("retries one transient startup query failure after the native cooldown", async () => {
+    let activeReads = 0;
+    let saved: CodexQuotaSnapshot | undefined;
+    vi.mocked(ipc.codexQuotaRead).mockImplementation(async options => {
+      if (options?.cacheOnly) return saved ?? { status: "unavailable", windows: {}, errorCode: "not_loaded" };
+      activeReads += 1;
+      if (activeReads === 1) return { status: "unavailable", windows: {}, errorCode: "query_failed" };
+      saved = { ...quota(37), collectedAt: Date.now() / 1000 };
+      return saved;
+    });
+    await render();
+    expect(activeReads).toBe(1);
+    await act(async () => vi.advanceTimersByTimeAsync(121_000));
+    expect(activeReads).toBe(2);
+    expect(container.textContent).toBe("37 ready");
+    await act(async () => vi.advanceTimersByTimeAsync(180_000));
+    expect(activeReads).toBe(2);
+  });
   it("does not bootstrap authentication failures", async () => {
     vi.mocked(ipc.codexQuotaRead).mockResolvedValueOnce({ status: "unavailable", windows: {}, errorCode: "auth_metadata_unavailable" });
     await render();
     expect(ipc.codexQuotaRead).toHaveBeenCalledOnce();
     expect(vi.mocked(ipc.codexQuotaRead).mock.calls.every(([options]) => options?.cacheOnly)).toBe(true);
+  });
+  it("retries startup after temporarily unavailable authentication metadata", async () => {
+    vi.mocked(ipc.codexQuotaRead)
+      .mockResolvedValueOnce({ status: "unavailable", windows: {}, errorCode: "auth_metadata_unavailable" })
+      .mockResolvedValueOnce({ ...quota(45), status: "stale" })
+      .mockResolvedValueOnce({ ...quota(55), collectedAt: NOW + 60 });
+    await render();
+    await act(async () => vi.advanceTimersByTimeAsync(60_000));
+    expect(vi.mocked(ipc.codexQuotaRead).mock.calls.map(([options]) => options?.cacheOnly)).toEqual([true, true, false]);
+    expect(container.textContent).toBe("55 ready");
+  });
+  it("cancels a scheduled startup retry when the route changes", async () => {
+    vi.mocked(ipc.codexQuotaRead)
+      .mockResolvedValueOnce({ status: "unavailable", windows: {}, errorCode: "not_loaded" })
+      .mockResolvedValueOnce({ status: "unavailable", windows: {}, errorCode: "query_failed" });
+    await render();
+    await render("custom-api");
+    await act(async () => vi.advanceTimersByTimeAsync(180_000));
+    expect(vi.mocked(ipc.codexQuotaRead).mock.calls.filter(([options]) => options?.cacheOnly === false)).toHaveLength(1);
   });
   it("shows the restored sample while refreshing once without opening a popup", async () => {
     const fresh = deferred<CodexQuotaSnapshot>();

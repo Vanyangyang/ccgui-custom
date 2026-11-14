@@ -1,5 +1,143 @@
 # @ccgui/plugin-sdk changelog
 
+## 0.3.56 — 2026-11-07
+
+- `managedChildHandoffSelection` advertises an independent `targetSelection` on `tasks.handoffManagedChild`. It configures the successor engine, model, provider and reasoning effort; omission preserves the original child configuration.
+- The host resolves and displays the target in its confirmation, checks it again before submission, and binds the choice to the durable operation. Changing this selection does not regenerate the summary or change the parent conversation. Older hosts must not silently ignore an explicit choice.
+
+## 0.3.55 — 2026-11-02
+
+- `existingConversationAttachment` advertises `tasks.attachConversation`: register an existing, exact native root conversation without sending a prompt, creating a native chat, or transferring child ownership. An `attached` receipt describes metadata registration, never model completion.
+- Attached conversations reuse native transcript, permission, input-delivery and stop paths. Permanent exact-session reservations remain separate from active write-scope claims, including cold recovery and unloaded plugin owners.
+
+## 0.3.54 — 2026-11-01
+
+- An unknown dedicated-turn delivery may expose `terminalOutcome` after its exact native run is verified to have ended. Delivery remains unknown and the original request must never be replayed.
+
+## 0.3.53 — 2026-11-01
+
+- Memory status advertises `automationVersion: 1` only when the native host provides durable request receipts and shared token/failure controls. Consumers must require this capability before enabling unattended maintenance.
+- Extraction and review accept `reconcileOnly: true` with the exact original request identity and input. This reads a stored outcome and never starts another model request; missing or uncertain outcomes remain explicit.
+- The native host counts input before generation, reserves bounded input/output capacity and records actual provider usage, including thinking. Extraction and review share persistent limits across reloads; uncertain requests retain their reservations.
+- Foreground activity prevents new background dispatch. An already sent bounded call may finish, while explicit cancellation, maintenance, source ownership and permission checks remain enforced. Plugins still own their memory records, work queues and commit version checks.
+
+## 0.3.52 — 2026-10-31
+
+- `ctx.host.memoryReview` provides bounded, tools-free project memory reconciliation through native AGY. It shares extraction's permission, desktop-owner, foreground-priority and cancellation gates; plugins own persistence, queues and final CAS application.
+- Source ownership, original quotes, event order and complete applicable context are checked natively. A batch contains a root and up to six candidates; results bind their exact revisions and preserve original text. Record lifecycle is optional for compatibility and defaults to active.
+- Explicit condition refinement can be assessed without requiring identical condition strings; changed conditions must be cited separately from original user authority. Unknown provenance and withdrawn supporting records cannot establish current conclusions.
+- A response interrupted after network dispatch is `request_outcome_unknown`, distinct from a pre-dispatch delay or explicit rate-limit rejection. Consumers must preserve uncertain work rather than automatically repeating the paid call.
+
+## 0.3.51 — 2026-10-31
+
+- `coordinatorMessageQueue` advertises explicit `sendMessage({ deliveryMode: "queue" })`: the durable input waits for the current coordinator reply to finish instead of automatically steering it. Claude can accept it through its existing live channel while background tasks remain; active children do not block the parent.
+- The policy participates in idempotency and recovery. Explicit `sendMessageNow` can prioritize that same queued receipt; costs, permissions, stop fences and unknown-delivery rules remain enforced. Omitted policy keeps existing automatic delivery.
+- Conversation snapshots expose `nativeReplyIdle` to distinguish an idle reply from a still-running process, while `nativeStatus` and `canSend` retain their existing roles.
+
+## 0.3.50 — 2026-10-30
+
+- AGY can load plugin fixed instructions from its isolated per-run host-plugin rules, including native resume. The host-owned policy ledger and permission boundaries remain authoritative; user turns and saved history are not rewritten.
+- Discussion and task catalogs expose per-engine `supportsFixedInstructions`. AGY requires explicit native support; a newer frontend over an older binary continues to use the full-text compatibility path. Rule changes wait for a complete native turn and uncertain inputs are never replayed automatically.
+
+## 0.3.48 — 2026-10-30
+
+- Handoff progress optionally includes `timing`: elapsed and per-stage wall time, started/ended/active model-call counts, summed ended-call duration, and last/longest call duration. Ended calls include failures; concurrent model durations overlap and must not be interpreted as total waiting time.
+- Final snapshots retain timing for inspection. Progress-only timing updates keep the accepted request and business revision unchanged, reject regressive counters/durations, and remain compatible with older snapshots without timing.
+
+## 0.3.47 — 2026-10-30
+
+- Handoff snapshots optionally expose a fixed acceptance `startedAt` and native `progress` phases (`reading`, `segments`, `merging`, `verifying`) with completed/total counts and merge rounds. These counts describe actual work and are not an overall percentage or completion estimate.
+- Progress is transient and does not change request identity or business revision. Late, regressive, discarded and superseded updates cannot revive an old request. Older native hosts fall back to elapsed waiting without allocating an unsupported Channel.
+
+## 0.3.46 — 2026-10-30
+
+- `ctx.handoff.summarize` accepts an owned coordinator source, identified by its plugin task request and expected revision, when `coordinatorFullHistoryHandoff` is advertised. It reads all saved visible history through the same native compressor as `/handoff`; plugins cannot provide arbitrary session IDs.
+- The host checks source ownership, session identity, idle state, descendants and pending inputs before and after compression. This operation only returns a summary; it neither sends a continuation nor transfers child-task authority. Existing managed-child and explicit-text Handoff remain supported.
+
+## 0.3.45 — 2026-10-30
+
+- Plugin discussion catalogs include available, enabled AGY engines with their native model IDs and configured channels. Controlled discussions use the existing AGY read-only plan mode; choosing a model does not change an existing conversation.
+- Explicit task channel selections also support AGY. AGY encodes reasoning level in its model ID and omits independent `effort`; Claude/Codex retain their required effort. Accepted selections remain pinned through dispatch, persistence and restoration.
+
+## 0.3.44 — 2026-10-29
+
+- Task conversation snapshots optionally expose `nativeStatus` independently of aggregate coordination status. Queued inputs or running descendants must not be presented as the native coordinator thinking after its turn ends; older hosts may omit the field.
+- Same-session continuations capture the native chat's current model, effort, channel and defaults for each delivery preparation. The initial task receipt remains immutable, and late changes (including previously absent choices) still fail the store's final selection fence. Per-input Codex service tier and existing cost/permission gates remain authoritative.
+
+## 0.3.43 — 2026-10-29
+
+- Withdraw the experimental OpenAI Decisions capability introduced in 0.3.42. `host:decisions` is now rejected as an unknown permission; plugins must remove it from their manifests. The host no longer provides the stdio helper, injects Decisions environment variables, or supports key-management CLI modes. Retired CLI flags fail explicitly.
+- Remove the current Decisions integration instructions. All other SDK capabilities remain available; the 0.3.42 entry below is retained as a historical record, not a supported contract.
+
+## 0.3.42 — 2026-10-29
+
+- `host:decisions` permits bounded OpenAI Decisions memory ranking and Handoff coverage checks through a host-owned stdio helper. Granted `plugin_exec_run`/`plugin_exec_spawn` processes receive `CCGUI_DECISIONS_HELPER`, `CCGUI_DECISIONS_PLUGIN_ID` and an opaque signed capability; inherited or caller-supplied values are removed or replaced. Paid requests require proof bound to the plugin, profile, helper and still-live owner process, plus a fresh grant check. The helper only accepts the fixed version 1 operations. No arbitrary endpoint, model, key retrieval, execution or approval is exposed.
+- On Windows, the API key is held in the current user's Credential Manager, scoped to the host profile. The helper uses fixed `gpt-6-luna` and the official Decisions endpoint, preserves configured proxy routing, rejects redirects, bounds requests/responses and does not retry automatically. Results are advisory; failed or unsupported checks must retain the original retrieval/draft workflow.
+
+## 0.3.41 — 2026-10-29
+
+- Managed-child cost approvals optionally expose ordered `imageRefs` for exact pending attachment identity and cost-count evidence. Handoff previews preserve these host-managed references; they are read-only identities, not plugin image IDs or filesystem paths. They cannot be used with plugin image resolution or coordinator input APIs.
+- Native managed-task Handoff sends the history summary, complete held assignment and its durable original images together after human confirmation. Attachment identity changes invalidate the preview and approval; old child nodes remain traceable through handoff links.
+
+## 0.3.40 — 2026-10-28
+
+- Optional `handoff.catalog` projects the same compressor engine/model/channel/effort discovery as `/handoff` into safe labels and IDs. Plugins can keep the picker inside their own window without focusing the desktop owner. Discovery does not start inference or change global preferences; no raw provider configuration is exposed.
+- Existing `chooseModel` remains available for clients using the desktop dialog. Catalog loading and explicit selection still require the desktop owner's `host:chat` capability.
+
+## 0.3.39 — 2026-10-28
+
+- Optional `handoff.chooseModel` reuses the native /handoff model, channel and effort picker without a model call or global-setting change. `handoff.summarize` may freeze an explicit `selection`; retries include it in immutable request identity.
+- `fullHistoryHandoff` and an owned `managedChild` source let the host read every saved visible child-history page. Raw session IDs are not accepted; both `host:chat` and `host:tasks` are required. The native full-history core splits long input, preserves exact code anchors separately, and fails explicitly on incomplete reads or budget overflow. It is not a lossless original-log archive.
+- Generation never mixes compressor choices or intermediate results across operations. Preparation and model selection do not incur inference; generation does. Unknown identities are reconciled without replay, and discarding output does not promise cancellation or stopped billing.
+
+## 0.3.38 — 2026-10-28
+
+- Pending cost approvals optionally expose `requestEstimate`: full pending text size, a documented local token heuristic, current versus conditional historical context, verified exact-model API price references and missing-data reasons. `displayLines` is localized by the host and shared verbatim by cards and confirmation dialogs; it is neither a bill nor a total-cost limit.
+- Cost evidence refreshes at cache/price boundaries and changes invalidate approval. GPT persistent-cache policy remains independent of a measured cache hit. Older hosts may omit the new fields; plugins must show unknown rather than invent fees.
+
+## 0.3.37 — 2026-10-27
+
+- `managedChildCostHandoff` and optional `tasks.handoffManagedChild` transfer an owned pending leader cost review to a native successor after operating-system human confirmation. Exact source stamps, full messages, model and ownership are checked again after confirmation. The original read-only preview API is unchanged.
+- Persist the stable operation ID before calling; `accepted` proves a successor link, `cancelled` leaves the ledger unchanged, and unknown outcomes reject without automatic retries. Optional child `handoffFrom`/`handoffTo` links support reconciliation without exposing native payload fingerprints. `handed_off` ends only the old child, not the successor task.
+- `not_submitted` returns the original operation ID and safe host reason only when this invocation has not crossed the submission boundary. It cannot establish whether that ID was submitted in an earlier call or host process. Invoke once per fresh, durably frozen operation ID; reconcile unknown outcomes through child links instead of retrying them.
+
+## 0.3.36 — 2026-10-27
+
+- Pending task cost approvals may expose context reference/model attribution and a validated historical cache reference. Exact owned target telemetry follows native cost review semantics, preserves held child-task cache evidence, and never estimates the pending request's cost. All new fields are optional for older hosts.
+
+## 0.3.35 — 2026-10-27
+
+- Pending task cost approvals now distinguish `leader` child-task requests from `crossSession` messages and `coordinatorInput` continuations. The original approval identity and native human confirmation remain authoritative; older hosts may omit `kind`.
+
+## 0.3.34 — 2026-10-27
+
+- The `coordinatorInputCostReview` capability protects new turns continuing an owned coordinator with the same native human cost decision used for held cross-session requests. The original queued input and its exact revision remain authoritative.
+- `costHandoffPreview` and `tasks.previewCostHandoff` provide an owned pending decision's exact message, attachment identities and bounded source excerpt for an editable workbench draft. A preview never sends, approves, cancels or transfers a request; callers must check the capability and revalidate the source before any later action.
+
+## 0.3.33 — 2026-10-27
+
+- The `coordinatorServiceTier` capability allows an owned Codex coordinator to request standard or priority service per input. Omitting the choice follows the app setting; a changed tier waits for a new native turn and never changes managed child policy.
+
+## 0.3.32 — 2026-10-27
+
+- An owned continuous coordinator may expose the existing transient host composer prediction via `composerPrediction`; the `dismissPrediction` action clears only its exact generation. The `composerPrediction` capability gates the projection, which observes the existing user setting and never requests an additional prediction.
+
+## 0.3.31 — 2026-10-27
+
+- Detached center tabs may register a notice destination for an owned coordinator. The host verifies the native conversation identity and focuses the correct view; the plugin appends user-selected notice text to its draft without sending.
+- `costReviewDialog` exposes bounded pending cost reviews for an owned coordinator and proven descendants. `requestCostReview` only asks the host to show an operating-system confirmation; the host revalidates the exact request and model after the human decision. Handoff prepares a draft and leaves the original request pending.
+
+## 0.3.30 — 2026-10-27
+
+- `tasks.sendMessageNow` prioritizes one original queued continuation using its receipt `inputRevision`, gated by `catalog().capabilities.immediateMessages`. Supported native engines may yield the current reply or steer; managed descendants are never stopped by this action.
+- Queued/unknown inputs are never cancelled and recreated. `sendNowRequested` only records queued priority intent; actual delivery still requires the native receipt. Pending permissions, changed fixed instructions, ambiguous delivery, stopped/paused ownership and conflicting scope remain fenced. Older hosts retain the ordinary queue and cancellation behavior.
+
+## 0.3.29 — 2026-10-26
+
+- `ctx.handoff` (`host:chat`, desktop owner only) compresses plugin-supplied excerpts through the same native core and host model/provider preferences as `/handoff`. It never opens a chat or accepts a source session ID. Floating views dispatch through their owner.
+- Durable request identities, revision checks and input hashes prevent duplicate inference. `summarize` returns a running snapshot; `onEvent`/`inspect` report results. Restored requests without a live native flight become unknown and are never replayed. Full source text is not persisted.
+- `discard` abandons the result, not the underlying inference or its cost. Late results are ignored; runtime updates remain blocked until native work settles. Plugin reload detaches listeners without stopping accepted work.
+
 ## 0.3.28 — 2026-10-26
 
 - 更新准备可识别 `lifecycle: "plugin"` 服务的所属插件：只有所属插件全部登记关闭钩子、且没有其他阻塞时，才先调用 `prepare` 排空操作并关闭服务；随后仍由原生入口检查进程已退出。正在执行的一次性命令保持阻塞。

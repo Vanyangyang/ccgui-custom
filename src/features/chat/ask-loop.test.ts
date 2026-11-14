@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it } from "vitest";
 import type { Message } from "@/lib/ipc";
 import { ASK_OTHER_OPTION, declaredMulti, parseAskFrame } from "./store/ask-loop";

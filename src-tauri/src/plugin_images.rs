@@ -623,7 +623,7 @@ mod tests {
     #[test]
     fn imports_previews_and_resolves_supported_raster_formats() {
         let (_temp, app_home, root) = setup_fixture();
-        install_test_plugin(&app_home, "example-dashboard", true, false, &["host:chat"]);
+        install_test_plugin(&app_home, "fixture-workbench", true, false, &["host:chat"]);
         install_test_plugin(&app_home, "tasks-only-plugin", true, false, &["host:tasks"]);
 
         for (bytes, mime, name) in [
@@ -636,7 +636,7 @@ mod tests {
             let attachment = import_image_in(
                 &app_home,
                 &root,
-                "example-dashboard",
+                "fixture-workbench",
                 &b64,
                 mime,
                 name,
@@ -647,13 +647,13 @@ mod tests {
             assert_eq!(attachment.name, name.unwrap());
 
             let preview =
-                preview_image_in(&app_home, &root, "example-dashboard", &attachment.id).unwrap();
+                preview_image_in(&app_home, &root, "fixture-workbench", &attachment.id).unwrap();
             assert_eq!(preview.data_url, format!("data:{mime};base64,{b64}"));
 
             let resolved = resolve_images_in(
                 &app_home,
                 &root,
-                "example-dashboard",
+                "fixture-workbench",
                 &[attachment.id.clone()],
             )
             .unwrap();

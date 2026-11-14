@@ -26,7 +26,7 @@ export interface CrossSessionRequest {
   managedParent?: ManagedParentTarget;
 }
 
-export type CrossSessionCommunicationStatus = "preparing" | HostChatReceipt["status"];
+export type CrossSessionCommunicationStatus = "preparing" | "handed_off" | HostChatReceipt["status"];
 
 export interface CrossSessionParticipant {
   engine: string;
@@ -44,6 +44,8 @@ export interface CrossSessionCommunicationRecord {
   sender: CrossSessionParticipant;
   target: CrossSessionParticipant;
   message: string;
+  /** Opaque native task-image identities, never filesystem paths. */
+  imageRefs?: string[];
   status: CrossSessionCommunicationStatus;
   replyText?: string;
   truncated?: boolean;
@@ -91,7 +93,7 @@ export function isCrossSessionRecordUnread(
 ): boolean {
   if (isCrossSessionActiveStatus(record.status)) return false;
   // Successful child work remains available in history without a completion prompt.
-  if (record.kind === "subtask" && record.status === "completed") return false;
+  if (record.kind === "subtask" && (record.status === "completed" || record.status === "handed_off")) return false;
   if (participant && !crossSessionRecordMatchesParticipant(record, participant)) return false;
   return (participant ? [participant] : [record.sender, record.target])
     .some((side) => !record.reviewedBy?.includes(crossSessionParticipantKey(side)));
@@ -106,6 +108,7 @@ function sameReviewContent(
     current.replyText === observed.replyText &&
     current.error === observed.error &&
     current.message === observed.message &&
+    JSON.stringify(current.imageRefs ?? []) === JSON.stringify(observed.imageRefs ?? []) &&
     (current.runId === undefined || observed.runId === undefined || current.runId === observed.runId)
   );
 }

@@ -434,7 +434,7 @@ fn legacy_host_file_reflection_differs_but_runtime_probe_uses_fresh_contract() {
     let descriptors = [("leader", &leader), ("plan-review", &plan)];
     let clean_hash =
         crate::task_worker::compute_schema_contract_hash(&db.0.lock(), &descriptors).unwrap();
-    assert_eq!(clean_hash, crate::task_worker::SCHEMA_CONTRACT_V3_HASH);
+    assert_eq!(clean_hash, crate::task_worker::SCHEMA_CONTRACT_V4_HASH);
     let image = f.root.join("legacy-preview.png");
     std::fs::write(&image, b"\x89PNG\r\n\x1a\nlegacy").unwrap();
     let image = image.canonicalize().unwrap().to_string_lossy().into_owned();

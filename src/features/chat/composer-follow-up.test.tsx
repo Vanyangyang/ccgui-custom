@@ -6,6 +6,8 @@ import { ipc } from "@/lib/ipc";
 import { sessionKey, useChatStore } from "./store";
 import { EMPTY_SESSION, runRouting } from "./store/stream";
 import { useComposerActions } from "./components/use-composer-actions";
+import { useSessionSendCostGuardStore } from "./cross-session-cost";
+import type { SessionMeta } from "@/lib/ipc";
 
 /** The composer's submit while a turn is in flight: a Claude CLI that idles with
  *  background tasks running takes the message at once (as the native CLI does),
@@ -49,9 +51,10 @@ let submit: ((value: string) => void) | null = null;
 let stop: (() => void) | null = null;
 
 function Probe() {
+  const active = useChatStore((s) => s.active);
   const streaming = useChatStore((s) => s.bySession[KEY]?.streaming ?? false);
   const actions = useComposerActions({
-    active: TAB,
+    active,
     sessionKey: KEY,
     streaming,
     images: [],
@@ -104,6 +107,8 @@ function seed(activity: "waiting" | "running" | "requires_action" | null, stream
 }
 
 beforeEach(() => {
+  useSessionSendCostGuardStore.getState().reset();
+  useChatStore.setState({ sessions: [] });
   vi.clearAllMocks();
   localStorage.clear();
   runRouting.clear();
@@ -129,6 +134,19 @@ function seedProbe() {
 }
 
 describe("composer submit while a turn is in flight", () => {
+  it.each([49_999, 50_000])("checks Windows alias metadata at %i measured tokens", async used => {
+    seed(null, false);
+    const tab = { ...TAB, workspacePath: "G:\\project" };
+    const meta = { ...tab, workspacePath: "G:/project", promptCache: {
+      startedAt: Date.now() - 7_200_000, observedAt: Date.now() - 7_200_000, ttlSeconds: 300, source: "anthropic-usage",
+    } } as SessionMeta;
+    useChatStore.setState(s => ({ active: tab, openTabs: [tab], sessions: [meta],
+      bySession: { [KEY]: { ...s.bySession[KEY], usage: { input_tokens: used } } } }));
+    await submitText("Continue");
+    expect(!!useSessionSendCostGuardStore.getState().bySessionKey[KEY]).toBe(used >= 50_000);
+    expect(ipc.sendMessage).toHaveBeenCalledTimes(used >= 50_000 ? 0 : 1);
+    expect(meta.workspacePath).toBe("G:/project");
+  });
   it("hands the message to a Claude CLI that idles with background tasks running", async () => {
     seed("waiting");
     await submitText("then deploy");

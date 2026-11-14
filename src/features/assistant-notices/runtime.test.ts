@@ -117,6 +117,27 @@ describe("Assistant notices native lifecycle", () => {
     env.fire(request("blurred")); await settle(); await vi.advanceTimersByTimeAsync(1020);
     expect(env.invoke).toHaveBeenCalledWith("assistant_notices_focus_ack", expect.objectContaining({ requestId: "blurred", success: false }));
   });
+  it("routes a notice to the matching plugin coordinator and acknowledges its exact window", async () => {
+    const destination = { requestId: "owned-coordinator", deliver: vi.fn(async () => true), present: vi.fn(async () => ({ windowId: "plugin-window-id" })) };
+    const resolveDestination = vi.fn(async () => destination);
+    const env = setup({ resolveDestination }); await settle();
+    env.fire({ ...request(), action: "draft", text: "保留的旁白🙂" });
+    await settle();
+    expect(resolveDestination).toHaveBeenCalledWith(source);
+    expect(destination.deliver).toHaveBeenCalledWith(expect.objectContaining({ source, requestId: "owned-coordinator", noticeId: "notice-1", action: "draft", text: "保留的旁白🙂", signal: expect.any(AbortSignal) }));
+    expect(destination.present).toHaveBeenCalledOnce();
+    expect(env.invoke).toHaveBeenCalledWith("assistant_notices_focus_ack", { documentId: "doc", requestId: "r1", success: true, targetWindowId: "plugin-window-id" });
+    expect(env.state.selectSession).not.toHaveBeenCalled();
+    expect(env.state.setDraft).not.toHaveBeenCalled();
+  });
+  it("does not fall back to another chat when a claimed plugin destination refuses the notice", async () => {
+    const destination = { requestId: "owned-coordinator", deliver: vi.fn(async () => false), present: vi.fn(async () => ({})) };
+    const env = setup({ resolveDestination: vi.fn(async () => destination) }); await settle();
+    env.fire({ ...request(), action: "draft", text: "旁白" }); await settle();
+    expect(env.invoke).toHaveBeenCalledWith("assistant_notices_focus_ack", { documentId: "doc", requestId: "r1", success: false });
+    expect(destination.present).not.toHaveBeenCalled();
+    expect(env.state.selectSession).not.toHaveBeenCalled();
+  });
   it("waits briefly for native focus and React surface visibility before acknowledging", async () => {
     const env = setup(); await settle();
     vi.mocked(document.hasFocus).mockReturnValue(false); env.visible(false);

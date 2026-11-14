@@ -27,6 +27,7 @@ Thumbs.db
 /ccgui-plugin-*/
 
 # Local agent / editor tooling
+.local/
 .claude/
 .agents/
 .omp/

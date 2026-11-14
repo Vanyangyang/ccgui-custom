@@ -926,9 +926,11 @@ pub fn update_cursor_model_selection<R: tauri::Runtime>(
 }
 
 fn remove_retired_connection_settings(settings: &mut AppSettings) {
-    // Flattened extension fields must not keep the retired service switch alive.
+    // Flattened extension fields must not keep retired controls alive.
     settings.bin_overrides.remove("spellcastConnectionEnabled");
     settings.bin_overrides.remove("spellcastConnectionGeneration");
+    settings.bin_overrides.remove("agyAutoCompactOverrideEnabled");
+    settings.bin_overrides.remove("agyAutoCompactOverride");
 }
 
 /// Validate + persist + apply. The public command keeps reporting rejected
@@ -1333,6 +1335,30 @@ mod tests {
             assert_eq!(saved["theme"], "light");
             assert_eq!(saved["futurePreference"], serde_json::json!({"keep": true}));
         }
+    }
+
+    #[test]
+    fn retired_agy_context_overrides_are_dropped_on_read_and_write() {
+        let scratch = Scratch::new();
+        let path = scratch.path("settings.json");
+        let raw = serde_json::json!({
+            "agyAutoCompactOverrideEnabled": true,
+            "agyAutoCompactOverride": "500000",
+            "futurePreference": {"keep": true}
+        });
+        let mut settings: AppSettings = serde_json::from_value(raw).unwrap();
+        remove_retired_connection_settings(&mut settings);
+        let normalized = serde_json::to_value(&settings).unwrap();
+        assert!(normalized.get("agyAutoCompactOverrideEnabled").is_none());
+        assert!(normalized.get("agyAutoCompactOverride").is_none());
+        // Older clients may submit these fields again through generic settings.
+        settings.bin_overrides.insert("agyAutoCompactOverrideEnabled".into(), serde_json::json!(true));
+        settings.bin_overrides.insert("agyAutoCompactOverride".into(), serde_json::json!("80%"));
+        persist_settings_to(&mut settings, &path).unwrap();
+        let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert!(saved.get("agyAutoCompactOverrideEnabled").is_none());
+        assert!(saved.get("agyAutoCompactOverride").is_none());
+        assert_eq!(saved["futurePreference"], serde_json::json!({"keep": true}));
     }
 
     #[test]

@@ -130,7 +130,7 @@ fn broken_workspace_catalogue_is_not_reported_as_missing_permission() {
 }
 
 #[test]
-fn kv_storage_preserves_v3_contract_and_does_not_create_development_tables() {
+fn kv_storage_preserves_v4_contract_and_does_not_create_development_tables() {
     let db = db();
     let scratch = Scratch::new();
     approve(&db, &scratch.image("new.png"), "file").unwrap();
@@ -139,7 +139,7 @@ fn kv_storage_preserves_v3_contract_and_does_not_create_development_tables() {
         [], |r| r.get(0)).unwrap();
     assert_eq!(count, 0);
     let hash = crate::task_worker::schema_hash();
-    assert_eq!(hash, crate::task_worker::SCHEMA_CONTRACT_V3_HASH);
+    assert_eq!(hash, crate::task_worker::SCHEMA_CONTRACT_V4_HASH);
 }
 
 fn legacy_preview(conn: &rusqlite::Connection, path: &str) {

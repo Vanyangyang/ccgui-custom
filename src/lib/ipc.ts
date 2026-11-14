@@ -3,6 +3,7 @@ import { invoke, listen } from "./transport";
 import type { NativePerformanceDiagnostics } from "./performance-types";
 import { withGrantRetry } from "./grant";
 import type { LeaderSnapshot } from "@/features/leader/types";
+import { withHandoffProgress, type HandoffProgressCallback } from "./handoff-progress";
 
 // ==================== Shared types (mirror Rust serde camelCase) ====================
 
@@ -65,6 +66,8 @@ export interface AgyVertexCreditsSnapshot {
   gdpMonthlyRemainingPercent: number | null;
   collectedAt?: number;
   errorCode?: string;
+  /** Why the last background refresh could not update this (still shown) balance. */
+  refreshError?: "login_required" | "scrape_timeout";
 }
 
 /** Non-secret metadata from this user's own local Vertex configuration. */
@@ -92,11 +95,15 @@ export interface ThroughputTotals {
   elapsedMs: number;
   completedTurns: number;
   excludedTurns: number;
+  interruptedTurns?: number;
+  missingTurns?: number;
+  medianTps?: number;
 }
 export interface ThroughputStatsSnapshot {
   global: ThroughputTotals;
   session: ThroughputTotals;
   byEngine: Record<string, ThroughputTotals>;
+  byModel?: Record<string, ThroughputTotals>;
   /** Unix milliseconds: when recording was enabled for this application profile. */
   startedAt?: number;
 }
@@ -227,9 +234,13 @@ export interface CodexApproval {
 }
 
 export interface Message {
+  /** Stable local row identity. A late internal input may use a negative id
+   * between existing rows without renumbering native output or action targets. */
   seq: number;
   role: string; // "user" | "assistant" | "tool" | "thinking"
   text: string;
+  /** Display provenance of a host-attested internal input; never grants authority. */
+  internalSource?: { engine: string; sessionId: string; workspacePath?: string };
   /** Target file of a tool call (read/edit/write/...); renders as a file chip. */
   path?: string | null;
   /** Full tool-call arguments; shown in the expandable tool-call panel. */
@@ -1324,7 +1335,7 @@ export const ipc = {
     invoke<CodexContextWindowSettings>("codex_context_window_write", options),
   agyQuotaRead: (options: { force?: boolean; cacheOnly?: boolean; providerId?: string; workspacePath?: string } = {}) =>
     invoke<AgyQuotaSnapshot>("agy_quota_read", options),
-  agyVertexCreditsRead: (options: { force?: boolean } = {}) =>
+  agyVertexCreditsRead: (options: { force?: boolean; silent?: boolean } = {}) =>
     invoke<AgyVertexCreditsSnapshot>("agy_vertex_credits_read", options),
   agyVertexConfigRead: () =>
     invoke<AgyVertexConfigSnapshot>("agy_vertex_config_read"),
@@ -1448,6 +1459,8 @@ export const ipc = {
     claudeUltracode?: boolean | null;
     /** Session-only native subagent definition; false/omitted keeps the existing strategy. */
     claudeHaikuAssist?: boolean;
+    /** Per-launch Codex tier; omission inherits the global preference. */
+    codexServiceTierOverride?: "default" | "priority";
     permission: string | null;
     providerId: string | null;
     /** 电脑操控: hand the agent the app's screenshot/input driver for this
@@ -1602,16 +1615,34 @@ export const ipc = {
   predictNextPrompt: (turns: PredictionTurn[]) =>
     invoke<string | null>("predict_next_prompt", { turns }),
   taskSnapshot: () => invoke<LeaderSnapshot>("task_snapshot", {}),
+  /** Main-window-only observation; never opens, restores or runs the source. */
+  taskSessionLifecycle: (ref: { engine: string; sessionId: string; workspacePath: string }) =>
+    invoke<{ engine: string; sessionId: string; workspacePath: string; archived: boolean; idle: boolean }>("task_session_lifecycle", ref),
+  handoffFullHistorySupported: () => invoke<boolean>("handoff_full_history_supported", {}),
+  cancelSessionHandoff: (requestId: string) => invoke<boolean>("cancel_session_handoff", { requestId }),
   summarizeSessionHandoff: (args: {
+    requestId?: string | null;
     engine: string;
     sessionId: string;
     title?: string | null;
     transcriptExcerpt?: string | null;
+    /** Read every saved visible history page; never falls back to recent excerpts. */
+    historyScope?: "full";
     childContext?: string | null;
+    sourceWorkspacePath?: string | null;
+    /** Selected managed child branches whose saved histories should be distilled with the source chat. */
+    childBranchIds?: string[] | null;
     /** Legacy Cursor selector; new callers send the complete selection. */
     compressionModel?: string | null;
     compressionSelection?: HandoffCompressionSelection | null;
-  }) => invoke<string>("summarize_session_handoff", args),
+    onProgress?: HandoffProgressCallback;
+  }, onProgressArg?: HandoffProgressCallback) => {
+    const { onProgress: inlineOnProgress, ...invokeArgs } = args;
+    const onProgress = inlineOnProgress ?? onProgressArg;
+    return withHandoffProgress(progress => invoke<string>("summarize_session_handoff", {
+      ...invokeArgs, ...(progress ? { progress } : {}),
+    }), onProgress);
+  },
   inspectAppCache: () => invoke<AppCacheSummary>("inspect_app_cache"),
   pruneAppCache: () => invoke<PruneAppCacheResult>("prune_app_cache"),
   /** Remember the model id this session ran ("provider/model", as the picker

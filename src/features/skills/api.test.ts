@@ -1,3 +1,4 @@
+// @vitest-environment node
 /**
  * IPC 形状回归：desktop 端 `skills_hub_mutate` 的签名是两个参数
  * (`action: String`, `payload: Value`)，而查询是 (`mode`, `params`)。

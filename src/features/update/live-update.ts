@@ -76,6 +76,9 @@ export interface LiveUpdateBlockerDetail {
   state?: LiveUpdateBlockerState;
 }
 export interface LiveUpdateBlocker extends LiveUpdateBlockerDetail { participant?: string; detail?: string }
+export function requiresPluginUpdateRetry(blockers: readonly LiveUpdateBlocker[]): boolean {
+  return blockers.some(({ reason }) => ["plugin-update-close-failed", "plugin-update-close-timeout", "plugin-window-unconfirmed-edits"].includes(reason));
+}
 export type LiveUpdateErrorCode = "invalidInput" | "statusFailed" | "stageFailed" | "switchFailed" | "recoveryFailed" | "previousFailed";
 export interface LiveUpdateState {
   support: "checking" | "supported" | "unsupported" | "web" | "not-custom";
@@ -95,6 +98,7 @@ export interface LiveUpdateState {
   requestUpdate: (sourceRoot?: string) => Promise<void>;
   watch: () => () => void;
   refresh: () => Promise<void>;
+  retrySwitch: () => Promise<void>;
   stagePackage: (source: string, manifestSha256: string) => Promise<void>;
   cancel: () => Promise<void>;
   /** Application teardown/HMR only; closing settings keeps a queued update alive. */
@@ -198,6 +202,10 @@ export function createLiveUpdateStore(deps: LiveUpdateDependencies) {
   // Keep the same id after an uncertain reply so native retries are idempotent.
   let requestId: string | undefined;
   let viewPreparation: AbortController | undefined;
+  // A rejected close is not a changing readiness signal. Retrying it on every
+  // status read can repeatedly disturb a window that still has unsaved edits.
+  let preparationFailure: { transactionId: string; blocker: LiveUpdateBlocker } | undefined;
+  let pendingPluginBlockers: { transactionId: string; reasons: string[] } | undefined;
 
   const store = create<LiveUpdateState>(() => ({
     support: !deps.custom ? "not-custom" : deps.web ? "web" : "checking",
@@ -248,10 +256,18 @@ export function createLiveUpdateStore(deps: LiveUpdateDependencies) {
       if (disposed || operation) return;
       // A failed cleanup needs an explicit cancel retry, not another activation.
       if (store.getState().errorCode !== "recoveryFailed") {
+        pendingPluginBlockers = undefined;
         autoApply = true;
         failedTransactionId = undefined;
         store.setState({ error: undefined, errorCode: undefined, recoveryError: undefined, cancelled: false });
       }
+      await poll();
+    },
+    async retrySwitch() {
+      if (disposed || operation || !preparationFailure || store.getState().errorCode === "recoveryFailed") return;
+      preparationFailure = undefined;
+      pendingPluginBlockers = undefined;
+      autoApply = true;
       await poll();
     },
     async stagePackage(source, manifestSha256) {
@@ -268,6 +284,8 @@ export function createLiveUpdateStore(deps: LiveUpdateDependencies) {
       activationSent = false;
       autoApply = true;
       failedTransactionId = undefined;
+      preparationFailure = undefined;
+      pendingPluginBlockers = undefined;
       store.setState({ stage: "importing", checking: false, canCancel: true, cancelled: false, blockers: [], error: undefined, errorCode: undefined, recoveryError: undefined });
       operation = (async () => {
         try {
@@ -352,6 +370,15 @@ export function createLiveUpdateStore(deps: LiveUpdateDependencies) {
     activationSent = false;
     cancelRequested = false;
     if (waitBlockers && recoveryErrors.length === 0) {
+      if (cause instanceof PluginViewPreparationError) {
+        preparationFailure = { transactionId: transaction.id, blocker: waitBlockers[0] };
+      } else {
+        const reasons = waitBlockers.map(blocker => blocker.reason).filter(reason =>
+          ["plugin-processes", "plugin-window-without-checkpoint", "plugin-view-without-checkpoint"].includes(reason));
+        // Preparation has already run once. Restoring and preparing the same
+        // blocked views again cannot establish that the blocker has cleared.
+        if (reasons.length) pendingPluginBlockers = { transactionId: transaction.id, reasons };
+      }
       store.setState({ stage: "waiting", transaction, blockers: waitBlockers, canCancel: true,
         errorCode: undefined, error: undefined, recoveryError: undefined });
       return;
@@ -365,6 +392,8 @@ export function createLiveUpdateStore(deps: LiveUpdateDependencies) {
       store.setState({ stage: "error", transaction: { ...transaction, phase: "Failed" }, canCancel: false,
         errorCode: "switchFailed", error: message(cause), recoveryError: undefined });
     } else {
+      preparationFailure = undefined;
+      pendingPluginBlockers = undefined;
       store.setState({ stage: "idle", transaction: null, blockers: [], canCancel: false, cancelled: true,
         errorCode: undefined, error: undefined, recoveryError: undefined });
     }
@@ -389,6 +418,9 @@ export function createLiveUpdateStore(deps: LiveUpdateDependencies) {
       });
     } catch (error) {
       if (cancelRequested || disposed) throw error;
+      if (!timedOut && error && typeof error === "object" && "code" in error && error.code === "DETACHED_RETURN_BLOCKED") {
+        throw new PluginViewPreparationError("plugin-window-unconfirmed-edits");
+      }
       throw new PluginViewPreparationError(timedOut ? "plugin-update-close-timeout" : "plugin-update-close-failed", timedOut ? undefined : message(error));
     } finally {
       clearTimeout(timeout);
@@ -457,15 +489,23 @@ export function createLiveUpdateStore(deps: LiveUpdateDependencies) {
           throw new Error("Invalid live update status");
         }
         const transaction = status.state.transaction;
+        if (preparationFailure && (transaction?.id !== preparationFailure.transactionId || !eligible(transaction))) {
+          preparationFailure = undefined;
+        }
         if (requestId && (status.channel?.updateRequest?.requestId === requestId || status.channel?.batch?.requestId === requestId)) {
           requestId = undefined;
           store.setState({ requestError: undefined });
         }
         nativeReasons = nativeBlockers(status.blockers, status.blockerDetails);
         const blockers: LiveUpdateBlocker[] = [
+          ...(preparationFailure ? [preparationFailure.blocker] : []),
           ...nativeReasons,
           ...deps.readiness().map(({ participant, reason }) => ({ participant, reason })),
         ];
+        if (pendingPluginBlockers && (transaction?.id !== pendingPluginBlockers.transactionId || !eligible(transaction) ||
+          !blockers.some(blocker => pendingPluginBlockers!.reasons.includes(blocker.reason)))) {
+          pendingPluginBlockers = undefined;
+        }
         if (store.getState().errorCode === "statusFailed") {
           store.setState({ errorCode: undefined, error: undefined });
           if (failedTransactionId === undefined) autoApply = true;
@@ -481,7 +521,7 @@ export function createLiveUpdateStore(deps: LiveUpdateDependencies) {
           store.setState({ stage: "handoff", canCancel: false });
         } else if (eligible(transaction)) {
           if (store.getState().errorCode === undefined) store.setState({ stage: "waiting", canCancel: true });
-          if (autoApply && store.getState().errorCode === undefined && (blockers.length === 0 ||
+          if (!preparationFailure && !pendingPluginBlockers && autoApply && store.getState().errorCode === undefined && (blockers.length === 0 ||
             (!!deps.preparePluginViews && deps.canClosePluginViews?.(blockers) === true))) ready = transaction;
         } else if (transaction?.phase === "Failed" || transaction?.phase === "RolledBack") {
           autoApply = false;

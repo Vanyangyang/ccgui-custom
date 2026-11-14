@@ -3,6 +3,7 @@ import { useVirtualizer, type Virtualizer } from "@tanstack/react-virtual";
 import { useTranslation } from "react-i18next";
 import Copy from "lucide-react/dist/esm/icons/copy";
 import Check from "lucide-react/dist/esm/icons/check";
+import MessagesSquare from "lucide-react/dist/esm/icons/messages-square";
 import type { Message } from "@/lib/ipc";
 
 import type { SessionState } from "../store";
@@ -25,7 +26,7 @@ import { createAnchorRowsBuilder } from "./timeline-anchors";
 import { buildRows, collectToolKeys, rowKey, type TimelineRow } from "./timeline-rows";
 import { TurnSummaryBar } from "./TurnSummaryBar";
 import { modelDisplayName } from "@/features/settings/usage-model";
-import { encodedModelEffort } from "@/components/application/ai-chat/model-effort";
+import { supportsIndependentModelEffort } from "@/components/application/ai-chat/model-effort";
 import { ProcessDisclosure, type ProcessSearchTarget } from "./ProcessDisclosure";
 import { CollapsibleMessage } from "./CollapsibleMessage";
 import { useScrollFollow, useTailPin } from "./use-scroll-follow";
@@ -35,6 +36,7 @@ import { PluginBoundary } from "@/features/plugins/boundary/PluginBoundary";
 import { useAnchorRailScroll } from "./use-anchor-rail-scroll";
 import { useLoadEarlier } from "./use-load-earlier";
 import { stripAgentBlock } from "./agent-block";
+import { internalMessageTitle, parseInternalMessage, type InternalMessageSource } from "./internal-message";
 import { supportsInteractiveAnswer } from "@/features/interactive-answer/prompt";
 import { registerShortcutHandler } from "@/features/shortcuts/runtime";
 import { TimelineSearchBar } from "./TimelineSearchBar";
@@ -171,7 +173,7 @@ function MessageMeta({ message, engine }: { message: Message; engine?: string })
   const { t } = useTranslation();
   const effortText = useMemo(() => {
     if (!message.effort) return null;
-    if (message.model && encodedModelEffort(engine ?? "agy", message.model)) return null;
+    if (message.model && !supportsIndependentModelEffort(engine ?? "agy", message.model)) return null;
     const key = `chat.effort${message.effort.charAt(0).toUpperCase() + message.effort.slice(1).toLowerCase()}`;
     const translated = t(key);
     const effortVal = translated && translated !== key ? translated : message.effort;
@@ -254,6 +256,10 @@ function UserMessageCopy({ text }: { text: string }) {
 function UserMessageRow({ message, workspacePath }: { message: Message; workspacePath: string }) {
   const { t } = useTranslation();
   const stripped = useMemo(() => stripAgentBlock(message.text), [message.text]);
+  const internal = useMemo(() => message.internalSource ? { source: message.internalSource, text: stripped.text }
+    : parseInternalMessage(stripped.text), [message.internalSource, stripped.text]);
+  if (internal) return <InternalMessageRow source={internal.source} text={internal.text} message={message} workspacePath={workspacePath}
+    agentName={stripped.agentName} agentIcon={stripped.agentIcon} />;
   return (
     <div className="group -mr-1.5 ml-auto flex w-full min-w-0 flex-col items-end">
       {stripped.agentName && (
@@ -274,6 +280,39 @@ function UserMessageRow({ message, workspacePath }: { message: Message; workspac
         </CollapsibleMessage>
       </div>
       <UserMessageCopy text={stripped.text} />
+    </div>
+  );
+}
+
+function InternalMessageRow({ source, text, message, workspacePath, agentName, agentIcon }: {
+  source: InternalMessageSource;
+  text: string;
+  message: Message;
+  workspacePath: string;
+  agentName?: string;
+  agentIcon?: string;
+}) {
+  const { t } = useTranslation();
+  const sessions = useChatStore(state => state.sessions);
+  const title = useMemo(() => internalMessageTitle(source, sessions), [source, sessions]);
+  const label = t("chat.internalMessageFrom", { title });
+  return (
+    <div data-internal-message className="group flex w-full min-w-0 flex-col items-start">
+      <span title={`${label}\n${source.engine} · ${source.sessionId}${source.workspacePath ? `\n${source.workspacePath}` : ""}`} className="mb-1 flex max-w-full min-w-0 items-center gap-1.5 text-caption-1-medium text-text-secondary">
+        <MessagesSquare className="size-3.5 shrink-0" aria-hidden />
+        <span className="truncate">{label}</span>
+      </span>
+      {agentName && <span aria-label={t("chat.agentBadge", { name: agentName })} className="mb-1 flex items-center gap-1 text-caption-1-regular text-text-tertiary">
+        {agentIcon && <span aria-hidden>{agentIcon}</span>}
+        {agentName}
+      </span>}
+      <div className="flex w-fit min-w-0 max-w-full flex-col rounded-xl border border-border-secondary bg-background-secondary-default px-3.5 py-2.5 text-left text-body-regular whitespace-pre-wrap [overflow-wrap:anywhere] text-text-primary">
+        <CollapsibleMessage tone="neutral">
+          {message.images && message.images.length > 0 && <MessageImages images={message.images} workspacePath={workspacePath} />}
+          {text}
+        </CollapsibleMessage>
+      </div>
+      <UserMessageCopy text={text} />
     </div>
   );
 }
@@ -593,10 +632,10 @@ export const MessageTimeline = memo(function MessageTimeline({
 
   const activeEffort = useMemo(() => {
     if (handoff) return handoff.effort;
-    if (activeModel && encodedModelEffort(engine ?? "agy", activeModel)) return null;
+    if (activeModel && !supportsIndependentModelEffort(engine ?? "agy", activeModel)) return null;
     if (session.activeEffort) return session.activeEffort;
     for (let i = items.length - 1; i >= 0; i--) {
-      if (items[i].model && encodedModelEffort(engine ?? "agy", items[i].model!)) return null;
+      if (items[i].model && !supportsIndependentModelEffort(engine ?? "agy", items[i].model!)) return null;
       if (items[i].effort) return items[i].effort;
     }
     return null;

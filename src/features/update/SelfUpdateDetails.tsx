@@ -1,6 +1,6 @@
 import { useTranslation } from "react-i18next";
-import { deriveSelfUpdateProgress, deriveSelfUpdateResult, formatLiveUpdateBlocker } from "./SelfUpdateStatusChip";
-import type { LiveUpdateChannelChange, LiveUpdateState } from "./live-update";
+import { deriveSelfUpdateProgress, deriveSelfUpdateResult, formatLiveUpdateBlocker, formatSelfUpdateError } from "./SelfUpdateStatusChip";
+import { requiresPluginUpdateRetry, type LiveUpdateChannelChange, type LiveUpdateState } from "./live-update";
 
 function Changes({ title, changes }: { title: string; changes: LiveUpdateChannelChange[] }) {
   return <section className="min-w-0 space-y-2">
@@ -42,7 +42,7 @@ export function SelfUpdateDetails({ state }: { state: LiveUpdateState }) {
       {result?.kind === "unverified" && <p className="text-body-2-regular text-notification-warning">{t("settings.liveUpdateUnverifiedHint")}</p>}
     </div>
     {progress?.kind === "waiting-switch" && state.blockers.length > 0 && <section className="space-y-2" data-testid="self-update-blockers">
-      <h4 className="text-body-2-medium text-text-primary">{t("settings.liveUpdateWaitingReasons")}</h4>
+      <h4 className="text-body-2-medium text-text-primary">{t(requiresPluginUpdateRetry(state.blockers) ? "settings.liveUpdateRetryReasons" : "settings.liveUpdateWaitingReasons")}</h4>
       <ul className="list-disc space-y-1 break-words pl-5 text-body-2-regular text-text-secondary">
         {state.blockers.map((blocker, index) => <li key={`${blocker.reason}:${blocker.runId ?? blocker.participant ?? "native"}:${index}`}>{formatLiveUpdateBlocker(t, blocker)}</li>)}
       </ul>
@@ -50,7 +50,7 @@ export function SelfUpdateDetails({ state }: { state: LiveUpdateState }) {
     {batch && <div className="space-y-2" data-testid="self-update-batch">
       <Changes title={t(result ? "settings.liveUpdateLatestChanges" : "settings.liveUpdateBatchChanges", { count: batch.changes.length })} changes={batch.changes} />
       {batch.changes.length === 0 && <p className="text-body-2-regular text-text-tertiary">{t("settings.liveUpdateNoChangeDetails")}</p>}
-      {error && <p role="alert" className="break-words text-body-2-regular text-text-error-primary">{error}</p>}
+      {error && <p role="alert" className="break-words text-body-2-regular text-text-error-primary">{formatSelfUpdateError(t, error)}</p>}
     </div>}
     {request && request.waitingFor.length > 0 && <p className="break-words text-body-2-regular text-text-secondary">
       {t("settings.liveUpdateWaitingTasks", { tasks: request.waitingFor.join(", ") })}

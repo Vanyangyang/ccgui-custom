@@ -1,11 +1,25 @@
 import type { ModelOption } from "./cli-menu";
 import type { EffortLevel } from "./effort-levels";
 
+export const AGY_ENCODED_EFFORT_LEVELS: readonly EffortLevel[] = ["low", "medium", "high", "xhigh"];
+const AGY_EFFORT_SUFFIX = new RegExp(`-(${AGY_ENCODED_EFFORT_LEVELS.join("|")})$`, "i");
+
 /** AGY encodes these levels in model IDs and suppresses the separate --effort
  * argument (engine/agy.rs::model_encodes_effort). Other engines keep their IDs. */
 export function encodedModelEffort(engine: string, modelId: string): EffortLevel | undefined {
   if (engine !== "agy") return undefined;
-  return /-(low|medium|high)$/i.exec(modelId)?.[1].toLowerCase() as EffortLevel | undefined;
+  return AGY_EFFORT_SUFFIX.exec(modelId)?.[1].toLowerCase() as EffortLevel | undefined;
+}
+
+/** Native AGY models with no user-selectable effort tier. */
+export function modelHasNoEffort(engine: string, modelId: string): boolean {
+  if (engine !== "agy") return false;
+  const normalized = modelId.trim().toLowerCase();
+  return normalized === "gemini-pro-orchestrator" || normalized === "gemini-pro-orchestrator-argon";
+}
+
+export function supportsIndependentModelEffort(engine: string, modelId: string): boolean {
+  return !modelHasNoEffort(engine, modelId) && !encodedModelEffort(engine, modelId);
 }
 
 export function modelBaseLabel(engine: string, model: ModelOption): string {
@@ -27,7 +41,6 @@ export interface ModelChoiceRow {
 export function modelChoiceRows(engine: string, models: ModelOption[]): ModelChoiceRow[] {
   const rows: ModelChoiceRow[] = [];
   const grouped = new Map<string, ModelChoiceRow>();
-  const order = ["low", "medium", "high"];
   for (const model of models) {
     const effort = encodedModelEffort(engine, model.id);
     if (!effort) {
@@ -35,7 +48,7 @@ export function modelChoiceRows(engine: string, models: ModelOption[]): ModelCho
       continue;
     }
     const label = modelBaseLabel(engine, model);
-    const key = JSON.stringify([model.provider, model.id.replace(/-(low|medium|high)$/i, ""), label]);
+    const key = JSON.stringify([model.provider, model.id.replace(AGY_EFFORT_SUFFIX, ""), label]);
     let row = grouped.get(key);
     if (!row) {
       row = { key, model: { ...model, label }, variants: [] };
@@ -44,6 +57,6 @@ export function modelChoiceRows(engine: string, models: ModelOption[]): ModelCho
     }
     row.variants!.push({ model, effort });
   }
-  for (const row of rows) row.variants?.sort((a, b) => order.indexOf(a.effort) - order.indexOf(b.effort));
+  for (const row of rows) row.variants?.sort((a, b) => AGY_ENCODED_EFFORT_LEVELS.indexOf(a.effort) - AGY_ENCODED_EFFORT_LEVELS.indexOf(b.effort));
   return rows;
 }

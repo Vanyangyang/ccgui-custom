@@ -16,6 +16,8 @@ import { createPreferenceActions } from "./store/preferences";
 import { createComposerActions } from "./store/composer";
 import type { ChatStore } from "./store/types";
 import { hasRestoredChatCheckpoint, registerChatCheckpoint, unreadableUsageKeys } from "./store/runtime-checkpoint";
+import { createSessionMemoryCache, type SessionMemoryCache } from "./store/session-memory-cache";
+import { isRuntimeSubmissionPaused } from "@/lib/runtime-checkpoint";
 
 // Facade re-exports: callers keep importing everything from "../store".
 export { parseDraftSessionKey, sessionKey } from "./store/persistence";
@@ -33,6 +35,7 @@ export { sortedWorkspaceGroups } from "./store/session-utils";
 /** Unlisteners for the module-scope event subscriptions set up in init. */
 const eventTeardowns: Array<() => void> = [];
 let resumeCheckpointQueues: () => void = () => {};
+let sessionMemoryCache: SessionMemoryCache;
 
 /** Load a page of session history, routing remote (plugin-fed, e.g. WSL
  *  distro CLI) transcripts through the host's remote fetch instead of the
@@ -72,6 +75,7 @@ function loadHistoryPage(
 }
 
 export const useChatStore = create<ChatStore>((set, get) => {
+  sessionMemoryCache = createSessionMemoryCache({ set, get, loadHistoryPage, paused: isRuntimeSubmissionPaused });
   const {
     activateTab,
     stampActiveTab,
@@ -79,7 +83,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
     forgetClosedTab,
     forgetClosedTabs,
     ...tabActions
-  } = createTabActions({ set, get });
+  } = createTabActions({ set, get, memoryCache: sessionMemoryCache });
   const { drainQueue, drainQueueLive, markUnseenIfBackground, ...messagingActions } =
     createMessagingActions({
       set,
@@ -117,6 +121,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
   });
   const composerActions = createComposerActions({ set });
   resumeCheckpointQueues = () => {
+    sessionMemoryCache.schedule();
     for (const [key, session] of Object.entries(get().bySession)) {
       if (session.interrupted || session.queueParked || session.messages.some((row) =>
         row.question?.status === "pending" || row.grant?.status === "pending" ||
@@ -127,6 +132,11 @@ export const useChatStore = create<ChatStore>((set, get) => {
     // The restored usage came from the previous runtime; re-read the ones the
     // gauge cannot show so this runtime's history parser gets a say.
     if (hasRestoredChatCheckpoint(get)) {
+      for (const tab of get().openTabs) {
+        if (tab.sessionId && get().bySession[sessionKey(tab.engine, tab.sessionId, tab.workspacePath)]?.historyReloadRequired) {
+          void get().selectSession(tab.engine, tab.sessionId, tab.workspacePath, { background: true }).catch(() => {});
+        }
+      }
       for (const key of unreadableUsageKeys(get())) {
         void get().refreshSessionUsage(key).catch(() => {});
       }
@@ -174,6 +184,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
 
 // Registration restores synchronously before any importer can render or send.
 eventTeardowns.push(registerChatCheckpoint(useChatStore, useChatStore.getState, () => resumeCheckpointQueues()));
+eventTeardowns.push(sessionMemoryCache!.connect(listener => useChatStore.subscribe(listener)));
 
 // Dev-only handle for poking the store from the webview console; stripped
 // from production builds by the env guard.

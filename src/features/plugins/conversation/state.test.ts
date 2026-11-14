@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ConversationModeState } from "./state";
 
 describe("conversation mode state", () => {
@@ -56,5 +56,46 @@ describe("conversation mode state", () => {
     expect(state.selected("first")).toBe("relay");
     state.removeMode("relay");
     expect(state.selected("first")).toBeUndefined();
+  });
+  it("notifies only occupation transitions and releases disposed subscribers", () => {
+    const state = new ConversationModeState(), changed = vi.fn();
+    const identity = state.identity("new:agy:/a", "/a", true);
+    const off = state.subscribeOccupation(changed);
+    state.select(identity, "first", true, 0);
+    expect(changed).not.toHaveBeenCalled();
+    state.select(identity, "first", false, 0);
+    expect(changed).toHaveBeenCalledTimes(1);
+    state.select(identity, "second", false, 0);
+    state.setExitBlocked(identity, "second", true);
+    state.exit(identity);
+    state.removeMode("second");
+    state.retain([]);
+    expect(changed).toHaveBeenCalledTimes(1);
+    state.setExitBlocked(identity, "second", false);
+    expect(changed).toHaveBeenCalledTimes(2);
+    state.select(identity, "second", false, 0);
+    expect(changed).toHaveBeenCalledTimes(3);
+    state.exit(identity);
+    expect(changed).toHaveBeenCalledTimes(4);
+    off();
+    state.select(identity, "first", false, 0);
+    state.retain([]);
+    expect(changed).toHaveBeenCalledTimes(4);
+  });
+
+  it("compares tab occupation across pruning and atomic checkpoint restoration", () => {
+    const state = new ConversationModeState(), changed = vi.fn();
+    const identity = state.identity("new:agy:/a", "/a", true);
+    state.select(identity, "first", false, 0);
+    const snapshot = state.captureCheckpoint(), off = state.subscribeOccupation(changed);
+    state.restoreCheckpoint({ ...snapshot, selections: { [identity]: "second" } });
+    expect(changed).not.toHaveBeenCalled();
+    expect(() => state.restoreCheckpoint({ ...snapshot, blocked: { [identity]: 123 } })).toThrow(/checkpoint/);
+    expect(changed).not.toHaveBeenCalled();
+    state.retain([]);
+    expect(changed).toHaveBeenCalledTimes(1);
+    state.restoreCheckpoint(snapshot);
+    expect(changed).toHaveBeenCalledTimes(2);
+    off();
   });
 });

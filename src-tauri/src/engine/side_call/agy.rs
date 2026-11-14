@@ -27,13 +27,33 @@ struct Context {
     settings: NativeSettings,
 }
 
+const VERSION_CACHE_LIMIT: usize = 8;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BinFingerprint {
+    path: String,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+fn bin_fingerprint(bin: &str) -> Option<BinFingerprint> {
+    let path = crate::engine::resolve::resolve_launchable_cli_binary(bin);
+    let metadata = std::fs::metadata(&path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    Some(BinFingerprint {
+        path,
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
+}
+
 pub(crate) fn configuration_fingerprint() -> Option<[u8;32]> {
     let context = context(None).ok()?;
-    let bin = crate::engine::resolve::resolve_launchable_cli_binary(&context.bin);
-    let metadata = std::fs::metadata(&bin).ok()?;
-    if !metadata.is_file() { return None; }
+    let fp = bin_fingerprint(&context.bin)?;
     let environment = context.env.iter().collect::<std::collections::BTreeMap<_,_>>();
-    let bytes = serde_json::to_vec(&(&bin,metadata.len(),metadata.modified().ok(),context.settings,environment)).ok()?;
+    let bytes = serde_json::to_vec(&(&fp.path,fp.len,fp.modified,context.settings,environment)).ok()?;
     Some(Sha256::digest(bytes).into())
 }
 
@@ -63,6 +83,18 @@ fn remove_staging(path: &Path) -> bool {
     staging::remove_payload_then_markers(path)
 }
 
+fn read_native_settings(file: &Path) -> Result<NativeSettings, SideCallError> {
+    let fail = || SideCallError::Unavailable;
+    match std::fs::metadata(file) {
+        Ok(metadata) if metadata.len() <= 256 * 1024 => {
+            let bytes = std::fs::read(file).map_err(|_| fail())?;
+            serde_json::from_slice(bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes)).map_err(|_| fail())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(NativeSettings::default()),
+        _ => Err(fail()),
+    }
+}
+
 fn context(provider_id: Option<&str>) -> Result<Context, SideCallError> {
     let fail = || SideCallError::Unavailable;
     let config = crate::config::read_config().map_err(|_| fail())?;
@@ -72,13 +104,7 @@ fn context(provider_id: Option<&str>) -> Result<Context, SideCallError> {
     let native = matches!(selected, "" | crate::config::LOCAL_PROVIDER_ID | crate::config::LEGACY_LOCAL_CONFIG_TOML_ID);
     let (settings, env) = if native {
         let file = crate::engine::agy::agy_home().join("settings.json");
-        let settings = match std::fs::metadata(&file) {
-            Ok(metadata) if metadata.len() <= 256 * 1024 => {
-                serde_json::from_slice::<NativeSettings>(&std::fs::read(file).map_err(|_| fail())?).map_err(|_| fail())?
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => NativeSettings::default(),
-            _ => return Err(fail()),
-        };
+        let settings = read_native_settings(&file)?;
         if settings.model_provider.as_deref().is_some_and(|provider| !matches!(provider, "gemini" | "antigravity")) {
             return Err(fail());
         }
@@ -205,13 +231,61 @@ pub(crate) async fn structured(call: StructuredCall<'_>) -> Result<SideCallOutpu
     execute_in(context, call, &root).await
 }
 
+fn remember_verified_version(cache: &mut Vec<BinFingerprint>, fp: BinFingerprint) {
+    cache.retain(|entry| entry != &fp);
+    cache.push(fp);
+    if cache.len() > VERSION_CACHE_LIMIT {
+        cache.remove(0);
+    }
+}
+
+async fn ensure_supported_version(
+    context: &Context,
+    home: &Path,
+    cwd: &Path,
+    timeout: Duration,
+) -> Result<(), SideCallError> {
+    static VERIFIED: std::sync::OnceLock<std::sync::Mutex<Vec<BinFingerprint>>> =
+        std::sync::OnceLock::new();
+    let before = bin_fingerprint(&context.bin);
+    if let Some(fp) = &before {
+        let cache = VERIFIED
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if cache.contains(fp) {
+            return Ok(());
+        }
+    }
+    let mut version = command(context, home);
+    version.arg("--version");
+    super::run_with_parser_in_home(
+        "agy",
+        version,
+        cwd,
+        "",
+        Duration::from_secs(5).min(timeout),
+        version_result,
+        Some(home),
+    )
+    .await?;
+    if let (Some(before), Some(after)) = (before, bin_fingerprint(&context.bin)) {
+        if before == after {
+            let mut cache = VERIFIED
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            remember_verified_version(&mut cache, after);
+        }
+    }
+    Ok(())
+}
+
 async fn execute_in(context: Context, call: StructuredCall<'_>, root: &Path) -> Result<SideCallOutput, SideCallError> {
     let deadline = Instant::now() + call.timeout;
     let _cleanup = staging::create(root)?;
     let (home, cwd) = stage(&root, &call, &context.settings)?;
-    let mut version = command(&context, &home);
-    version.arg("--version");
-    super::run_with_parser_in_home("agy", version, &cwd, "", Duration::from_secs(5).min(call.timeout), version_result, Some(&home)).await?;
+    ensure_supported_version(&context, &home, &cwd, call.timeout).await?;
     let input = format!("{}\n", json!({"event":"user","message":{"content":call.input}}));
     let remaining = deadline.checked_duration_since(Instant::now()).ok_or(SideCallError::Timeout)?;
     super::run_with_parser_in_home("agy", request_command(&context, &home, &call), &cwd, &input, remaining, parse_result, Some(&home)).await

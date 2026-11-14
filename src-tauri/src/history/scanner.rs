@@ -1,7 +1,8 @@
 use super::discovery::{
-    codex_candidates, discover_agy, discover_claude, discover_grok, discover_kimi,
-    discover_cursor, discover_opencode, discover_qoder, dsh_candidates, identify_head, is_codex_subagent_file,
-    is_cursor_bugbot_file, is_dsh_subagent_file, path_is_under, pi_family_candidates,
+    codex_candidates, discover_agy_workspaces, discover_claude, discover_cursor, discover_grok,
+    discover_kimi, discover_opencode, discover_qoder, dsh_candidates, identify_head,
+    is_codex_subagent_file, is_cursor_bugbot_file, is_dsh_subagent_file, path_is_under,
+    pi_family_candidates,
 };
 use super::{same_or_child, scan_summary_file, stat_signature, ScanSummary};
 use serde::Serialize;
@@ -14,7 +15,7 @@ use std::sync::Arc;
 pub(super) static SCAN_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 /// Bump when title derivation changes so unchanged files still re-title.
-const TITLE_VERSION: &str = "14";
+const TITLE_VERSION: &str = "15";
 
 /// Titles matching these prefixes were derived before envelope stripping
 /// existed; one migration pass re-derives them even when files are unchanged.
@@ -87,7 +88,10 @@ pub(super) fn scan_with_guard(
 // ---------- phase helpers (each stage is lock-free except where noted) ----------
 
 /// Enumerate every candidate session file (readdir/index only, no content).
-fn gather_candidates(workspaces: &[String]) -> Vec<Candidate> {
+fn gather_candidates(
+    workspaces: &[String],
+    agy_pinned: &std::collections::HashMap<String, String>,
+) -> Vec<Candidate> {
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut seen_paths: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     for workspace_path in workspaces {
@@ -97,7 +101,6 @@ fn gather_candidates(workspaces: &[String]) -> Vec<Candidate> {
             .into_iter()
             .chain(discover_kimi(&workspace))
             .chain(discover_grok(&workspace))
-            .chain(discover_agy(&workspace))
             .chain(discover_cursor(&workspace))
             .chain(discover_qoder(
                 &workspace,
@@ -117,6 +120,19 @@ fn gather_candidates(workspaces: &[String]) -> Vec<Candidate> {
                     known_workspace: Some(file.workspace_path),
                 });
             }
+        }
+    }
+    // AGY resolves across all registered workspaces at once so `--add-dir`
+    // (`granted_roots`) entries in `conversation_summaries.workspace_uris`
+    // cannot let an unrelated workspace steal a session.
+    for file in discover_agy_workspaces(workspaces, agy_pinned) {
+        if seen_paths.insert(file.file_path.clone()) {
+            candidates.push(Candidate {
+                engine: file.engine,
+                path: file.file_path,
+                known_id: Some(file.session_id),
+                known_workspace: Some(file.workspace_path),
+            });
         }
     }
     // Head-keyed engines: enumerate once, attribute by content on change.
@@ -167,7 +183,13 @@ pub(crate) fn index_side_session(
     } else {
         let files = match engine {
             "claude" => discover_claude(workspace),
-            "agy" => discover_agy(workspace),
+            "agy" => {
+                let pinned = std::collections::HashMap::from([(
+                    session_id.to_string(),
+                    workspace_path.to_string(),
+                )]);
+                discover_agy_workspaces(&[workspace_path.to_string()], &pinned)
+            }
             "cursor" => discover_cursor(workspace),
             _ => return Err("Unsupported Sidechat engine".into()),
         };
@@ -182,6 +204,9 @@ pub(crate) fn index_side_session(
     if summary.message_count == 0 {
         return Err(format!("Sidechat history has no readable messages: {engine}/{session_id}"));
     }
+    if engine == "agy" {
+        let _ = db.remember_agy_session_workspace(session_id, workspace_path);
+    }
     let row = PreparedUpsert {
         engine: file.engine,
         session_id: file.session_id,
@@ -194,7 +219,7 @@ pub(crate) fn index_side_session(
     upsert_rows(db, &[row], None)
 }
 
-/// Stat every candidate and fold (path, size, mtime) into one signature.
+/// Stat every candidate and fold (path, workspace, size, mtime) into one signature.
 fn stat_all(workspaces: &[String], candidates: &[Candidate]) -> (Vec<Option<(i64, i64)>>, String) {
     let mut signature_hasher = Sha256::new();
     signature_hasher.update(format!("v{}|", crate::db::CACHE_VERSION).as_bytes());
@@ -217,6 +242,10 @@ fn stat_all(workspaces: &[String], candidates: &[Candidate]) -> (Vec<Option<(i64
         let sig = stat_signature(&cand.path);
         if let Some((size, mtime_ms)) = sig {
             signature_hasher.update(cand.path.to_string_lossy().as_bytes());
+            if let Some(ws) = &cand.known_workspace {
+                signature_hasher.update(b"@");
+                signature_hasher.update(ws.as_bytes());
+            }
             signature_hasher.update(size.to_le_bytes());
             signature_hasher.update(mtime_ms.to_le_bytes());
         }
@@ -286,14 +315,14 @@ fn prefetch_stat_keys(
     retitle_pending: bool,
 ) -> Result<
     (
-        std::collections::HashMap<String, (i64, i64)>,
+        std::collections::HashMap<String, (i64, i64, String)>,
         std::collections::HashSet<String>,
     ),
     String,
 > {
     let conn = db.0.lock();
     let mut stmt = conn
-        .prepare("SELECT file_path, file_size, file_mtime_ms FROM sessions")
+        .prepare("SELECT file_path, file_size, file_mtime_ms, workspace_path FROM sessions")
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([], |r| {
@@ -301,14 +330,15 @@ fn prefetch_stat_keys(
                 r.get::<_, String>(0)?,
                 r.get::<_, i64>(1)?,
                 r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
             ))
         })
         .map_err(|e| e.to_string())?;
     let mut stats = std::collections::HashMap::new();
     for row in rows {
         match row {
-            Ok((path, size, mtime)) => {
-                stats.insert(path, (size, mtime));
+            Ok((path, size, mtime, workspace_path)) => {
+                stats.insert(path, (size, mtime, workspace_path));
             }
             Err(e) => eprintln!("[scanner] skipping undecodable session stat row: {e}"),
         }
@@ -350,14 +380,19 @@ struct PreparedUpsert {
 fn prepare_candidate(
     cand: &Candidate,
     sig: (i64, i64),
-    stat_keys: &std::collections::HashMap<String, (i64, i64)>,
+    stat_keys: &std::collections::HashMap<String, (i64, i64, String)>,
     stale_paths: &std::collections::HashSet<String>,
     workspaces: &[String],
 ) -> Option<PreparedUpsert> {
     let (size, mtime_ms) = sig;
     let path_str = cand.path.to_string_lossy().to_string();
-    // Unchanged on disk (stat key match) and not pending re-title: reuse.
-    if stat_keys.get(&path_str) == Some(&sig) && !stale_paths.contains(&path_str) {
+    // Unchanged on disk (stat key + workspace match) and not pending re-title: reuse.
+    let stat_matches = stat_keys.get(&path_str).is_some_and(|(s, m, existing_ws)| {
+        *s == size
+            && *m == mtime_ms
+            && cand.known_workspace.as_deref().is_none_or(|ws| ws == existing_ws)
+    });
+    if stat_matches && !stale_paths.contains(&path_str) {
         return None;
     }
     // Identify the session (peek only for head-keyed engines).
@@ -606,7 +641,8 @@ fn scan_inner(
 ) -> Result<ScanReport, String> {
     crate::engine::sidechat::ensure_hidden_loaded(db);
     let workspaces = db.workspace_paths()?;
-    let candidates = gather_candidates(&workspaces);
+    let agy_pinned = db.agy_session_workspaces().unwrap_or_default();
+    let candidates = gather_candidates(&workspaces, &agy_pinned);
     let (stats, signature) = stat_all(&workspaces, &candidates);
     let Some(tier1) = tier1_gate(db, signature)? else {
         let pruned = prune_stale_sessions(db)?;
@@ -648,7 +684,10 @@ fn scan_inner(
         match prepare_candidate(cand, *sig, &stat_keys, &stale_paths, &workspaces) {
             Some(row) => rows.push(row),
             None => {
-                if stat_keys.get(&cand.path.to_string_lossy().to_string()) == Some(sig) {
+                if stat_keys.get(&cand.path.to_string_lossy().to_string()).is_some_and(|(size, mtime, ws)| {
+                    (*size, *mtime) == *sig
+                        && cand.known_workspace.as_deref().is_none_or(|known| known == ws)
+                }) {
                     reused += 1;
                 }
             }
@@ -716,7 +755,7 @@ pub fn spawn_scan(db: Arc<crate::db::Db>, sink: Arc<crate::event_sink::EventSink
 }
 
 #[cfg(test)]
-pub(super) mod tests {
+pub(crate) mod tests {
 
     #[test]
     fn cursor_prompt_cache_scan_preserves_live_evidence_without_mtime_renewal() -> Result<(), String> {
@@ -781,11 +820,11 @@ pub(super) mod tests {
 
     #[test]
     fn cursor_auxiliary_migration_reparses_unchanged_files_and_preserves_user_state() -> Result<(), String> {
-        for old_version in ["8", "9"] {
+        for (old_version, kind) in [("8", "cursor_do"), ("9", "cursor_do"), ("14", "cursor_cce")] {
         let home = scratch_dir("cursor-auxiliary-migration");
         std::fs::create_dir_all(&home).unwrap();
         let path = home.join("session.jsonl");
-        let prompt = super::super::cursor_auxiliary::fixture("cursor_do", "修复标题 🚀");
+        let prompt = super::super::cursor_auxiliary::fixture(kind, "修复标题 🚀");
         std::fs::write(&path, serde_json::json!({"role":"user","message":{"content":prompt}}).to_string()).unwrap();
         let db = crate::db::Db::open_in_memory().unwrap();
         let sig = stat_signature(&path).unwrap();
@@ -822,11 +861,11 @@ pub(super) mod tests {
         db.0.lock().execute("DELETE FROM session_archives", []).unwrap();
         let sessions = super::super::reader::list_sessions_from(&db)?;
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].auxiliary_kind.as_deref(), Some("cursor_do"));
+        assert_eq!(sessions[0].auxiliary_kind.as_deref(), Some(kind));
         assert_eq!(sessions[0].custom_title.as_deref(), Some("用户标题"));
         assert_eq!(sessions[0].title, "合理自动标题");
         assert!(sessions[0].pinned);
-        assert_eq!(db.plugin_kv_get(crate::db::session_auxiliary::NAMESPACE, "cursor:aux")?, Some(serde_json::json!("cursor_do")));
+        assert_eq!(db.plugin_kv_get(crate::db::session_auxiliary::NAMESPACE, "cursor:aux")?, Some(serde_json::json!(kind)));
         // Reclassification must clear persisted metadata, not retain the old mark.
         let mut ordinary = prepare_candidate(&candidate, sig, &stats, &std::collections::HashSet::from([path.to_string_lossy().to_string()]), &["/ws".into()]).unwrap();
         ordinary.summary.auxiliary_kind = None;
@@ -884,6 +923,61 @@ pub(super) mod tests {
         let dir = std::env::temp_dir().join(format!("ccgui-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Isolated real SQLite ACP history, registered and pinned but not yet indexed.
+    pub(crate) fn with_unindexed_agy(test: impl FnOnce(&crate::db::Db, &Path, &Path, &str)) {
+        let root = scratch_dir(&format!("native-acp-history-{}", uuid::Uuid::new_v4()));
+        let _home = HomeGuard::set(&root);
+        struct AgyHomeEnv(Option<std::ffi::OsString>);
+        impl Drop for AgyHomeEnv {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => std::env::set_var("ANTIGRAVITY_HOME", value),
+                    None => std::env::remove_var("ANTIGRAVITY_HOME"),
+                }
+            }
+        }
+        let _agy_env = AgyHomeEnv(std::env::var_os("ANTIGRAVITY_HOME"));
+        let agy_home = root.join(".gemini/antigravity-cli");
+        std::env::set_var("ANTIGRAVITY_HOME", &agy_home);
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(agy_home.join("conversations")).unwrap();
+        let sid = format!("native-acp-{}", uuid::Uuid::new_v4());
+        let session = agy_home.join(format!("conversations/{sid}.db"));
+        let conn = rusqlite::Connection::open(&session).unwrap();
+        conn.execute_batch("CREATE TABLE steps(idx INTEGER, step_type INTEGER, step_payload BLOB)").unwrap();
+        conn.execute("INSERT INTO steps VALUES(0, 14, ?1)", [b"\x9a\x01\x07\x12\x05hello".as_slice()]).unwrap();
+        drop(conn);
+        let db = crate::db::Db::open_at(&root.join("app.db")).unwrap();
+        db.0.lock().execute("INSERT INTO workspaces(id,path,name) VALUES('native-acp-ws',?1,'workspace')", [workspace.to_string_lossy().as_ref()]).unwrap();
+        db.remember_agy_session_workspace(&sid, workspace.to_string_lossy().as_ref()).unwrap();
+        test(&db, &workspace, &session, &sid);
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agy_workspace_correction_reindexes_without_size_or_mtime_changes() {
+        with_unindexed_agy(|db, workspace, session, sid| {
+            let wrong = workspace.parent().unwrap().join("wrong/deeper/granted");
+            std::fs::create_dir_all(&wrong).unwrap();
+            db.0.lock().execute("INSERT INTO workspaces(id,path,name) VALUES('wrong',?1,'granted')", [wrong.to_string_lossy().as_ref()]).unwrap();
+            db.remember_agy_session_workspace(sid, wrong.to_string_lossy().as_ref()).unwrap();
+            let before = stat_signature(session).unwrap();
+            assert_eq!(scan_with(db, || {}).unwrap().reparsed, 1);
+            assert_eq!(scan_with(db, || {}).unwrap().reparsed, 0);
+            let stored = || db.0.lock().query_row("SELECT workspace_path FROM sessions WHERE engine='agy' AND session_id=?1", [sid], |r| r.get::<_, String>(0)).unwrap();
+            assert_eq!(stored(), wrong.to_string_lossy());
+            db.remember_agy_session_workspace(sid, workspace.to_string_lossy().as_ref()).unwrap();
+            assert_eq!(stat_signature(session), Some(before));
+            let report = scan_with(db, || {}).unwrap();
+            assert_eq!(report.reparsed, 1, "both global and per-file stat gates must notice workspace changes");
+            assert_eq!(stored(), workspace.to_string_lossy());
+            assert_eq!(stat_signature(session), Some(before));
+            assert_eq!(scan_with(db, || {}).unwrap().reparsed, 0);
+        });
     }
 
     pub fn write_zstd_jsonl(path: &Path, lines: &[&str]) {

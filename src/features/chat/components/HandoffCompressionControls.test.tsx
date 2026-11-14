@@ -275,6 +275,21 @@ describe("handoff compression unified picker", () => {
     expect(mocks.setCompressionMode).not.toHaveBeenCalled();
   });
 
+  it("locks the picker during compression but permits abandoning the result with the mode switch", async () => {
+    await render({ mode: "grok" });
+    await press(picker());
+    await render({ mode: "grok", compressionRunning: true });
+    expect(picker().disabled).toBe(true);
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(toggle().disabled).toBe(false);
+    await press(toggle());
+    expect(mocks.setCompressionMode).toHaveBeenCalledWith("/workspace", "local");
+    await render({ mode: "local", compressionRunning: true });
+    expect(toggle().disabled).toBe(true);
+    expect(picker().disabled).toBe(true);
+    expect(mocks.setCompressionSelection).not.toHaveBeenCalled();
+  });
+
   it("prevents opening while engine discovery is pending and rejects unsupported engines", async () => {
     const discovery = Promise.withResolvers<typeof engines>();
     mocks.listEngines.mockReturnValue(discovery.promise);
@@ -297,6 +312,15 @@ describe("handoff compression unified picker", () => {
     expect(container.textContent).toContain(i18n.t("chat.handoffModelsLoading"));
     expect(toggle().disabled).toBe(true);
     expect([...container.querySelectorAll('button')].every(button => button.disabled)).toBe(true);
+    expect(mocks.setCompressionSelection).not.toHaveBeenCalled();
+  });
+
+  it("refreshes custom models from settings without committing a selection", async () => {
+    await render();
+    await press(picker());
+    mocks.getAppSettings.mockResolvedValue({ customModels: { cursor: ["custom/new"] }, customModelLabels: { cursor: { "custom/new": "New custom" } } });
+    await press(document.querySelector(`[data-engine-flyout] button[aria-label="${i18n.t("common.refresh")}"]`)!);
+    expect([...document.querySelectorAll('[role="radio"]')].some(row => row.textContent?.includes("New custom"))).toBe(true);
     expect(mocks.setCompressionSelection).not.toHaveBeenCalled();
   });
 

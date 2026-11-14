@@ -26,6 +26,8 @@ pub struct TaskDelegation {
     pub request_id: String,
     pub run_id: Option<String>,
     pub task: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<TaskImage>,
     pub state: String,
     pub created_at: i64,
     pub updated_at: i64,
@@ -42,6 +44,7 @@ impl TaskDelegation {
             request_id: request_id.into(),
             run_id: branch.run_id.clone(),
             task: branch.task.clone(),
+            images: branch.images.clone(),
             state: branch.state.clone(),
             created_at,
             updated_at: branch.updated_at,
@@ -143,6 +146,7 @@ pub(super) fn unknown_projection(
     let mut d = TaskDelegation::new(&id, branch, branch.created_at);
     d.run_id = None;
     d.task.clear();
+    d.images.clear();
     d.result.clear();
     d.result_truncated = false;
     d.unknown(now, LEGACY_UNKNOWN);
@@ -250,6 +254,7 @@ pub(super) fn response_branch(request: &Request, branch: &LeaderBranch) -> Resul
     let mut delegation = TaskDelegation::new(&request.request_id, branch, branch.created_at);
     delegation.run_id = None;
     delegation.task.clear();
+    delegation.images.clear();
     delegation.result.clear();
     delegation.result_truncated = false;
     delegation.unknown(branch.updated_at, LEGACY_UNKNOWN);

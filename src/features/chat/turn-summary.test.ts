@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it } from "vitest";
 import { buildTurnSummary } from "./turn-summary";
 import { parseUsage } from "./usage";
@@ -9,13 +10,90 @@ describe("finished turn summary", () => {
     expect(buildTurnSummary({ usage: { context_usage_kind: "last_prompt", input_tokens: 900, output_tokens: 30 } })).toBeNull();
   });
 
-  it("uses the whole turn duration, including tools and waits, for the average", () => {
+  it("falls back to whole-turn wall duration for older records without turn_throughput", () => {
     const summary = buildTurnSummary({ durationMs: 10_000, usage: {
       input_tokens: 100, cache_read_input_tokens: 800,
       cache_creation_input_tokens: 100, output_tokens: 200, reasoning_output_tokens: 50,
     } }, 3);
-    expect(summary).toEqual({ durationMs: 10_000, input: 1000, output: 200,
-      usageComplete: true, cacheHitPercent: 80, reasoning: 50, tools: 3, outputTps: 20 });
+    expect(summary).toEqual({
+      durationMs: 10_000,
+      input: 1000,
+      output: 200,
+      usageComplete: true,
+      cacheHitPercent: 80,
+      reasoning: 50,
+      tools: 3,
+      outputTps: 20,
+      speedBasis: "wall",
+      breakdown: null,
+    });
+  });
+
+  it("uses active-time model_ms and breakdown when paired turn_throughput is present", () => {
+    const summary = buildTurnSummary({
+      durationMs: 9_200,
+      usage: {
+        usage_scope: "turn",
+        input_tokens: 400,
+        cache_read_input_tokens: 600,
+        output_tokens: 100,
+        thinking_tokens: 30,
+        turn_throughput: {
+          output_tokens: 100,
+          elapsed_ms: 2_000,
+          wall_ms: 9_200,
+          tool_ms: 5_400,
+          wait_ms: 0,
+          startup_ms: 1_800,
+        },
+      },
+    }, 2);
+    expect(summary).toEqual({
+      durationMs: 9_200,
+      input: 1_000,
+      output: 100,
+      usageComplete: true,
+      cacheHitPercent: 60,
+      reasoning: 30,
+      tools: 2,
+      outputTps: 50,
+      speedBasis: "model",
+      breakdown: {
+        modelMs: 2_000,
+        toolMs: 5_400,
+        waitMs: 0,
+        startupMs: 1_800,
+        wallMs: 9_200,
+      },
+    });
+  });
+
+  it("suppresses fallback wall speed when turn_throughput_reason marks the turn excluded or rate exceeds 1000 tok/s", () => {
+    expect(buildTurnSummary({
+      durationMs: 5_000,
+      usage: {
+        usage_scope: "turn",
+        input_tokens: 1000,
+        output_tokens: 2500,
+        turn_throughput_reason: "subagent_mixed",
+      },
+    })).toMatchObject({
+      input: 1000,
+      output: 2500,
+      usageComplete: true,
+      outputTps: null,
+      speedBasis: null,
+    });
+
+    expect(buildTurnSummary({
+      durationMs: 1_000,
+      usage: {
+        usage_scope: "turn",
+        input_tokens: 100,
+        output_tokens: 24_764,
+        turn_throughput: { output_tokens: 24_764, elapsed_ms: 1_000 },
+      },
+    })?.outputTps).toBeNull();
   });
 
   it("does not double count Codex cached input or reasoning output", () => {
@@ -48,8 +126,7 @@ describe("finished turn summary", () => {
     } })).toMatchObject({ input: 100, output: 20, usageComplete: true });
   });
 
-  it("uses verified Codex whole-turn throughput sample (20 tok/s) instead of last request output divided by turn duration (0.3 tok/s)", () => {
-    // 【Codex多请求回归】last output 90、本轮 output 6000 / 300000ms => 整轮效率 20 而非 0.3；通用 parseUsage 仍返回 last 请求占用。
+  it("uses verified Codex active-time throughput sample (20 tok/s) instead of last request output divided by turn duration (0.3 tok/s)", () => {
     const usage = {
       usage_scope: "last_request",
       input_tokens: 45_000,
@@ -75,11 +152,12 @@ describe("finished turn summary", () => {
       reasoning: 40,
       tools: 12,
       outputTps: 20,
+      speedBasis: "model",
+      breakdown: null,
     });
   });
 
   it("marks Codex last-request usage as partial and hides cache ratio and throughput when no verified sample exists", () => {
-    // 【Codex缺基线与历史回归】无 turn_throughput 或样本非法时，不回落到 last 请求除整轮耗时（0.3 tok/s）。
     const liveWithoutSample = buildTurnSummary({
       durationMs: 300_000,
       usage: {

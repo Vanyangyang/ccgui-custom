@@ -177,6 +177,31 @@ pub(crate) fn active_run_count(map: &HashMap<String, ChildEntry>) -> usize {
 /// an evicted child leaks (no key routes an interrupt to it).
 impl ProcessRegistry {
     pub(crate) fn active_run_count_from_map(&self, map:&HashMap<String, ChildEntry>) -> usize { active_run_count(map) }
+
+    /// Linearize a fallback OS-process launch with Stop. The callback is
+    /// synchronous and must not await or re-enter this registry. Holding the
+    /// map through spawn and publication means Stop either cancels the pid-0
+    /// reservation first, or obtains the real child it must terminate.
+    pub(crate) fn spawn_reserved_child<T>(
+        &self,
+        run_id: &str,
+        killed: &Arc<std::sync::atomic::AtomicBool>,
+        spawn: impl FnOnce() -> Result<(ChildEntry, T), String>,
+    ) -> Result<(ChildEntry, T), String> {
+        let mut map = self.0.lock().map_err(|_| "Process registry unavailable during launch".to_string())?;
+        let reservation = map.get(run_id).ok_or("Process launch reservation is missing")?;
+        if reservation.run_id != run_id || reservation.pid != 0 || reservation.child.is_some()
+            || !Arc::ptr_eq(&reservation.killed, killed)
+        {
+            return Err("Process launch no longer owns its reservation".into());
+        }
+        if killed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("Run was stopped before process launch".into());
+        }
+        let (entry, output) = spawn()?;
+        map.insert(run_id.into(), entry.clone());
+        Ok((entry, output))
+    }
     /// Clone the entry registered under `key` (run id or session id).
     pub(crate) fn get(&self, key: &str) -> Option<ChildEntry> {
         self.0.lock().ok().and_then(|map| map.get(key).cloned())
@@ -462,6 +487,10 @@ impl ProcessRegistry {
                     .filter(|(k, e)| *k == key || e.run_id == key)
                     .filter(|(_, e)| seen_pids.insert(e.pid))
                     .map(|(_, e)| {
+                        // Publish cancellation while holding the same lock as
+                        // reservation promotion. A cloned pid-0 entry must not
+                        // become stale before its cancellation flag is visible.
+                        e.killed.store(true, std::sync::atomic::Ordering::SeqCst);
                         e.native_tasks.close();
                         if let Some(control) = &e.codex_control { control.close(); }
                         (
@@ -742,6 +771,150 @@ mod registry_tests {
             native_tasks: Default::default(),
             codex_control: None,
         }
+    }
+
+    /// Offline child fixture: no CLI/model, no network, and no visible window.
+    fn launch_reserved_sleep(reservation: &ChildEntry) -> Result<(ChildEntry, ()), String> {
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = tokio::process::Command::new("powershell.exe");
+            command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 30"]);
+            super::super::hide_console(&mut command);
+            command
+        };
+        #[cfg(not(windows))]
+        let mut command = {
+            let mut command = tokio::process::Command::new("sleep");
+            command.arg("30").process_group(0);
+            command
+        };
+        let child = command.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+            .kill_on_drop(true).spawn().map_err(|error| error.to_string())?;
+        let entry = ChildEntry {
+            pid: child.id().ok_or("sleep fixture has no pid")?,
+            child: Some(Arc::new(TokioMutex::new(child))),
+            ..reservation.clone()
+        };
+        Ok((entry, ()))
+    }
+
+    async fn assert_reserved_child_reaped(entry: &ChildEntry) {
+        let child = entry.child.as_ref().expect("real child");
+        let status = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            child.lock().await.wait().await
+        }).await.expect("Stop must terminate the actual newly spawned process").unwrap();
+        assert!(!status.success(), "stopped child must not look like successful work");
+        assert!(entry.killed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn fallback_spawn_stop_before_launch_never_spawns_or_submits() {
+        let registry = Arc::new(ProcessRegistry::default());
+        let reservation = virtual_entry("stop-first", 0);
+        registry.insert(reservation.run_id.clone(), reservation.clone());
+        assert!(registry.kill(&reservation.run_id));
+        let mut calls = 0;
+        let result = registry.spawn_reserved_child(&reservation.run_id, &reservation.killed, || {
+            calls += 1;
+            launch_reserved_sleep(&reservation)
+        });
+        assert!(matches!(result, Err(error) if error.contains("stopped before process launch")));
+        assert_eq!(calls, 0, "initial payload writer must never run after pre-launch cancellation");
+        assert_eq!(registry.get(&reservation.run_id).unwrap().pid, 0);
+        registry.remove_reservation(&reservation.run_id);
+        assert_eq!(registry.active_run_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn fallback_spawn_stop_during_launch_obtains_real_child() {
+        let registry = Arc::new(ProcessRegistry::default());
+        let reservation = virtual_entry("spawn-first", 0);
+        registry.insert(reservation.run_id.clone(), reservation.clone());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let launch_registry = registry.clone();
+        let launch_reservation = reservation.clone();
+        let launch = tokio::task::spawn_blocking(move || {
+            launch_registry.spawn_reserved_child(&launch_reservation.run_id, &launch_reservation.killed, || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+                launch_reserved_sleep(&launch_reservation)
+            })
+        });
+        entered_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert!(registry.0.try_lock().is_err(), "spawn must retain the reservation lock until publication");
+        let (stop_entered_tx, stop_entered_rx) = std::sync::mpsc::channel();
+        let stop_registry = registry.clone();
+        let stop = tokio::task::spawn_blocking(move || {
+            stop_entered_tx.send(()).unwrap();
+            stop_registry.kill("spawn-first")
+        });
+        stop_entered_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        release_tx.send(()).unwrap();
+        let (entry, ()) = launch.await.unwrap().unwrap();
+        assert!(stop.await.unwrap());
+        assert_eq!(registry.get("spawn-first").unwrap().pid, entry.pid);
+        assert_ne!(entry.pid, 0);
+        assert_reserved_child_reaped(&entry).await;
+        registry.remove_run_if_pid(&entry.run_id, entry.pid);
+        assert_eq!(registry.active_run_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn fallback_spawn_published_alias_stops_same_child_and_cannot_launch_twice() {
+        let registry = Arc::new(ProcessRegistry::default());
+        let reservation = virtual_entry("published", 0);
+        registry.insert(reservation.run_id.clone(), reservation.clone());
+        let (entry, ()) = registry.spawn_reserved_child(&reservation.run_id, &reservation.killed,
+            || launch_reserved_sleep(&reservation)).unwrap();
+        registry.insert_alias("preassigned-session".into(), entry.clone());
+        let mut duplicates = 0;
+        let duplicate = registry.spawn_reserved_child(&reservation.run_id, &reservation.killed, || {
+            duplicates += 1;
+            launch_reserved_sleep(&reservation)
+        });
+        assert!(matches!(duplicate, Err(error) if error.contains("no longer owns")));
+        assert_eq!(duplicates, 0, "a duplicate attempt must not send another initial prompt");
+        assert!(registry.kill("preassigned-session"));
+        assert_reserved_child_reaped(&entry).await;
+        assert_eq!(registry.get("published").unwrap().pid, registry.get("preassigned-session").unwrap().pid);
+        registry.remove_run_if_pid(&entry.run_id, entry.pid);
+        assert_eq!(registry.active_run_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn fallback_spawn_os_failure_preserves_error_and_cleans_only_reservation() {
+        let registry = Arc::new(ProcessRegistry::default());
+        let reservation = virtual_entry("spawn-error", 0);
+        registry.insert(reservation.run_id.clone(), reservation.clone());
+        let result: Result<(ChildEntry, ()), String> = registry.spawn_reserved_child(&reservation.run_id, &reservation.killed, || {
+            let mut command = tokio::process::Command::new(format!("ccgui-missing-fixture-{}", uuid::Uuid::new_v4()));
+            command.spawn().map_err(|error| format!("fixture spawn error: {error}"))?;
+            panic!("missing fixture executable unexpectedly exists");
+        });
+        assert!(matches!(result, Err(error) if error.contains("fixture spawn error")));
+        assert_eq!(registry.get(&reservation.run_id).unwrap().pid, 0);
+        assert!(!reservation.killed.load(std::sync::atomic::Ordering::SeqCst));
+        registry.remove_reservation(&reservation.run_id);
+        assert_eq!(registry.active_run_count(), 0);
+        let result: Result<(ChildEntry, ()), String> = registry.spawn_reserved_child(&reservation.run_id, &reservation.killed,
+            || panic!("removed reservation cannot spawn"));
+        assert!(matches!(result, Err(error) if error.contains("missing")));
+    }
+
+    #[test]
+    fn fallback_spawn_foreign_or_drained_reservations_never_launch() {
+        let registry = ProcessRegistry::default();
+        let reservation = virtual_entry("stale", 0);
+        registry.insert(reservation.run_id.clone(), virtual_entry("stale", 0));
+        let result: Result<(ChildEntry, ()), String> = registry.spawn_reserved_child(&reservation.run_id, &reservation.killed,
+            || panic!("stale launch must not use a replacement reservation"));
+        assert!(matches!(result, Err(error) if error.contains("no longer owns")));
+        registry.kill_all();
+        let result: Result<(ChildEntry, ()), String> = registry.spawn_reserved_child(&reservation.run_id, &reservation.killed,
+            || panic!("teardown must prevent a late launch"));
+        assert!(matches!(result, Err(error) if error.contains("missing")));
     }
 
     /// A colliding session key belongs to another live run. The claim fails

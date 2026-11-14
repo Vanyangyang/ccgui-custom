@@ -1,11 +1,14 @@
 pub mod agent_catalog;
 pub mod app_cache;
+mod handoff_progress;
 pub mod auto_title;
 pub mod composer_prediction;
 pub mod agents;
 pub mod browser;
 pub mod cc_switch;
 pub mod cli_lifecycle;
+mod cli_plugins;
+mod cli_hooks;
 pub mod claude_quota;
 pub mod codex_quota;
 pub mod codex_context_window;
@@ -54,6 +57,8 @@ mod session_sidebar;
 mod session_sidebar_host;
 mod plugin_images;
 mod plugin_windows;
+mod host_confirmation;
+mod task_workspace_access;
 pub mod plugins;
 pub mod prompts;
 pub mod provider_files;
@@ -105,6 +110,7 @@ pub struct AppState {
     pub relay: relay::RelayState,
     pub dsh_host: std::sync::Arc<dsh_host::DshHostState>,
     pub opencode_server: std::sync::Arc<engine::opencode_server::OpencodeServerState>,
+    pub agy_acp: std::sync::Arc<engine::agy_acp::AgyAcpState>,
     /// In-flight worktree creations (git_worktree_create) by creationId —
     /// the cancel command signals through this registry.
     pub worktree_creations: git_worktree::CreationRegistry,
@@ -128,6 +134,20 @@ pub fn run() {
     // Protect both the installed launcher and retained self-update releases.
     // Service modes inherit the strict environment without opening a dialog.
     launch_protection::arm(&mode);
+    if mode == startup::Mode::AgyAcpService {
+        if let Err(error) = engine::agy_acp::service::run_stdio() {
+            eprintln!("[agy-acp] {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if mode == startup::Mode::WorkerRecovery {
+        if let Err(error) = worker_host::run_recovery_stdio() {
+            eprintln!("[worker-recovery] {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if mode == startup::Mode::UpdateSupervisor {
         if let Err(error) = live_update::activation::run_stdio() {
             eprintln!("[live-update] {error}");
@@ -321,6 +341,7 @@ pub fn run() {
                 opencode_server: std::sync::Arc::new(
                     engine::opencode_server::OpencodeServerState::default(),
                 ),
+                agy_acp: std::sync::Arc::new(engine::agy_acp::AgyAcpState::default()),
                 worktree_creations: git_worktree::CreationRegistry::default(),
             };
             // Clone what the initial scan needs before state moves into manage.
@@ -364,6 +385,11 @@ pub fn run() {
             }
             tauri::async_runtime::block_on(worker_host::initialize(app.handle(), running_workers))
                 .map_err(std::io::Error::other)?;
+            if let Err(error) = tauri::async_runtime::block_on(
+                app.state::<AppState>().agy_acp.ensure_broker_service(),
+            ) {
+                eprintln!("[agy-acp] independent broker unavailable (falling back to task-local pool): {error}");
+            }
             if restored { worker_host::set_paused(true); }
             tauri::async_runtime::block_on(handoff::restore_sources()).map_err(std::io::Error::other)?;
             app.manage(metrics::MetricsState::load().map_err(std::io::Error::other)?);
@@ -506,6 +532,11 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
+            if matches!(event, tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed) {
+                // CloseRequested is important: detached close waits for the
+                // action queue, whose current Handoff may await this dialog.
+                host_confirmation::cancel_parent(window.app_handle(), window.label());
+            }
             if let tauri::WindowEvent::Destroyed = event {
                 // The pet is a secondary window.  It must not run the main
                 // window's process/terminal teardown, and the main window
@@ -534,6 +565,7 @@ pub fn run() {
                     state.processes.kill_all();
                     state.dsh_host.kill_spawned();
                     state.opencode_server.kill_spawned();
+                    state.agy_acp.kill_spawned();
                     plugin_caps::kill_all_tracked_children();
                     tauri::async_runtime::block_on(terminal::kill_all(&state.terminals));
                     computer_use::disarm_esc(&window.app_handle());
@@ -553,6 +585,7 @@ pub fn run() {
             handoff::live_update_confirm,
             handoff::runtime_observer_respond,
             worker_host::runtime_worker_sources,
+            worker_host::runtime_worker_terminal_outcome,
             worker_host::runtime_worker_events,
             worker_host::runtime_worker_control,
             worker_host::runtime_worker_start,
@@ -593,10 +626,19 @@ pub fn run() {
             host_chat::host_chat_ledger_set,
             host_chat::host_chat_ledger_delete,
             leader::task_snapshot,
+            leader::parent_wakeup::task_parent_wakeups,
+            leader::parent_wakeup::task_claim_parent_wakeup,
+            leader::parent_wakeup::task_resolve_parent_wakeup,
             leader::task_branch_action,
             leader::task_delete_branch,
             leader::task_resolve_cost_approval,
+            leader::task_handoff_child,
+            leader::task_managed_child_handoff_supported,
+            leader::task_managed_child_handoff_selection_supported,
+            leader::task_resolve_handoff_selection,
             leader::task_group_action,
+            leader::task_group_archive_checked,
+            leader::task_subtree_archive_checked,
             // config
             config::get_cli_config,
             claude_quota::claude_quota_read,
@@ -664,13 +706,24 @@ pub fn run() {
             plugins::plugin_storage_set,
             plugins::plugin_storage_delete,
             plugin_windows::plugin_window_open,
+            host_confirmation::host_confirmation_open,
+            host_confirmation::host_confirmation_read,
+            host_confirmation::host_confirmation_ready,
+            host_confirmation::host_confirmation_respond,
             plugin_windows::plugin_window_presentation_register,
             plugin_windows::plugin_window_presentation_set,
             plugin_windows::plugin_window_init,
             plugin_windows::plugin_window_publish,
+            plugin_windows::plugin_window_capabilities,
+            plugin_windows::plugin_window_snapshot,
+            plugin_windows::plugin_window_publish_update,
+            plugin_windows::plugin_window_respond_update,
+            plugin_windows::plugin_window_action_update,
+            plugin_windows::plugin_window_inspect_action_update,
             plugin_windows::plugin_window_action,
             plugin_windows::plugin_window_inspect_action,
             plugin_windows::plugin_window_focus_owner,
+            plugin_windows::plugin_window_confirm_cost_review,
             plugin_windows::plugin_window_respond,
             plugin_windows::plugin_window_return,
             plugin_windows::plugin_window_request_return,
@@ -685,6 +738,7 @@ pub fn run() {
             plugins::market::plugin_check_updates,
             // engine
             engine::send_message,
+            engine::codex_service_tier_override_supported,
             engine::send_side_message,
             engine::cleanup_side_session,
             engine::promote_side_session,
@@ -715,6 +769,10 @@ pub fn run() {
             mcp::mcp_inventory,
             mcp::mcp_set_enabled,
             mcp::probe::mcp_probe,
+            cli_plugins::cli_plugins_inventory,
+            cli_hooks::cli_hooks_inventory,
+            cli_hooks::cli_hooks_set_enabled,
+            cli_plugins::cli_plugins_action,
             // skills hub (设置 → 能力扩展 → Skills)
             skills_hub::skills_hub_query,
             skills_hub::skills_hub_mutate,
@@ -738,6 +796,9 @@ pub fn run() {
             auto_title::auto_title_models,
             composer_prediction::predict_next_prompt,
             app_cache::summarize_session_handoff,
+            app_cache::cancel_session_handoff,
+            app_cache::handoff_full_history_supported,
+            handoff_progress::handoff_progress_supported,
             app_cache::inspect_app_cache,
             app_cache::prune_app_cache,
             history::reader::remember_session_model,
@@ -846,6 +907,7 @@ pub fn run() {
             // plugin capability egress (network:/exec: manifest grants)
             plugin_caps::plugin_http_request,
             plugin_caps::plugin_fixed_instructions_supported,
+            plugin_caps::plugin_fixed_instructions_engines,
             plugin_caps::plugin_add_workspace,
             plugin_caps::plugin_publish_workspace_project,
             plugin_caps::plugin_exec_run,
@@ -859,12 +921,16 @@ pub fn run() {
             plugin_memory::plugin_memory_checkpoint,
             plugin_memory::plugin_memory_prepare,
             plugin_memory::plugin_memory_extract,
+            plugin_memory::review::plugin_memory_review,
             plugin_memory::plugin_memory_cancel,
             plugin_tasks::plugin_task_plan_cancel,
             plugin_tasks::plugin_task_resolve,
             plugin_tasks::plugin_task_pending_claims,
+            plugin_tasks::plugin_task_attachment_capabilities,
+            leader::task_lifecycle::task_session_lifecycle,
             plugin_conversations::plugin_conversation_claim,
             plugin_conversations::plugin_conversation_resolve,
+            plugin_conversations::plugin_summarize_handoff,
             plugin_images::plugin_image_import,
             plugin_images::plugin_image_preview,
             plugin_images::plugin_image_resolve,

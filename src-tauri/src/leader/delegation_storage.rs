@@ -36,7 +36,7 @@ fn request_identity(request: &Request) -> Result<String, String> {
         None => arguments_fingerprint(&request.arguments)?,
     };
     arguments_fingerprint(&json!([
-        key(&request.parent),
+        legacy_key(&request.parent),
         request.request_id,
         method,
         request.branch_id,
@@ -87,6 +87,7 @@ fn validate(request: &Request, metadata: &Projection) -> Result<(), String> {
                 | "waiting"
                 | "awaiting_cost_approval"
                 | "completed"
+                | "handed_off"
                 | "failed"
                 | "stopped"
                 | "unknown"
@@ -243,7 +244,7 @@ pub(super) fn decode_request(raw: &str) -> Result<Request, String> {
     Ok(request)
 }
 
-fn branch_requests(
+pub(super) fn branch_requests(
     conn: &rusqlite::Connection,
     branch: &LeaderBranch,
 ) -> Result<Vec<Request>, String> {

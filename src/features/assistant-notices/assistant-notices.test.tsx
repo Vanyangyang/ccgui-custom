@@ -210,6 +210,36 @@ describe("built-in assistant notices", () => {
     });
     expect(mock.invoke.mock.calls.some(([cmd]) => /infer|complete|prompt|predict|chat/.test(cmd))).toBe(false);
   });
+  it("selects and saves Orchestrator without an effort field or model inference", async () => {
+    mock.models.mockResolvedValue([{ engine: "agy", id: "gemini-pro-orchestrator", name: "Orchestrator", provider: "Google Channel", supportsEffort: false, effortLevels: [], resolvedModel: "gemini-pro-orchestrator" }]);
+    if (!globalThis.CSS) vi.stubGlobal("CSS", {});
+    if (!CSS.escape) CSS.escape = value => value.replace(/[^a-zA-Z0-9_-]/g, character => `\\${character}`);
+    await act(async () => root.render(<AssistantNoticesControl />));
+    const press = async (element: Element) => act(async () => { for (const type of ["pointerdown", "mousedown", "mouseup", "click"]) element.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true })); });
+    await press(container.querySelector('[data-setting-anchor="observerModel"] button')!);
+    const choice = [...document.querySelectorAll('[role="option"]')].find(element => element.textContent?.includes("Orchestrator"))!;
+    await press(choice);
+    expect(container.querySelector('[data-setting-anchor="observerEffort"]')).toBeNull();
+    mock.invoke.mockResolvedValueOnce({ ...status, observerEngine: "agy", observerModel: "gemini-pro-orchestrator", observerEffort: "", revision: 2 });
+    await act(async () => button("assistantNotices.save").click());
+    expect(mock.invoke).toHaveBeenLastCalledWith("assistant_notices_configure", {
+      config: { ...noticeConfig(status), observerEngine: "agy", observerModel: "gemini-pro-orchestrator", observerEffort: "" },
+      expectedRevision: 1,
+    });
+    expect(mock.invoke.mock.calls.some(([cmd]) => /infer|complete|prompt|predict|chat/.test(cmd))).toBe(false);
+  });
+
+  it("hides a saved Orchestrator effort even when its catalog is unavailable", async () => {
+    mock.invoke.mockImplementation(async (command: string) => command === "assistant_notices_status" ? {
+      ...status, observerEngine: "agy", observerModel: "gemini-pro-orchestrator", observerEffort: "medium",
+    } : []);
+    mock.models.mockResolvedValue([]);
+    await act(async () => root.render(<AssistantNoticesControl />));
+    expect(container.textContent).toContain("gemini-pro-orchestrator");
+    expect(container.querySelector('[data-setting-anchor="observerEffort"]')).toBeNull();
+    expect(mock.invoke.mock.calls.some(([cmd]) => cmd === "assistant_notices_configure")).toBe(false);
+  });
+
   it("retains saved AGY selection when AGY catalog is disabled or removed without silently switching to Vertex", async () => {
     mock.invoke.mockImplementation(async (command: string) => command === "assistant_notices_status" ? {
       ...status,

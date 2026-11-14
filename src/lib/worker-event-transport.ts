@@ -34,8 +34,9 @@ const validId = (value: unknown): value is string => typeof value === "string" &
 /**
  * Per-worker consumption with a serialized replay/checkpoint boundary. Existing
  * archives in a fresh client's first discovery are not attached automatically.
- * Restored checkpoints and sources first discovered after initialization permit
- * replay from zero; a new live sequence 1 also attaches itself. Unknown later
+ * Restored checkpoints and new worker sources discovered after initialization
+ * permit replay from zero; archive-only discovery requires an existing cursor or
+ * explicit attachment. A new live sequence 1 also attaches itself. Unknown later
  * frames stay queued with an explicit error until authoritative attachment or
  * discovery establishes that the source started after this client's baseline.
  */
@@ -43,6 +44,8 @@ export class WorkerEventTransport {
   private readonly sources = new Map<string, Source>();
   private readonly queues = new Map<string, Queued[]>();
   private readonly unknownReported = new Set<string>();
+  private readonly recoveryErrors = new Set<string>();
+  private readonly recoveryReported = new Set<string>();
   private queuedCount = 0;
   private queuedBytes = 0;
   private readonly limits: Required<WorkerEventOptions>;
@@ -139,6 +142,8 @@ export class WorkerEventTransport {
       // A prior failed fanout may have committed some subscribers. Finish that
       // envelope (or reject) before allowing UI + cursor checkpoint capture.
       await this.synchronize(false);
+      const failed = [...this.sources.keys()].find(id => this.recoveryErrors.has(id));
+      if (failed) throw new WorkerEventTransportError("worker-recovery-failed", "Worker recovery requires attention", failed);
       this.paused = true;
       this.clearReconciliation();
     }).finally(() => { if (!this.paused) this.scheduleReconciliation(); });
@@ -159,6 +164,8 @@ export class WorkerEventTransport {
     this.clearListeners();
     this.queues.clear();
     this.unknownReported.clear();
+    this.recoveryErrors.clear();
+    this.recoveryReported.clear();
     this.queuedCount = this.queuedBytes = 0;
   }
 
@@ -212,6 +219,10 @@ export class WorkerEventTransport {
 
   private report(error: unknown): void {
     const normalized = error instanceof WorkerEventTransportError ? error : new WorkerEventTransportError("transport-failed", "Worker event transport operation failed");
+    if (normalized.code === "worker-recovery-failed" && normalized.streamId) {
+      if (this.recoveryReported.has(normalized.streamId)) return;
+      this.recoveryReported.add(normalized.streamId);
+    }
     // Reporting cannot break serialization or produce an unhandled rejection.
     try { this.deps.onError(normalized); } catch { /* The original operation still rejects. */ }
   }
@@ -221,6 +232,7 @@ export class WorkerEventTransport {
     try {
       const event = payload as EventEnvelope;
       if (!event || !validId(event.stream_id) || !nonnegative(event.seq) || event.seq === 0 || !validId(event.name)) throw new WorkerEventTransportError("invalid-event", "Invalid live worker envelope");
+      if (this.recoveryErrors.has(event.stream_id)) return;
       if (!this.sources.has(event.stream_id) && event.seq === 1) this.addSource(event.stream_id, 0);
       const source = this.sources.get(event.stream_id);
       // Even a dropped final live frame advances the authoritative replay target.
@@ -282,10 +294,18 @@ export class WorkerEventTransport {
       if (!Array.isArray(listed)) throw new WorkerEventTransportError("invalid-sources", "Invalid worker source list");
       const available = new Set<string>();
       for (const item of listed) {
-        if (!item || !validId(item.streamId) || typeof item.runId !== "string" || !nonnegative(item.head)) throw new WorkerEventTransportError("invalid-sources", "Invalid worker source entry");
+        if (!item || !validId(item.streamId) || typeof item.runId !== "string" || !nonnegative(item.head)
+          || (Object.prototype.hasOwnProperty.call(item, "replayOnly") && typeof item.replayOnly !== "boolean")
+          || (Object.prototype.hasOwnProperty.call(item, "recoveryError") && !validId(item.recoveryError))) throw new WorkerEventTransportError("invalid-sources", "Invalid worker source entry");
         available.add(item.streamId);
       }
       if (available.size > this.limits.maxSources) throw new WorkerEventTransportError("source-limit", "Too many discovered worker sources");
+      for (const id of this.recoveryErrors) {
+        if (!available.has(id)) {
+          this.recoveryErrors.delete(id);
+          this.recoveryReported.delete(id);
+        }
+      }
       for (const id of expectedSources) {
         if (!available.has(id)) throw new WorkerEventTransportError("source-unavailable", "A restored or attached worker archive is unavailable", id);
       }
@@ -293,9 +313,16 @@ export class WorkerEventTransport {
       if (initial) this.initialSources = this.restored ? new Set() : new Set(available);
       for (const item of listed) {
         // Fresh observers must not adopt pre-existing history. Once initialized,
-        // new IDs represent missed starts; a restored snapshot also authorizes
-        // catching up sources created after its checkpoint boundary.
-        if (!this.sources.has(item.streamId) && (this.restored || !initial) && !this.initialSources!.has(item.streamId)) this.addSource(item.streamId, 0);
+        // new worker IDs represent missed starts. Hydrating an old archive does
+        // not establish a new start, even after restoring a snapshot.
+        if (!this.sources.has(item.streamId) && item.replayOnly !== true && (this.restored || !initial) && !this.initialSources!.has(item.streamId)) this.addSource(item.streamId, 0);
+        if (item.recoveryError) {
+          this.recoveryErrors.add(item.streamId);
+          this.report(new WorkerEventTransportError("worker-recovery-failed", "Worker recovery requires attention", item.streamId));
+          continue;
+        }
+        this.recoveryErrors.delete(item.streamId);
+        this.recoveryReported.delete(item.streamId);
         const source = this.sources.get(item.streamId);
         if (source) {
           if (item.head < source.stream.cursor) throw new WorkerEventTransportError("source-regressed", "Worker archive head is behind its consumed cursor", item.streamId);
@@ -306,6 +333,7 @@ export class WorkerEventTransport {
     // Snapshot the work set and replay target: continuous live traffic cannot
     // prolong a checkpoint barrier indefinitely.
     for (const [id, source] of [...this.sources]) {
+      if (this.recoveryErrors.has(id)) continue;
       const queue = this.queues.get(id);
       const count = queue?.length ?? 0;
       for (let index = 0; index < count; index++) {

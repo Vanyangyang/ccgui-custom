@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it } from "vitest";
 import { listExternalSessionMetas, registerSessionSource, type ExternalSessionRow } from "./session-source";
 

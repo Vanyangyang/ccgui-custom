@@ -1,55 +1,64 @@
 import { beforeEach, expect, it, vi } from "vitest";
-const mocks = vi.hoisted(() => ({
-  task: { ready: vi.fn(), activeEngine: () => "claude", engines: () => [{ id: "claude", available: true, enabled: true, defaultModel: "opus", defaultEffort: "high" }, { id: "codex", available: true, enabled: false }],
-    models: async () => [{ id: "opus", name: "Opus" }],
-    projects: async () => [{ id: "project", defaultPath: "C:/work", members: [{ id: "member", path: "C:/member", label: "Member", status: "available" }] }],
-    workspaces: () => [{ id: "local", path: "C:/work", name: "Local", remote: false, archived: false }, { id: "remote", path: "/remote", remote: true }] },
-  getCliConfig: vi.fn(), send: vi.fn(), stop: vi.fn(), interrupt: vi.fn(), subscribe: vi.fn(), invoke: vi.fn(),
-  state: { sidechatBySession: {} as Record<string, any> },
+
+const f = vi.hoisted(() => ({
+  sideState: {} as Record<string, any>,
+  engines: [
+    { id: "claude", available: true, enabled: true, defaultModel: "opus", defaultEffort: "high" },
+    { id: "agy", available: true, enabled: true, supportsImages: true, defaultModel: "gemini-4-argon-high", defaultEffort: "high" },
+  ],
+  support: vi.fn(async (_engine?: string) => true),
+  models: vi.fn(async (id: string) => [{ id: id === "agy" ? "gemini-4-argon-high" : "opus", name: id === "agy" ? "Gemini 4 Argon High" : "Opus" }]),
+  config: { claude: { providers: {}, current: null }, agy: { providers: { channel: { name: "AGY custom", apiKey: "must-not-leak" } }, current: "channel" } },
 }));
-vi.mock("./task-facade", () => ({ desktopTaskFacade: async () => mocks.task,
-  registeredWorkspace: (_: unknown, path: string) => mocks.task.workspaces().find((w) => w.path === path) }));
-vi.mock("@/lib/ipc", () => ({ ipc: { getCliConfig: mocks.getCliConfig, interruptSession: mocks.interrupt } }));
-vi.mock("@/lib/transport", () => ({ invoke: mocks.invoke }));
+vi.mock("./task-facade", () => ({ desktopTaskFacade: async () => ({
+  ready: async () => {}, engines: () => f.engines, models: f.models,
+  workspaces: () => [], projects: async () => [], activeEngine: () => "agy",
+}), registeredWorkspace: vi.fn() }));
 vi.mock("@/features/sidechat/store", () => ({ useSidechatStore: {
-  getState: () => ({ ...mocks.state, sendSidechatMessage: mocks.send, stopSidechat: mocks.stop }),
-  setState: (fn: (s: typeof mocks.state) => typeof mocks.state) => Object.assign(mocks.state, fn(mocks.state)), subscribe: mocks.subscribe,
+  getState: () => ({ sidechatBySession: f.sideState }), subscribe: vi.fn(),
+  setState: (update: (s: { sidechatBySession: Record<string, any> }) => { sidechatBySession: Record<string, any> }) => {
+    f.sideState = update({ sidechatBySession: f.sideState }).sidechatBySession;
+  },
 } }));
+vi.mock("@/lib/ipc", () => ({ ipc: { getCliConfig: async () => f.config } }));
+vi.mock("@/lib/transport", () => ({ invoke: vi.fn() }));
+vi.mock("./fixed-instructions", () => ({ nativeFixedInstructionsSupported: f.support }));
 import { desktopConversationFacade } from "./conversation-facade";
-it("delegates ownership and selection resolution to native commands", async () => {
-  const facade = await desktopConversationFacade();
-  await facade.claim("plugin", "thread");
-  expect(mocks.invoke).toHaveBeenCalledWith("plugin_conversation_claim", { pluginId: "plugin", threadId: "thread" });
-  const selection = { engine: "claude" as const, model: "opus", effort: "high", providerId: "channel" };
-  mocks.invoke.mockResolvedValueOnce({ ...selection, model: "claude-opus-exact" });
-  expect(await facade.resolveSelection("plugin", selection)).toEqual({ ...selection, model: "claude-opus-exact" });
-  expect(mocks.invoke).toHaveBeenLastCalledWith("plugin_conversation_resolve", { pluginId: "plugin", selection });
+
+beforeEach(() => { f.engines[1].available = true; f.engines[1].enabled = true; f.models.mockClear(); f.support.mockImplementation(async () => true); });
+it("publishes native AGY models and named channels without secrets or independent effort", async () => {
+  const catalog = await (await desktopConversationFacade()).catalog();
+  expect(catalog.defaultEngine).toBe("agy");
+  expect(catalog.engines.find(e => e.id === "agy")).toEqual({ id: "agy", label: "AGY", available: true, supportsImages: true, supportsFixedInstructions: true,
+    models: [{ id: "gemini-4-argon-high", label: "Gemini 4 Argon High" }], providers: [{ id: "__local_settings_json__", label: expect.any(String) }, { id: "channel", label: "AGY custom" }],
+    efforts: [], defaultModel: "gemini-4-argon-high", defaultEffort: null, defaultProviderId: "channel" });
+  expect(JSON.stringify(catalog)).not.toContain("must-not-leak");
+  expect(catalog.engines.find(e => e.id === "claude")?.defaultEffort).toBe("high");
 });
-beforeEach(() => {
-  vi.clearAllMocks(); mocks.state.sidechatBySession = {};
-  mocks.getCliConfig.mockResolvedValue({ claude: { current: "channel", providers: { channel: { name: "Named channel", apiKey: "secret", env: { TOKEN: "secret" } } } } });
+it.each(["available", "enabled"] as const)("does not publish AGY when %s is false", async field => {
+  f.engines[1][field] = false;
+  const catalog = await (await desktopConversationFacade()).catalog();
+  expect(catalog.engines.some(e => e.id === "agy")).toBe(false);
+  expect(f.models).not.toHaveBeenCalledWith("agy");
 });
-it("projects only installed enabled choices and never leaks provider credentials", async () => {
-  const facade = await desktopConversationFacade();
-  const catalog = await facade.catalog();
-  expect(catalog.engines).toHaveLength(1);
-  expect(catalog.defaultEngine).toBe("claude");
-  expect(catalog.engines[0]).toMatchObject({ defaultProviderId: "channel", models: [{ id: "opus", label: "Opus" }] });
-  expect(JSON.stringify(catalog)).not.toContain("secret");
-  await expect(facade.workspace("/remote")).rejects.toThrow("local");
-  expect(await facade.workspace("C:/member")).toBe("C:/member");
+it("keeps legacy global capability while explicitly disabling AGY on old hosts", async () => {
+  f.support.mockImplementation(async engine => engine !== "agy");
+  const catalog = await (await desktopConversationFacade()).catalog();
+  expect(catalog.capabilities?.fixedInstructions).toBe(true);
+  expect(catalog.engines.find(e => e.id === "agy")?.supportsFixedInstructions).toBe(false);
+  expect(catalog.engines.find(e => e.id === "claude")?.supportsFixedInstructions).toBe(true);
 });
-it("launches only controlled parentless branches with frozen choices and stops exact runs", async () => {
+it("releases only the same idle state and never discards new activity or drafts", async () => {
   const facade = await desktopConversationFacade();
-  mocks.invoke.mockResolvedValueOnce(["C:/pasted/img1.png"]);
-  expect(await facade.resolveImages!("plugin", ["img1"])).toEqual(["C:/pasted/img1.png"]);
-  expect(mocks.invoke).toHaveBeenLastCalledWith("plugin_image_resolve", { pluginId: "plugin", imageIds: ["img1"] });
-  await facade.send("key", "C:/work", { engine: "claude", model: "opus", providerId: "channel" }, "prompt", "sidechat-1", ["C:/pasted/img1.png"]);
-  expect(mocks.send).toHaveBeenCalledWith(expect.objectContaining({ strictBusy: true, requestedRunId: "sidechat-1", parentSessionId: null, parentMessages: [], providerId: "channel", images: ["C:/pasted/img1.png"] }));
-  mocks.state.sidechatBySession.key = { streaming: true, runId: "sidechat-other" };
-  await facade.stop("key", "sidechat-1"); expect(mocks.interrupt).not.toHaveBeenCalled();
-  mocks.state.sidechatBySession.key.runId = "sidechat-1";
-  await facade.stop("key", "sidechat-1"); expect(mocks.interrupt).toHaveBeenCalledWith("sidechat-1");
-  expect(mocks.stop).not.toHaveBeenCalled();
-  expect(mocks.state.sidechatBySession.key.streaming).toBe(true);
+  const idle = { streaming: false, runId: null, draft: "", messages: [{ text: "完整原文😀" }] } as any;
+  f.sideState = { owned: idle, other: { ...idle } };
+  expect(facade.release!("owned", { ...idle })).toBe(false);
+  expect(facade.release!("owned", idle)).toBe(true);
+  expect(f.sideState.owned).toBeUndefined(); expect(f.sideState.other).toBeDefined();
+  for (const patch of [{ streaming: true }, { runId: "sidechat-live" }, { draft: "未发送" }, { draftImages: ["image"] }]) {
+    const protectedState = { ...idle, ...patch };
+    f.sideState = { owned: protectedState };
+    expect(facade.release!("owned", protectedState)).toBe(false);
+    expect(f.sideState.owned).toBe(protectedState);
+  }
 });

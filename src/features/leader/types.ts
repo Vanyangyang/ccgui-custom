@@ -7,6 +7,28 @@ export interface LeaderIdentity {
   workspacePath: string;
 }
 
+export interface GroupCleanupExpectation {
+  branchIds: string[];
+  members: LeaderIdentity[];
+  lastActivityAt: number;
+}
+
+export interface LeaderHandoffLink {
+  branchId: string;
+  requestId: string;
+  operationId: string;
+  payloadFingerprint: string;
+}
+
+/** Native-owned image; filesystem locations must never enter plugin projections. */
+export interface TaskImage { source: string; path: string; sha256: string }
+export function taskImageRefs(images: TaskImage[] = []): string[] {
+  return images.map(image => {
+    if (!/^[a-f0-9]{64}$/.test(image.sha256)) throw new Error("Invalid native task image identity");
+    return `task-image:${image.sha256}`;
+  });
+}
+
 export interface LeaderBranch {
   id: string;
   parentEngine: string;
@@ -19,11 +41,16 @@ export interface LeaderBranch {
   sessionId: string | null;
   title: string;
   task: string;
+  images?: TaskImage[];
   model: string | null;
   effort: string | null;
+  /** Explicit handoff channel retained for successor launches and recovery. */
+  providerId?: string;
   runId: string | null;
-  state: "starting" | "running" | "waiting" | "awaiting_cost_approval" | "completed" | "failed" | "stopped" | "unknown" | "reclaiming" | "reclaimed";
-  costApproval?: { requestId: string; capturedAt: number; cache?: PromptCacheWindow | null; model?: string | null };
+  state: "starting" | "running" | "waiting" | "awaiting_cost_approval" | "completed" | "failed" | "stopped" | "handed_off" | "unknown" | "reclaiming" | "reclaimed";
+  handoffTo?: LeaderHandoffLink;
+  handoffFrom?: LeaderHandoffLink;
+  costApproval?: { requestId: string; capturedAt: number; cache?: PromptCacheWindow | null; model?: string | null; imageRefs?: string[] };
   createdAt: number;
   updatedAt: number;
   lastActivityAt: number;
@@ -40,6 +67,7 @@ export interface TaskDelegation {
   requestId: string;
   runId: string | null;
   task: string;
+  images?: TaskImage[];
   state: LeaderBranch["state"];
   createdAt: number;
   updatedAt: number;
@@ -85,6 +113,24 @@ export function isLeaderGroupMember(snapshot: LeaderSnapshot, identity: LeaderId
       engine: branch.engine, sessionId: branch.sessionId, workspacePath: branch.workspacePath,
     }, identity)))) || !!snapshot.archivedGroups?.some((group) =>
       sameIdentity(group.root, identity) || group.members.some((member) => sameIdentity(member, identity)));
+}
+
+/** A record rooted at a managed child chat archives only that child's subtree;
+ * its own branch is implied by the chat identity rather than listed. */
+export function archivedChildBranch(snapshot: LeaderSnapshot, group: LeaderArchivedGroup): LeaderBranch | undefined {
+  return snapshot.branches.find((branch) => branch.state !== "reclaimed" && branch.sessionId !== null && sameIdentity({
+    engine: branch.engine, sessionId: branch.sessionId, workspacePath: branch.workspacePath,
+  }, group.root));
+}
+
+/** Every branch a record governs, including a child-rooted record's own branch. */
+export function archivedGroupBranches(snapshot: LeaderSnapshot, group: LeaderArchivedGroup): LeaderBranch[] {
+  const top = archivedChildBranch(snapshot, group);
+  return snapshot.branches.filter((branch) => branch === top || group.branchIds.includes(branch.id));
+}
+
+export function archivedBranchIds(snapshot: LeaderSnapshot): Set<string> {
+  return new Set((snapshot.archivedGroups ?? []).flatMap((group) => archivedGroupBranches(snapshot, group).map((branch) => branch.id)));
 }
 
 export function leaderGroupRoot(snapshot: LeaderSnapshot, identity: LeaderIdentity): LeaderIdentity {

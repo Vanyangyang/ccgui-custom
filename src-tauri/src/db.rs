@@ -267,6 +267,107 @@ impl Db {
         Ok(())
     }
 
+    /// Persist the authoritative workspace path for an AGY session in `meta`
+    /// (without altering table DDL / worker schema compatibility). ACP mode
+    /// does not write `cache/last_conversations.json`, and AGY's
+    /// `conversation_summaries.workspace_uris` includes every `--add-dir`
+    /// (`granted_roots`) alongside the real cwd.
+    pub fn remember_agy_session_workspace(
+        &self,
+        session_id: &str,
+        workspace_path: &str,
+    ) -> Result<(), String> {
+        let sid = session_id.trim();
+        let ws = workspace_path.trim();
+        if sid.is_empty() || ws.is_empty() {
+            return Ok(());
+        }
+        let key = format!("agy_workspace:{sid}");
+        let conn = self.0.lock();
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            rusqlite::params![key, ws],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn forget_agy_session_workspace_tx(
+        tx: &rusqlite::Connection,
+        session_id: &str,
+    ) -> Result<(), String> {
+        let sid = session_id.trim();
+        if sid.is_empty() {
+            return Ok(());
+        }
+        tx.execute(
+            "DELETE FROM meta WHERE key=?1",
+            [format!("agy_workspace:{sid}")],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Collect authoritative `session_id -> workspace_path` mappings for AGY
+    /// sessions from existing app state (lowest to highest precedence:
+    /// `usage_ledger`, `leader_branches`, `sessions`, explicit `meta` pin).
+    pub fn agy_session_workspaces(&self) -> Result<std::collections::HashMap<String, String>, String> {
+        let conn = self.0.lock();
+        let mut out = std::collections::HashMap::new();
+        let mut collect = |sql: &str| -> Result<(), String> {
+            let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .map_err(|e| e.to_string())?;
+            for row in rows {
+                let (sid, ws) = row.map_err(|e| e.to_string())?;
+                let sid = sid.trim();
+                let ws = ws.trim();
+                if !sid.is_empty() && !ws.is_empty() {
+                    out.insert(sid.to_string(), ws.to_string());
+                }
+            }
+            Ok(())
+        };
+
+        collect(
+            "SELECT session_id, workspace_path FROM usage_ledger
+             WHERE engine='agy' AND session_id IS NOT NULL AND session_id != ''
+               AND workspace_path IS NOT NULL AND workspace_path != ''
+             ORDER BY id ASC",
+        )?;
+
+        let has_leader_branches: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='leader_branches'",
+                [],
+                |_| Ok(true),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .unwrap_or(false);
+        if has_leader_branches {
+            collect(
+                "SELECT session_id, workspace_path FROM leader_branches
+                 WHERE engine='agy' AND session_id IS NOT NULL AND session_id != ''
+                   AND workspace_path != ''",
+            )?;
+        }
+
+        collect(
+            "SELECT session_id, workspace_path FROM sessions
+             WHERE engine='agy' AND workspace_path != ''",
+        )?;
+
+        collect(
+            "SELECT substr(key, 15), value FROM meta
+             WHERE key LIKE 'agy_workspace:%' AND value IS NOT NULL AND value != ''",
+        )?;
+
+        Ok(out)
+    }
+
     /// Remember that this app handed a prompt (by digest) to Codex Desktop.
     pub fn remember_codex_desktop_prompt(
         &self,
@@ -930,6 +1031,44 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn agy_workspace_pins_override_legacy_sources_without_schema_changes() {
+        let db = Db::open_in_memory().unwrap();
+        let schema = || {
+            let conn = db.0.lock();
+            let mut stmt = conn.prepare("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name").unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
+        };
+        let before = schema();
+        db.0.lock().execute("INSERT INTO usage_ledger(ts,engine,session_id,workspace_path) VALUES(1,'agy','sid','/usage')", []).unwrap();
+        assert_eq!(db.agy_session_workspaces().unwrap()["sid"], "/usage");
+        db.0.lock().execute("INSERT INTO sessions(engine,session_id,workspace_path,file_path,file_size,file_mtime_ms) VALUES('agy','sid','/indexed','/sid.db',1,2)", []).unwrap();
+        assert_eq!(db.agy_session_workspaces().unwrap()["sid"], "/indexed");
+        db.remember_agy_session_workspace(" sid ", " /native ").unwrap();
+        db.remember_agy_session_workspace("", "/ignored").unwrap();
+        db.remember_agy_session_workspace("sid", " ").unwrap();
+        assert_eq!(db.agy_session_workspaces().unwrap()["sid"], "/native");
+        assert_eq!(schema(), before, "workspace metadata must not alter the host schema");
+        {
+            let mut conn = db.0.lock();
+            let tx = conn.transaction().unwrap();
+            Db::forget_agy_session_workspace_tx(&tx, "sid").unwrap();
+            tx.commit().unwrap();
+        }
+        assert_eq!(db.agy_session_workspaces().unwrap()["sid"], "/indexed");
+    }
+
+    #[test]
+    fn agy_workspace_legacy_leader_source_has_defined_precedence() {
+        let db = Db::open_in_memory().unwrap();
+        crate::leader::ensure_schema(&db).unwrap();
+        db.0.lock().execute("INSERT INTO usage_ledger(ts,engine,session_id,workspace_path) VALUES(1,'agy','sid','/usage')", []).unwrap();
+        db.0.lock().execute("INSERT INTO leader_branches(id,parent_engine,parent_session_id,workspace_path,engine,session_id,state,record_json,permission) VALUES('branch','agy','parent','/leader','agy','sid','completed','{}','auto')", []).unwrap();
+        assert_eq!(db.agy_session_workspaces().unwrap()["sid"], "/leader");
+        db.remember_agy_session_workspace("sid", "/native").unwrap();
+        assert_eq!(db.agy_session_workspaces().unwrap()["sid"], "/native");
+    }
 
     #[test]
     fn auxiliary_kind_storage_keeps_v1_schema() {

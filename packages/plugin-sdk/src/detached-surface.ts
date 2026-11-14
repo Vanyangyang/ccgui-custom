@@ -58,4 +58,12 @@ export interface PluginDetachedSurfaceDefinition {
   getSnapshot(): unknown;
   subscribe(listener: () => void): Disposer;
   dispatch(action: PluginDetachedAction): unknown | Promise<unknown>;
+  /** Route a human-selected assistant notice to an exact plugin-owned
+   * coordinator. The host verifies the returned request against its native
+   * session before calling deliver. A draft must be appended, not sent. */
+  noticeTarget?: {
+    resolve(source: { engine: string; sessionId: string; workspacePath: string }): string | null;
+    deliver(request: { source: { engine: string; sessionId: string; workspacePath: string }; requestId: string; noticeId: string;
+      action: "open" | "draft"; text?: string; signal: AbortSignal }): Promise<boolean>;
+  };
 }

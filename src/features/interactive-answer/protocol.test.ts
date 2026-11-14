@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it } from "vitest";
 import { checkInteractiveProgram, isClosedInteractiveFence } from "./protocol";
 import { LEGACY_REQUEST_INSTRUCTIONS, stripInteractiveAnswerPrompt, supportsInteractiveAnswer } from "./prompt";

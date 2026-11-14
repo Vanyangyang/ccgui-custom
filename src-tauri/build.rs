@@ -2,6 +2,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CCGUI_FRONTEND_FINGERPRINT");
     println!("cargo:rerun-if-env-changed=USERPROFILE");
     println!("cargo:rerun-if-env-changed=HOME");
+    println!("cargo:rerun-if-env-changed=CCGUI_SOURCE_SNAPSHOT");
     if let Some(fingerprint) = std::env::var_os("CCGUI_FRONTEND_FINGERPRINT") {
         let fingerprint = fingerprint.to_str().expect("frontend fingerprint must be Unicode");
         assert!(
@@ -17,8 +18,11 @@ fn main() {
     );
     if let Some(repo_root) = manifest_dir.parent() {
         let repo_str = repo_root.to_string_lossy();
-        let is_snapshot =
-            repo_str.contains("runtime-updates") || repo_str.contains("ccgui-self-update");
+        // Isolated maintenance checkouts are Git worktrees too; they set this
+        // explicitly so they never replace the developer's registered source.
+        let is_snapshot = repo_str.contains("runtime-updates")
+            || repo_str.contains("ccgui-self-update")
+            || std::env::var_os("CCGUI_SOURCE_SNAPSHOT").is_some_and(|value| value == "1");
         if !is_snapshot
             && repo_root.join(".git").exists()
             && manifest_dir.join("tauri.conf.json").is_file()

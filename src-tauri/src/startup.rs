@@ -8,7 +8,9 @@ pub(crate) enum Mode {
     HostChatMcp,
     ComputerUseMcp,
     TaskWorker,
+    AgyAcpService,
     TaskWorkerProbe,
+    WorkerRecovery,
     UpdateSupervisor,
 }
 
@@ -30,6 +32,8 @@ fn parse_options(
 ) -> Result<Options, &'static str> {
     let (mut host, mut computer, mut worker, mut probe) = (false, false, false, false);
     let mut supervisor = false;
+    let mut recovery = false;
+    let mut acp_service = false;
     let mut resume = None;
     let mut profile = None;
     let mut args = args
@@ -58,19 +62,26 @@ fn parse_options(
                 return Err("Missing --dev-profile path");
             }
             profile = Some(PathBuf::from(value));
+        } else if arg == OsStr::new("--plugin-decisions")
+            || arg == OsStr::new("--decisions-import-key")
+            || arg == OsStr::new("--decisions-remove-key")
+        {
+            return Err("Decisions support has been removed");
         } else {
             host |= arg == OsStr::new("--host-chat-mcp");
             computer |= arg == OsStr::new("--computer-use-mcp");
             worker |= arg == OsStr::new("--task-worker");
             probe |= arg == OsStr::new("--task-worker-probe");
             supervisor |= arg == OsStr::new("--live-update-supervisor");
+            recovery |= arg == OsStr::new("--worker-recovery");
+            acp_service |= arg == OsStr::new("--agy-acp-service");
             if let Some(id) = arg.to_str().and_then(|arg| arg.strip_prefix("--live-update-resume=")) {
                 if resume.is_some() || id.len() != 36 || uuid::Uuid::parse_str(id).is_err() { return Err("Invalid update recovery identity"); }
                 resume = Some(id.to_string());
             }
         }
     }
-    if [host, computer, worker, probe, supervisor].iter().filter(|enabled| **enabled).count() > 1 {
+    if [host, computer, worker, probe, supervisor, recovery, acp_service].iter().filter(|enabled| **enabled).count() > 1 {
         return Err("Conflicting MCP service modes");
     }
     let mode = match (host, computer) {
@@ -80,6 +91,8 @@ fn parse_options(
         _ if worker => Mode::TaskWorker,
         _ if probe => Mode::TaskWorkerProbe,
         _ if supervisor => Mode::UpdateSupervisor,
+        _ if recovery => Mode::WorkerRecovery,
+        _ if acp_service => Mode::AgyAcpService,
         _ => Mode::Gui,
     };
     if resume.is_some() && mode != Mode::Gui { return Err("Update recovery requires GUI mode"); }
@@ -149,6 +162,15 @@ fn error_text(language: &str, error: &str) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retired_decisions_modes_are_rejected_without_starting_gui_or_service() {
+        for flag in ["--plugin-decisions", "--decisions-import-key", "--decisions-remove-key"] {
+            assert_eq!(mode(["ccgui", flag]), Err("Decisions support has been removed"));
+            assert_eq!(mode(["ccgui", flag, "C:/unused-fixture.txt"]), Err("Decisions support has been removed"));
+            assert_eq!(mode(["ccgui", "--host-chat-mcp", flag]), Err("Decisions support has been removed"));
+        }
+    }
 
     #[test]
     fn profile_options_preserve_modes_and_reject_missing_duplicate_or_release_options() {
@@ -228,6 +250,25 @@ mod tests {
             mode(["ccgui-next.exe", "--host-chat-mcp-extra"]),
             Ok(Mode::Gui)
         );
+    }
+
+    #[test]
+    fn worker_recovery_is_an_explicit_exclusive_service() {
+        assert_eq!(mode(["ccgui", "--worker-recovery"]), Ok(Mode::WorkerRecovery));
+        for flag in ["--task-worker", "--task-worker-probe", "--host-chat-mcp", "--computer-use-mcp", "--live-update-supervisor",
+            "--live-update-resume=11111111-1111-4111-8111-111111111111"] {
+            assert!(mode(["ccgui", "--worker-recovery", flag]).is_err());
+        }
+    }
+
+    #[test]
+    fn acp_pool_is_an_explicit_exclusive_service() {
+        assert_eq!(mode(["ccgui", "--agy-acp-service"]), Ok(Mode::AgyAcpService));
+        for flag in ["--task-worker", "--task-worker-probe", "--host-chat-mcp", "--computer-use-mcp",
+            "--live-update-supervisor", "--worker-recovery",
+            "--live-update-resume=11111111-1111-4111-8111-111111111111"] {
+            assert!(mode(["ccgui", "--agy-acp-service", flag]).is_err());
+        }
     }
 
     #[test]

@@ -1,9 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { ipc, type SessionMeta } from "@/lib/ipc";
+import { ipc, type Message, type SessionMeta } from "@/lib/ipc";
 import { useChatStore } from "./store";
 import { handleEngineEvents, type EngineEventDeps } from "./store/engine-events";
 import { sessionKey } from "./store/persistence";
-import { EMPTY_SESSION, resolveSessionModel, resolveSessionEffort, runRouting } from "./store/stream";
+import { EMPTY_SESSION, latestHistoryModel, latestHistoryEffort, resolveSessionModel, resolveSessionEffort, runRouting } from "./store/stream";
 
 vi.mock("@/lib/ipc", () => ({
   ipc: {
@@ -192,6 +192,24 @@ describe("a session's provider and model memory", () => {
     expect(useChatStore.getState().bySession[KEY]!.activeEffort).toBe("high");
   });
 
+  it("native model reports replace live history before invalidating cached model/effort facts", () => {
+    const messages: Message[] = [Object.freeze({ seq: 1, role: "assistant", text: "live", ts: null, live: true, model: "gemini-4-argon", effort: "medium" })];
+    Object.freeze(messages);
+    const agyKey = sessionKey("agy", SID, WS);
+    const tab = { engine: "agy", sessionId: SID, workspacePath: WS };
+    useChatStore.setState({ active: tab, openTabs: [tab], bySession: { [agyKey]: { ...EMPTY_SESSION, messages } } });
+    expect(latestHistoryModel(messages)).toBe("gemini-4-argon");
+    expect(latestHistoryEffort(messages)).toBe("medium");
+    handleEngineEvents([{ runId: "cached-model", sessionId: SID, engine: "agy", seq: 1, kind: "model", data: "gemini-4-argon-high" }], deps());
+    const next = useChatStore.getState().bySession[agyKey];
+    expect(next.messages).not.toBe(messages);
+    expect(latestHistoryModel(next.messages)).toBe("gemini-4-argon-high");
+    expect(latestHistoryEffort(next.messages)).toBeNull();
+    expect(resolveSessionEffort(tab, next, "medium")).toBeUndefined();
+    expect(latestHistoryModel(messages)).toBe("gemini-4-argon");
+    expect(latestHistoryEffort(messages)).toBe("medium");
+  });
+
   it("adopts the reasoning level this session ran when it is opened", async () => {
     useChatStore.setState({ sessions: [meta(SENT, "xhigh")] });
 
@@ -273,27 +291,34 @@ describe("a session's provider and model memory", () => {
     expect(vi.mocked(ipc.rememberSessionEffort)).toHaveBeenCalledWith("omp", SID, "high");
   });
 
-  it("suppresses independent effort when an Antigravity model already encodes its tier", async () => {
+  it.each([
+    "gemini-4-argon-high",
+    "gemini-4-hydrogen-xhigh",
+    "gemini-pro-orchestrator",
+    "gemini-pro-orchestrator-argon",
+  ])("suppresses unsupported independent effort for Antigravity model %s", async (model) => {
+    const runId = `run-${model}`;
+    vi.mocked(ipc.sendMessage).mockResolvedValueOnce({ runId, sessionId: null });
     const agyKey = sessionKey("agy", SID, WS);
     const tab = { engine: "agy", sessionId: SID, workspacePath: WS };
     useChatStore.setState({
       active: tab,
       openTabs: [tab],
-      sessions: [{ ...meta("gemini-4-argon-high", "medium"), engine: "agy" }],
-      models: { agy: "gemini-4-argon-high" },
+      sessions: [{ ...meta(model, "medium"), engine: "agy" }],
+      models: { agy: model },
       efforts: { agy: "medium" },
       bySession: {},
     });
 
     await useChatStore.getState().selectSession("agy", SID, WS);
-    expect(useChatStore.getState().bySession[agyKey]!.activeModel).toBe("gemini-4-argon-high");
+    expect(useChatStore.getState().bySession[agyKey]!.activeModel).toBe(model);
     expect(useChatStore.getState().bySession[agyKey]!.activeEffort).toBeNull();
     expect(
       resolveSessionEffort(
         tab,
         useChatStore.getState().bySession[agyKey],
         "medium",
-        "gemini-4-argon-high",
+        model,
       ),
     ).toBeUndefined();
 
@@ -301,7 +326,7 @@ describe("a session's provider and model memory", () => {
     expect(vi.mocked(ipc.sendMessage)).toHaveBeenCalledWith(
       expect.objectContaining({
         engine: "agy",
-        model: "gemini-4-argon-high",
+        model,
         effort: null,
       }),
     );
@@ -309,10 +334,10 @@ describe("a session's provider and model memory", () => {
 
     handleEngineEvents(
       [
-        { runId: "run-1", sessionId: SID, engine: "agy", seq: 1, kind: "effort", data: "medium" },
-        { runId: "run-1", sessionId: SID, engine: "agy", seq: 2, kind: "delta", data: "完成" },
+        { runId, sessionId: SID, engine: "agy", seq: 1, kind: "effort", data: "medium" },
+        { runId, sessionId: SID, engine: "agy", seq: 2, kind: "delta", data: "完成" },
         {
-          runId: "run-1",
+          runId,
           sessionId: SID,
           engine: "agy",
           seq: 3,
@@ -326,26 +351,26 @@ describe("a session's provider and model memory", () => {
     const session = useChatStore.getState().bySession[agyKey]!;
     expect(session.activeEffort).toBeNull();
     const assistant = session.messages.find((m) => m.role === "assistant");
-    expect(assistant?.model).toBe("gemini-4-argon-high");
+    expect(assistant?.model).toBe(model);
     expect(assistant?.effort ?? null).toBeNull();
   });
 
-  it("allows switching from an encoded-tier AGY model to Vertex gemini-4-argon and changing effort before sending", async () => {
+  it.each(["gemini-4-argon-high", "gemini-pro-orchestrator"])("restores independent effort after switching from %s to Vertex gemini-4-argon", async (model) => {
     const agyKey = sessionKey("agy", SID, WS);
     const tab = { engine: "agy", sessionId: SID, workspacePath: WS };
     useChatStore.setState({
       activeEngine: "agy",
       active: tab,
       openTabs: [tab],
-      sessions: [{ ...meta("gemini-4-argon-high"), engine: "agy" }],
-      models: { agy: "gemini-4-argon-high" },
+      sessions: [{ ...meta(model), engine: "agy" }],
+      models: { agy: model },
       efforts: { agy: "high" },
       bySession: {
         [agyKey]: {
           ...EMPTY_SESSION,
-          activeModel: "gemini-4-argon-high",
+          activeModel: model,
           activeEffort: null,
-          messages: [{ seq: 1, role: "assistant", text: "hi", ts: null, model: "gemini-4-argon-high", effort: "high" }],
+          messages: [{ seq: 1, role: "assistant", text: "hi", ts: null, model, effort: "high" }],
         },
       },
     });

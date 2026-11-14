@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it } from "vitest";
 import { leaderWorkspacePathKey, sameLeaderWorkspace } from "./workspace-path";
 import { isDirectChild, leaderGroupBranches, leaderGroupRoot, sameIdentity, type LeaderBranch } from "./types";
@@ -11,13 +12,15 @@ describe("Leader workspace path identity", () => {
     ["G://Projects///ccgui-custom", "G:/Projects/ccgui-custom"],
     [String.raw`G:\/Projects/\ccgui-custom`, "G:/Projects/ccgui-custom"],
     ["G:////", "G:/"],
+    ["c:\\Projects\\ccgui-custom", "C:/Projects/ccgui-custom"],
+    ["C:\\", "c:/"],
   ])("recognizes Windows separators in %s", (a, b) => {
     expect(sameLeaderWorkspace(a, b)).toBe(true);
   });
 
   it.each([
     ["G:/project", "G:/other"], ["G:/project", "G:/project/child"],
-    ["G:/project", "g:/project"], ["G:/project", "G:/PROJECT"],
+    ["G:/project", "G:/PROJECT"],
     ["G:/project", "G:/other/../project"], ["G:/", "G:"],
     ["G:/project", "G:/project/"], ["\\\\server\\share", "//server/share"],
     ["/project/name", "/project\\name"], ["project/name", "project\\name"],
@@ -36,9 +39,9 @@ describe("Leader workspace path identity", () => {
     expect(leaderWorkspacePathKey("G:\\")).toBe("G:/");
   });
 
-  it("resolves ancestry and tree ownership across separator variants only", () => {
+  it("resolves ancestry and tree ownership across Windows separator and drive-letter variants", () => {
     const root = { engine: "claude", sessionId: "root", workspacePath: "G:/project" };
-    const child = { id: "child", engine: "codex", sessionId: "child", parentEngine: "claude", parentSessionId: "root", workspacePath: "G:\\project", state: "running", title: "task" } as LeaderBranch;
+    const child = { id: "child", engine: "codex", sessionId: "child", parentEngine: "claude", parentSessionId: "root", workspacePath: "g:\\project", state: "running", title: "task" } as LeaderBranch;
     const snapshot = { leaders: [{ ...root, workspacePath: "G:\\project" }], branches: [child] };
     expect(sameIdentity(root, snapshot.leaders[0])).toBe(true);
     expect(isDirectChild(child, root)).toBe(true);

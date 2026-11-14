@@ -2,7 +2,10 @@
 use parking_lot::Mutex;
 use std::{
     collections::VecDeque,
-    sync::{Arc, LazyLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, LazyLock,
+    },
     time::{Duration, Instant},
 };
 use tokio::sync::watch;
@@ -11,6 +14,7 @@ pub(crate) static GATE: LazyLock<Arc<Gate>> = LazyLock::new(|| Arc::new(Gate::ne
 pub(crate) struct Gate(Mutex<State>);
 struct State {
     epoch: u64,
+    sent_epoch: Option<u64>,
     foreground: usize,
     quiet_since: Option<Instant>,
     calls: VecDeque<Instant>,
@@ -25,8 +29,23 @@ pub(crate) struct Lease {
     gate: Arc<Gate>,
     pub epoch: u64,
     pub cancelled: watch::Receiver<bool>,
+    pub plugin: String,
+    pub sources: Vec<super::protocol::SourceKind>,
+    sent: AtomicBool,
 }
 impl Lease {
+    pub fn sent(&self) -> bool {
+        self.sent.load(Ordering::Acquire)
+    }
+    pub fn mark_sent(&self) -> bool {
+        let mut s = self.gate.0.lock();
+        if s.epoch != self.epoch || s.foreground > 0 || s.stopped || *self.cancelled.borrow() {
+            return false;
+        }
+        s.sent_epoch = Some(self.epoch);
+        self.sent.store(true, Ordering::Release);
+        true
+    }
     pub async fn run<T>(&mut self, future: impl std::future::Future<Output = T>) -> Result<T, ()> {
         if *self.cancelled.borrow() || !self.gate.valid(self.epoch) {
             return Err(());
@@ -38,6 +57,7 @@ impl Gate {
     pub fn new() -> Self {
         Self(Mutex::new(State {
             epoch: 0,
+            sent_epoch: None,
             foreground: 0,
             quiet_since: None,
             calls: VecDeque::new(),
@@ -57,6 +77,7 @@ impl Gate {
     fn invalidate(s: &mut State) {
         s.epoch = s.epoch.wrapping_add(1);
         s.quiet_since = None;
+        s.sent_epoch = None;
         if let Some((_, _, _, tx)) = &s.active {
             tx.send_replace(true);
         }
@@ -64,8 +85,18 @@ impl Gate {
     pub fn foreground(self: &Arc<Self>) -> Foreground {
         let mut s = self.0.lock();
         s.foreground += 1;
-        Self::invalidate(&mut s);
+        Self::foreground_busy(&mut s);
         Foreground(self.clone())
+    }
+    fn foreground_busy(s: &mut State) {
+        s.quiet_since = None;
+        // A sent bounded call owns its evidence epoch until explicit cancel.
+        if s.sent_epoch != Some(s.epoch) {
+            Self::invalidate(s);
+        }
+    }
+    pub fn observe_foreground(&self) {
+        Self::foreground_busy(&mut self.0.lock());
     }
     pub fn cancel(&self, owner: Option<(&str, &str)>, shutdown: bool) {
         let mut s = self.0.lock();
@@ -94,8 +125,12 @@ impl Gate {
     }
     pub fn read_epoch(&self, busy: impl FnOnce() -> bool, paused: bool) -> Result<u64, ()> {
         let mut s = self.0.lock();
-        if busy() || paused || s.foreground > 0 || s.stopped {
+        if paused || s.stopped {
             Self::invalidate(&mut s);
+            return Err(());
+        }
+        if busy() || s.foreground > 0 {
+            Self::foreground_busy(&mut s);
             return Err(());
         }
         if s.active.is_some() {
@@ -105,11 +140,15 @@ impl Gate {
     }
     pub fn valid(&self, epoch: u64) -> bool {
         let s = self.0.lock();
-        s.epoch == epoch && s.foreground == 0 && !s.stopped
+        s.epoch == epoch && (s.foreground == 0 || s.sent_epoch == Some(epoch)) && !s.stopped
     }
     fn delay(s: &mut State, now: Instant, registry_busy: bool, paused: bool) -> u64 {
-        if registry_busy || paused || s.foreground > 0 || s.stopped {
+        if paused || s.stopped {
             Self::invalidate(s);
+            return 30_000;
+        }
+        if registry_busy || s.foreground > 0 {
+            Self::foreground_busy(s);
             return 30_000;
         }
         if s.active.is_some() {
@@ -175,6 +214,9 @@ impl Gate {
             gate: self.clone(),
             epoch,
             cancelled: rx,
+            plugin: plugin.into(),
+            sources: vec![],
+            sent: AtomicBool::new(false),
         })
     }
     pub fn failure(&self, retry_after: Option<u64>) -> u64 {
@@ -210,6 +252,7 @@ impl Drop for Lease {
             .is_some_and(|(epoch, _, _, _)| *epoch == self.epoch)
         {
             s.active = None;
+            s.sent_epoch = None;
             // Timestamp completion, not only admission: slow local preparation
             // must not erase the >=60s spacing between actual HTTP calls.
             if let Some(last) = s.calls.back_mut() {
@@ -230,6 +273,26 @@ mod tests {
     use super::*;
     fn ready() -> Arc<Gate> {
         Gate::test_ready()
+    }
+    #[tokio::test]
+    async fn sent_request_survives_foreground_but_explicit_cancel_and_maintenance_win() {
+        let g = ready();
+        let mut lease = g.admit("p", "sent", || false, false).unwrap();
+        assert!(lease.mark_sent());
+        let front = g.foreground();
+        assert!(g.valid(lease.epoch));
+        assert!(!*lease.cancelled.borrow());
+        assert!(g.status(|| true, false) > 0);
+        assert_eq!(lease.run(async { 42 }).await, Ok(42));
+        g.cancel(Some(("p", "sent")), false);
+        assert!(!g.valid(lease.epoch));
+        assert!(lease.run(async { 43 }).await.is_err());
+        drop(front);
+        let g = ready();
+        let lease = g.admit("p", "maintenance", || false, false).unwrap();
+        assert!(lease.mark_sent());
+        g.status(|| false, true);
+        assert!(!g.valid(lease.epoch));
     }
     #[test]
     fn foreground_invalidates_before_reservation_and_cannot_admit() {
@@ -275,7 +338,7 @@ mod tests {
         assert_eq!(g.failure(Some(u64::MAX)), 3_600_000);
     }
     #[tokio::test]
-    async fn foreground_drops_pending_admission_headers_and_streaming_body() {
+    async fn foreground_drops_only_work_before_generation_is_committed() {
         use std::sync::atomic::{AtomicBool, Ordering};
         struct Dropped(Arc<AtomicBool>);
         impl Drop for Dropped {
@@ -283,7 +346,7 @@ mod tests {
                 self.0.store(true, Ordering::SeqCst);
             }
         }
-        for phase in ["admission", "headers", "body"] {
+        for phase in ["source", "token_count", "before_send"] {
             let g = ready();
             let mut lease = g.admit("p", phase, || false, false).unwrap();
             let started = Arc::new(tokio::sync::Notify::new());

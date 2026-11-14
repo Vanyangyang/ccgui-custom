@@ -15,7 +15,8 @@ import { listenSessionsChanged } from "@/lib/events";
 import { ipc, type SessionMeta } from "@/lib/ipc";
 import { useChatStore } from "@/features/chat/store";
 import { useLeaderStore } from "@/features/leader/store";
-import { isDirectChild, type LeaderArchivedGroup, type LeaderBranch, type LeaderIdentity } from "@/features/leader/types";
+import { archivedChildBranch, archivedGroupBranches, isDirectChild, type LeaderArchivedGroup, type LeaderBranch, type LeaderIdentity } from "@/features/leader/types";
+import { parentOfBranch } from "@/features/leader/tree";
 import { listen } from "@/lib/transport";
 
 const ALL_WORKSPACES = "*";
@@ -235,7 +236,7 @@ export function ArchivedSessionsSection() {
             </SettingsSectionLabel>
             <SettingsCard>
               {rows.taskGroups.map((group) => <ArchivedLeaderGroupCard key={JSON.stringify(group.root)} group={group}
-                branches={snapshot.branches.filter((branch) => group.branchIds.includes(branch.id))} when={dateFormatter.format(new Date(group.archivedAt))}
+                branches={archivedGroupBranches(snapshot, group)} childBranch={archivedChildBranch(snapshot, group)} when={dateFormatter.format(new Date(group.archivedAt))}
                 busy={busyKey != null || leaderBusy} onRestore={() => void runGroup(group, "restore")} onDelete={() => setDeletingGroup(group)} />)}
               {rows.sessions.map((session) => {
                 const key = JSON.stringify([session.engine, session.sessionId, session.workspacePath]);
@@ -309,8 +310,10 @@ export function ArchivedSessionsSection() {
           }}
         />
       )}
-      {deletingGroup && <ConfirmDialog danger confirmLabel={t("leader.deleteGroup")}
-        message={t("leader.deleteGroupConfirm", { title: deletingGroup.title, count: deletingGroup.branchIds.length })}
+      {deletingGroup && <ConfirmDialog danger confirmLabel={t(archivedChildBranch(snapshot, deletingGroup) ? "leader.deleteChild" : "leader.deleteGroup")}
+        message={archivedChildBranch(snapshot, deletingGroup)
+          ? t("leader.deleteChildConfirm", { title: deletingGroup.title, count: deletingGroup.members.length })
+          : t("leader.deleteGroupConfirm", { title: deletingGroup.title, count: deletingGroup.branchIds.length })}
         onCancel={() => setDeletingGroup(null)} onConfirm={() => {
           const group = deletingGroup; setDeletingGroup(null); void runGroup(group, "delete");
         }} />}
@@ -318,8 +321,9 @@ export function ArchivedSessionsSection() {
   );
 }
 
-function ArchivedLeaderGroupCard({ group, branches, when, busy, onRestore, onDelete }: {
-  group: LeaderArchivedGroup; branches: LeaderBranch[]; when: string; busy: boolean; onRestore: () => void; onDelete: () => void;
+/** A child-rooted record archives one subtree whose parent stays live. */
+function ArchivedLeaderGroupCard({ group, branches, childBranch, when, busy, onRestore, onDelete }: {
+  group: LeaderArchivedGroup; branches: LeaderBranch[]; childBranch?: LeaderBranch; when: string; busy: boolean; onRestore: () => void; onDelete: () => void;
 }) {
   const { t } = useTranslation();
   const seen = new Set<string>();
@@ -339,18 +343,18 @@ function ArchivedLeaderGroupCard({ group, branches, when, busy, onRestore, onDel
       <EngineIcon engine={group.root.engine} size={18} className="shrink-0 text-foreground-icon-secondary" />
       <div className="min-w-0 flex-1">
         <p className="truncate text-body-regular text-text-primary" title={group.title}>{group.title}</p>
-        <p className="text-body-2-regular text-text-secondary">{t("leader.archivedGroup")} · {when}</p>
+        <p className="text-body-2-regular text-text-secondary">{t(childBranch ? "leader.archivedChild" : "leader.archivedGroup")} · {when}</p>
       </div>
       <div className="flex shrink-0 gap-2">
-        <Button size="small" variant="secondary" leadingIcon={ArchiveRestore} disabled={busy || group.deletionStarted === true} onClick={onRestore}>{t("leader.restoreGroup")}</Button>
-        <Button size="small" variant="danger" leadingIcon={Trash2} disabled={busy} onClick={onDelete}>{t(group.deletionStarted ? "leader.retryDeleteGroup" : "leader.deleteGroup")}</Button>
+        <Button size="small" variant="secondary" leadingIcon={ArchiveRestore} disabled={busy || group.deletionStarted === true} onClick={onRestore}>{t(childBranch ? "leader.restoreChild" : "leader.restoreGroup")}</Button>
+        <Button size="small" variant="danger" leadingIcon={Trash2} disabled={busy} onClick={onDelete}>{t(group.deletionStarted ? "leader.retryDeleteGroup" : childBranch ? "leader.deleteChild" : "leader.deleteGroup")}</Button>
       </div>
     </div>
     {group.deletionStarted && <p role="alert" className="mt-2 text-body-2-regular text-text-error-primary">{t("leader.groupDeletionIncomplete")}</p>}
     <details className="mt-2 text-body-2-regular text-text-secondary">
       <summary>{t("leader.groupDetails", { count: group.branchIds.length })}</summary>
       <p className="mt-2 break-all text-caption-1-medium text-text-tertiary">{group.root.engine}/{group.root.sessionId}</p>
-      <ul>{descendants(group.root)}</ul>
+      <ul>{descendants(childBranch ? parentOfBranch(childBranch) : group.root)}</ul>
     </details>
   </div>;
 }

@@ -946,8 +946,28 @@ mod tests {
     }
 
     #[test]
+    fn v4_live_update_rejects_v3_in_both_directions_without_changing_state() {
+        for (installed, proposed) in [
+            (crate::task_worker::SCHEMA_CONTRACT_V3_HASH, crate::task_worker::SCHEMA_CONTRACT_V4_HASH),
+            (crate::task_worker::SCHEMA_CONTRACT_V4_HASH, crate::task_worker::SCHEMA_CONTRACT_V3_HASH),
+        ] {
+            let fixture = Fixture::new();
+            let store = fixture.store();
+            let (source, hash) = fixture.release_with_schema("installed", installed);
+            store.initialize_active(store.stage(&source, &hash).unwrap()).unwrap();
+            let (source, hash) = fixture.release_with_schema("candidate", proposed);
+            let candidate = store.stage(&source, &hash).unwrap();
+            let before = store.read_state().unwrap();
+            assert_eq!(store.prepare(candidate, &Compatibility {
+                worker_protocol: 1, checkpoint_schema: 1, schema_hash: installed.into(),
+            }).unwrap_err(), "database schema hash mismatch");
+            assert_eq!(store.read_state().unwrap(), before);
+        }
+    }
+
+    #[test]
     fn offline_upgrade_preserves_old_metadata_and_uses_installed_baseline_for_next_update() {
-        for source_schema in [crate::task_worker::SCHEMA_CONTRACT_V1_HASH, crate::task_worker::SCHEMA_CONTRACT_V2_HASH] {
+        for source_schema in [crate::task_worker::SCHEMA_CONTRACT_V1_HASH, crate::task_worker::SCHEMA_CONTRACT_V2_HASH, crate::task_worker::SCHEMA_CONTRACT_V3_HASH] {
             assert_offline_upgrade_preserves_metadata_and_installed_baseline(source_schema);
         }
     }
@@ -967,7 +987,7 @@ mod tests {
         let saved: UpdateState = serde_json::from_slice(&fs::read(backups[0].path()).unwrap()).unwrap();
         assert_eq!(saved, before);
         assert!(store.verify_identity(&old).is_ok());
-        let (source, hash) = fixture.release_with_schema("v3", crate::task_worker::SCHEMA_CONTRACT_V3_HASH);
+        let (source, hash) = fixture.release_with_schema("v4", crate::task_worker::SCHEMA_CONTRACT_V4_HASH);
         let new = store.stage(&source, &hash).unwrap();
         let next = store.prepare(new, &Compatibility {
             worker_protocol: 1, checkpoint_schema: 1, schema_hash: crate::task_worker::schema_hash(),

@@ -71,7 +71,7 @@ fn valid_text(value: &str, max: usize, field: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn local_path(value: &str) -> Result<&Path, String> {
+pub(crate) fn local_path(value: &str) -> Result<&Path, String> {
     let slash = value.replace('\\', "/");
     if value.trim() != value
         || value.chars().any(char::is_control)
@@ -84,7 +84,7 @@ fn local_path(value: &str) -> Result<&Path, String> {
     Ok(Path::new(value))
 }
 
-fn identity(path: &Path) -> Result<String, String> {
+pub(crate) fn identity(path: &Path) -> Result<String, String> {
     if !path.is_dir() {
         return Err("project member directory is missing".into());
     }
@@ -167,28 +167,56 @@ pub(crate) fn list_inner(conn: &Connection) -> Result<Vec<WorkspaceProject>, Str
 
 /// Exact project membership for background extraction; never infer a project
 /// from an ancestor directory or from sidebar placement.
+#[derive(Default)]
+pub(crate) struct MemorySourceContext {
+    pub(crate) archived: Vec<String>,
+    pub(crate) host_source: Option<std::path::PathBuf>,
+}
+
+/// Resolve external stores before the caller acquires the application DB lock.
+pub(crate) fn read_memory_source_context() -> Result<MemorySourceContext, String> {
+    let archived = crate::settings::read_settings()
+        .map_err(|_| "workspace_settings_unavailable")?.archived_workspaces;
+    let host_source = crate::creator_skill::registered_self_update_source_root(&crate::paths::app_home())
+        .map_err(|_| "host_source_unavailable")?;
+    Ok(MemorySourceContext { archived, host_source })
+}
+
 pub(crate) fn authorize_memory_source(
     conn: &Connection, plugin: &str, project_id: &str, workspace: &str, development: bool,
+    context: &MemorySourceContext,
 ) -> Result<String, String> {
-    let archived = crate::settings::read_settings().map_err(|_| "workspace_settings_unavailable")?.archived_workspaces;
-    authorize_memory_source_with_archives(conn, plugin, project_id, workspace, development, &archived)
+    authorize_memory_source_with_archives(conn, plugin, project_id, workspace, development,
+        &context.archived, context.host_source.as_deref())
 }
 
 fn authorize_memory_source_with_archives(
     conn: &Connection, plugin: &str, project_id: &str, workspace: &str, development: bool,
-    archived: &[String],
+    archived: &[String], host_source: Option<&Path>,
 ) -> Result<String, String> {
     let current = identity(local_path(workspace)?)?;
-    let host_source = Path::new(env!("CARGO_MANIFEST_DIR")).parent().ok_or("host_source_unavailable")?;
-    if identity(host_source).is_ok_and(|host| host == current) {
+    let roots = registered_roots(conn).map_err(|_| "workspace_storage_unavailable")?;
+    // Inspect registered nodes themselves: neither ancestors nor name prefixes
+    // establish host identity, and each checkout can be independently protected.
+    if roots.iter().any(|root| root == &current
+        && Path::new(root).join("scripts/self-update-build.mjs").is_file()
+        && Path::new(root).join("src-tauri/tauri.conf.json").is_file()) {
         return Err("host_source_project_excluded".into());
+    }
+    if let Some(host_source) = host_source {
+        let host_path = local_path(host_source.to_str().ok_or("host_source_unavailable")?)
+            .map_err(|_| "host_source_unavailable")?;
+        let host = identity(host_path)
+            .map_err(|_| "host_source_unavailable")?;
+        if host == current {
+            return Err("host_source_project_excluded".into());
+        }
     }
     let project = storage::read(conn).map_err(|_| "project_storage_unavailable")?.into_iter()
         .find(|p| p.id == project_id).ok_or("project_not_registered")?;
     if project.source_plugin_id.as_deref().is_some_and(|owner| owner != plugin) {
         return Err("foreign_project_owner".into());
     }
-    let roots = registered_roots(conn)?;
     let same_spelling = |a: &str, b: &str| {
         #[cfg(windows)] { a.replace('\\', "/").trim_end_matches('/').to_lowercase() == b.replace('\\', "/").trim_end_matches('/').to_lowercase() }
         #[cfg(not(windows))] { a.trim_end_matches('/') == b.trim_end_matches('/') }
@@ -204,32 +232,6 @@ fn authorize_memory_source_with_archives(
         return Err("workspace_not_local_or_archived".into());
     }
     Ok(format!("{}:{}:{}:{:?}", project.id, member.id, current, member.role))
-}
-
-/// Read-only native authorization. Both paths must still name their recorded
-/// local identities; a retargeted symlink cannot inherit the old membership.
-/// Exact executable workspace registration/archive checks belong to the caller.
-pub(crate) fn authorize_task_target(
-    conn: &Connection, parent: &str, target: &str, same_path: fn(&str, &str) -> bool,
-) -> Result<(), String> {
-    let parent_identity = identity(local_path(parent)?)?;
-    let target_identity = identity(local_path(target)?)?;
-    let roots = registered_roots(conn)?;
-    let projects = storage::read(conn).map_err(|e| e.to_string())?;
-    let available = |member: &StoredMember, path: &str, expected: &str| {
-        // Use the caller's established workspace spelling equivalence. Canonical
-        // identity detects retargeting; it must not grant an unlisted alias a role.
-        same_path(&member.path, path) && member.canonical_identity == expected
-            && member_status(&member.path, &member.canonical_identity, &roots) == MemberStatus::Available
-    };
-    if projects.iter().any(|project| {
-        project.members.iter().any(|m| available(m, parent, &parent_identity))
-            && project.members.iter().any(|m| m.role == MemberRole::Development && available(m, target, &target_identity))
-    }) {
-        Ok(())
-    } else {
-        Err("Cross-workspace child must target an available development member of the parent's registered project".into())
-    }
 }
 
 fn materialize(project: StoredProject, roots: &[String]) -> WorkspaceProject {

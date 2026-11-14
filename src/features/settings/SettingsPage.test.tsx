@@ -303,6 +303,42 @@ describe("SettingsPage system rail", () => {
   });
 });
 
+describe("native CLI plugin settings", () => {
+  it("appears when searching for 插件, without requiring a CCGUI extension", async () => {
+    const language = i18n.language;
+    try {
+      await act(async () => { await i18n.changeLanguage("zh"); });
+      await render([]);
+      const input = container.querySelector<HTMLInputElement>("nav input");
+      expect(input).not.toBeNull();
+      await act(async () => {
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, "插件");
+        input!.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+      expect(navLabels()).toContain("CLI 插件");
+    } finally {
+      await act(async () => { await i18n.changeLanguage(language); });
+    }
+  });
+
+  it("finds the native hook inventory when searching for 钩子", async () => {
+    const language = i18n.language;
+    try {
+      await act(async () => { await i18n.changeLanguage("zh"); });
+      await render([]);
+      const input = container.querySelector<HTMLInputElement>("nav input");
+      expect(input).not.toBeNull();
+      await act(async () => {
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, "钩子");
+        input!.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+      expect(navLabels()).toContain("CLI 钩子");
+    } finally {
+      await act(async () => { await i18n.changeLanguage(language); });
+    }
+  });
+});
+
 describe("SettingsPage CLI rail", () => {
   it("buckets uninstalled CLIs under 未安装, disabled ones under 未启用", async () => {
     await render([
@@ -514,6 +550,8 @@ describe("SettingsPage capabilities rail", () => {
     expect(itemsUnder("settings.groupCapabilities")).toEqual([
       i18n.t("settings.skills"),
       i18n.t("settings.mcp"),
+      i18n.t("settings.cliPlugins"),
+      i18n.t("settings.cliHooks"),
       // 电脑操控入口暂时隐藏：恢复时取消注释。
       // i18n.t("settings.computerUse"),
     ]);

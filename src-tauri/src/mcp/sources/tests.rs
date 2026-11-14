@@ -86,6 +86,15 @@ fn every_declared_source_is_registered_and_consistent() {
 }
 
 #[test]
+fn jsonc_preserves_string_commas_and_rejects_unclosed_comments() {
+    let parsed = super::read::parse_jsonc(r#"{"value":"literal,}","list":["x,]",],/*ok*/}"#, "fixture").unwrap();
+    assert_eq!(parsed["value"], "literal,}");
+    assert_eq!(parsed["list"][0], "x,]");
+    assert!(super::read::parse_jsonc("{\"a\":1 /* missing", "fixture").is_err());
+    assert!(super::read::parse_jsonc("{\"a\":1 /* gap */ 2}", "fixture").is_err());
+}
+
+#[test]
 fn kimi_json_entries_read_transport_state_and_redact_url() {
     let scratch = Scratch::new("kimi");
     let path = scratch.path().join("mcp.json");
@@ -115,6 +124,20 @@ fn kimi_json_entries_read_transport_state_and_redact_url() {
     assert_eq!(remote.header_keys, vec!["Authorization"]);
     let off = entries.iter().find(|entry| entry.name == "off").unwrap();
     assert!(!off.enabled);
+}
+
+#[test]
+fn pi_native_mcp_is_visible_without_probing_untrusted_project_config() {
+    let scratch = Scratch::new("pi-native");
+    let path = scratch.path().join("mcp.json");
+    std::fs::write(&path, r#"{"mcpServers":{"example":{"command":"node","enabled":false}}}"#).unwrap();
+    let entries = read_json_source(source("pi_project"), &path).unwrap();
+    assert_eq!(engine_support("pi"), "native");
+    assert_eq!(entries.len(), 1);
+    assert!(!entries[0].enabled);
+    assert_eq!(entries[0].probe_allowed, Some(false));
+    assert!(!entries[0].writable);
+    assert_eq!(candidate_paths("pi_project", Some("/work")), vec![Path::new("/work").join(".pi/mcp.json")]);
 }
 
 #[test]

@@ -5,6 +5,8 @@ import { createDetachedSurfaceOwner, type DetachedSurfaceOwnerOptions } from "..
 import { usePluginTabsStore } from "./center-tabs";
 import { canClosePluginViewsForUpdate, preparePluginViewsForUpdate, resumePluginViewsAfterUpdate } from "./update-close";
 import { installHardening, resetHardeningForTests } from "./hardening";
+import type { DetachedTransport } from "../windows/protocol";
+import { resolvePluginNoticeDestination } from "@/features/assistant-notices/plugin-destination";
 
 vi.mock("./composer-draft", () => ({ setActiveComposerDraft: vi.fn() }));
 vi.mock("@/features/chat/center-surfaces", () => ({ dismissCenterSurfaces: vi.fn() }));
@@ -13,6 +15,8 @@ const fakeOwner = vi.hoisted(() => ({ open: vi.fn(), returnToMain: vi.fn(), disp
   present: vi.fn(), restore: vi.fn(), flushPresentation: vi.fn(), checkpointParticipant: "plugin-window-owner:test",
   getStatus: () => ({ phase: "docked" }), subscribeStatus: () => () => {} }));
 vi.mock("../windows/owner", () => ({ createDetachedSurfaceOwner: vi.fn(() => fakeOwner) }));
+const fakeTaskBridge = vi.hoisted(() => ({ conversation: vi.fn(), noticeCoordinator: vi.fn(), dispose: vi.fn() }));
+vi.mock("./task-bridge", async original => ({ ...await original<object>(), createHostTaskBridge: vi.fn(() => fakeTaskBridge) }));
 
 const backend: PluginContextBackend = { get: async () => null, set: async () => {}, delete: async () => {}, bridgeInvoke: async () => null };
 const manifest = (extra = true): PluginManifest => ({ id: "detached-demo", name: "Demo", version: "1.0.0", tier: "js", permissions: ["ui:center-tab", ...(extra ? ["ui:detached-window"] : [])] });
@@ -31,6 +35,32 @@ function definition() {
 }
 
 describe("detachable center-tab context", () => {
+  it("routes notices only after proving the plugin-owned coordinator identity", async () => {
+    const target = { engine: "codex", sessionId: "native-session", workspacePath: "G:/game" };
+    const callbacks = { resolve: vi.fn(() => "owned-request"), deliver: vi.fn(async () => true) };
+    const def = definition();
+    const denied = handle();
+    expect(() => denied.ctx.ui.registerCenterTab({ ...def, detached: { ...def.detached, noticeTarget: callbacks } })).toThrow(/host:tasks/);
+    const h = createPluginContext({ ...manifest(), permissions: [...manifest().permissions, "host:tasks"] }, backend,
+      { appVersion: "1", detachedBundle: () => ({ code: "bundle", css: "", rendererExports: new Set(["createWindow"]) }) });
+    cleanup.push(() => { for (const dispose of [...h.disposers].reverse()) dispose(); });
+    fakeTaskBridge.conversation.mockResolvedValue({ sessionRef: target });
+    fakeTaskBridge.noticeCoordinator.mockResolvedValue("owned-request");
+    const unregister = h.ctx.ui.registerCenterTab({ ...def, detached: { ...def.detached, noticeTarget: callbacks } });
+    const route = await resolvePluginNoticeDestination(target);
+    expect(route?.requestId).toBe("owned-request");
+    await expect(route!.present()).resolves.toEqual({});
+    expect(usePluginTabsStore.getState().activeId).toBe("plugin:detached-demo:workbench");
+    fakeTaskBridge.conversation.mockResolvedValue({ sessionRef: { ...target, sessionId: "other" } });
+    await expect(resolvePluginNoticeDestination(target)).rejects.toThrow(/not its proven coordinator/);
+    fakeTaskBridge.conversation.mockResolvedValue({ sessionRef: target });
+    for (const invalid of [null, "other-request"]) {
+      callbacks.resolve.mockReturnValueOnce(invalid as never);
+      await expect(resolvePluginNoticeDestination(target)).rejects.toThrow(/unavailable or has changed/);
+    }
+    unregister();
+    expect(await resolvePluginNoticeDestination(target)).toBeNull();
+  });
   it("validates update handlers before wrapping and guards their initial synchronous IPC calls", async () => {
     const originalInternals = window.__TAURI_INTERNALS__;
     const invoke = vi.fn(async () => null);
@@ -86,6 +116,49 @@ describe("detachable center-tab context", () => {
     expect(h.disposers).toHaveLength(1);
     for (const dispose of [...h.disposers].reverse()) dispose();
     expect(fakeOwner.dispose).toHaveBeenCalledTimes(1);
+    expect(centerTabRegistry.get("plugin:detached-demo:workbench")).toBeUndefined();
+  });
+  it("the production registration keeps the receiver and uses the real owner's single isolation boundary", async () => {
+    const actual = await vi.importActual<typeof import("../windows/owner")>("../windows/owner");
+    const invoke = vi.fn(async (command: string, args?: Record<string, unknown>) => {
+      const request = args?.request as { registrationId: string };
+      if (command === "plugin_window_open") return { windowId: "real-owner", registrationId: request.registrationId, label: "real-owner" };
+      return undefined;
+    });
+    const transport: DetachedTransport = { invoke: <T>(command: string, args?: Record<string, unknown>) => invoke(command, args) as Promise<T>, listen: async () => () => {} };
+    let owner!: ReturnType<typeof createDetachedSurfaceOwner>;
+    vi.mocked(createDetachedSurfaceOwner).mockImplementationOnce(options => owner = actual.createDetachedSurfaceOwner({ ...options, transport }));
+    const source: { draft: string; nested: string[]; invalid?: unknown } = { draft: "source", nested: ["中文👩🏽‍💻"] };
+    let changed = () => {};
+    const def = { ...definition(), detached: { ...definition().detached,
+      subscribe: (listener: () => void) => { changed = listener; return () => {}; },
+    } };
+    def.detached.getSnapshot = function() { expect(this).toBe(def.detached); return source; };
+    const parse = vi.spyOn(JSON, "parse");
+    try {
+      handle().ctx.ui.registerCenterTab(def);
+      // Isolation now copies validated nodes directly; no full serialization
+      // round-trip is needed at either adjacent host layer.
+      expect(parse.mock.calls.filter(([text]) => text.includes('"draft":"source"'))).toHaveLength(0);
+    } finally { parse.mockRestore(); }
+    await settle();
+    const registered = invoke.mock.calls.find(([command]) => command === "plugin_window_presentation_register")![1]!.request as any;
+    source.nested[0] = "caller mutation";
+    expect(registered.snapshot.state.nested).toEqual(["中文👩🏽‍💻"]);
+    await owner.open();
+    const opened = invoke.mock.calls.find(([command]) => command === "plugin_window_open")![1]!.request as any;
+    expect(opened.snapshot.state.nested).toEqual(["caller mutation"]);
+    source.nested[0] = "second mutation";
+    expect(opened.snapshot.state.nested).toEqual(["caller mutation"]);
+    source.invalid = undefined; changed(); await settle(); await settle();
+    expect(owner.getStatus()).toMatchObject({ phase: "error", error: "Unable to publish detached state" });
+  });
+  it.each([undefined, NaN, Symbol("invalid"), new Date(), { [Symbol("hidden")]: true }])("the real owner rejects invalid registered snapshot values (%s)", async invalid => {
+    const actual = await vi.importActual<typeof import("../windows/owner")>("../windows/owner");
+    vi.mocked(createDetachedSurfaceOwner).mockImplementationOnce(options => actual.createDetachedSurfaceOwner(options));
+    const def = definition();
+    def.detached.getSnapshot = () => ({ draft: "valid text", invalid }) as never;
+    expect(() => handle().ctx.ui.registerCenterTab(def)).toThrow(/Detached payload/);
     expect(centerTabRegistry.get("plugin:detached-demo:workbench")).toBeUndefined();
   });
   it("restores an open surface without activating the main tab and focuses its saved presentation on demand", async () => {

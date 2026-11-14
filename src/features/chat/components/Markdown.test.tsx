@@ -236,3 +236,71 @@ describe("GFM email autolinks (WKWebView lookbehind compatibility)", () => {
     expect(source).not.toMatch(/\(\?<[=!]/);
   });
 });
+
+describe("CJK emphasis next to full-width punctuation", () => {
+  // CommonMark's flanking rules treat full-width punctuation like ASCII
+  // punctuation, so `**“文字”**中文` stayed as bare asterisks. Only the
+  // emphasis-side `remark-cjk-friendly` runs; the source text is not rewritten.
+  const CASES: Array<[string, string, string]> = [
+    ["**“文字”**紧贴中文", "“文字”", "“文字”紧贴中文"],
+    ["中文**（文字）**", "（文字）", "中文（文字）"],
+    ["**地区门槛和重复奖励要一起检查。**现有地区", "地区门槛和重复奖励要一起检查。", "地区门槛和重复奖励要一起检查。现有地区"],
+  ];
+
+  it.each(CASES)("renders %s as strong text without leftover asterisks", async (source, strong, visible) => {
+    await renderMarkdown(source);
+    expect(container.querySelector("strong")?.textContent).toBe(strong);
+    expect(container.textContent).toBe(visible);
+  });
+
+  it("settles a streamed CJK emphasis row without dropping or duplicating characters", async () => {
+    vi.useFakeTimers();
+    try {
+      const head = "**“文字”**紧贴中文 🙂";
+      await act(async () => root.render(<Markdown text={head} workspacePath="/ws" streaming />));
+      await act(async () => vi.advanceTimersByTime(300));
+      expect(container.querySelector("strong")?.textContent).toBe("“文字”");
+      expect(container.textContent).toBe("“文字”紧贴中文 🙂");
+      const full = `${head}\n\n中文**（文字）**与 **地区门槛和重复奖励要一起检查。**现有地区`;
+      await act(async () => root.render(<Markdown text={full} workspacePath="/ws" streaming />));
+      await act(async () => vi.advanceTimersByTime(600));
+      expect([...container.querySelectorAll("strong")].map(node => node.textContent)).toEqual(["“文字”", "（文字）", "地区门槛和重复奖励要一起检查。"]);
+      await act(async () => root.render(<Markdown text={full} workspacePath="/ws" />));
+      expect(container.textContent).toBe("“文字”紧贴中文 🙂\n中文（文字）与 地区门槛和重复奖励要一起检查。现有地区");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps code, escapes, math, links and tables on their existing semantics", async () => {
+    await renderMarkdown([
+      "`**（不变）**` 与 \\*\\*（转义）\\*\\*",
+      "",
+      "[**“链接”**说明](https://example.com) 和 $a*b*c$",
+      "",
+      "| 列 | 值 |",
+      "| --- | --- |",
+      "| 中文**（单元格）** | 1 |",
+      "",
+      "```md",
+      "**“代码”**中文",
+      "第二行",
+      "```",
+    ].join("\n"));
+    expect(container.querySelector(":not(pre) > code")?.textContent).toBe("**（不变）**");
+    expect(container.textContent).toContain("**（转义）**");
+    expect(container.querySelector("a[href='https://example.com'] strong")?.textContent).toBe("“链接”");
+    expect(container.querySelector(".katex")).not.toBeNull();
+    expect(container.querySelector("td strong")?.textContent).toBe("（单元格）");
+    expect(container.querySelector("pre code")?.textContent).toContain("**“代码”**中文");
+  });
+
+  it("leaves the excluded autolink and strikethrough plugins out of the chat pipeline", async () => {
+    // `cjk.remarkPluginsAfter` would split this autolink at `。` and turn the
+    // CJK `~~` run into <del>; neither is part of this change.
+    await renderMarkdown("见https://example.com。后续\n\n中文~~删除。~~中文\n\n**“文字”**ASCII");
+    expect(container.querySelector("a")?.textContent).toBe("https://example.com。后续");
+    expect(container.querySelector("del")).toBeNull();
+    expect(container.textContent).toContain("**“文字”**ASCII");
+  });
+});

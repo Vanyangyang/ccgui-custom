@@ -756,7 +756,7 @@ export const useSidechatStore = create<SidechatStore>((set, get) => ({
       throw new Error("Sidechat is busy");
     }
     if (strictBusy && (parentSessionId !== null || parentPermission ||
-      (engine !== "claude" && engine !== "codex") ||
+      (engine !== "claude" && engine !== "codex" && engine !== "agy") ||
       (current && (current.mode === "execute" || current.engine !== engine ||
         current.workspacePath !== workspacePath || current.parentSessionId !== null)))) {
       throw new Error("Invalid controlled read-only Sidechat identity");

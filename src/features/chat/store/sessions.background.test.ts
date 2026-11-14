@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createSessionActions, type SessionDeps } from "./sessions";
 import { EMPTY_SESSION } from "./stream";
+import { appendCommittedRows } from "./session-utils";
 import { sessionKey } from "./persistence";
 import type { ChatStore } from "./types";
 import type { SessionMeta, SessionPage } from "@/lib/ipc";
@@ -32,6 +33,16 @@ function fixture(native: Pick<SessionDeps, "nativeProcessRunning" | "subscribePr
 beforeEach(() => { vi.clearAllMocks(); localStorage.clear(); });
 afterEach(() => { cleanups.splice(0).forEach((off) => off()); });
 describe("background native session preparation", () => {
+  it("refuses archived background sources before creating a ghost tab or loading cache", async () => {
+    const f = fixture(); f.set({ archivedSessionKeys: { [key]: true } });
+    await expect(f.actions.selectSession(target.engine, target.sessionId, target.workspacePath, { background: true }))
+      .rejects.toThrow("Archived session");
+    expect(f.get().openTabs).toEqual([active]);
+    expect(f.get().bySession[key]).toBeUndefined();
+    expect(f.get().archivedSessionKeys[key]).toBe(true);
+    expect(f.load).not.toHaveBeenCalled();
+    expect(mocks.plans).not.toHaveBeenCalled();
+  });
   it("opens and loads an idle target with remembered settings without changing active engine, draft or read state", async () => {
     const f = fixture(); const drafts = f.get().drafts;
     const meta = { ...target, model: "remembered-model", effort: "high", provider: "remembered-provider" } as SessionMeta;
@@ -95,6 +106,156 @@ describe("background native session preparation", () => {
 });
 
 describe("deferred authoritative native history refresh", () => {
+  it("keeps a released empty shell loading until its reopened history arrives", async () => {
+    const f = fixture();
+    f.set({ bySession: { [key]: { ...EMPTY_SESSION, historyReloadRequired: true } } });
+    let resolve!: (value: SessionPage) => void;
+    f.load.mockImplementationOnce(() => new Promise(r => { resolve = r; }));
+    const pending = f.actions.selectSession(target.engine, target.sessionId, target.workspacePath, { background: true });
+    expect(f.get().bySession[key]).toMatchObject({ loading: true, messages: [], historyReloadRequired: true });
+    resolve(page); await pending;
+    expect(f.get().bySession[key]).toMatchObject({ loading: false, messages: page.messages });
+    expect(f.get().bySession[key].historyReloadRequired).toBeUndefined();
+  });
+
+  it("does not replace a new native turn with the old empty-shell history read", async () => {
+    const f = fixture();
+    f.set({ bySession: { [key]: { ...EMPTY_SESSION, historyReloadRequired: true } } });
+    let resolve!: (value: SessionPage) => void;
+    f.load.mockImplementationOnce(() => new Promise(r => { resolve = r; }));
+    const pending = f.actions.selectSession(target.engine, target.sessionId, target.workspacePath, { background: true });
+    const live = [{ role: "assistant", text: "new native turn 🙂", seq: 2, ts: null, live: true }];
+    f.updateSession({ messages: live, streaming: true });
+    resolve(page); await pending;
+    expect(f.get().bySession[key]).toMatchObject({ loading: false, streaming: true, messages: live, historyReloadRequired: true });
+  });
+
+  it("keeps an open shell unavailable through Claude retirement and then finishes its own refresh", async () => {
+    let retired!: () => void;
+    const running = vi.fn().mockResolvedValueOnce(true).mockResolvedValue(false);
+    const f = fixture({ nativeProcessRunning: running, subscribeProcessRetired: async callback => { retired = callback; return vi.fn(); } });
+    f.set({ bySession: { [key]: { ...EMPTY_SESSION, historyReloadRequired: true } } });
+    await f.actions.selectSession(target.engine, target.sessionId, target.workspacePath, { background: true });
+    expect(f.load).not.toHaveBeenCalled(); expect(f.get().bySession[key].loading).toBe(true);
+    retired();
+    await vi.waitFor(() => expect(f.get().bySession[key].messages).toBe(page.messages));
+    expect(f.get().bySession[key].loading).toBe(false);
+  });
+
+  it("releases a closed shell's deferred loading flag without loading its history", async () => {
+    const f = fixture({ nativeProcessRunning: async () => true, subscribeProcessRetired: async () => vi.fn() });
+    f.set({ bySession: { [key]: { ...EMPTY_SESSION, historyReloadRequired: true } } });
+    await f.actions.selectSession(target.engine, target.sessionId, target.workspacePath, { background: true });
+    expect(f.get().bySession[key].loading).toBe(true);
+    f.set({ openTabs: [active] });
+    expect(f.get().bySession[key].loading).toBe(false);
+    expect(f.get().bySession[key].historyReloadRequired).toBe(true);
+    expect(f.load).not.toHaveBeenCalled();
+  });
+
+  function legacyArchiveFixture() {
+    const f = fixture();
+    const ref = { ...target, engine: "agy" }, legacyKey = sessionKey(ref.engine, ref.sessionId, ref.workspacePath);
+    const messages = [
+      { role: "assistant", text: "latest native summary", seq: 23, ts: "2026-10-30T09:44:01Z" },
+      { role: "tool", text: "old read_file replay", seq: 24, ts: "2026-10-30T10:18:00Z" },
+    ];
+    const update = (patch: Partial<ChatStore["bySession"][string]>) => f.set((s) => ({ bySession: {
+      ...s.bySession, [legacyKey]: { ...s.bySession[legacyKey], ...patch },
+    } }));
+    f.set({ openTabs: [active, ref], bySession: { [legacyKey]: { ...EMPTY_SESSION, messages, historyReloadRequired: true } } });
+    return { ...f, ref, legacyKey, messages, update,
+      reload: () => f.actions.selectSession(ref.engine, ref.sessionId, ref.workspacePath, { background: true }) };
+  }
+
+  it("repairs a marked AGY cache from its native page without changing focus or drafts", async () => {
+    const f = legacyArchiveFixture(), drafts = f.get().drafts;
+    await f.reload();
+    expect(f.load).toHaveBeenCalledTimes(1);
+    expect(f.get().bySession[f.legacyKey].messages).toBe(page.messages);
+    expect(f.get().bySession[f.legacyKey].historyReloadRequired).toBeUndefined();
+    expect(f.get().active).toBe(active); expect(f.get().drafts).toBe(drafts);
+    await f.reload(); expect(f.load).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["streaming", "queue", "question", "grant", "plan", "loading", "failed-prompt"])("defers legacy cache repair while %s protects the timeline", async (blocker) => {
+    const f = legacyArchiveFixture();
+    if (blocker === "streaming") f.update({ streaming: true });
+    if (blocker === "loading") f.update({ loading: true });
+    if (blocker === "failed-prompt") f.update({ error: "unpersisted send failed" });
+    if (blocker === "queue") f.update({ queue: [{ id: "q", text: "pending", images: [], queuedAt: 1 }] });
+    if (blocker === "question") f.update({ messages: [...f.messages, { role: "question", text: "pending", seq: 25, ts: null,
+      question: { runId: "live", requestId: "question", status: "pending", questions: [] } }] });
+    if (blocker === "grant") f.update({ messages: [...f.messages, { role: "grant", text: "pending", seq: 25, ts: null,
+      grant: { status: "pending" } } as never] });
+    if (blocker === "plan") f.update({ messages: [...f.messages, { role: "plan_review", text: "pending", seq: 25, ts: null,
+      planReview: { status: "awaiting_review" } } as never] });
+    const held = f.get().bySession[f.legacyKey].messages;
+    await f.reload();
+    expect(f.load).not.toHaveBeenCalled();
+    expect(f.get().bySession[f.legacyKey].messages).toBe(held);
+    expect(f.get().bySession[f.legacyKey].historyReloadRequired).toBe(true);
+    f.update({ streaming: false, loading: false, queue: [], messages: f.messages, error: null });
+    await vi.waitFor(() => expect(f.get().bySession[f.legacyKey].messages).toBe(page.messages));
+    expect(f.load).toHaveBeenCalledTimes(1);
+  });
+
+  it("retains a legacy repair marker across a new turn racing its native history read", async () => {
+    const f = legacyArchiveFixture(); let finish!: (value: SessionPage) => void;
+    f.load.mockImplementationOnce(() => new Promise((r) => { finish = r; }));
+    const pending = f.reload();
+    const live = [...f.messages, { role: "user", text: "new user input", seq: 25, ts: null }];
+    f.update({ streaming: true, messages: live }); finish(page); await pending;
+    expect(f.get().bySession[f.legacyKey].messages).toBe(live);
+    expect(f.get().bySession[f.legacyKey].historyReloadRequired).toBe(true);
+    const latest = { ...page, messages: [...page.messages, live[2]] };
+    f.load.mockResolvedValueOnce(latest); f.update({ streaming: false });
+    await vi.waitFor(() => expect(f.get().bySession[f.legacyKey].messages).toBe(latest.messages));
+    expect(f.get().bySession[f.legacyKey].historyReloadRequired).toBeUndefined();
+    expect(f.load).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps the old cache after a failed repair and retries only on explicit selection", async () => {
+    const f = legacyArchiveFixture(); f.load.mockRejectedValueOnce(new Error("native history unavailable"));
+    await expect(f.reload()).rejects.toThrow("native history unavailable");
+    expect(f.get().bySession[f.legacyKey].messages).toBe(f.messages);
+    expect(f.get().bySession[f.legacyKey].historyReloadRequired).toBe(true);
+    f.set({ unseen: {} }); await Promise.resolve(); expect(f.load).toHaveBeenCalledTimes(1);
+    await f.reload();
+    expect(f.get().bySession[f.legacyKey].messages).toBe(page.messages);
+    expect(f.get().bySession[f.legacyKey].historyReloadRequired).toBeUndefined();
+    expect(f.get().bySession[f.legacyKey].error).toBeNull();
+  });
+
+  it("does not let a late history rejection overwrite a new failed user input", async () => {
+    const f = legacyArchiveFixture(); let reject!: (reason: Error) => void;
+    f.load.mockImplementationOnce(() => new Promise((_resolve, fail) => { reject = fail; }));
+    const pending = expect(f.reload()).rejects.toThrow("old history read failed");
+    appendCommittedRows(f.set, f.legacyKey, [{ role: "user", text: "not persisted", ts: null }], { streaming: true, error: null });
+    const live = f.get().bySession[f.legacyKey].messages;
+    f.update({ streaming: false, error: "new user send failed" });
+    reject(new Error("old history read failed")); await pending;
+    expect(f.get().bySession[f.legacyKey].error).toBe("new user send failed");
+    expect(f.get().bySession[f.legacyKey].historyReloadError).toBeUndefined();
+    await f.reload();
+    expect(f.load).toHaveBeenCalledTimes(1);
+    expect(f.get().bySession[f.legacyKey].messages).toBe(live);
+  });
+
+  it("does not mistake a new send failure for an earlier history error with the same text", async () => {
+    const f = legacyArchiveFixture();
+    f.load.mockRejectedValueOnce(new Error("same failure"));
+    await expect(f.reload()).rejects.toThrow("same failure");
+    expect(f.get().bySession[f.legacyKey].historyReloadError).toBe("Error: same failure");
+    appendCommittedRows(f.set, f.legacyKey, [{ role: "user", text: "not persisted", ts: null }], { streaming: true, error: null });
+    const live = f.get().bySession[f.legacyKey].messages;
+    f.update({ streaming: false, error: "Error: same failure" });
+    await f.reload();
+    expect(f.get().bySession[f.legacyKey].historyReloadError).toBeUndefined();
+    expect(f.load).toHaveBeenCalledTimes(1);
+    expect(f.get().bySession[f.legacyKey].messages).toBe(live);
+  });
+
   async function racedFixture(native?: Parameters<typeof fixture>[0]) {
     const f = fixture(native); let resolve!: (value: SessionPage) => void;
     f.load.mockImplementationOnce(() => new Promise((r) => { resolve = r; }));

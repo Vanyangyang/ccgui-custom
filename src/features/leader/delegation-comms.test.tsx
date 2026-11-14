@@ -42,6 +42,24 @@ beforeEach(() => {
 afterEach(() => { stop?.(); stop = undefined; });
 
 describe("communication follows the durable parent delegation", () => {
+  it("clears prior image identities when the same child receives a text-only assignment", () => {
+    const images = [{ source: "original", path: "G:/private/image.png", sha256: "a".repeat(64) }];
+    syncLeaderBranchComms(publish(branch({ delegation: delegation({ images }) })));
+    expect(current().imageRefs).toHaveLength(1);
+    syncLeaderBranchComms(publish(branch({ delegation: delegation({ requestId: "assignment-2", updatedAt: 21 }) })));
+    expect(current().requestId).toBe("assignment-2");
+    expect(current().imageRefs).toEqual([]);
+    expect(Object.isFrozen(current().imageRefs)).toBe(true);
+  });
+  it("projects only frozen hashes from the assignment and never exposes native image locations", () => {
+    const images = [{ source: "private-source", path: "G:/private/image.png", sha256: "a".repeat(64) }];
+    syncLeaderBranchComms(publish(branch({ images: [{ ...images[0], sha256: "b".repeat(64) }], delegation: delegation({ images }) })));
+    expect(current().imageRefs).toEqual([`task-image:${"a".repeat(64)}`]);
+    expect(Object.isFrozen(current().imageRefs)).toBe(true);
+    images[0].sha256 = "c".repeat(64);
+    expect(current().imageRefs).toEqual([`task-image:${"a".repeat(64)}`]);
+    expect(JSON.stringify(current())).not.toMatch(/private-source|G:\/private/);
+  });
   it("keeps navigation participants in their respective workspaces", () => {
     syncLeaderBranchComms(publish(branch({ parentWorkspacePath: "/host", workspacePath: "/game" })));
     expect(current().sender).toMatchObject({ engine: "claude", sessionId: "parent", workspacePath: "/host" });
@@ -71,6 +89,17 @@ describe("communication follows the durable parent delegation", () => {
     expect(current()).toMatchObject({ status: "completed", replyText: "Done with guidance" });
     publish(branch({ delegation: delegation({ state: "waiting", updatedAt: 21 }) }));
     expect(current().status).toBe("completed");
+  });
+
+  it("marks the old assignment handed off without treating it as a completed result or reopening its cost card", async () => {
+    const costApproval = { requestId: "approval-1", capturedAt: 15, model: "gemini" };
+    await start(branch({ delegation: delegation({ state: "awaiting_cost_approval", costApproval }) }));
+    const handed = delegation({ state: "handed_off", runId: null, updatedAt: 21, costApproval: undefined, result: "" });
+    publish(branch({ state: "handed_off", runId: null, delegation: handed }));
+    expect(current()).toMatchObject({ status: "handed_off", requestId: "assignment-1" });
+    expect(current().leaderCostApproval).toBeUndefined();
+    publish(branch({ delegation: delegation({ state: "awaiting_cost_approval", costApproval, updatedAt: 21 }) }));
+    expect(current().status).toBe("handed_off");
   });
 
   it("opens a new task_send assignment and rejects streams and snapshots from the previous one", async () => {

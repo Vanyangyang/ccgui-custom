@@ -5,6 +5,14 @@ const claim = { pluginId: "disabled-owner", requestId: "request", runId: "native
   workspacePath: "G:/project", writePaths: ["src"], session: null };
 
 describe("persisted task claims", () => {
+  it("retains a permanent session reservation independently of its workspace write scope", () => {
+    const reservation = { ...claim, runId: "", exclusiveSession: true, reservationOnly: true, sessionProven: true,
+      session: { engine: "codex", sessionId: "thread", workspacePath: claim.workspacePath } };
+    expect(decodePersistedTaskClaims([reservation])[0]).toMatchObject({ exclusiveSession: true, reservationOnly: true, session: reservation.session });
+    for (const patch of [{ session: null }, { sessionProven: false }, { exclusiveSession: false }, { reservationOnly: "yes" }]) {
+      expect(() => decodePersistedTaskClaims([{ ...reservation, ...patch }])).toThrow(/restore/);
+    }
+  });
   it("keeps an inactive owner's lock and treats missing write declarations conservatively", () => {
     expect(decodePersistedTaskClaims([claim])[0]).toMatchObject({ pluginId: "disabled-owner", writePaths: ["src"], status: "unknown" });
     expect(decodePersistedTaskClaims([{ ...claim, writePaths: null }])[0].writePaths).toBeNull();

@@ -101,8 +101,8 @@ export function resolveModelPricing(engine: string, model: string): ModelPricing
     };
   }
 
-  // Google Gemini / Antigravity family (gemini-4-argon, gemini-3.x, gemini-2.5)
-  if (clean.includes("gemini") || clean.includes("argon")) {
+  // Google Gemini / Antigravity family (gemini-4-argon, gemini-4-carbon, gemini-3.x, gemini-2.5)
+  if (clean.includes("gemini") || clean.includes("argon") || clean.includes("carbon")) {
     const isFlash = clean.includes("flash");
     const input = isFlash ? 0.3 : 1.25;
     const output = isFlash ? 2.5 : 10;

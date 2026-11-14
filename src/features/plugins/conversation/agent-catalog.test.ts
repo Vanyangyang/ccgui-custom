@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it, vi } from "vitest";
 import type { CliConfig, EngineInfo } from "@/lib/ipc";
 import { buildAgentCatalog } from "./agent-catalog";

@@ -3,6 +3,8 @@ import { createMessagingActions } from "./messaging";
 import { EMPTY_SESSION, runRouting } from "./stream";
 import { sessionKey } from "./persistence";
 import type { ChatStore } from "./types";
+import type { SessionMeta } from "@/lib/ipc";
+import { useSessionSendCostGuardStore } from "../cross-session-cost";
 
 const mocks = vi.hoisted(() => ({
   ipc: { sendMessage: vi.fn(), rememberSessionModel: vi.fn(async () => {}), rememberSessionEffort: vi.fn(async () => {}), rememberSessionProvider: vi.fn(async () => {}),
@@ -30,6 +32,28 @@ function fixture() {
 beforeEach(() => { runRouting.clear(); vi.clearAllMocks(); mocks.getSelectedAgent.mockReturnValue(null); mocks.ipc.sendMessage.mockImplementation(async (request: { runId: string; sessionId: string }) => ({ runId: request.runId, sessionId: request.sessionId })); });
 
 describe("original messaging host correlation seam", () => {
+  it.each([49_999, 50_000])("guards queue draining through Windows aliases at %i tokens", used => {
+    useSessionSendCostGuardStore.getState().reset();
+    const f = fixture(); const now = Date.now();
+    f.get().openTabs[0] = { ...a, workspacePath: "G:\\one" };
+    f.get().sessions = [{ ...a, promptCache: { startedAt: now - 7_200_000, observedAt: now - 7_200_000,
+      ttlSeconds: 300, source: "anthropic-usage" } } as SessionMeta];
+    Object.assign(f.get().bySession[key], { usage: { input_tokens: used },
+      queue: [{ id: "q", text: "continue", images: [], queuedAt: now - 3_600_000 }] });
+    f.actions.drainQueue(key);
+    expect(!!useSessionSendCostGuardStore.getState().bySessionKey[key]).toBe(used >= 50_000);
+    expect(f.get().bySession[key].queue[0]?.manualOnly ?? false).toBe(used >= 50_000);
+  });
+  it("records the selected model when manually approving legacy queued metadata", async () => {
+    useSessionSendCostGuardStore.getState().reset();
+    const f = fixture();
+    f.get().openTabs[0] = { ...a, workspacePath: "G:\\one", model: "chosen-model" };
+    f.get().sessions = [{ ...a, workspacePath: "" } as SessionMeta];
+    f.get().bySession[key].queue = [{ id: "q", text: "continue", images: [], queuedAt: Date.now() }];
+    await f.actions.sendQueuedNow("q", key);
+    expect(useSessionSendCostGuardStore.getState().approvedByKey[key]?.model).toBe("chosen-model");
+    expect(f.get().sessions[0].workspacePath).toBe("");
+  });
   it("appends user row to exact background timeline and preserves model, effort, provider and permission", async () => {
     const f = fixture(); const started = vi.fn();
     await f.actions.send("Canvas instruction", [], { requestedRunId: "run-frozen", onRunStarted: started }, a);

@@ -126,6 +126,30 @@ describe("archived task groups", () => {
     expect(invoke).toHaveBeenCalledWith("task_group_action", { ...identity, action: "delete" });
     expect(ipc.deleteSession).not.toHaveBeenCalled(); expect(ipc.deleteRemoteSession).not.toHaveBeenCalled();
   });
+  it("shows a child-rooted archive as a child task beneath its live parent and restores or deletes it by its chat", async () => {
+    const childChat = { engine: child.engine, sessionId: child.sessionId!, workspacePath: child.workspacePath };
+    const grandChat = { engine: grandchild.engine, sessionId: grandchild.sessionId!, workspacePath: grandchild.workspacePath };
+    snapshot = { leaders: [identity], branches: [child, grandchild], archivedGroups: [{
+      root: childChat, title: "Archived research child", archivedAt: 100, members: [childChat, grandChat], branchIds: [grandchild.id],
+    }] };
+    vi.mocked(ipc.listArchivedSessions).mockResolvedValue([flatMembers[1], flatMembers[2]]);
+    await render();
+    const card = container.querySelector("[data-leader-archived-group]")!;
+    expect(card.textContent).toContain("Archived research child");
+    expect(card.textContent).toContain("Archived child task");
+    await act(async () => card.querySelector("summary")!.click());
+    // The tree starts at the child's own branch under its parent.
+    expect(card.querySelectorAll("li")).toHaveLength(2);
+    expect(card.querySelector("li")!.textContent).toContain("Research child");
+    expect(card.querySelector("li")!.textContent).toContain("Parent: claude/archived-ui-root");
+    await act(async () => button(container, "Delete child task").click());
+    const dialog = document.body.querySelector('[role="dialog"]')!;
+    expect(dialog.textContent).toContain("its 2 conversations"); expect(dialog.textContent).toContain("parent conversation is kept");
+    await act(async () => button(dialog, "Cancel").click());
+    await act(async () => button(container, "Restore child task").click());
+    expect(invoke).toHaveBeenCalledWith("task_group_action", { ...childChat, action: "restore" });
+    expect(container.querySelector("[data-leader-archived-group]")).toBeNull();
+  });
   it("guards simultaneous group and ordinary actions, retains the card on error, and permits retry", async () => {
     await render();
     let reject!: (error: Error) => void;

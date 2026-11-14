@@ -23,26 +23,42 @@ export type McpConfigSource =
   | "claude_user"
   | "claude_local"
   | "claude_project"
+  | "claude_plugin"
   | "codex_user"
   | "codex_project"
+  | "codex_plugin"
   | "kimi_user"
   | "kimi_local"
   | "kimi_project"
+  | "kimi_plugin"
   | "grok_user"
   | "grok_project"
+  | "grok_plugin"
+  | "pi_user"
+  | "pi_project"
+  | "pi_plugin"
   | "omp_user"
   | "omp_project"
+  | "omp_plugin"
   | "opencode_user"
   | "opencode_project"
+  | "opencode_plugin"
   | "agy_user"
   | "agy_project"
+  | "agy_plugin"
   | "qoder_user"
   | "qoder_local"
   | "qoder_project"
+  | "qoder_plugin"
   | "qoder_cn_user"
   | "qoder_cn_local"
   | "qoder_cn_project"
-  | "dsh_profile";
+  | "qoder-cn_plugin"
+  | "cursor_user"
+  | "cursor_project"
+  | "cursor_plugin"
+  | "dsh_profile"
+  | "dsh_plugin";
 
 /** native（原生支持）/ plugin（由插件提供）/ none（不内置 MCP）。 */
 export type McpEngineSupport = "native" | "plugin" | "none";
@@ -60,10 +76,12 @@ export interface McpConfigEntry {
   engine: McpEngineId;
   name: string;
   source: McpConfigSource;
-  scope: "user" | "project";
+  scope: "user" | "project" | "unknown";
   path: string;
   format: "json" | "toml" | "yaml";
   enabled: boolean;
+  /** False when the engine did not report the effective plugin state. */
+  enablementKnown?: boolean;
   transport: string | null;
   command: string | null;
   argsCount: number;
@@ -76,6 +94,8 @@ export interface McpConfigEntry {
   /** Localizable reason code (`mcp.readonlyReason.<code>`); absent on older
    *  sources that still ship a literal reason string. */
   readonlyReasonCode?: string | null;
+  /** False when the host cannot safely reproduce the engine's launch context. */
+  probeAllowed?: boolean;
   /** Content hash at read time; a mismatch on write means an external edit. */
   version: string;
 }

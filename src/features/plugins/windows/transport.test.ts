@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createDetachedSurfaceOwner } from "./owner";
 import { createDetachedSurfaceClient } from "./client";
-import { copyJson, EVENTS, type DetachedInit, type DetachedTransport, type JsonValue } from "./protocol";
+import { copyJson, equalJson, EVENTS, jsonKey, type DetachedInit, type DetachedTransport, type JsonValue } from "./protocol";
 import { abortRuntimeCheckpoint, getRuntimeCheckpointReadiness, prepareRuntimeCheckpoint } from "@/lib/runtime-checkpoint";
 import { usePluginTabsStore } from "../runtime/center-tabs";
 
@@ -46,6 +46,36 @@ function clientFixture() {
 }
 
 describe("detached owner", () => {
+  it("focuses main with the exact private owner identity without returning or submitting", async () => {
+    const f = ownerFixture(); f.setState({ draft: "保留草稿 👩🏽‍💻" }); await f.owner.open();
+    const identity = f.identity(), status = f.owner.getStatus();
+    f.invoke.mockClear(); f.getSnapshot.mockClear();
+    await f.owner.focusMain();
+    expect(f.invoke.mock.calls).toEqual([["plugin_window_focus_owner", { request: identity }]]);
+    expect(f.owner.getStatus()).toBe(status);
+    expect(f.getSnapshot).not.toHaveBeenCalled();
+    expect(f.dispatch).not.toHaveBeenCalled(); expect(f.onReturn).not.toHaveBeenCalled();
+  });
+  it("rejects focus with no live identity or after disposal without IPC", async () => {
+    const f = ownerFixture(); await turns(); f.invoke.mockClear();
+    await expect(f.owner.focusMain()).rejects.toThrow("Detached window unavailable");
+    expect(f.invoke).not.toHaveBeenCalled();
+    await f.owner.open(); const identity = f.identity();
+    f.emit(EVENTS.returned, { ...identity, tabId: "tab", reason: "closed" }); f.invoke.mockClear();
+    await expect(f.owner.focusMain()).rejects.toThrow("Detached window unavailable");
+    expect(f.invoke).not.toHaveBeenCalled();
+    f.owner.dispose(); f.invoke.mockClear();
+    await expect(f.owner.focusMain()).rejects.toThrow("Owner disposed");
+    expect(f.invoke).not.toHaveBeenCalled();
+  });
+  it("propagates native focus rejection while preserving the detached window", async () => {
+    const f = ownerFixture(); await f.owner.open(); const status = f.owner.getStatus();
+    f.invoke.mockClear(); f.invoke.mockRejectedValueOnce(new Error("plugin_window_owner_mismatch"));
+    await expect(f.owner.focusMain()).rejects.toThrow("plugin_window_owner_mismatch");
+    expect(f.owner.getStatus()).toBe(status);
+    expect(f.invoke).toHaveBeenCalledOnce();
+    expect(f.dispatch).not.toHaveBeenCalled(); expect(f.onReturn).not.toHaveBeenCalled();
+  });
   it("does no snapshot work for docked changes and opens with the latest exact state", async () => {
     const f = ownerFixture(); const baseline = f.getSnapshot.mock.calls.length;
     for (let i = 0; i < 30; i++) f.setState({ draft: `中文👩🏽‍💻 ${i}` });
@@ -77,12 +107,33 @@ describe("detached owner", () => {
   });
   it("an action receipt captures its committed state even while display publication is pending", async () => {
     const f = ownerFixture(); await f.owner.open();
+    const identity = f.identity(), gate = deferred<unknown>(), original = f.invoke.getMockImplementation()!;
+    f.invoke.mockClear();
+    f.invoke.mockImplementation(async (command, args) => command === "plugin_window_publish" ? gate.promise : original(command, args));
+    f.setState({ draft: "older in-flight publication" }); await turns();
     f.dispatch.mockImplementation(async () => { f.setState({ draft: "已提交，不等展示队列" }); return true; });
-    f.emit(EVENTS.action, { ...f.identity(), sequence: 1, action: { name: "save", args: [] } });
+    f.emit(EVENTS.action, { ...identity, sequence: 1, action: { name: "save", args: [] } });
     await turns();
     const response = f.invoke.mock.calls.find(([command]) => command === "plugin_window_respond");
     expect((response![1]!.request as any).snapshot.state).toEqual({ draft: "已提交，不等展示队列" });
     expect(f.dispatch).toHaveBeenCalledOnce();
+    expect(f.invoke.mock.calls.filter(([command]) => command === "plugin_window_publish")).toHaveLength(1);
+    gate.resolve(undefined); await turns();
+    const publications = f.invoke.mock.calls.filter(([command]) => command === "plugin_window_publish");
+    expect(publications).toHaveLength(2);
+    expect((publications[1][1]!.request as any).snapshot.state).toEqual({ draft: "已提交，不等展示队列" });
+  });
+  it("keeps snapshots isolated from the owner's mutable source and ignores object key order", async () => {
+    const f = ownerFixture(); const state = { draft: "中文👩🏽‍💻", history: [{ content: "unchanged" }] };
+    f.setState(state); await f.owner.open(); f.invoke.mockClear();
+    state.history[0].content = "edited";
+    f.setState(state); await turns();
+    const request = f.invoke.mock.calls.find(([command]) => command === "plugin_window_publish")![1]!.request as any;
+    expect(request.snapshot.state.history[0].content).toBe("edited");
+    state.history[0].content = "later mutation without notification";
+    expect(request.snapshot.state.history[0].content).toBe("edited");
+    f.setState({ history: [{ content: "edited" }], draft: "中文👩🏽‍💻" }); await turns();
+    expect(f.invoke.mock.calls.filter(([command]) => command === "plugin_window_publish")).toHaveLength(1);
   });
   it("an obsolete publish cannot block reopening or report its late failure on the new window", async () => {
     const f = ownerFixture(); await f.owner.open(); const old = f.identity();
@@ -177,8 +228,11 @@ describe("detached owner", () => {
     warning.mockRestore();
   });
   it("reports failed restore and retries registration on explicit user entry without business actions", async () => {
-    const f = ownerFixture();
-    f.invoke.mockRejectedValueOnce(new Error("read failed"));
+    const f = ownerFixture(), original = f.invoke.getMockImplementation()!; let failed = false;
+    f.invoke.mockImplementation(async (command, args) => {
+      if (command === "plugin_window_presentation_register" && !failed) { failed = true; throw new Error("read failed"); }
+      return original(command, args);
+    });
     await expect(f.owner.restore()).rejects.toThrow("read failed");
     expect(f.owner.getStatus().phase).toBe("error");
     expect(await f.owner.present()).toBe("docked");
@@ -378,7 +432,7 @@ describe("detached owner", () => {
   });
   it("keeps the same window usable when its renderer refuses return for unsynchronized edits", async () => {
     const f = ownerFixture(); await f.owner.open();
-    const returned = f.owner.returnToMain(); const rejected = expect(returned).rejects.toThrow("Unconfirmed edits"); await turns();
+    const returned = f.owner.returnToMain(); const rejected = expect(returned).rejects.toMatchObject({ code: "DETACHED_RETURN_BLOCKED", message: "Unconfirmed edits remain in detached window" }); await turns();
     f.emit(EVENTS.returnBlocked, { ...f.identity(), tabId: "tab" }); await rejected;
     expect(f.owner.getStatus()).toMatchObject({ phase: "detached", windowId: "window", returnBlocked: true });
     expect(f.onReturn).not.toHaveBeenCalled();
@@ -676,6 +730,59 @@ describe("detached client", () => {
     expect(f.client.getSnapshot()?.state).toEqual({ draft: "" }); expect(f.client.getStatus().phase).toBe("error");
     await expect(f.client.flush()).rejects.toThrow();
   });
+  it("notifies only for changed snapshots or applicable theme changes, independent of object key order", async () => {
+    const f = clientFixture(); await f.client.init(); const notify = vi.fn(); f.client.subscribe(notify);
+    const event = { ...initData(), snapshot: { revision: 1, state: { draft: "中文👩🏽‍💻", nested: { a: 1, b: [false, null] } } } };
+    f.emit(EVENTS.snapshot, event); expect(notify).toHaveBeenCalledTimes(1);
+    const previous = f.client.getSnapshot();
+    f.emit(EVENTS.snapshot, { ...event, snapshot: { revision: 1, state: { nested: { b: [false, null], a: 1 }, draft: "中文👩🏽‍💻" } } });
+    expect(f.client.getSnapshot()).toBe(previous); expect(notify).toHaveBeenCalledTimes(1);
+    f.emit(EVENTS.snapshot, { ...event, dark: true });
+    expect(f.client.getDark()).toBe(true); expect(notify).toHaveBeenCalledTimes(2);
+    f.emit(EVENTS.snapshot, { ...initData(), dark: false });
+    expect(f.client.getDark()).toBe(true); expect(f.client.getSnapshot()).toBe(previous); expect(notify).toHaveBeenCalledTimes(2);
+    f.emit(EVENTS.snapshot, { ...event, dark: true }); expect(notify).toHaveBeenCalledTimes(2);
+  });
+  it("detaches event and receipt data from caller mutations before exposing snapshots", async () => {
+    const f = clientFixture(); const data = initData();
+    f.invoke.mockResolvedValue(data); await f.client.init(); (data.snapshot.state as any).draft = "external init mutation";
+    expect(f.client.getSnapshot()?.state).toEqual({ draft: "" });
+    const event = { ...initData(), snapshot: { revision: 1, state: { nested: ["original event"] } } };
+    f.emit(EVENTS.snapshot, event); event.snapshot.state.nested[0] = "external event mutation";
+    expect(f.client.getSnapshot()?.state).toEqual({ nested: ["original event"] });
+    const receipt = { sequence: 1, ok: true, value: { nested: ["original value"] }, snapshot: { revision: 2, state: { nested: ["original receipt"] } } };
+    f.invoke.mockResolvedValue(receipt); const result = await f.client.dispatch({ name: "edit", args: [] });
+    receipt.snapshot.state.nested[0] = "external receipt mutation"; receipt.value.nested[0] = "external value mutation";
+    expect(result.snapshot.state).toEqual({ nested: ["original receipt"] });
+    expect(result.value).toEqual({ nested: ["original value"] });
+  });
+  it.each([
+    { invalid: { value: undefined } }, { invalid: { value: NaN } },
+    { invalid: { [Symbol("hidden")]: true } }, { invalid: new Date() },
+  ])("still validates invalid duplicate and stale payloads: $invalid", async ({ invalid }) => {
+    for (const revision of [0, 1]) {
+      const f = clientFixture(); await f.client.init();
+      f.emit(EVENTS.snapshot, { ...initData(), snapshot: { revision: 1, state: "current" } });
+      const previous = f.client.getSnapshot();
+      f.emit(EVENTS.snapshot, { ...initData(), snapshot: { revision, state: invalid } });
+      expect(f.client.getSnapshot()).toBe(previous); expect(f.client.getStatus().phase).toBe("error");
+      await expect(f.client.flush()).rejects.toThrow("Invalid detached snapshot");
+    }
+  });
+  it("does not install a receipt snapshot if its value fails JSON validation", async () => {
+    const f = clientFixture(); await f.client.init();
+    f.invoke.mockResolvedValue({ sequence: 1, ok: true, value: { invalid: undefined }, snapshot: { revision: 1, state: "must not install" } });
+    const result = f.client.dispatch({ name: "edit", args: [] }); const settled = Promise.allSettled([result]);
+    await turns(); expect(f.client.getSnapshot()).toEqual(initData().snapshot); expect(f.client.getStatus().phase).toBe("recovering");
+    f.client.dispose(); await settled;
+  });
+});
+
+it("structural JSON comparison retains canonical equality for arrays, object keys and escaped content", () => {
+  const values: JsonValue[] = [null, false, 0, -0, "中文👩🏽‍💻\n```", [], {}, [1, 2], [2, 1], { a: 1 }, { b: 1 },
+    { a: 1, b: [false, { nested: "original" }] }, { b: [false, { nested: "original" }], a: 1 },
+    JSON.parse('{"__proto__":{"a":1}}'), { a: null }];
+  for (const a of values) for (const b of values) expect(equalJson(a, b)).toBe(jsonKey(a) === jsonKey(b));
 });
 
 it("rejects non-JSON and unbounded payloads", () => {

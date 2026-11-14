@@ -10,7 +10,6 @@ import {
   requiresSessionSendCostApproval,
   useSessionSendCostGuardStore,
 } from "./cross-session-cost";
-import { writeAgyReferenceWindow } from "./components/agy-context";
 
 const NOW = 1_800_000_000_000;
 function fixture(engine = "claude", usage: unknown = null) {
@@ -52,6 +51,24 @@ describe("cross-session cost review telemetry", () => {
     expect(changed.context).toMatchObject({ usageModel: "gpt-6.1-terra", modelMismatch: true, kind: "last_request" });
     expect(requiresSessionSendCostApproval(changed, f.meta, f.session, NOW)).toBe(true);
     expect(requiresCrossSessionCostApproval(changed)).toBe(true);
+  });
+  it.each([[49_999, "G:\\project"], [50_000, "G:\\project"], [49_999, "g:\\project"], [50_000, "g:/project"]] as const)("keeps the selected GPT model at %i tokens in Windows workspace %s", (used, path) => {
+    const f = fixture("codex", { input_tokens: used });
+    f.meta.workspacePath = "G:/project";
+    f.state.openTabs[0].workspacePath = path;
+    f.state.openTabs[0].model = "gpt-6-astra";
+    f.meta.promptCache!.startedAt = NOW - 7_200_000;
+    expect(f.review()).toMatchObject({ model: "gpt-6-astra", cacheExpiryDisabled: true });
+    expect(requiresSessionSendCostApproval(f.review(), f.meta)).toBe(false);
+    f.session.messages = [{ model: "other-model", usage: f.session.usage }] as never;
+    expect(requiresSessionSendCostApproval(f.review(), f.meta)).toBe(used >= 50_000);
+  });
+  it.each(["G:/other", "G:/PROJECT", "G:/project/", "/project"]) ("does not borrow a model from workspace %s", path => {
+    const f = fixture("codex", { input_tokens: 50_000 });
+    f.meta.workspacePath = "G:/project";
+    f.state.openTabs[0].workspacePath = path;
+    f.state.openTabs[0].model = "gpt-6-astra";
+    expect(f.review().model).not.toBe("gpt-6-astra");
   });
   it.each([0, 43920, 49999, 50000])("applies the cross-session threshold to current context %i", (used) => {
     const f = fixture("claude", { input_tokens: used });
@@ -134,10 +151,10 @@ describe("cross-session cost review telemetry", () => {
     expect(f.review().context.kind).toBe("unknown");
     expect(f.review().context.used).toBeUndefined();
   });
-  it("keeps AGY last request distinct even with a user reference window", () => {
+  it("keeps AGY last request distinct and ignores a retired reference window", () => {
     const f = fixture("agy", { context_usage_kind: "last_prompt", context_usage: { input_tokens: 10000, output_tokens: 1000 } });
-    writeAgyReferenceWindow(200000);
-    expect(f.review().context).toMatchObject({ used: 11000, max: 200000, kind: "last_request", reference: true });
+    localStorage.setItem("ccgui.agy.reference-context-window", "200000");
+    expect(f.review().context).toMatchObject({ used: 11000, kind: "last_request", reference: false });
     f.session.usage = { context_usage_kind: "current_context", context_usage: { input_tokens: 10000, model_context_window: 1000000 } };
     expect(f.review().context).toMatchObject({ used: 10000, max: 1000000, kind: "current_context", reference: false });
   });
@@ -231,10 +248,11 @@ describe("cross-session cost review telemetry", () => {
     expect(requiresSessionSendCostApproval(smallColdReview, f.meta, f.session, NOW + 7200000)).toBe(false);
     expect(requiresQueueDrainCostApproval(smallColdReview)).toBe(false);
 
-    // Approving a specific model + cacheStartedAt signature allows that exact state until changed
+    // Approval covers the displayed evidence, including context and price basis.
     const key = sessionKey(f.meta.engine, f.meta.sessionId, f.meta.workspacePath);
     useSessionSendCostGuardStore.getState().markApproved(key, coldReview);
     expect(useSessionSendCostGuardStore.getState().isApproved(key, coldReview)).toBe(true);
     expect(useSessionSendCostGuardStore.getState().isApproved(key, { ...coldReview, model: "model-b" })).toBe(false);
+    expect(useSessionSendCostGuardStore.getState().isApproved(key, { ...coldReview, context: { ...coldReview.context, used: 99999 } })).toBe(false);
   });
 });

@@ -3,6 +3,7 @@ import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import { CliMenu, type EffortLevel } from "../../src/components/application/ai-chat/cli-menu";
 import { getEffortLevels } from "../../src/components/application/ai-chat/effort-levels";
+import { AGY_ENCODED_EFFORT_LEVELS } from "../../src/components/application/ai-chat/model-effort";
 import "../../src/index.css";
 import "../../src/lib/i18n";
 
@@ -16,12 +17,17 @@ const catalog = engine === "agy" ? [
   { id: "claude-opus-5-5-high", label: "Claude Opus 5.5 (High)", provider: "anthropic" },
   { id: "gemini-3-8-flash-low", label: "Gemini 3.8 Flash (Low)", provider: "google" },
   { id: "gemini-3-8-flash-high", label: "Gemini 3.8 Flash (High)", provider: "google" },
+  { id: "gemini-4-hydrogen-high", label: "Gemini 4 Hydrogen (High)", provider: "google" },
+  { id: "gemini-4-hydrogen-xhigh", label: "Gemini 4 Hydrogen (XHigh)", provider: "google" },
+  { id: "gemini-4-hydrogen-medium", label: "Gemini 4 Hydrogen (Medium)", provider: "google" },
+  { id: "gemini-4-hydrogen-low", label: "Gemini 4 Hydrogen (Low)", provider: "google" },
+  { id: "gemini-pro-orchestrator", label: "Orchestrator", provider: "google" },
   { id: "gpt-oss-120b-medium", label: "GPT-OSS 120B (Medium)", provider: "openai" },
   { id: "custom-model", label: "Custom model" },
 ] : [engine === "claude" ? { id: "claude-opus-4-8", label: "Claude Opus 4.8" } : { id: "openai-codex/gpt-5.4", label: "GPT-5.4", provider: "openai-codex" }];
 function Test() {
   const [effort, setEffort] = useState<EffortLevel>("low");
-  const [modelId, setModelId] = useState(catalog[0].id);
+  const [modelId, setModelId] = useState(engine === "agy" && !manual ? "gemini-4-hydrogen-low" : catalog[0].id);
   const [modelChanges, setModelChanges] = useState(0);
   const [ultracode, setUltracode] = useState(false);
   const [effortChanges, setEffortChanges] = useState(0);
@@ -37,9 +43,9 @@ function Test() {
       await new Promise(resolve => setTimeout(resolve, 500));
       await frame(); await frame();
       const measurements = [];
-      for (const level of getEffortLevels(engine)) {
+      for (const level of engine === "agy" ? AGY_ENCODED_EFFORT_LEVELS : getEffortLevels(engine)) {
         if (cancelled) return;
-        flushSync(() => setEffort(level));
+        flushSync(() => engine === "agy" ? setModelId(`gemini-4-hydrogen-${level}`) : setEffort(level));
         await frame(); await frame();
         const r = button.getBoundingClientRect();
         const dialog = document.querySelector('[role="dialog"]')?.getBoundingClientRect();

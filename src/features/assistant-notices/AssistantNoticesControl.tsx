@@ -4,6 +4,7 @@ import { Button } from "@/components/base/buttons/button";
 import { Select, SelectItem } from "@/components/base/select/select";
 import { SettingsCard, SettingsRow, SettingsSectionLabel } from "@/components/application/settings/settings-rows";
 import { getEffortLevels, getDefaultEffort } from "@/components/application/ai-chat/effort-levels";
+import { modelHasNoEffort } from "@/components/application/ai-chat/model-effort";
 import { EngineIcon } from "@/components/foundations/icons/engine-icon";
 import { CLI_DISPLAY_NAMES } from "@/components/foundations/icons/engine-brands";
 import { ActionFeedbackIcon, useActionFeedback } from "@/components/base/action-feedback";
@@ -25,6 +26,8 @@ export function AssistantNoticesControl() {
   const disabled = !draft || busy;
   const selectedKey = draft ? noticeModelKey({ engine: draft.observerEngine, id: draft.observerModel }) : noticeModelKey(vertexModel);
   const selected = models.find(model => noticeModelKey(model) === selectedKey);
+  const noEffort = selected?.effortLevels?.length === 0
+    || Boolean(draft && modelHasNoEffort(draft.observerEngine, draft.observerModel));
   const choices = selected || !draft ? models : [{ engine: draft.observerEngine, id: draft.observerModel, name: draft.observerModel, provider: providers[draft.observerEngine] ?? "", supportsEffort: false, resolvedModel: null }, ...models];
   const levels: string[] = selected?.engine === "agy_vertex" ? ["medium"] : getEffortLevels(draft?.observerEngine ?? "claude").filter(level => !selected?.effortLevels || selected.effortLevels.includes(level));
   const efforts = draft && !levels.includes(draft.observerEffort) ? [draft.observerEffort, ...levels] : levels;
@@ -46,17 +49,18 @@ export function AssistantNoticesControl() {
       <SettingsRow anchor="observerModel" label={t("assistantNotices.observerModel")} description={t(!selected ? "assistantNotices.modelUnavailable" : selected.engine === "agy" ? "assistantNotices.agyModelDescription" : "assistantNotices.modelDescription")}>
         <Select aria-label={t("assistantNotices.observerModel")} selectedKey={selectedKey} isDisabled={disabled} triggerClassName={trigger} onSelectionChange={key => {
           const model = models.find(item => noticeModelKey(item) === key); if (!model) return;
-          const effort = model.engine === "agy_vertex" ? "medium" : !model.supportsEffort && model.effortLevels?.[0] ? model.effortLevels[0]
+          const effort = model.engine === "agy_vertex" ? "medium" : modelHasNoEffort(model.engine, model.id) || model.effortLevels?.length === 0 ? ""
+            : !model.supportsEffort && model.effortLevels?.[0] ? model.effortLevels[0]
             : model.id === "" && draft?.observerEngine === model.engine && getEffortLevels(model.engine).some(level => level === draft.observerEffort)
             ? draft.observerEffort : model.effortLevels?.includes(getDefaultEffort(model.engine)) ? getDefaultEffort(model.engine) : model.effortLevels?.[0] ?? getDefaultEffort(model.engine);
           change({ observerEngine: model.engine, observerModel: model.id, observerEffort: effort });
         }}>{choices.map(model => <SelectItem key={noticeModelKey(model)} id={noticeModelKey(model)}>{[...new Set([model.id === "" ? t("assistantNotices.engineDefaultModel") : model.name, model.engine === "agy_vertex" ? "Vertex" : CLI_DISPLAY_NAMES[model.engine] ?? model.engine, model.provider || providers[model.engine]].filter(Boolean))].join(" · ")}</SelectItem>)}</Select>
       </SettingsRow>
-      <SettingsRow anchor="observerEffort" label={t("assistantNotices.observerEffort")}>
+      {!noEffort && <SettingsRow anchor="observerEffort" label={t("assistantNotices.observerEffort")}>
         <Select aria-label={t("assistantNotices.observerEffort")} selectedKey={draft?.observerEffort ?? "medium"} isDisabled={disabled || !selected?.supportsEffort || selected.engine === "agy_vertex"} triggerClassName={trigger} onSelectionChange={key => change({ observerEffort: String(key) })}>
           {efforts.map(level => <SelectItem key={level} id={level}>{level}</SelectItem>)}
         </Select>
-      </SettingsRow>
+      </SettingsRow>}
     </SettingsCard>
     <SettingsSectionLabel>{t("assistantNotices.voiceGroup")}</SettingsSectionLabel>
     <SettingsCard>{toggles(["voiceEnabled"])}<CompletionAudioSettings audio={audio} engines={status?.sourceEngines ?? []} disabled={disabled || audio.busy} /></SettingsCard>

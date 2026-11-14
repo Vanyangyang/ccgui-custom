@@ -61,7 +61,7 @@ export interface HostTaskCatalogProject {
 
 export interface HostTaskCatalog {
   /** 0.3.22: exact launch selection and project-member native child routing. 0.3.23: durable image attachments. */
-  readonly capabilities?: { readonly nativeCoordination: boolean; readonly images?: boolean; readonly continuousCoordination?: boolean; readonly fixedInstructions?: boolean };
+  readonly capabilities?: { readonly existingConversationAttachment?: boolean; readonly nativeCoordination: boolean; readonly images?: boolean; readonly continuousCoordination?: boolean; readonly fixedInstructions?: boolean; readonly immediateMessages?: boolean; readonly coordinatorMessageQueue?: boolean; readonly costReviewDialog?: boolean; readonly composerPrediction?: boolean; readonly coordinatorServiceTier?: boolean; readonly coordinatorInputCostReview?: boolean; readonly costHandoffPreview?: boolean; readonly managedChildCostHandoff?: boolean; readonly managedChildHandoffSelection?: boolean; readonly fullHistoryHandoff?: boolean; readonly coordinatorFullHistoryHandoff?: boolean };
   readonly defaultEngine: string;
   readonly engines: readonly HostTaskCatalogEngine[];
   readonly workspaces: readonly HostTaskCatalogWorkspace[];
@@ -176,7 +176,8 @@ export type HostTaskHandoff = { requestId: string } | { session: HostTaskSession
 export interface HostTaskSelection {
   readonly engine: string;
   readonly model: string;
-  readonly effort: string;
+  /** Omitted for AGY, whose reasoning level belongs to the model ID. */
+  readonly effort?: string;
   readonly providerId: string;
 }
 
@@ -201,7 +202,10 @@ export interface HostTaskSubmission {
   writePaths?: string[];
   /** References the AI should consult on demand (paths, memory ids). Listed, never expanded. */
   contextRefs?: string[];
-  /** "auto" reuses the slot's chat when still valid; "new" always starts a chat. */
+  /** "auto" reuses the slot's chat when still valid; "new" always starts a chat.
+   * Current hosts prepare new chats independently of user-owned pending tabs,
+   * preserving their text, images, choices and focus. Native run/session proof
+   * is still required; unknown delivery is never automatically replayed. */
   sessionMode: "auto" | "new";
   /** Reserve an exclusive coordinator from durable acceptance, before any view
    * attaches. Requires sessionMode: "new". Ordinary task routing is unchanged. */
@@ -212,13 +216,26 @@ export interface HostTaskSubmission {
   engine?: string;
   model?: string;
   effort?: string;
-  /** 0.3.22: exact channel id. Requires explicit engine/model/effort, currently Claude/Codex. */
+  /** Exact channel id. Requires explicit engine/model; Claude/Codex require effort, AGY omits it. */
   providerId?: string;
+  /** Coordinator-only Codex service tier for this initial turn; omitted follows the app setting. Requires coordinatorServiceTier capability. */
+  codexServiceTier?: "default" | "priority";
   /** 0.3.23: up to 8 opaque plugin image attachment IDs owned by this plugin. */
   images?: string[];
 }
 
-export type HostTaskStatus = "queued" | "starting" | "executing" | "awaiting_permission" | "completed" | "failed" | "cancelled" | "unknown";
+/** Associates an existing native chat without sending a turn or changing its settings. */
+export interface HostTaskAttachmentRequest {
+  requestId: string;
+  taskId: string;
+  projectId: string;
+  slotKey: string;
+  session: HostTaskSessionRef;
+  writePaths?: string[];
+}
+
+/** attached is durable metadata association, never evidence of model completion. */
+export type HostTaskStatus = "attached" | "queued" | "starting" | "executing" | "awaiting_permission" | "completed" | "failed" | "cancelled" | "unknown";
 
 export interface HostTaskReceipt {
   readonly requestedSelection?: HostTaskSelection;
@@ -232,11 +249,14 @@ export interface HostTaskReceipt {
   readonly workspacePath: string;
   /** "starting" = the host may have started the native turn; after a restart it becomes "unknown", never replayed. */
   readonly status: HostTaskStatus;
-  readonly sessionDecision: "reused" | "new" | null;
+  readonly sessionDecision: "attached" | "reused" | "new" | null;
   /** Only native evidence fills this; null while a new chat awaits its session announcement. */
   readonly session: HostTaskSessionRef | null;
   readonly runId: string | null;
-  /** Requests whose declared writes or chat this one waits behind. */
+  /** Blocking request IDs or the reserved "user-draft" marker. New hosts may
+   * append "user-draft:<reason>" codes (for example text, focused or mode).
+   * They report pending-chat protection, not delivery; unknown reasons should
+   * keep a generic waiting state. No draft contents are exposed. */
   readonly blockedBy?: readonly string[];
   /** This request's assistant output, at most 65,536 characters. */
   readonly text?: string;

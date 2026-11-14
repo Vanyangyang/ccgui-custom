@@ -53,6 +53,30 @@ it("loads the real overlay entry without importing the chat store or main applic
   expect(forbiddenImport).not.toHaveBeenCalled();
 });
 
+it("loads the real confirmation entry without chat, plugin or update initialization", async () => {
+  const forbidden = vi.fn();
+  vi.doMock("./features/chat/store", () => { forbidden("chat"); return {}; });
+  vi.doMock("./App", () => { forbidden("app"); return {}; });
+  vi.doMock("./features/plugins", () => { forbidden("plugins"); return {}; });
+  vi.doMock("./lib/live-update-bootstrap", () => { forbidden("updates"); return {}; });
+  const entry = await vi.importActual<typeof import("./features/host-confirmation/bootstrap")>("./features/host-confirmation/bootstrap");
+  expect(entry.startHostConfirmationApp).toBeTypeOf("function");
+  expect(forbidden).not.toHaveBeenCalled();
+});
+
+it("routes only the native host confirmation label into its isolated bootstrap", async () => {
+  vi.stubGlobal("window", { location: { hash: "#/" }, __TAURI_INTERNALS__: {} });
+  const start = vi.fn(), forbidden = vi.fn();
+  vi.doMock("@tauri-apps/api/window", () => ({ getCurrentWindow: () => ({ label: "host-confirmation-fixture" }) }));
+  vi.doMock("./features/host-confirmation/bootstrap", () => ({ startHostConfirmationApp: start }));
+  vi.doMock("./lib/react-scan", () => ({ installReactScanHook: forbidden, isReactScanEnabled: () => false }));
+  vi.doMock("./lib/live-update-bootstrap", () => { forbidden("updates"); return {}; });
+  vi.doMock("./bootstrap", () => { forbidden("main app"); return {}; });
+  await import("./main");
+  await vi.waitFor(() => expect(start).toHaveBeenCalledOnce());
+  expect(forbidden).not.toHaveBeenCalled();
+});
+
 it.each([
   { hash: "#/assistant-notices", label: "assistant-notices" },
   { hash: "#/assistant-notices?display=compact", label: "main" },

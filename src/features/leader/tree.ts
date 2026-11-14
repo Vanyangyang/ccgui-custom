@@ -41,7 +41,14 @@ export function groupLeaderThreads(threads: AiChatThread[], snapshot: LeaderSnap
   const prune = (row: AiChatThread): AiChatThread | null => {
     if (row.id && visited.has(row.id)) return null;
     if (row.id) visited.add(row.id);
-    if (row.children) row.children = row.children.map(prune).filter((t): t is AiChatThread => !!t);
+    if (row.children) {
+      const children = row.children.map(prune).filter((t): t is AiChatThread => !!t);
+      const history = children.filter((child) => child.leaderBranch?.state === "handed_off" && child.leaderBranch.handoffTo);
+      row.children = history.length ? [
+        ...children.filter((child) => !history.includes(child)),
+        { id: `leader-handoff-history:${row.id}`, label: "", time: "", handoffHistory: true, selectable: false, children: history },
+      ] : children;
+    }
     return row;
   };
   const roots = [...rows.values()].filter((row) => !row.id || !childIds.has(row.id)).map(prune).filter((t): t is AiChatThread => !!t);
@@ -54,7 +61,7 @@ export function threadContains(row: AiChatThread, id: string): boolean {
 }
 
 export function flattenLeaderThreads(rows: AiChatThread[]): AiChatThread[] {
-  return rows.flatMap((row) => [row, ...flattenLeaderThreads(row.children ?? [])]);
+  return rows.flatMap((row) => [...(row.handoffHistory ? [] : [row]), ...flattenLeaderThreads(row.children ?? [])]);
 }
 
 export function parentOfBranch(branch: LeaderBranch) {

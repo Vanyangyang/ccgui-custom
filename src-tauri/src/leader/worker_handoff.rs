@@ -26,8 +26,8 @@ impl ManagedWorkerRegistration {
 
     fn validate(&self, saved: &WorkerTaskRegistration) -> Result<(), String> {
         let branch = &self.branch;
-        if branch.delegation.is_some() {
-            return Err("Worker task capsules cannot supply a host delegation projection".into());
+        if branch.delegation.is_some() || branch.handoff_to.is_some() || branch.handoff_from.is_some() {
+            return Err("Worker task capsules cannot supply host delegation or handoff metadata".into());
         }
         supported(&branch.parent_engine)?;
         text_limit(&branch.id, "worker branch_id", 128)?;
@@ -51,7 +51,7 @@ impl ManagedWorkerRegistration {
         {
             return Err("Invalid managed worker task registration".into());
         }
-        for value in [&branch.model, &branch.effort] {
+        for value in [&branch.model, &branch.effort, &branch.provider_id] {
             if let Some(value) = value {
                 text_limit(value, "worker branch setting", 256)?;
             }
@@ -175,12 +175,25 @@ pub(super) fn detached_worker_presentation(
     if archived {
         return Err("Managed worker branch belongs to an archived task group".into());
     }
-    Ok(Some(json!({
+    // The branch JSON intentionally omits the host-owned delegation. Recover
+    // it from the same receipts used by the coordinator before attributing input.
+    let mut projection = Inner::default();
+    for request in delegation_storage::branch_requests(&conn, &branch)? {
+        projection.requests.insert((key(&request.parent), request.request_id.clone()), request);
+    }
+    projection.branches.insert(branch.id.clone(), BranchRecord {
+        branch, permission: String::new(), output: Output::default(),
+        questions: HashSet::new(), plans: HashSet::new(), stopping: false, dirty: false,
+    });
+    delegation_storage::hydrate(&mut projection, 0)?;
+    let branch = &projection.branches[branch_id].branch;
+    let mut metadata = json!({
         "branchId": branch.id,
         "workspacePath": branch.workspace_path,
         "title": branch.title,
-        "assignment": branch.task,
-    })))
+    });
+    annotate_assignment(&mut metadata, branch, run_id);
+    Ok(Some(metadata))
 }
 
 impl LeaderManager {
@@ -255,6 +268,8 @@ impl LeaderManager {
             }
             let mut branch = record.branch.clone();
             branch.delegation = None;
+            branch.handoff_to = None;
+            branch.handoff_from = None;
             Some(ManagedWorkerRegistration {
                 branch,
                 output: record.output.clone(),
@@ -426,8 +441,10 @@ impl LeaderManager {
             || branch.created_at != managed.branch.created_at
             || branch.title != managed.branch.title
             || branch.task != managed.branch.task
+            || branch.images != managed.branch.images
             || branch.model != managed.branch.model
             || branch.effort != managed.branch.effort
+            || branch.provider_id != managed.branch.provider_id
             || saved.session_id.as_ref().is_some_and(|session| {
                 branch
                     .session_id
@@ -518,6 +535,8 @@ impl LeaderManager {
         // A committed first identity and a user's TTL renewal are independent
         // of streamed output; never undo either when rewinding that projection.
         record.branch.session_id = session.clone();
+        record.branch.handoff_to = branch.handoff_to.clone();
+        record.branch.handoff_from = branch.handoff_from.clone();
         record.branch.deadline_at = branch.deadline_at;
         record.branch.expired = (self.clock)() >= branch.deadline_at;
         record.branch.delegation = delegation::restore_host_projection(inner, branch, &record.branch, &managed.last_seq, &managed.settled_turns);
@@ -595,7 +614,8 @@ mod tests {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE sessions(engine TEXT,session_id TEXT,workspace_path TEXT);
-             CREATE TABLE session_archives(engine TEXT,session_id TEXT);",
+             CREATE TABLE session_archives(engine TEXT,session_id TEXT);
+             CREATE TABLE plugin_kv(plugin_id TEXT,key TEXT,value TEXT,PRIMARY KEY(plugin_id,key));",
         )
         .unwrap();
         let db = Arc::new(Db(Mutex::new(conn)));
@@ -625,6 +645,7 @@ mod tests {
             workspace_path: "workspace".into(),
         };
         let args = SpawnArgs {
+            images: Vec::new(),
             workspace_path: None,
             request_id: "spawn".into(),
             engine: "claude".into(),
@@ -892,6 +913,11 @@ mod tests {
         invalid.managed.as_mut().unwrap().branch.parent_session_id = "another-parent".into();
         assert!(recovered.restore_worker_registration(&invalid).is_err());
         let mut invalid = checkpoint.clone();
+        invalid.managed.as_mut().unwrap().branch.images.push(TaskImage {
+            source: "replacement.png".into(), path: "fixture-only/replacement.png".into(), sha256: "a".repeat(64),
+        });
+        assert!(recovered.restore_worker_registration(&invalid).is_err(), "a worker checkpoint cannot replace the host's immutable assignment images");
+        let mut invalid = checkpoint.clone();
         invalid.managed.as_mut().unwrap().output.stream_start = Some(1);
         assert!(recovered.restore_worker_registration(&invalid).is_err());
         let mut invalid = checkpoint.clone();
@@ -1079,6 +1105,7 @@ mod tests {
         let expected = json!({
             "branchId": id, "workspacePath": "workspace",
             "title": "Worker", "assignment": "Return a verified result",
+            "assignmentSource": {"engine":"claude", "sessionId":"parent", "workspacePath":"workspace"},
         });
         assert_eq!(presentation, expected);
         {
@@ -1105,6 +1132,56 @@ mod tests {
         )
         .is_err());
         assert_eq!(presentation, expected);
+    }
+
+    #[test]
+    fn assignment_prompt_preserves_original_text_and_parent_identity_for_history() {
+        let (manager, id, _) = fixture();
+        let mut task = branch(&manager, &id);
+        task.task = "中文🙂\n```rs\nlet value = 1;\n```\n  ".into();
+        let prompt = assignment_prompt(&task);
+        let (header, body) = prompt.split_once("\n\n").unwrap();
+        let source: Value = serde_json::from_str(header.strip_prefix("[Message from CC GUI ").unwrap().strip_suffix(']').unwrap()).unwrap();
+        assert_eq!(source, json!({"engine": task.parent_engine, "session_id": task.parent_session_id}));
+        assert_eq!(body, task.task);
+        assert_eq!(task.task, "中文🙂\n```rs\nlet value = 1;\n```\n  ");
+    }
+
+    #[test]
+    fn assignment_presentation_tracks_parent_workspace_and_excludes_manual_runs() {
+        let (manager, id, run) = fixture();
+        {
+            let mut inner = manager.inner.lock();
+            let record = inner.branches.get_mut(&id).unwrap();
+            record.branch.parent_workspace_path = Some("parent-workspace".into());
+        }
+        // The source comes from the branch identity, not the child's cwd.
+        let mut session = json!({"runId":run,"engine":"claude","kind":"session","data":"child","seq":1});
+        manager.observe(&mut session);
+        assert_eq!(session["leader"]["assignmentSource"]["workspacePath"], "parent-workspace");
+        assert_eq!(session["leader"]["assignment"], "Return a verified result");
+        let frozen = detached_worker_presentation(&manager.db, &run, "claude", Some("child"), "workspace", Some(&id)).unwrap().unwrap();
+        assert_eq!(frozen["assignmentSource"], session["leader"]["assignmentSource"]);
+
+        let (manager, id, run) = fixture();
+        observe(&manager, &run, "session", json!("child"), 1);
+        observe(&manager, &run, "done", json!({}), 2);
+        let mut continued = json!({"runId":format!("{run}-c1"),"engine":"claude","kind":"session","data":"child","seq":1});
+        manager.observe(&mut continued);
+        assert!(continued["leader"].get("assignment").is_none());
+        assert!(continued["leader"].get("assignmentSource").is_none());
+        observe(&manager, &format!("{run}-c1"), "done", json!({}), 2);
+        manager.processes.remove_run_if_pid(&run, 42);
+        manager.finish(&run);
+        manager.db.0.lock().execute_batch("CREATE TABLE workspaces(id TEXT,path TEXT,meta TEXT); INSERT INTO workspaces VALUES('workspace','workspace',NULL);").unwrap();
+        manager.prepare("manual-run", "claude", Some("child"), "workspace", Some("manual")).unwrap();
+        let mut manual = json!({"runId":"manual-run","engine":"claude","kind":"session","data":"child","seq":1});
+        manager.observe(&mut manual);
+        assert!(manual["leader"].get("assignment").is_none());
+        assert!(manual["leader"].get("assignmentSource").is_none());
+        let frozen = detached_worker_presentation(&manager.db, "manual-run", "claude", Some("child"), "workspace", Some(&id)).unwrap().unwrap();
+        assert!(frozen.get("assignment").is_none());
+        assert!(frozen.get("assignmentSource").is_none());
     }
 
     #[test]

@@ -29,19 +29,27 @@ describe("ctx.tasks facade", () => {
       () => denied.ctx.tasks.excerpt({ engine: "claude", sessionId: "s", workspacePath: "G:/x" }),
       () => denied.ctx.tasks.plan({ requestId: "p", goal: "g", projects: [] }), () => denied.ctx.tasks.getPlan("p"),
       () => denied.ctx.tasks.cancelPlan("p"), () => denied.ctx.tasks.submit({} as never), () => denied.ctx.tasks.receipt("r"),
+      () => denied.ctx.tasks.attachConversation({} as never),
       () => denied.ctx.tasks.list(), () => denied.ctx.tasks.cancel("r"), () => denied.ctx.tasks.open("r"),
       () => denied.ctx.tasks.forget("r"), () => denied.ctx.tasks.slots(),
       () => denied.ctx.tasks.conversation("r"), () => denied.ctx.tasks.sendMessage({ conversationRequestId: "r", requestId: "m", expectedInputRevision: 0, prompt: "hello" }),
       () => denied.ctx.tasks.messageReceipt("r", "m"), () => denied.ctx.tasks.cancelMessage("r", "m"), () => denied.ctx.tasks.stopConversation("r"),
+      () => denied.ctx.tasks.sendMessageNow("r", "m", 1),
       () => denied.ctx.tasks.conversationAction("r", { type: "openNative", conversationRequestId: "r", expectedRevision: 1 }),
+      () => denied.ctx.tasks.previewCostHandoff!({ conversationRequestId: "r", expectedRevision: 1, approvalId: "a", approvalRequestId: "held" }),
+      () => denied.ctx.tasks.handoffManagedChild!({ conversationRequestId: "r", expectedRevision: 1, approvalId: "a", approvalRequestId: "held", sourceStamp: "0".repeat(64), operationId: "op", summary: "summary" }),
     ]) await expect(call()).rejects.toThrow(/host:tasks/);
     expect(() => denied.ctx.tasks.onEvent(() => {})).toThrow(/host:tasks/);
     expect(() => denied.ctx.tasks.onConversationEvent(() => {})).toThrow(/host:tasks/);
     // jsdom has no __TAURI_INTERNALS__, so the host transport is Web.
     const web = createPluginContext(manifest(["host:tasks"]), backend, { appVersion: "1" });
     await expect(web.ctx.tasks.catalog()).rejects.toThrow(/desktop/);
+    await expect(web.ctx.tasks.attachConversation({} as never)).rejects.toThrow(/desktop/);
     expect(() => web.ctx.tasks.onEvent(() => {})).toThrow(/desktop/);
     await expect(web.ctx.tasks.conversation("r")).rejects.toThrow(/desktop/);
+    await expect(web.ctx.tasks.sendMessageNow("r", "m", 1)).rejects.toThrow(/desktop/);
+    await expect(web.ctx.tasks.previewCostHandoff!({ conversationRequestId: "r", expectedRevision: 1, approvalId: "a", approvalRequestId: "held" })).rejects.toThrow(/desktop/);
+    await expect(web.ctx.tasks.handoffManagedChild!({ conversationRequestId: "r", expectedRevision: 1, approvalId: "a", approvalRequestId: "held", sourceStamp: "0".repeat(64), operationId: "op", summary: "summary" })).rejects.toThrow(/desktop/);
     expect(() => web.ctx.tasks.onConversationEvent(() => {})).toThrow(/desktop/);
     expect(backend.bridgeInvoke).not.toHaveBeenCalled();
     expect(backend.data.size).toBe(0);

@@ -1,4 +1,4 @@
-import { matchesHostTaskSelection } from "./host-task-selection";
+import { matchesHostTaskSelection, type HostLaunchChoices } from "./host-task-selection";
 import { ipc } from "@/lib/ipc";
 import { cursorLaunchModel, cursorRememberedModel } from "@/components/application/ai-chat/cursor-models";
 import { engineSupportsCompact } from "@/components/application/ai-chat/app-commands";
@@ -14,8 +14,11 @@ import {
   type ActiveSession,
 } from "./persistence";
 import { isBackgroundDraftAvailable } from "./tabs";
+import { hostPendingKey, pendingHostOrigin } from "./host-pending-chat";
+import { workspaceCatalogPathKey } from "@/lib/workspace-path";
 import {
   EMPTY_SESSION,
+  isUnloadedHistory,
   adoptedDraftKeys,
   resolveLiveSessionKey,
   resolveLiveSessionTab,
@@ -37,7 +40,7 @@ import {
   type SessionState,
 } from "./stream";
 import { latestMessageUsage, mergeUsage, parseUsage } from "../usage";
-import { crossSessionCostReview, requiresQueueDrainCostApproval, useSessionSendCostGuardStore } from "../cross-session-cost";
+import { crossSessionCostReview, requiresQueueDrainCostApproval, sameSessionCostWorkspace, useSessionSendCostGuardStore } from "../cross-session-cost";
 import { settleThroughput } from "../throughput";
 import { persistClaudeUltracode } from "./claude-ultracode";
 import { resolveClaudeHaikuAssist } from "../claude-haiku-assist";
@@ -54,6 +57,8 @@ import {
   rememberProviderForRun,
   routeAndReconcileRun,
   upsertSessionMetaInto,
+  adoptHostPendingSession,
+  forgetPendingSessionSelection,
 } from "./engine-events";
 import { ASK_OTHER_OPTION, askLoops, beginAskSubmit, revertAskSubmit } from "./ask-loop";
 import { engineSupportsComputerUse } from "../computer-use";
@@ -70,7 +75,8 @@ import {
   migrateSelectedAgent,
 } from "@/features/agents/selected-agent";
 import { appendCommittedRows } from "./session-utils";
-import { beginNativeRun } from "./native-tasks";
+import { beginNativeRun, supportsNativeTasks } from "./native-tasks";
+import { staleAcpContextUsage } from "../usage";
 import {
   INTERRUPT_GRACE_MS,
   followUpGuardActive,
@@ -115,6 +121,12 @@ function keyOfTarget(
     : "";
 }
 
+function sendKey(tab: ActiveSession, options?: SendOptions): string {
+  return options?.hostIndependentDraft && options.hostNewChat && options.requestedRunId && tab.sessionId === null
+    ? hostPendingKey(tab.engine, options.requestedRunId)
+    : sessionKey(tab.engine, tab.sessionId, tab.workspacePath);
+}
+
 /** 已经算好 key 的调用点直接用 key，没给就回退到激活会话。 */
 function resolveKey(key: string | undefined, active: ActiveSession | null): string {
   return resolveLiveSessionKey(key ?? keyOfTarget(null, active));
@@ -149,6 +161,7 @@ export function createMessagingActions(
   | "resendLastUser"
   | "queueMessage"
   | "sendWhileBusy"
+  | "prepareImmediateFollowUp"
   | "removeQueued"
   | "moveQueued"
   | "clearQueue"
@@ -166,6 +179,14 @@ export function createMessagingActions(
   markUnseenIfBackground: (key: string) => void;
 } {
   const { set, get, loadHistoryPage, subscribe } = deps;
+  const assertHostSelection = (tab: ActiveSession, launch?: HostLaunchChoices) => {
+    const state = get();
+    const currentTab = state.openTabs.find(t => t.engine === tab.engine && t.sessionId === tab.sessionId && t.workspacePath === tab.workspacePath);
+    if (!currentTab) throw new HostChatBusyError("Exact host chat target is no longer reachable");
+    if (launch && !matchesHostTaskSelection(currentTab, state.bySession[sessionKey(tab.engine, tab.sessionId, tab.workspacePath)], launch)) {
+      throw new HostChatBusyError("Host task session selection changed before delivery");
+    }
+  };
   // Stop can arrive before send_message registers the child. A false reply
   // then means "not yet"; retry once when that exact launch is registered.
   const pendingNativeLaunches = new Map<string, { runId: string; ready: boolean; retryInterrupt: boolean }>();
@@ -227,17 +248,26 @@ export function createMessagingActions(
     if (tab.sessionId !== null || live || (!prompt.trim() && !images.length)) {
       return sendPreparedPrompt(tab, prompt, images, options, live);
     }
-    const key = sessionKey(tab.engine, null, tab.workspacePath);
+    const key = sendKey(tab, options);
     const draft = get().bySession[key];
     if (draft?.loading || draft?.streaming || draft?.draftLaunching) {
       if (options?.requestedRunId) throw new HostChatBusyError();
       return;
     }
     const draftLaunch = { id: newId(), invoked: false };
-    patchSession(set, key, { draftLaunching: draftLaunch.id, interrupted: false });
+    patchSession(set, key, { draftLaunching: draftLaunch.id, interrupted: false,
+      ...(options?.hostIndependentDraft ? { hostTaskOrigin: { engine: tab.engine, workspacePath: tab.workspacePath, runId: options.requestedRunId! } } : {}) });
     try {
       await sendPreparedPrompt(tab, prompt, images, options, live, draftLaunch);
     } finally {
+      if (options?.hostIndependentDraft && !draftLaunch.invoked && pendingHostOrigin(key, get().bySession[key])?.runId === options.requestedRunId) {
+        set(s => {
+          const bySession = { ...s.bySession }; delete bySession[key];
+          return { bySession, streamingByKey: setStreamingFlag(s.streamingByKey, key, false), retryingByKey: setRetryingFlag(s.retryingByKey, key, false) };
+        });
+        runRouting.delete(options.requestedRunId!); untrackRun(options.requestedRunId!); dropRunUsage(options.requestedRunId!);
+        forgetPendingSessionSelection(key);
+      }
       if (get().bySession[key]?.draftLaunching === draftLaunch.id) {
         patchSession(set, key, { draftLaunching: undefined });
         if (draftLaunch.invoked && !get().bySession[key]?.interrupted) drainQueue(key);
@@ -258,8 +288,18 @@ export function createMessagingActions(
     const assertHostIdle = () => {
       if (!options?.requestedRunId) return;
       const state = get();
-      const key = sessionKey(tab.engine, tab.sessionId, tab.workspacePath);
+      const key = sendKey(tab, options);
       const session = state.bySession[key];
+      if (options.hostIndependentDraft) {
+        const origin = pendingHostOrigin(key, session);
+        const workspace = state.workspaces.find(w => workspaceCatalogPathKey(w.path) === workspaceCatalogPathKey(tab.workspacePath));
+        if (!options.hostNewChat || tab.sessionId !== null || !state.initialized || !workspace || state.archivedWorkspaces.includes(workspace.id) ||
+          workspace.meta && typeof workspace.meta === "object" && "wsl" in workspace.meta ||
+          !origin || origin.runId !== options.requestedRunId || origin.engine !== tab.engine || origin.workspacePath !== tab.workspacePath ||
+          !draftLaunch || session?.draftLaunching !== draftLaunch.id || session.interrupted ||
+          !state.engines.some(e => e.id === tab.engine && e.available && e.enabled)) throw new HostChatBusyError("Independent task start changed before delivery");
+        return;
+      }
       if (options.hostNewChat) {
         // A first task turn targets exactly one open pending chat; an adopted,
         // closed, focused or user-edited draft is a pre-spawn refusal, never a
@@ -277,7 +317,7 @@ export function createMessagingActions(
         }
         return;
       }
-      if (!state.initialized || !tab.sessionId || !session || session.loading || state.archivedSessionKeys[key] ||
+      if (!state.initialized || !tab.sessionId || !session || session.loading || isUnloadedHistory(session) || state.archivedSessionKeys[key] ||
         !state.openTabs.some((t) => t.engine === tab.engine && t.sessionId === tab.sessionId && t.workspacePath === tab.workspacePath)) {
         throw new HostChatBusyError("Exact host chat target is no longer reachable");
       }
@@ -295,7 +335,7 @@ export function createMessagingActions(
     // transcript keeps (the bubble strips it back out for display). Slash
     // prompts ("/compact") never get it, and a re-sent committed message
     // already carries its block, so re-injecting would duplicate it.
-    const selectedAgent = getSelectedAgent(tab.workspacePath, tab.sessionId);
+    const selectedAgent = options?.hostIndependentDraft ? null : getSelectedAgent(tab.workspacePath, tab.sessionId);
     // Built-in resolve failures are re-flagged after the optimistic-turn
     // patch below (which resets `error` for the new turn).
     let agentResolveError: string | null = null;
@@ -342,12 +382,12 @@ export function createMessagingActions(
     if (options?.requestedRunId) {
       await options.hostBeforeSend?.();
       assertHostIdle();
-      tab = get().openTabs.find((t) => t.engine === tab.engine && t.sessionId === tab.sessionId && t.workspacePath === tab.workspacePath)!;
+      if (!options.hostIndependentDraft) tab = get().openTabs.find((t) => t.engine === tab.engine && t.sessionId === tab.sessionId && t.workspacePath === tab.workspacePath)!;
     }
     const engine = tab.engine;
-    const key = sessionKey(engine, tab.sessionId, tab.workspacePath);
+    const key = sendKey(tab, options);
     // Closing or retargeting during agent resolution cancels this first launch.
-    if (tab.sessionId === null && !get().openTabs.some((t) =>
+    if (!options?.hostIndependentDraft && tab.sessionId === null && !get().openTabs.some((t) =>
       t.engine === engine && t.sessionId === null && t.workspacePath === tab.workspacePath)) {
       if (options?.hostNewChat) throw new HostChatBusyError();
       return;
@@ -456,6 +496,7 @@ export function createMessagingActions(
     // Built-in agent resolution above can yield: recheck immediately before
     // claiming this timeline so an external queued send cannot overlap a user.
     assertHostIdle();
+    const beforeOptimisticTurn = options?.hostContinuation ? { ...get().bySession[key] } : undefined;
     set((s) => ({
       streamingByKey: setStreamingFlag(s.streamingByKey, key, true),
     }));
@@ -471,9 +512,11 @@ export function createMessagingActions(
         },
       ],
       {
+        ...(supportsNativeTasks(engine)
+          ? beginNativeRun(get().bySession[key] ?? EMPTY_SESSION, requestedRunId)
+          : {}),
         ...(engine === "claude"
           ? {
-              ...beginNativeRun(get().bySession[key] ?? EMPTY_SESSION, requestedRunId),
               // The CLI fixes these at launch: a later live follow-up compares.
               liveLaunch: { model, effort, provider, permission, claudeUltracode, claudeHaikuAssist },
             }
@@ -498,6 +541,16 @@ export function createMessagingActions(
     );
     // Refresh independently: a slow history read must not delay sending or Stop.
     const hostUserRow = get().bySession[key]?.messages.at(-1);
+    const optimisticTurn = options?.hostContinuation ? { ...get().bySession[key] } : undefined;
+    // Our optimistic turn resolves inherited choices into active* fields.
+    // Freeze that exact post-write state, not the pre-write null choices, so
+    // persistence can be followed by a final check without rejecting our writes.
+    const optimisticTab = get().openTabs.find(t => t.engine === tab.engine && t.sessionId === tab.sessionId && t.workspacePath === tab.workspacePath) ?? tab;
+    const finalSelection = options?.hostContinuation ? { expectedNativeSelection: {
+      model: resolveSessionModel(optimisticTab, optimisticTurn) ?? null,
+      effort: resolveSessionEffort(optimisticTab, optimisticTurn) ?? null,
+      providerId: resolveSessionProvider(optimisticTab, optimisticTurn) ?? null,
+    } } : undefined;
     options?.onCommitted?.();
     void get().refreshSessionUsage(key);
     routeAndReconcileRun(set, requestedRunId, key);
@@ -514,15 +567,27 @@ export function createMessagingActions(
       ? { runId: requestedRunId, ready: false, retryInterrupt: false }
       : undefined;
     if (nativeLaunch) pendingNativeLaunches.set(requestedRunId, nativeLaunch);
+    let nativeInvoked = false;
     try {
       if (options?.hostUserRow && hostUserRow?.role === "user") {
         await options.hostUserRow({ runId: requestedRunId, seq: hostUserRow.seq, ts: hostUserRow.ts, text: hostUserRow.text, ...(hostUserRow.images ? { images: [...hostUserRow.images] } : {}) });
-        // Correlation persistence may yield to cancellation or an ownership fence.
-        await options.hostBeforeSend?.();
-        if (!get().openTabs.some(t => t.engine === tab.engine && t.sessionId === tab.sessionId && t.workspacePath === tab.workspacePath) ||
-          runRouting.get(requestedRunId) !== key || get().bySession[key]?.interrupted || get().bySession[key]?.queueParked) throw new HostChatBusyError("Exact host delivery was stopped during row persistence");
       }
+      if (options?.hostContinuation || (options?.hostUserRow && hostUserRow?.role === "user")) {
+        // Correlation persistence may yield to cancellation or an ownership fence.
+        // Continuations also need the final fence when no row is correlated.
+        await options.hostBeforeSend?.();
+        const current = get().bySession[key];
+        const independent = options.hostIndependentDraft && pendingHostOrigin(key, current)?.runId === requestedRunId;
+        if ((!independent && !get().openTabs.some(t => t.engine === tab.engine && t.sessionId === tab.sessionId && t.workspacePath === tab.workspacePath)) ||
+          runRouting.get(requestedRunId) !== key || current?.interrupted || current?.queueParked ||
+          (options?.hostContinuation && (!current || current.settledRunIds?.includes(requestedRunId) ||
+            (supportsNativeTasks(engine) ? current.nativeTaskRunId !== requestedRunId : engine === "codex" ? current.codexRunId !== requestedRunId : current.throughput?.runId !== requestedRunId)))) {
+          throw new HostChatBusyError("Exact host delivery was stopped during row persistence");
+        }
+      }
+      if (finalSelection) assertHostSelection(tab, finalSelection);
       if (draftLaunch) draftLaunch.invoked = true;
+      nativeInvoked = true;
       const result = await ipc.sendMessage({
         runId: requestedRunId,
         engine,
@@ -533,10 +598,15 @@ export function createMessagingActions(
         model: launchModel,
         effort,
         ...(engine === "claude" ? { claudeUltracode, claudeHaikuAssist } : {}),
+        ...(options?.hostLaunch?.codexServiceTierOverride !== undefined
+          ? { codexServiceTierOverride: options.hostLaunch.codexServiceTierOverride } : {}),
         permission,
         providerId: provider,
         computerUse: options?.computerUse === true,
       });
+      if (options?.hostIndependentDraft && result.runId !== requestedRunId) {
+        throw Object.assign(new Error("Independent task run identity was not acknowledged"), { outcomeUnknown: true, nativeIdentityMismatch: true });
+      }
       if (nativeLaunch) {
         nativeLaunch.runId = result.runId;
         nativeLaunch.ready = true;
@@ -561,7 +631,11 @@ export function createMessagingActions(
       // forever and no one clears its streaming flag. If onSession already
       // migrated the state, bySession[key] is gone and this stays a no-op.
       const stillPending = get().bySession[key] !== undefined;
-      if (result.sessionId && !tab.sessionId
+      if (options?.hostIndependentDraft && result.sessionId) {
+        if (!adoptHostPendingSession({ set, get }, engine, result.runId, result.sessionId)) {
+          throw Object.assign(new Error("Independent task session identity could not be bound"), { outcomeUnknown: true, nativeIdentityMismatch: true });
+        }
+      } else if (result.sessionId && !tab.sessionId
           && (!settled || (knownKey && get().bySession[knownKey]?.interrupted) || stillPending)) {
         // Preassigned native id (grok): adopt immediately.
         migrateSelectedAgent(tab.workspacePath, result.sessionId);
@@ -666,7 +740,8 @@ export function createMessagingActions(
       // A native id adopted
       // just above moved the state to a new key, so read the key the turn
       // actually lives under.
-      const liveKey = runRouting.get(result.runId) ?? knownKey ?? (
+      const liveKey = options?.hostIndependentDraft && result.sessionId ? sessionKey(engine, result.sessionId, tab.workspacePath)
+        : runRouting.get(result.runId) ?? knownKey ?? (
         result.sessionId && !tab.sessionId
           ? sessionKey(engine, result.sessionId, tab.workspacePath)
           : key);
@@ -676,7 +751,14 @@ export function createMessagingActions(
       if (result.runId !== requestedRunId && get().bySession[liveKey]?.codexRunId === requestedRunId) {
         patchSession(set, liveKey, { codexRunId: result.runId });
       }
-      if (get().bySession[liveKey]?.interrupted && !usesNativeInterrupt(liveKey)) {
+      const liveState = get().bySession[liveKey];
+      const ownsIndependentTurn = !options?.hostIndependentDraft ||
+        ((supportsNativeTasks(engine) ? liveState?.nativeTaskRunId : engine === "codex" ? liveState?.codexRunId : liveState?.throughput?.runId) === result.runId &&
+          // Native task catalogs retain their owner after settlement. A newer
+          // turn's throughput or route overrides that retained identity.
+          (!liveState?.throughput?.runId || liveState.throughput.runId === result.runId) &&
+          ![...runRouting].some(([runId, routed]) => routed === liveKey && runId !== result.runId));
+      if (ownsIndependentTurn && liveState?.interrupted && !usesNativeInterrupt(liveKey)) {
         patchSession(set, liveKey, { settledRunIds: rememberSettledRun(get().bySession[liveKey], result.runId) });
         runRouting.delete(result.runId);
         untrackRun(result.runId);
@@ -692,12 +774,59 @@ export function createMessagingActions(
         await interruptReplyOnly(liveKey, get().bySession[liveKey]?.queueParked === true, true);
       }
     } catch (error) {
+      if (options?.hostIndependentDraft && !nativeInvoked) {
+        throw new HostChatBusyError(errorText(error));
+      }
+      if (options?.hostIndependentDraft && nativeInvoked && !isDeliveryOutcomeUnknown(error)) {
+        // The task ledger cannot treat an IPC rejection as proof that native
+        // delivery never happened. Retain its exact private Stop/event route.
+        error = Object.assign(new Error(errorText(error)), { outcomeUnknown: true });
+      }
+      if (options?.hostContinuation && !nativeInvoked && beforeOptimisticTurn && optimisticTurn) {
+        // No native request exists yet: remove only this exact optimistic row.
+        // A newer run or concurrent history/draft edit must survive a late fence.
+        set((s) => {
+          const current = s.bySession[key];
+          if (!current) return {};
+          const ownsRun = supportsNativeTasks(engine) ? current.nativeTaskRunId === requestedRunId
+            : engine === "codex" ? current.codexRunId === requestedRunId
+            : current.throughput?.runId === requestedRunId;
+          const restored = { ...current, messages: current.messages.filter(row => row !== hostUserRow) };
+          if (ownsRun) {
+            const restoreField = <K extends keyof SessionState>(field: K) => {
+              // Restore only our own unchanged writes, preserving Stop and any
+              // newer per-field state that arrived while the callback awaited.
+              if (field === "messages" || Object.is(beforeOptimisticTurn[field], optimisticTurn[field]) ||
+                !Object.is(current[field], optimisticTurn[field])) return;
+              if (Object.prototype.hasOwnProperty.call(beforeOptimisticTurn, field)) {
+                restored[field] = beforeOptimisticTurn[field] as SessionState[K];
+              } else {
+                delete restored[field];
+              }
+            };
+            (Object.keys(optimisticTurn) as (keyof SessionState)[]).forEach(restoreField);
+          }
+          return {
+            bySession: { ...s.bySession, [key]: restored },
+            ...(ownsRun ? { streamingByKey: setStreamingFlag(s.streamingByKey, key, restored.streaming) } : {}),
+          };
+        });
+        runRouting.delete(requestedRunId);
+        untrackRun(requestedRunId);
+        dropRunUsage(requestedRunId);
+        if (options.computerUse && !Object.values(get().bySession).some(session => session.streaming && session.activeComputerUse)) {
+          void ipc.computerUseSetActive?.(false)?.catch(() => {});
+        }
+        // The durable caller decides queued/unknown from the original failure.
+        // Never drain the composer queue or turn this into a native failure.
+        throw error;
+      }
       const failedKey = runRouting.get(requestedRunId) ?? Object.keys(get().bySession).find(
         (candidate) => get().bySession[candidate]?.nativeTaskRunId === requestedRunId || get().bySession[candidate]?.codexRunId === requestedRunId,
       ) ?? key;
       if (isDeliveryOutcomeUnknown(error)) {
         const current = get().bySession[failedKey];
-        const ownsRun = engine === "claude" ? current?.nativeTaskRunId === requestedRunId
+        const ownsRun = supportsNativeTasks(engine) ? current?.nativeTaskRunId === requestedRunId
           : engine === "codex" ? current?.codexRunId === requestedRunId
           : runRouting.get(requestedRunId) === failedKey;
         if (current && ownsRun && !current.settledRunIds?.includes(requestedRunId)) {
@@ -712,7 +841,7 @@ export function createMessagingActions(
       untrackRun(requestedRunId);
       dropRunUsage(requestedRunId);
       const failed = get().bySession[failedKey];
-      if (engine === "claude" && (!failed || failed.nativeTaskRunId !== requestedRunId ||
+      if (supportsNativeTasks(engine) && (!failed || failed.nativeTaskRunId !== requestedRunId ||
         failed.settledRunIds?.includes(requestedRunId))) {
         // A native event already settled/replaced this launch. Its late IPC
         // error must not clear the new run or drain a second process into it.
@@ -776,10 +905,10 @@ export function createMessagingActions(
         (item) =>
           item.engine === tab.engine &&
           item.sessionId === tab.sessionId &&
-          (!item.workspacePath || item.workspacePath === tab.workspacePath),
+          (!item.workspacePath || sameSessionCostWorkspace(item.workspacePath, tab.workspacePath)),
       );
       if (meta) {
-        const review = crossSessionCostReview(meta, s, "idle");
+        const review = crossSessionCostReview({ ...meta, workspacePath: tab.workspacePath }, s, "idle");
         const cache = review.cache;
         const ttlMs = cache ? (cache.reference?.maxTtlSeconds ?? cache.ttlSeconds) * 1000 : 0;
         const stalePreTurnCache = !!cache && cache.observedAt < head.queuedAt &&
@@ -1016,6 +1145,7 @@ export function createMessagingActions(
     try {
       if (options?.hostUserRow && hostUserRow?.role === "user") await options.hostUserRow({ runId, seq: hostUserRow.seq, ts: hostUserRow.ts, text: hostUserRow.text, ...(hostUserRow.images ? { images: [...hostUserRow.images] } : {}) });
       if (options?.hostUserRow && (get().bySession[key]?.codexRunId !== runId || codexSteerBlocker(get(), tab, get().bySession[key], options))) throw new HostChatBusyError("Exact host steer changed during row persistence");
+      if (options?.hostContinuation) assertHostSelection(tab, options.hostLaunch);
       const accepted = await ipc.sendFollowUp({
         sessionId: runId, engine: tab.engine, workspacePath: tab.workspacePath,
         prompt, imagePaths: images.length ? images : null,
@@ -1082,13 +1212,18 @@ export function createMessagingActions(
       await options.hostContinuation.beforeDelivery("live", runId);
       if (get().bySession[key]?.nativeTaskRunId !== runId || liveFollowUpBlocker(get(), tab, get().bySession[key], options)) throw new HostChatBusyError();
     }
+    // The durable fence can yield while a newer usage snapshot arrives.
+    const liveSession = get().bySession[key];
+    if (!liveSession || liveSession.nativeTaskRunId !== runId) throw new HostChatBusyError();
     const claimedAt = Date.now();
+    const staleUsage = staleAcpContextUsage(liveSession.usage);
     const before = {
-      activity: cur.nativeActivity ?? null,
-      turnStartedAt: cur.turnStartedAt,
-      turnUsage: cur.turnUsage,
-      throughput: cur.throughput,
-      error: cur.error,
+      activity: liveSession.nativeActivity ?? null,
+      turnStartedAt: liveSession.turnStartedAt,
+      turnUsage: liveSession.turnUsage,
+      usage: liveSession.usage,
+      throughput: liveSession.throughput,
+      error: liveSession.error,
     };
     appendCommittedRows(
       set,
@@ -1109,6 +1244,7 @@ export function createMessagingActions(
         nativeActivity: "running",
         turnStartedAt: claimedAt,
         turnUsage: null,
+        usage: staleUsage,
         throughput: startThroughput(runId),
         // An explicit send is the user's next move: it lifts a Stop's park.
         queueParked: false,
@@ -1125,7 +1261,7 @@ export function createMessagingActions(
       set((s) => {
         const session = s.bySession[key];
         if (!session) return {};
-        const untouched = session.followUpAt === claimedAt;
+        const untouched = session.nativeTaskRunId === runId && session.followUpAt === claimedAt;
         return {
           bySession: {
             ...s.bySession,
@@ -1140,6 +1276,7 @@ export function createMessagingActions(
                     nativeActivity: before.activity,
                     turnStartedAt: before.turnStartedAt,
                     turnUsage: before.turnUsage,
+                    ...(session.usage === staleUsage ? { usage: before.usage } : {}),
                     throughput: before.throughput,
                     error: before.error,
                   }
@@ -1153,6 +1290,7 @@ export function createMessagingActions(
       if (options?.hostUserRow && hostUserRow?.role === "user") await options.hostUserRow({ runId, seq: hostUserRow.seq, ts: hostUserRow.ts, text: hostUserRow.text, ...(hostUserRow.images ? { images: [...hostUserRow.images] } : {}) });
       if (options?.hostUserRow && (get().bySession[key]?.nativeTaskRunId !== runId || get().bySession[key]?.queueParked ||
         liveFollowUpBlocker(get(), tab, get().bySession[key], { activity: "running" }))) throw new HostChatBusyError("Exact host live input changed during row persistence");
+      if (options?.hostContinuation) assertHostSelection(tab, options.hostLaunch);
       delivered = await ipc.sendFollowUp({
         sessionId: runId,
         engine: tab.engine,
@@ -1220,7 +1358,7 @@ export function createMessagingActions(
   /** Native Esc never escalates to a process kill. Keep routing and partial
    *  output until the CLI ends the reply; a write is not an acknowledgement.
    *  A later click resends an ignored request, and an IPC failure stays visible. */
-  async function interruptReplyOnly(key: string, park: boolean, afterSpawn = false): Promise<boolean> {
+  async function interruptReplyOnly(key: string, park: boolean, afterSpawn = false, throwOnError = false): Promise<boolean> {
     const session = get().bySession[key];
     if (!shouldInterruptTurn(session, key)) return false;
     const runId = session!.nativeTaskRunId!;
@@ -1261,7 +1399,7 @@ export function createMessagingActions(
         // Registration won the race against this false reply. Readdress the
         // registered child once (including an older backend's chosen run id).
         interruptsInFlight.delete(runId);
-        await interruptReplyOnly(currentKey, get().bySession[currentKey]?.queueParked === true, true);
+        await interruptReplyOnly(currentKey, get().bySession[currentKey]?.queueParked === true, true, throwOnError);
       } else {
         // The backend confirmed there is no live input channel. Settle locally;
         // there is nothing to kill. Send Now may now drain, Stop remains parked.
@@ -1279,7 +1417,14 @@ export function createMessagingActions(
       }
     } catch (error) {
       const currentKey = ownerKey();
-      if (currentKey) patchSession(set, currentKey, { error: i18n.t("chat.interruptFailed", { error: errorText(error) }) });
+      const message = i18n.t("chat.interruptFailed", { error: errorText(error) });
+      if (currentKey) patchSession(set, currentKey, {
+        error: message,
+        // This caller keeps the original durable inbox message. An IPC
+        // failure must allow its explicit retry without the successful-write grace.
+        ...(throwOnError ? { interruptRequestedAt: null } : {}),
+      });
+      if (throwOnError) throw new Error(message);
     } finally {
       if (interruptsInFlight.get(runId) === request) interruptsInFlight.delete(runId);
     }
@@ -1305,6 +1450,9 @@ export function createMessagingActions(
             messages: abortAutoReviews(messages),
             streaming: false,
             interrupted: true,
+            // The kill can retire the run before its final done arrives, so
+            // local settlement must clear its waiting/action indicator too.
+            nativeActivity: null,
             // The run is retired: no interrupt or delivery remains pending;
             // `interrupted` is what parks the queue now.
             followUpAt: null,
@@ -1327,6 +1475,10 @@ export function createMessagingActions(
 
   /** 按会话 key 停止，并取消仍在准备中的发送。 */
   async function interruptByKey(key: string) {
+    const current = get().bySession[key], origin = pendingHostOrigin(key, current);
+    // Done may beat both the launch ACK and native session identity. The
+    // retained launch flag cannot turn completed work into a cancelled turn.
+    if (origin && current?.settledRunIds?.includes(origin.runId)) return;
     if (get().bySession[key]?.draftLaunching && !get().bySession[key]?.streaming) {
       patchSession(set, key, { interrupted: true, queueParked: true, draftLaunching: undefined });
       return;
@@ -1430,6 +1582,13 @@ export function createMessagingActions(
     markUnseenIfBackground,
 
     send: async (prompt, images, options, target) => {
+      if (options?.hostIndependentDraft) {
+        if (!options.hostNewChat || !options.requestedRunId || !target || target.sessionId !== null) throw new HostChatBusyError("Invalid independent task start");
+        if (runRouting.has(options.requestedRunId) || Object.values(get().bySession).some(s => s.hostTaskOrigin?.runId === options.requestedRunId))
+          throw new HostChatBusyError("Independent task run already exists; not replayed");
+        await sendPrompt(target, prompt, images, options);
+        return;
+      }
       const session = resolveLiveSessionTab(target === undefined ? get().active : target, get().openTabs);
       if (session) await sendPrompt(session, prompt, images, options);
     },
@@ -1624,6 +1783,59 @@ export function createMessagingActions(
       enqueueExplicit(tab, text, images, options);
     },
 
+    prepareImmediateFollowUp: async (target, expectedRunId) => {
+      const s = get();
+      const tab = s.openTabs.find(t => t.engine === target.engine && t.sessionId === target.sessionId && t.workspacePath === target.workspacePath);
+      const key = sessionKey(target.engine, target.sessionId, target.workspacePath);
+      const session = s.bySession[key];
+      const unavailable = () => new HostChatBusyError(i18n.t("chat.steerUnavailable"));
+      if (!s.initialized || !target.sessionId || !tab || !session || session.loading || s.archivedSessionKeys[key] ||
+        session.queue.length || hasOpenCard(session)) throw unavailable();
+      if (!session.streaming) return;
+      const runId = tab.engine === "codex" ? session.codexRunId : session.nativeTaskRunId ??
+        (tab.engine === "agy" && !session.throughput?.ended ? session.throughput?.runId : undefined);
+      if (!runId || runId !== expectedRunId) throw unavailable();
+      if (tab.engine === "codex") {
+        if (codexSteerBlocker(s, tab, session)) throw unavailable();
+        return;
+      }
+      if (tab.engine === "agy") {
+        // AGY has no live steer channel. End this exact native run and let the
+        // ordinary terminal event release the durable inbox on the same chat.
+        // Do not settle optimistically or stop the coordinator's child tree.
+        if (runRouting.get(runId) !== key || session.interrupted || session.queueParked || session.activeComputerUse ||
+          session.handoff || session.compaction || session.draftLaunching || session.settledRunIds?.includes(runId)) throw unavailable();
+        const at = session.interruptRequestedAt;
+        if (interruptsInFlight.has(runId) || at != null && Date.now() - at < INTERRUPT_GRACE_MS) return;
+        const request = { at: Date.now() };
+        interruptsInFlight.set(runId, request);
+        patchSession(set, key, { interruptRequestedAt: request.at });
+        const stillOwns = () => {
+          const current = get().bySession[key];
+          const currentRunId = current?.nativeTaskRunId ?? (current?.throughput?.ended ? undefined : current?.throughput?.runId);
+          return interruptsInFlight.get(runId) === request && runRouting.get(runId) === key && current?.streaming &&
+            currentRunId === runId && current.interruptRequestedAt === request.at;
+        };
+        try {
+          const accepted = await ipc.interruptSession(runId);
+          if (!accepted && stillOwns()) throw unavailable();
+        } catch (error) {
+          const message = i18n.t("chat.interruptFailed", { error: errorText(error) });
+          if (stillOwns()) patchSession(set, key, { interruptRequestedAt: null, error: message });
+          throw new Error(message);
+        } finally {
+          if (interruptsInFlight.get(runId) === request) interruptsInFlight.delete(runId);
+        }
+        return;
+      }
+      if (tab.engine !== "claude") throw unavailable();
+      if (!liveFollowUpBlocker(s, tab, session)) return;
+      if (liveFollowUpBlocker(s, tab, session, { activity: "running" })) throw unavailable();
+      // A successful Esc write is not an idle acknowledgement. The task
+      // bridge waits for the ordinary event pump and retains its own message.
+      await interruptReplyOnly(key, false, false, true);
+    },
+
     removeQueued: (id, key) => {
       const targetKey = resolveKey(key, get().active);
       if (!targetKey) return;
@@ -1702,10 +1914,10 @@ export function createMessagingActions(
       const tab = get().openTabs.find((t) => sessionKey(t.engine, t.sessionId, t.workspacePath) === targetKey);
       if (tab?.sessionId) {
         const meta = get().sessions?.find(
-          (m) => m.engine === tab.engine && m.sessionId === tab.sessionId && (!m.workspacePath || m.workspacePath === tab.workspacePath),
+          (m) => m.engine === tab.engine && m.sessionId === tab.sessionId && (!m.workspacePath || sameSessionCostWorkspace(m.workspacePath, tab.workspacePath)),
         );
         if (meta) {
-          useSessionSendCostGuardStore.getState().markApproved(targetKey, crossSessionCostReview(meta, get(), running ? "busy" : "idle"));
+          useSessionSendCostGuardStore.getState().markApproved(targetKey, crossSessionCostReview({ ...meta, workspacePath: tab.workspacePath }, get(), running ? "busy" : "idle"));
         } else {
           useSessionSendCostGuardStore.getState().dismiss(targetKey);
         }
@@ -1748,8 +1960,9 @@ export function createMessagingActions(
       drainQueue(targetKey);
     },
 
-    interrupt: async (target) => {
-      const key = keyOfTarget(target === undefined ? get().active : target, null);
+    interrupt: async (target, hostPendingRunId) => {
+      const pending = hostPendingRunId ? Object.entries(get().bySession).find(([key, session]) => pendingHostOrigin(key, session)?.runId === hostPendingRunId) : undefined;
+      const key = hostPendingRunId ? pending?.[0] : keyOfTarget(target === undefined ? get().active : target, null);
       if (!key) return;
       await interruptByKey(key);
     },
@@ -1922,5 +2135,5 @@ export function createMessagingActions(
       }
     },
   }, ["send", "respondToGrant", "respondToPlanReview", "respondToQuestion", "resumePlanReview",
-    "resendLastUser", "queueMessage", "sendWhileBusy", "removeQueued", "moveQueued", "clearQueue", "sendQueuedNow", "interrupt", "compactContext"]);
+    "resendLastUser", "queueMessage", "sendWhileBusy", "prepareImmediateFollowUp", "removeQueued", "moveQueued", "clearQueue", "sendQueuedNow", "interrupt", "compactContext"]);
 }

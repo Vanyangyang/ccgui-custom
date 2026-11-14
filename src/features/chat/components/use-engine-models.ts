@@ -44,6 +44,7 @@ export interface EngineModelsState {
   channelModelsByEngine: Record<string, Record<string, string>>;
   failedEngines: Record<string, true>;
   configStatus: "loading" | "loaded" | "error";
+  settingsStatus: "loading" | "loaded" | "error";
 }
 
 function adoptCursorCatalog(models: CursorCatalogModel[]): CursorModel[] {
@@ -96,6 +97,9 @@ export function useEngineModels(
   const { t } = useTranslation();
   const [cliConfig, setCliConfig] = useState<CliConfig | null>(null);
   const [configStatus, setConfigStatus] = useState<"loading" | "loaded" | "error">("loading");
+  const [settingsStatus, setSettingsStatus] = useState<"loading" | "loaded" | "error">("loading");
+  const configRequest = useRef<object | null>(null);
+  const settingsRequest = useRef<object | null>(null);
   // A catalog is a property of the *context*, not of every workspace: the
   // backend answers from the local CLIs unless the workspace is a remote one
   // (a WSL distro's CLIs answer differently), so all local workspaces share
@@ -164,31 +168,50 @@ export function useEngineModels(
   }, [cursorEnabled]);
 
   const loadConfig = useCallback(async () => {
+    const token = {};
+    configRequest.current = token;
+    setConfigStatus("loading");
     try {
-      setCliConfig(await ipc.getCliConfig());
+      const config = await ipc.getCliConfig();
+      if (configRequest.current !== token) return;
+      setCliConfig(config);
       setConfigStatus("loaded");
     } catch (error) {
+      if (configRequest.current !== token) return;
       setConfigStatus("error");
       throw error;
     }
   }, []);
-  // The settings CLI page mutates provider config and custom models outside
-  // this tree; refetch so the picker tracks both immediately.
+  const loadSettings = useCallback(async () => {
+    const token = {};
+    settingsRequest.current = token;
+    setSettingsStatus("loading");
+    try {
+      const settings = await ipc.getAppSettings();
+      if (settingsRequest.current !== token) return;
+      setCustomModels(settings.customModels ?? {});
+      setCustomModelLabels(settings.customModelLabels ?? {});
+      setSettingsStatus("loaded");
+    } catch (error) {
+      if (settingsRequest.current !== token) return;
+      setSettingsStatus("error");
+      throw error;
+    }
+  }, []);
+  // Refetch local provider and custom-model settings without persisting defaults.
   useEffect(() => {
     const reload = () => {
       void loadConfig().catch(() => {});
-      ipc
-        .getAppSettings()
-        .then((s) => {
-          setCustomModels(s.customModels ?? {});
-          setCustomModelLabels(s.customModelLabels ?? {});
-        })
-        .catch(() => {});
+      void loadSettings().catch(() => {});
     };
     reload();
     window.addEventListener(CLI_CONFIG_CHANGED_EVENT, reload);
-    return () => window.removeEventListener(CLI_CONFIG_CHANGED_EVENT, reload);
-  }, [loadConfig]);
+    return () => {
+      configRequest.current = null;
+      settingsRequest.current = null;
+      window.removeEventListener(CLI_CONFIG_CHANGED_EVENT, reload);
+    };
+  }, [loadConfig, loadSettings]);
   // Catalog for the active workspace. Until the workspace's context is known
   // the shared local catalog proves nothing about it (it may be a remote one),
   // so the picker starts empty there and fills as the workspace's probes land.
@@ -530,7 +553,7 @@ export function useEngineModels(
   // share one catalog, so refreshing any of them covers the rest, while each
   // remote (distro) workspace keeps its own and would otherwise stay stale.
   const refresh = useCallback(async () => {
-    await loadConfig().catch(error => { if (selectionScope === "task") throw error; });
+    await Promise.all([loadConfig(), loadSettings()]).catch(error => { if (selectionScope === "task") throw error; });
     // Local context first — probed with the active workspace when that one is
     // local, so the spinner lands in the bucket the picker reads — then every
     // cached remote context, each of which owns its own catalog.
@@ -550,7 +573,7 @@ export function useEngineModels(
     const failed = results.find(result => result.status === "rejected");
     if (failed?.status === "rejected") throw failed.reason;
     if (context === "local") await loadCursorCatalog();
-  }, [engines, wsKey, context, requestCatalog, contextByWs, loadCursorCatalog, loadConfig, selectionScope]);
+  }, [engines, wsKey, context, requestCatalog, contextByWs, loadCursorCatalog, loadConfig, loadSettings, selectionScope]);
 
   // AGY's account catalog changes independently of the application. Keep the
   // local picker current without polling hidden windows or restarting the app.
@@ -587,5 +610,6 @@ export function useEngineModels(
     channelModelsByEngine,
     failedEngines,
     configStatus,
+    settingsStatus,
   };
 }

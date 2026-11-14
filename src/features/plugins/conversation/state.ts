@@ -20,6 +20,7 @@ export class ConversationModeState {
   private identities = new Map<string, string>();
   private selections = new Map<string, string>();
   private blocked = new Map<string, string>();
+  private occupationListeners = new Set<() => void>();
 
   constructor(
     saved: Record<string, string> = {},
@@ -36,6 +37,25 @@ export class ConversationModeState {
     return { version: 1, identities: Object.fromEntries(this.identities), selections: Object.fromEntries(this.selections), blocked: Object.fromEntries(this.blocked) };
   }
 
+  /** Read-only observation of tab occupation; mode edits that keep it occupied are silent. */
+  subscribeOccupation(listener: () => void): () => void {
+    this.occupationListeners.add(listener);
+    return () => { this.occupationListeners.delete(listener); };
+  }
+
+  private occupiedTabs(): Set<string> | undefined {
+    if (!this.occupationListeners.size) return undefined;
+    return new Set([...this.identities].filter(([, identity]) => this.selected(identity) !== undefined).map(([key]) => key));
+  }
+
+  private notifyOccupation(before: Set<string> | undefined): void {
+    if (!before) return;
+    const after = this.occupiedTabs();
+    if (after && (before.size !== after.size || [...before].some(key => !after.has(key)))) {
+      for (const listener of this.occupationListeners) listener();
+    }
+  }
+
   /** Validate every map before changing any state. Restoring must never write
    * preferences or mint a new draft identity. Existing callers retain this instance. */
   restoreCheckpoint(value: unknown): void {
@@ -44,23 +64,28 @@ export class ConversationModeState {
     const identities = checkpointStrings(snapshot.identities);
     const selections = checkpointStrings(snapshot.selections);
     const blocked = checkpointStrings(snapshot.blocked);
+    const before = this.occupiedTabs();
     this.identities = new Map(Object.entries(identities));
     this.selections = new Map(Object.entries(selections));
     this.blocked = new Map(Object.entries(blocked));
+    this.notifyOccupation(before);
   }
 
   identity(sessionKey: string, workspacePath: string, draft: boolean): string {
     const key = JSON.stringify([workspacePath, sessionKey]);
     let identity = this.identities.get(key);
     if (!identity) {
+      const before = this.occupiedTabs();
       identity = draft ? JSON.stringify([workspacePath, sessionKey, safeRandomUUID()]) : key;
       this.identities.set(key, identity);
       this.persist(Object.fromEntries(this.identities));
+      this.notifyOccupation(before);
     }
     return identity;
   }
 
   retain(sessions: readonly { key: string; workspacePath: string }[]): void {
+    const before = this.occupiedTabs();
     const retained = new Set(sessions.map((session) => JSON.stringify([session.workspacePath, session.key])));
     let changed = false;
     for (const [key, identity] of this.identities) {
@@ -71,11 +96,14 @@ export class ConversationModeState {
       }
     }
     if (changed) this.persist(Object.fromEntries(this.identities));
+    this.notifyOccupation(before);
   }
 
   select(identity: string, mode: string, streaming: boolean, queued: number): boolean {
     if (streaming || queued > 0 || (this.isExitBlocked(identity) && this.blocked.get(identity) !== mode)) return false;
+    const before = this.occupiedTabs();
     this.selections.set(identity, mode);
+    this.notifyOccupation(before);
     return true;
   }
 
@@ -85,10 +113,13 @@ export class ConversationModeState {
 
   exit(identity: string): void {
     if (this.isExitBlocked(identity)) return;
+    const before = this.occupiedTabs();
     this.selections.delete(identity);
+    this.notifyOccupation(before);
   }
 
   setExitBlocked(identity: string, mode: string, blocked: boolean): void {
+    const before = this.occupiedTabs();
     if (blocked) {
       this.blocked.set(identity, mode);
       this.selections.set(identity, mode);
@@ -96,6 +127,7 @@ export class ConversationModeState {
       this.blocked.delete(identity);
     } else return;
     this.persistLocks(Object.fromEntries(this.blocked));
+    this.notifyOccupation(before);
   }
 
   isExitBlocked(identity: string): boolean {
@@ -113,9 +145,11 @@ export class ConversationModeState {
   }
 
   removeMode(mode: string): void {
+    const before = this.occupiedTabs();
     for (const [identity, selected] of this.selections) {
       if (selected === mode) this.selections.delete(identity);
     }
+    this.notifyOccupation(before);
   }
 }
 

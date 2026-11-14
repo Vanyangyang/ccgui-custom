@@ -557,13 +557,31 @@ fn pending_claims(db: &crate::db::Db) -> Result<Vec<Value>, String> {
         for entry in entries {
             let receipt = entry.get("receipt").ok_or_else(invalid)?;
             let status = receipt.get("status").and_then(Value::as_str).ok_or_else(invalid)?;
+            if entry.get("attachment").is_some() || status == "attached" || receipt.get("sessionDecision").and_then(Value::as_str) == Some("attached") {
+                if entry.get("attachment") != Some(&Value::Bool(true)) || status != "attached"
+                    || receipt.get("sessionDecision").and_then(Value::as_str) != Some("attached")
+                    || receipt.get("runId") != Some(&Value::Null)
+                    || entry.get("prompt").and_then(Value::as_str) != Some("")
+                    || entry.get("coordination") != Some(&Value::Bool(true))
+                    || entry.get("conversationOwner") != Some(&Value::Bool(true))
+                    || entry.get("sessionProven") != Some(&Value::Bool(true))
+                    || !receipt.get("session").is_some_and(Value::is_object)
+                    || entry.get("conversationSession") != receipt.get("session") {
+                    return Err(invalid());
+                }
+            }
             let conversation_holding = match entry.get("conversationHolding") {
                 None => false,
                 Some(Value::Bool(holding)) => *holding,
                 _ => return Err(invalid()),
             };
-            if !matches!(status, "queued" | "starting" | "executing" | "awaiting_permission" | "unknown" | "completed" | "failed" | "cancelled") { return Err(invalid()); }
-            if !conversation_holding && matches!(status, "queued" | "completed" | "failed" | "cancelled") { continue; }
+            let exclusive = ["coordination", "conversationOwner"].iter().try_fold(false, |owned, field| match entry.get(*field) {
+                None => Ok(owned), Some(Value::Bool(true)) => Ok(true), _ => Err(invalid()),
+            })? && entry.get("sessionProven").and_then(Value::as_bool) == Some(true)
+                && receipt.get("session").is_some_and(Value::is_object);
+            if !matches!(status, "attached" | "queued" | "starting" | "executing" | "awaiting_permission" | "unknown" | "completed" | "failed" | "cancelled") { return Err(invalid()); }
+            let reservation_only = !conversation_holding && matches!(status, "attached" | "queued" | "completed" | "failed" | "cancelled");
+            if reservation_only && !exclusive { continue; }
             let request_id = receipt.get("requestId").and_then(Value::as_str).filter(|id| valid_request_id(id)).ok_or_else(invalid)?;
             let workspace = receipt.get("workspacePath").and_then(Value::as_str).filter(|path| plain_text(path, 4096)).ok_or_else(invalid)?;
             let writes = entry.get("writePaths").cloned().unwrap_or(Value::Null);
@@ -575,8 +593,9 @@ fn pending_claims(db: &crate::db::Db) -> Result<Vec<Value>, String> {
                 // The initial run may already have settled while continuation
                 // input or managed children still own this coordination scope.
                 // Its old terminal proof must not release the restored hold.
-                "writePaths": writes, "runId": if conversation_holding { "" } else { receipt.get("runId").and_then(Value::as_str).unwrap_or("") },
+                "writePaths": writes, "runId": if conversation_holding || reservation_only { "" } else { receipt.get("runId").and_then(Value::as_str).unwrap_or("") },
                 "session": receipt.get("session").cloned().unwrap_or(Value::Null), "status": "unknown",
+                "exclusiveSession": exclusive, "reservationOnly": reservation_only,
                 "sessionProven": entry.get("sessionProven").and_then(Value::as_bool).unwrap_or(false),
                 "identityMismatch": entry.get("identityMismatch").and_then(Value::as_bool).unwrap_or(false),
                 "cancelRequested": !conversation_holding && entry.get("cancelRequested").and_then(Value::as_bool).unwrap_or(false)
@@ -584,6 +603,12 @@ fn pending_claims(db: &crate::db::Db) -> Result<Vec<Value>, String> {
         }
     }
     Ok(claims)
+}
+
+#[tauri::command]
+pub(crate) fn plugin_task_attachment_capabilities(plugin_id: String) -> Result<Value, String> {
+    require_tasks_grant(&plugin_id)?;
+    Ok(json!({ "version": 1, "exclusiveSessionReservations": true }))
 }
 
 #[tauri::command]
@@ -597,6 +622,35 @@ pub(crate) fn plugin_task_pending_claims(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cold_restart_keeps_idle_exclusive_reservations_without_workspace_locks() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let session = json!({ "engine": "codex", "sessionId": "original", "workspacePath": "G:/repo" });
+        let ledger = json!({ "version": 1, "entries": [
+            { "receipt": { "requestId": "attached", "workspacePath": "G:/repo", "status": "attached", "sessionDecision": "attached", "runId": null, "session": session },
+              "attachment": true, "prompt": "", "coordination": true, "conversationOwner": true, "conversationSession": session,
+              "conversationHolding": false, "sessionProven": true, "writePaths": null },
+            { "receipt": { "requestId": "original-completed", "workspacePath": "G:/repo", "status": "completed", "runId": "old-run", "session": session },
+              "conversationOwner": true, "conversationHolding": false, "sessionProven": true, "writePaths": ["src"] }
+        ] });
+        db.0.lock().execute("INSERT INTO plugin_kv(plugin_id,key,value) VALUES(?1,?2,?3)",
+            rusqlite::params!["disabled-owner", "__host_tasks_v1:index", ledger.to_string()]).unwrap();
+        let claims = pending_claims(&db).unwrap();
+        assert_eq!(claims.len(), 2);
+        for claim in claims {
+            assert_eq!(claim["reservationOnly"], true);
+            assert_eq!(claim["exclusiveSession"], true);
+            assert_eq!(claim["runId"], "");
+            assert_eq!(claim["session"], session);
+        }
+        for field in ["attachment", "conversationOwner", "sessionProven", "conversationSession"] {
+            let mut malformed = ledger.clone();
+            malformed["entries"][0].as_object_mut().unwrap().remove(field);
+            db.0.lock().execute("UPDATE plugin_kv SET value = ?1", [malformed.to_string()]).unwrap();
+            assert!(pending_claims(&db).is_err(), "{field}");
+        }
+    }
 
     #[test]
     fn cold_restart_retains_disabled_owner_claims_without_exposing_prompt_or_output() {

@@ -81,6 +81,12 @@ export interface MemoryExtractionStatus {
   busy: boolean;
   retryAfterMs: number;
   reason?: string;
+  /** Native durable request receipts and shared token/failure limits are active.
+   * Automatic consumers must require this capability before enabling work. */
+  automationVersion?: 1;
+  /** Local source/receipt reads are currently permitted even if paid inference
+   * is waiting for its token budget or provider recovery. Never permits a call. */
+  canReconcile?: boolean;
 }
 export interface MemoryExtractionSourceRequest {
   projectId: string;
@@ -92,6 +98,9 @@ export interface MemoryExtractionRequest extends MemoryExtractionSourceRequest {
   context?: MemoryExtractionContext[];
   formatVersion?: 2;
   expectedSourceDigest?: string;
+  /** Look up this exact request's durable outcome. Never starts inference,
+   * including when the host has no receipt for the supplied requestId. */
+  reconcileOnly?: boolean;
 }
 export interface MemoryExtractionPrepareRequest extends MemoryExtractionSourceRequest {
   cursor?: MemoryExtractionCursor | null;
@@ -111,9 +120,11 @@ export type MemoryExtractionPreparation = {
  * selected source. Fixed tool-less Gemini4/Vertex extraction consumes provider
  * quota. The native host verifies source ownership, project and successful
  * completion; policies, carried references and tool/thinking output are excluded.
- * It waits for global foreground idle and cancels on new foreground input or
- * maintenance. Cancellation cannot guarantee upstream quota or billing refunds.
- * No queue, persistence or main-chat injection is performed by this API.
+ * It waits for foreground idle before dispatch. With automationVersion 1, a
+ * bounded request already sent may finish when foreground work starts; explicit
+ * cancellation, permissions and maintenance still fence its application.
+ * Native receipts and shared token limits are durable. The plugin owns its
+ * work queue and records. Cancellation cannot guarantee billing refunds.
  * Persist source/cursor metadata and validated notes with their evidence only;
  * generated notes never acquire user-confirmed authority automatically. */
 export interface HostMemoryExtractionApi {

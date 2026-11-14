@@ -137,7 +137,7 @@ async fn plan_requests_fail_closed_for_unproven_engines() {
             Some("plan".to_string()),
             None,
             None,
-            None, None,
+            None, None, None, None,
         )
         .await;
         let Err(message) = result else {

@@ -16,9 +16,9 @@ use toml_edit::DocumentMut;
 
 /// JSONC（opencode 的 `opencode.jsonc`）允许注释与尾逗号；写入会丢注释，
 /// 所以这类文件只读。解析先做字符串感知的注释/尾逗号清理，再走 serde_json。
-pub(super) fn parse_jsonc(text: &str, path: &str) -> Result<Value, McpError> {
+pub(crate) fn parse_jsonc(text: &str, path: &str) -> Result<Value, McpError> {
     let stripped = strip_jsonc(text)
-        .ok_or_else(|| McpError::format(format!("{path}: unterminated string in JSONC")))?;
+        .ok_or_else(|| McpError::format(format!("{path}: unterminated string or comment in JSONC")))?;
     serde_json::from_str::<Value>(&stripped)
         .map_err(|error| McpError::format(format!("{path}: invalid JSON: {error}")))
 }
@@ -45,6 +45,8 @@ pub(super) fn strip_jsonc(text: &str) -> Option<String> {
                 out.push(ch);
             }
             '/' if chars.peek() == Some(&'/') => {
+                chars.next();
+                out.push(' ');
                 for next in chars.by_ref() {
                     if next == '\n' {
                         out.push('\n');
@@ -54,13 +56,18 @@ pub(super) fn strip_jsonc(text: &str) -> Option<String> {
             }
             '/' if chars.peek() == Some(&'*') => {
                 chars.next();
+                out.push(' ');
                 let mut previous = ' ';
+                let mut closed = false;
                 for next in chars.by_ref() {
                     if previous == '*' && next == '/' {
+                        closed = true;
                         break;
                     }
+                    if next == '\n' { out.push('\n'); }
                     previous = next;
                 }
+                if !closed { return None; }
             }
             _ => out.push(ch),
         }
@@ -68,26 +75,23 @@ pub(super) fn strip_jsonc(text: &str) -> Option<String> {
     if in_string {
         return None;
     }
-    // 尾逗号：在对象/数组闭合前删掉逗号（字符串外已经安全）。
+    // Trailing commas are removed only outside strings. Comments have already
+    // become whitespace, so lookahead cannot join two JSON tokens.
     let mut trimmed = String::with_capacity(out.len());
-    let mut pending_comma: Option<usize> = None;
-    for ch in out.chars() {
+    let mut chars = out.chars().peekable();
+    let mut in_string = false;
+    while let Some(ch) = chars.next() {
+        if in_string {
+            trimmed.push(ch);
+            if ch == '\\' {
+                if let Some(next) = chars.next() { trimmed.push(next); }
+            } else if ch == '"' { in_string = false; }
+            continue;
+        }
         match ch {
-            ',' => {
-                pending_comma = Some(trimmed.len());
-                trimmed.push(ch);
-            }
-            ']' | '}' => {
-                if let Some(index) = pending_comma.take() {
-                    trimmed.remove(index);
-                }
-                trimmed.push(ch);
-            }
-            ch if ch.is_whitespace() => trimmed.push(ch),
-            ch => {
-                pending_comma = None;
-                trimmed.push(ch);
-            }
+            '"' => { in_string = true; trimmed.push(ch); }
+            ',' if matches!(chars.clone().find(|next| !next.is_whitespace()), Some(']' | '}')) => {}
+            _ => trimmed.push(ch),
         }
     }
     Some(trimmed)
@@ -158,6 +162,7 @@ pub(super) fn build_entry(
         path: path.to_string_lossy().into_owned(),
         format: source.format.to_string(),
         enabled: entry_enabled(source, spec_object),
+        enablement_known: None,
         transport,
         command,
         args_count,
@@ -167,6 +172,9 @@ pub(super) fn build_entry(
         writable,
         readonly_reason: spec.readonly_reason.map(str::to_string),
         readonly_reason_code,
+        // Pi loads project MCP only for trusted projects; the inventory does
+        // not establish trust, so never auto-launch those declarations.
+        probe_allowed: (source.id == "pi_project").then_some(false),
         version: version.to_string(),
     }
 }
@@ -315,6 +323,7 @@ pub(super) fn read_toml_source(source: &Source, path: &Path) -> Result<Vec<McpCo
             path: path.to_string_lossy().into_owned(),
             format: "toml".to_string(),
             enabled,
+            enablement_known: None,
             transport,
             command,
             args_count,
@@ -324,6 +333,7 @@ pub(super) fn read_toml_source(source: &Source, path: &Path) -> Result<Vec<McpCo
             writable: spec.writable,
             readonly_reason: spec.readonly_reason.map(str::to_string),
             readonly_reason_code: spec.readonly_reason_code.map(str::to_string),
+            probe_allowed: None,
             version: version.clone(),
         });
     }
@@ -473,6 +483,7 @@ pub(super) fn read_dsh_profile(path: &Path) -> Result<Vec<McpConfigEntry>, McpEr
             path: path.to_string_lossy().into_owned(),
             format: "yaml".to_string(),
             enabled: !plugin.disabled,
+            enablement_known: None,
             transport: dsh_text(config, "transport"),
             command: dsh_text(config, "command"),
             args_count,
@@ -482,6 +493,7 @@ pub(super) fn read_dsh_profile(path: &Path) -> Result<Vec<McpConfigEntry>, McpEr
             writable: spec.writable,
             readonly_reason: spec.readonly_reason.map(str::to_string),
             readonly_reason_code: spec.readonly_reason_code.map(str::to_string),
+            probe_allowed: None,
             version: version.clone(),
         });
     }

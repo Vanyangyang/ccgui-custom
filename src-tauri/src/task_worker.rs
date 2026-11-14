@@ -6,7 +6,7 @@
 mod client;
 mod protocol;
 mod storage;
-pub(crate) use client::launch_with_context;
+pub(crate) use client::{launch_with_context, process_identity};
 pub use client::{discover, launch, WorkerClient};
 pub use protocol::{
     Command, Outcome, Request, Response, StartArgs, WorkerConfig, WorkerError, WorkerManifest,
@@ -52,6 +52,10 @@ pub const SCHEMA_CONTRACT_V2_HASH: &str =
 pub const SCHEMA_CONTRACT_V3_HASH: &str =
     "496dde53c20f24f52aa37e33af9852ed7feda178ecfa1f2fb97a56361364a1c0";
 
+/// Managed handoff links, alias selectors and terminal states cannot be read by V3.
+pub const SCHEMA_CONTRACT_V4_HASH: &str =
+    "74a46547d44ad86b643ced0b2a5abd77d24bc4f4d36355ad3179a1cc084a0508";
+
 static SCHEMA_HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 pub fn schema_hash() -> String {
@@ -93,8 +97,10 @@ pub fn schemas_compatible(a: &str, b: &str) -> bool {
 pub(crate) fn offline_schema_upgrade_supported(from: &str, to: &str) -> bool {
     let from = canonical_schema_hash(from);
     (from == SCHEMA_CONTRACT_V1_HASH
-        && matches!(to, SCHEMA_CONTRACT_V2_HASH | SCHEMA_CONTRACT_V3_HASH))
-        || (from == SCHEMA_CONTRACT_V2_HASH && to == SCHEMA_CONTRACT_V3_HASH)
+        && matches!(to, SCHEMA_CONTRACT_V2_HASH | SCHEMA_CONTRACT_V3_HASH | SCHEMA_CONTRACT_V4_HASH))
+        || (from == SCHEMA_CONTRACT_V2_HASH
+            && matches!(to, SCHEMA_CONTRACT_V3_HASH | SCHEMA_CONTRACT_V4_HASH))
+        || (from == SCHEMA_CONTRACT_V3_HASH && to == SCHEMA_CONTRACT_V4_HASH)
 }
 
 pub(crate) fn normalize_sql_ddl(sql: &str) -> String {
@@ -568,6 +574,7 @@ fn app_state(db: Arc<crate::db::Db>, journal: Arc<storage::Journal>) -> Arc<crat
         relay: Default::default(),
         dsh_host: Arc::new(Default::default()),
         opencode_server: Arc::new(Default::default()),
+        agy_acp: Arc::new(Default::default()),
         worktree_creations: Default::default(),
     })
 }
@@ -1104,8 +1111,10 @@ impl Worker {
                 }
                 // Grace for the final acknowledgement; the archive is retained
                 // if the response is lost after the manifest has been retired.
+                let app_state = Arc::clone(&self.app);
                 let shutdown = self.shutdown.clone();
                 tokio::spawn(async move {
+                    app_state.agy_acp.kill_spawned();
                     tokio::time::sleep(Duration::from_secs(2)).await;
                     shutdown.send_replace(true);
                 });
@@ -1162,6 +1171,7 @@ impl Worker {
                 args.computer_use,
                 args.claude_ultracode,
                 args.claude_haiku_assist,
+                args.codex_service_tier_override.clone(),
             )
             .await
             .map_err(|error| WorkerError::new("engine_error", error))?,
@@ -1341,8 +1351,24 @@ mod tests {
             computer_use: None,
             claude_ultracode: None,
             claude_haiku_assist: None,
+            codex_service_tier_override: None,
             require_host_chat: true,
             require_leader: false,
+        }
+    }
+
+    #[test]
+    fn start_args_preserve_explicit_codex_tier_and_omit_inherited_tier() {
+        let mut args = args();
+        let inherited = serde_json::to_value(&args).unwrap();
+        assert!(inherited.get("codexServiceTierOverride").is_none());
+        assert_eq!(serde_json::from_value::<StartArgs>(inherited).unwrap().codex_service_tier_override, None);
+        args.engine = "codex".into();
+        for tier in ["default", "priority"] {
+            args.codex_service_tier_override = Some(tier.into());
+            let wire = serde_json::to_value(&args).unwrap();
+            assert_eq!(wire["codexServiceTierOverride"], tier);
+            assert_eq!(serde_json::from_value::<StartArgs>(wire).unwrap(), args);
         }
     }
 
@@ -1806,10 +1832,10 @@ mod tests {
     }
 
     #[test]
-    fn schema_hash_matches_v3_contract_and_isolates_older_contracts() {
+    fn schema_hash_matches_v4_contract_and_isolates_older_contracts() {
         let current = schema_hash();
         assert_eq!(
-            current, SCHEMA_CONTRACT_V3_HASH,
+            current, SCHEMA_CONTRACT_V4_HASH,
             "current schema_hash()={current}"
         );
         for legacy in LEGACY_V1_SOURCE_SCHEMA_HASHES {
@@ -1828,11 +1854,13 @@ mod tests {
         assert!(!schemas_compatible(SCHEMA_CONTRACT_V1_HASH, &current));
         assert!(!schemas_compatible(&current, SCHEMA_CONTRACT_V2_HASH));
         assert!(!schemas_compatible(SCHEMA_CONTRACT_V2_HASH, &current));
+        assert!(!schemas_compatible(&current, SCHEMA_CONTRACT_V3_HASH));
+        assert!(!schemas_compatible(SCHEMA_CONTRACT_V3_HASH, &current));
         assert!(schemas_compatible(&current, &current));
     }
 
     #[test]
-    fn schema_contract_stays_v3_after_session_sidebar_assign_and_replay() {
+    fn schema_contract_stays_v4_after_session_sidebar_assign_and_replay() {
         let db = crate::db::Db::open_in_memory().unwrap();
         crate::leader::ensure_schema(&db).unwrap();
         db.0.lock().execute_batch("INSERT INTO workspaces(id,path,name) VALUES('source','C:/source','Source'),('target','D:/target','Target');
@@ -1850,7 +1878,7 @@ mod tests {
             ("leader", &crate::leader::schema_contract_descriptor()),
             ("plan-review", &crate::engine::plan_review::schema_contract_descriptor()),
         ]).unwrap();
-        assert_eq!(actual, SCHEMA_CONTRACT_V3_HASH, "Sidebar metadata must not require changing the live worker database contract");
+        assert_eq!(actual, SCHEMA_CONTRACT_V4_HASH, "Sidebar metadata must not require changing the live worker database contract");
         let added_tables: i64 = conn.query_row(
             "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name IN ('session_sidebar_workspaces','session_sidebar_requests')",
             [], |row| row.get(0),
@@ -1860,27 +1888,33 @@ mod tests {
 
     #[test]
     fn offline_schema_upgrade_is_explicit_one_way_and_does_not_allow_hot_switching() {
-        for from in [SCHEMA_CONTRACT_V1_HASH, LEGACY_V1_SOURCE_SCHEMA_HASHES[0], SCHEMA_CONTRACT_V2_HASH] {
-            assert!(offline_schema_upgrade_supported(from, SCHEMA_CONTRACT_V3_HASH));
-            assert!(!offline_schema_upgrade_supported(SCHEMA_CONTRACT_V3_HASH, from));
-            assert!(!schemas_compatible(from, SCHEMA_CONTRACT_V3_HASH));
-            assert!(!schemas_compatible(SCHEMA_CONTRACT_V3_HASH, from));
+        for from in [SCHEMA_CONTRACT_V1_HASH, SCHEMA_CONTRACT_V2_HASH, SCHEMA_CONTRACT_V3_HASH]
+            .into_iter().chain(LEGACY_V1_SOURCE_SCHEMA_HASHES.iter().copied()) {
+            assert!(offline_schema_upgrade_supported(from, SCHEMA_CONTRACT_V4_HASH));
+            assert!(!offline_schema_upgrade_supported(SCHEMA_CONTRACT_V4_HASH, from));
+            assert!(!schemas_compatible(from, SCHEMA_CONTRACT_V4_HASH));
+            assert!(!schemas_compatible(SCHEMA_CONTRACT_V4_HASH, from));
         }
         assert!(offline_schema_upgrade_supported(SCHEMA_CONTRACT_V1_HASH, SCHEMA_CONTRACT_V2_HASH));
         assert!(!offline_schema_upgrade_supported(SCHEMA_CONTRACT_V2_HASH, SCHEMA_CONTRACT_V1_HASH));
+        assert!(offline_schema_upgrade_supported(SCHEMA_CONTRACT_V1_HASH, SCHEMA_CONTRACT_V3_HASH));
+        assert!(offline_schema_upgrade_supported(SCHEMA_CONTRACT_V2_HASH, SCHEMA_CONTRACT_V3_HASH));
+        assert!(!offline_schema_upgrade_supported(SCHEMA_CONTRACT_V4_HASH, SCHEMA_CONTRACT_V4_HASH));
+        assert!(!offline_schema_upgrade_supported(&"0".repeat(64), SCHEMA_CONTRACT_V4_HASH));
+        assert!(!offline_schema_upgrade_supported(SCHEMA_CONTRACT_V4_HASH, &"0".repeat(64)));
         assert!(!offline_schema_upgrade_supported(SCHEMA_CONTRACT_V3_HASH, SCHEMA_CONTRACT_V3_HASH));
         assert!(!offline_schema_upgrade_supported(&"0".repeat(64), SCHEMA_CONTRACT_V3_HASH));
         assert!(!offline_schema_upgrade_supported(SCHEMA_CONTRACT_V2_HASH, &"0".repeat(64)));
     }
 
     #[test]
-    fn schema_contract_keeps_host_receipt_projection_out_of_shared_v3_records() {
+    fn schema_contract_keeps_host_receipt_projection_out_of_shared_v4_records() {
         let descriptor = crate::leader::schema_contract_descriptor();
         assert!(descriptor["branchRecord"].get("delegation").is_none());
         assert!(descriptor["requestRecord"].get("projection").is_none());
         assert!(descriptor["requestRecord"].get("projection_invalid").is_none());
         assert_eq!(descriptor["requestRecord"]["response"], Value::Null);
-        assert_eq!(schema_hash(), SCHEMA_CONTRACT_V3_HASH);
+        assert_eq!(schema_hash(), SCHEMA_CONTRACT_V4_HASH);
         // Actual shared record additions must still change the contract hash.
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         let original = compute_schema_contract_hash(&conn, &[("leader", &descriptor)]).unwrap();
@@ -1889,12 +1923,67 @@ mod tests {
         assert_ne!(compute_schema_contract_hash(&conn, &[("leader", &changed)]).unwrap(), original);
     }
 
+    fn v3_leader_descriptor() -> Value {
+        let mut descriptor = crate::leader::schema_contract_descriptor();
+        // preserve_order is part of the historical hash: never swap remaining keys.
+        let branch = descriptor["branchRecord"].as_object_mut().unwrap();
+        branch.shift_remove("handoffTo");
+        branch.shift_remove("handoffFrom");
+        descriptor["requestRecord"].as_object_mut().unwrap().shift_remove("requested_branch_id");
+        for states in ["branchStates", "requestStates"] {
+            descriptor[states].as_array_mut().unwrap().retain(|value| value != "handed_off");
+        }
+        descriptor
+    }
+
+    #[test]
+    fn managed_handoff_fields_and_states_are_the_explicit_v3_to_v4_contract_change() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        crate::leader::ensure_schema(&db).unwrap();
+        let conn = db.0.lock();
+        let descriptor = crate::leader::schema_contract_descriptor();
+        let hash = |leader: &Value| compute_schema_contract_hash(&conn, &[
+            ("leader", leader),
+            ("plan-review", &crate::engine::plan_review::schema_contract_descriptor()),
+        ]).unwrap();
+        assert_eq!(hash(&v3_leader_descriptor()), SCHEMA_CONTRACT_V3_HASH);
+        let current = hash(&descriptor);
+        assert_eq!(current, SCHEMA_CONTRACT_V4_HASH);
+        assert_eq!(descriptor["requestRecord"]["requested_branch_id"], json!(""));
+        assert!(descriptor["requestRecord"].get("requestedBranchId").is_none());
+        for link in ["handoffTo", "handoffFrom"] {
+            assert_eq!(descriptor["branchRecord"][link], json!({
+                "branchId": "", "requestId": "", "operationId": "", "payloadFingerprint": "",
+            }));
+            for field in ["branchId", "requestId", "operationId", "payloadFingerprint"] {
+                let mut changed = descriptor.clone();
+                changed["branchRecord"][link].as_object_mut().unwrap().shift_remove(field);
+                assert_ne!(hash(&changed), current, "{link}/{field}");
+            }
+        }
+        for (record, field) in [
+            ("branchRecord", "handoffTo"), ("branchRecord", "handoffFrom"),
+            ("requestRecord", "requested_branch_id"),
+        ] {
+            let mut changed = descriptor.clone();
+            changed[record].as_object_mut().unwrap().shift_remove(field);
+            assert_ne!(hash(&changed), current, "{record}/{field}");
+        }
+        for states in ["branchStates", "requestStates"] {
+            let mut changed = descriptor.clone();
+            let values = changed[states].as_array_mut().unwrap();
+            assert!(values.iter().any(|value| value == "handed_off"));
+            values.retain(|value| value != "handed_off");
+            assert_ne!(hash(&changed), current, "{states}");
+        }
+    }
+
     #[test]
     fn cross_workspace_parent_field_is_the_explicit_v2_to_v3_contract_change() {
         let db = crate::db::Db::open_in_memory().unwrap();
         crate::leader::ensure_schema(&db).unwrap();
         let conn = db.0.lock();
-        let mut descriptor = crate::leader::schema_contract_descriptor();
+        let mut descriptor = v3_leader_descriptor();
         assert_eq!(descriptor["branchRecord"]["parentWorkspacePath"], json!(""));
         // preserve_order is part of the historical descriptor; remove without swapping keys.
         descriptor["branchRecord"].as_object_mut().unwrap().shift_remove("parentWorkspacePath");

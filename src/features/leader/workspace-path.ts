@@ -5,10 +5,11 @@ export function isWindowsWorkspacePath(path: string): boolean {
 
 export function leaderWorkspacePathKey(path: string): string {
   if (!isWindowsWorkspacePath(path)) return path;
-  // Collapse equivalent separators only for drive-absolute Windows paths.
-  // Preserve case, trailing-separator presence, dot segments and links;
+  // Fold only the drive letter and equivalent separators for absolute paths.
+  // Preserve directory casing, trailing separators, dot segments and links;
   // POSIX, remote and UNC paths pass through unchanged above.
-  return path.replace(/[\\/]+/g, "/");
+  const slash = path.replace(/[\\/]+/g, "/");
+  return slash[0].toUpperCase() + slash.slice(1);
 }
 
 export function sameLeaderWorkspace(a: string, b: string): boolean {

@@ -2,6 +2,38 @@ use super::*;
 use serde_json::json;
 
 #[test]
+fn notice_focus_only_resolves_a_live_registered_window() {
+    let mut registry = Registry::default();
+    let entry = Entry::new(request());
+    let id = entry.identity.window_id.clone();
+    let label = entry.identity.label.clone();
+    registry.entries.insert(id.clone(), entry);
+    assert_eq!(registry.focus_label(&id), Some(label));
+    assert_eq!(registry.focus_label("unregistered"), None);
+    registry.entries.get_mut(&id).unwrap().request_close(ReturnReason::Maintenance);
+    assert_eq!(registry.focus_label(&id), None);
+    registry.entries.remove(&id);
+    assert_eq!(registry.focus_label(&id), None);
+}
+
+#[test]
+fn cost_dialog_parent_requires_the_live_plugin_owner() {
+    let mut registry = Registry::default();
+    let entry = Entry::new(request());
+    let id = entry.identity.window_id.clone();
+    let plugin = entry.request.plugin_id.clone();
+    let label = entry.identity.label.clone();
+    registry.entries.insert(id.clone(), entry);
+    assert_eq!(registry.cost_dialog_label(&id, &plugin).unwrap(), label);
+    assert!(registry.cost_dialog_label(&id, "another-plugin").is_err());
+    registry.entries.get_mut(&id).unwrap().heartbeat = Instant::now() - OWNER_TTL - Duration::from_secs(1);
+    assert!(registry.cost_dialog_label(&id, &plugin).is_err());
+    registry.entries.get_mut(&id).unwrap().heartbeat = Instant::now();
+    registry.entries.get_mut(&id).unwrap().request_close(ReturnReason::Maintenance);
+    assert!(registry.cost_dialog_label(&id, &plugin).is_err());
+}
+
+#[test]
 fn return_close_and_maintenance_have_distinct_persisted_intents() {
     assert_eq!(
         ReturnReason::Return.intent(),
@@ -38,7 +70,7 @@ fn return_close_and_maintenance_have_distinct_persisted_intents() {
     );
 }
 
-fn request() -> OpenRequest {
+pub(super) fn request() -> OpenRequest {
     OpenRequest {
         plugin_id: "example-plugin".into(),
         tab_id: "plugin:example-plugin:panel".into(),
@@ -54,6 +86,7 @@ fn request() -> OpenRequest {
         },
         dark: false,
         focus: true,
+        incremental: false,
         labels: Labels {
             return_to_main: "返回".into(),
             owner_unavailable: "不可用".into(),
@@ -209,7 +242,9 @@ fn receipt_eviction_keeps_admission_watermark() {
 
 #[test]
 fn receipts_have_a_total_byte_budget() {
-    let mut entry = Entry::new(request());
+    let mut req = request();
+    req.incremental = true;
+    let mut entry = Entry::new(req);
     for sequence in 1..=6 {
         entry.admit(sequence, &action()).unwrap();
         entry.finish(
@@ -224,6 +259,25 @@ fn receipts_have_a_total_byte_budget() {
         .unwrap_err()
         .contains("expired_no_retry"));
     assert_eq!(entry.next_sequence, 7);
+}
+
+#[test]
+fn legacy_large_snapshot_receipt_remains_recoverable() {
+    let mut req = request();
+    req.snapshot.state = json!({"history":"x".repeat(17 * 1024 * 1024),"draft":"原文🌏"});
+    let mut entry = Entry::new(req);
+    let (_, fresh) = entry.admit(1, &action()).unwrap();
+    assert!(fresh);
+    entry.finish(receipt(&entry, 1, json!("saved")), true);
+    assert!(entry.receipt_bytes > MAX_RECEIPT_BYTES);
+    assert!(entry.receipt_bytes <= MAX_LEGACY_RECEIPT_BYTES);
+    let inspected = entry.inspect_receipt(1).unwrap();
+    assert_eq!(inspected.state, ReceiptState::Resolved);
+    let saved = inspected.receipt.unwrap();
+    assert_eq!(saved.value, json!("saved"));
+    assert_eq!(saved.snapshot.state["draft"], "原文🌏");
+    assert_eq!(saved.snapshot.state["history"].as_str().unwrap().len(), 17 * 1024 * 1024);
+    assert!(!entry.admit(1, &action()).unwrap().1);
 }
 
 #[test]
@@ -592,4 +646,69 @@ fn authorizes_main_and_active_detached_window_callers_only() {
         .unwrap_err(),
         "plugin_window_unsupported_window"
     );
+}
+
+
+#[test]
+fn authenticated_main_and_legacy_child_focus_are_read_only() {
+    let mut registry = Registry::default();
+    let entry = Entry::new(request());
+    let id = entry.identity.window_id.clone();
+    let label = entry.identity.label.clone();
+    let snapshot = entry.request.snapshot.clone();
+    let mut request = FocusOwnerRequest {
+        window_id: id.clone(), registration_id: entry.request.registration_id.clone(),
+        owner_token: Some(entry.request.owner_token.clone()),
+    };
+    // This was the old command's check, which rejected the owner document.
+    assert!(entry.child("main", &request.registration_id).is_err());
+    registry.entries.insert(id.clone(), entry);
+    assert_eq!(registry.authorize_focus_owner("main", &request), Ok(()));
+    request.owner_token = None;
+    assert_eq!(registry.authorize_focus_owner(&label, &request), Ok(()));
+    let entry = &registry.entries[&id];
+    assert_eq!(entry.request.snapshot, snapshot);
+    assert_eq!(entry.next_sequence, 1);
+    assert!(entry.slots.is_empty());
+    assert!(entry.completed.is_empty());
+    assert!(!entry.closing);
+    assert_eq!(registry.entries.len(), 1);
+}
+
+#[test]
+fn focus_rejects_missing_stale_spoofed_and_closing_identities() {
+    let mut registry = Registry::default();
+    let entry = Entry::new(request());
+    let id = entry.identity.window_id.clone();
+    let label = entry.identity.label.clone();
+    let registration = entry.request.registration_id.clone();
+    let token = entry.request.owner_token.clone();
+    registry.entries.insert(id.clone(), entry);
+    for (caller, window, reg, owner) in [
+        ("main", id.as_str(), registration.as_str(), None),
+        ("main", id.as_str(), registration.as_str(), Some("wrong")),
+        ("main", id.as_str(), "stale-registration", Some(token.as_str())),
+        ("main", "stale-window", registration.as_str(), Some(token.as_str())),
+        (label.as_str(), id.as_str(), registration.as_str(), Some(token.as_str())),
+        ("other-window", id.as_str(), registration.as_str(), None),
+        ("other-window", id.as_str(), registration.as_str(), Some(token.as_str())),
+        (label.as_str(), id.as_str(), "stale-registration", None),
+    ] {
+        let request = FocusOwnerRequest { window_id: window.into(), registration_id: reg.into(), owner_token: owner.map(str::to_owned) };
+        assert!(registry.authorize_focus_owner(caller, &request).is_err());
+    }
+    registry.entries.get_mut(&id).unwrap().request_close(ReturnReason::Maintenance);
+    for (caller, owner_token) in [("main", Some(token)), (label.as_str(), None)] {
+        let request = FocusOwnerRequest { window_id: id.clone(), registration_id: registration.clone(), owner_token };
+        assert_eq!(registry.authorize_focus_owner(caller, &request), Err("plugin_window_closing".into()));
+    }
+}
+
+#[test]
+fn focus_request_keeps_legacy_shape_and_rejects_unrelated_fields() {
+    let legacy = serde_json::json!({"windowId":"window", "registrationId":"registration"});
+    assert!(serde_json::from_value::<FocusOwnerRequest>(legacy.clone()).unwrap().owner_token.is_none());
+    let mut extra = legacy;
+    extra["action"] = serde_json::json!({"name":"submit"});
+    assert!(serde_json::from_value::<FocusOwnerRequest>(extra).is_err());
 }

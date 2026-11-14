@@ -124,6 +124,7 @@ fn delegation_explicit_task_send_replaces_projection_and_preserves_old_receipt()
     f.manager.finish(&run);
     hot_send_cache(&f, &id);
     let args = SendArgs {
+        images: Vec::new(),
         branch_id: id.clone(),
         request_id: "next-task".into(),
         message: "New assignment".into(),
@@ -364,6 +365,7 @@ fn delegation_ambiguous_legacy_order_uses_nonexecuting_unknown_identity() {
     f.manager.finish(&run);
     hot_send_cache(&f, &id);
     let args = SendArgs {
+        images: Vec::new(),
         branch_id: id.clone(),
         request_id: "second".into(),
         message: "Second task".into(),
@@ -408,6 +410,7 @@ fn delegation_old_request_replay_adds_unknown_projection_to_nonterminal_legacy_a
     f.manager.finish(&run);
     hot_send_cache(&f, &id);
     let args = SendArgs {
+        images: Vec::new(),
         branch_id: id.clone(),
         request_id: "second".into(),
         message: "Second task".into(),
@@ -574,6 +577,7 @@ fn delegation_monotonic_time_survives_clock_rollback_and_legacy_prefix_is_not_re
     f.clock.store(999_000, Ordering::SeqCst);
     hot_send_cache(&f, &id);
     let args = SendArgs {
+        images: Vec::new(),
         branch_id: id.clone(),
         request_id: "next".into(),
         message: "Next".into(),

@@ -1,4 +1,6 @@
-import { useChatStore } from "../store";
+import { useMemo } from "react";
+import type { Message } from "@/lib/ipc";
+import { useChatStore, type ChatStore } from "../store";
 import { useScopedSessionKey } from "../split/session-scope";
 import { QuestionCard } from "./QuestionCard";
 import { CodexApprovalCard } from "./CodexApprovalCard";
@@ -10,15 +12,24 @@ import { CodexApprovalCard } from "./CodexApprovalCard";
  */
 export function usePendingQuestion() {
   const key = useScopedSessionKey();
-  return useChatStore((s) => {
-    if (!key) return null;
-    const messages = s.bySession[key]?.messages ?? [];
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const m = messages[i];
-      if (m.role === "question" && m.question?.status === "pending") return m;
-    }
-    return null;
-  });
+  // Zustand evaluates selectors on every store write, including each draft
+  // keystroke. Cache the derived row, not the subscription to the whole array,
+  // so stream flushes that leave the pending result unchanged also stay quiet.
+  const select = useMemo(() => {
+    let previous: Message[] | undefined;
+    let pending: Message | null = null;
+    return (s: ChatStore) => {
+      const messages = key ? s.bySession[key]?.messages : undefined;
+      if (messages === previous) return pending;
+      previous = messages; pending = null;
+      for (let i = (messages?.length ?? 0) - 1; i >= 0; i--) {
+        const m = messages![i];
+        if (m.role === "question" && m.question?.status === "pending") { pending = m; break; }
+      }
+      return pending;
+    };
+  }, [key]);
+  return useChatStore(select);
 }
 
 /**

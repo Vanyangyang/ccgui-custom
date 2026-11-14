@@ -1,9 +1,11 @@
 //! Host-owned, low priority extraction. No transcript or credential is returned.
+pub(crate) mod automation;
 pub(crate) mod gate;
 pub(crate) mod protocol;
+pub(crate) mod review;
 mod source;
 
-use crate::engine::agy_vertex::memory::{self, Failure};
+use crate::engine::agy_vertex::memory;
 use protocol::*;
 use serde_json::{json, Value};
 use std::{sync::Arc, time::Duration};
@@ -45,9 +47,120 @@ fn require(window: &str, plugin: &str, source: Option<&SourceKind>) -> Result<()
 fn disposition(status: &str, reason: &str, retry: u64) -> Value {
     json!({"status":status,"reason":reason,"retryAfterMs":retry})
 }
+fn interrupted(lease: &gate::Lease) -> Value {
+    disposition(
+        "deferred",
+        if lease.sent() {
+            "request_outcome_unknown"
+        } else {
+            "preempted"
+        },
+        30_000,
+    )
+}
+/// No cache branch enters model admission. Missing legacy proof is unknown,
+/// while a preempted proof read is explicitly pending, never proof of no send.
+async fn replay_cached<F: std::future::Future<Output = Result<(), String>>>(
+    cached: automation::Cached,
+    validate: impl FnOnce(Value) -> F,
+) -> Value {
+    if !matches!(
+        cached.result["status"].as_str(),
+        Some("completed" | "empty")
+    ) {
+        return cached.result;
+    }
+    let Some(snapshot) = cached.replay else {
+        return automation::response("request_outcome_unknown", 60_000);
+    };
+    match validate(snapshot).await {
+        Ok(()) => cached.result,
+        Err(reason)
+            if matches!(
+                reason.as_str(),
+                "preempted" | "cache_validation_pending" | "memory_source_task_failed"
+            ) =>
+        {
+            automation::response("cache_validation_pending", 30_000)
+        }
+        Err(reason)
+            if matches!(
+                reason.as_str(),
+                "source_storage_unavailable"
+                    | "native_history_unavailable"
+                    | "session_metadata_unavailable"
+                    | "history_page_bound_exceeded"
+            ) =>
+        {
+            automation::response("request_outcome_unknown", 60_000)
+        }
+        Err(_) => automation::response("cached_source_changed", 0),
+    }
+}
+async fn validate_cache_read(
+    state: &crate::AppState,
+    validate: impl FnOnce(u64) -> Result<(), String> + Send + 'static,
+) -> Result<(), String> {
+    let epoch = gate::GATE
+        .read_epoch(
+            || state.processes.active_run_count() > 0,
+            crate::worker_host::paused(),
+        )
+        .map_err(|_| "cache_validation_pending".to_string())?;
+    let task = tauri::async_runtime::spawn_blocking(move || validate(epoch));
+    match cancellable_read(&gate::GATE, epoch, &state.processes, task).await {
+        Ok(Ok(result)) => result,
+        _ => Err("cache_validation_pending".into()),
+    }
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ExtractReplay {
+    source_digest: String,
+    range: source::ReplayRange,
+}
+fn validate_extract_replay(
+    db: &crate::db::Db,
+    plugin: &str,
+    request: &ExtractRequest,
+    snapshot: Value,
+    epoch: u64,
+) -> Result<(), String> {
+    permission(plugin, Some(&request.source.kind))?;
+    let replay = decode_extract_replay(request, snapshot)?;
+    for _ in 0..2 {
+        source::verify_replay_range(
+            db,
+            plugin,
+            &request.project_id,
+            &request.source,
+            &replay.range,
+            &gate::GATE,
+            epoch,
+        )?;
+    }
+    permission(plugin, Some(&request.source.kind))
+}
+fn decode_extract_replay(
+    request: &ExtractRequest,
+    snapshot: Value,
+) -> Result<ExtractReplay, String> {
+    let replay: ExtractReplay =
+        serde_json::from_value(snapshot).map_err(|_| "cached_source_changed")?;
+    if replay.range.from != request.cursor
+        || request
+            .expected_source_digest
+            .as_ref()
+            .is_some_and(|expected| !expected.eq_ignore_ascii_case(&replay.source_digest))
+    {
+        return Err("cached_source_changed".into());
+    }
+    Ok(replay)
+}
 fn source_error(reason: &str) -> Value {
     if reason == "preempted" {
         disposition("deferred", reason, 30_000)
+    } else if reason == "source_changed" {
+        disposition("deferred", reason, 60_000)
     } else if matches!(
         reason,
         "source_storage_unavailable"
@@ -93,12 +206,38 @@ pub(crate) async fn plugin_memory_status(
         || state.processes.active_run_count() > 0,
         crate::worker_host::paused(),
     );
-    let available = tauri::async_runtime::spawn_blocking(memory::available)
+    let configured = tauri::async_runtime::spawn_blocking(memory::configured_fingerprint)
         .await
-        .unwrap_or(false);
+        .unwrap_or(None);
+    let provider_available = configured.is_some();
+    let automation_ready = automation::ready(&state.db).is_ok();
+    let available = provider_available && automation_ready;
     let mut status = json!({"available":available,"busy":delay>0,"retryAfterMs":if available {delay} else {60_000}});
-    if !available {
+    if automation_ready {
+        status["automationVersion"] = 1.into();
+        // Receipt reads do not consume model quota. They may proceed while the
+        // paid-call budget/circuit waits, but still respect metadata read gates.
+        status["canReconcile"] = gate::GATE
+            .read_epoch(
+                || state.processes.active_run_count() > 0,
+                crate::worker_host::paused(),
+            )
+            .is_ok()
+            .into();
+    }
+    if !automation_ready {
+        status["reason"] = "automation_storage_unavailable".into();
+    } else if !available {
         status["reason"] = "vertex_unavailable".into();
+    } else if let Some((can_recover, reason, retry)) = automation::scheduler_wait(
+        &state.db,
+        configured.as_deref().unwrap_or_default(),
+        automation::now(),
+    )? {
+        status["available"] = can_recover.into();
+        status["busy"] = true.into();
+        status["reason"] = reason.into();
+        status["retryAfterMs"] = retry.max(delay).min(86_400_000).into();
     } else if delay > 0 {
         status["reason"] = "foreground_or_cooldown".into();
     }
@@ -168,6 +307,9 @@ async fn cancellable<T>(
     registry: &crate::engine::ProcessRegistry,
     future: impl std::future::Future<Output = T>,
 ) -> Result<T, ()> {
+    let sent = lease.sent();
+    let plugin = lease.plugin.clone();
+    let sources = lease.sources.clone();
     lease
         .run(async {
             tokio::select! {
@@ -175,7 +317,9 @@ async fn cancellable<T>(
                 _ = async {
                     loop {
                         tokio::time::sleep(Duration::from_millis(100)).await;
-                        if registry.active_run_count()>0 || crate::worker_host::paused() {
+                        if (!sent && registry.active_run_count()>0) || crate::worker_host::paused()
+                            || permission(&plugin,None).is_err()
+                            || sources.iter().any(|s| permission(&plugin,Some(s)).is_err()) {
                             gate::cancel_all(false); break;
                         }
                     }
@@ -185,6 +329,123 @@ async fn cancellable<T>(
         })
         .await
         .and_then(|result| result)
+}
+/// Both paths share durable counting, reservation and provider health. No retry
+/// loop exists here: every outcome belongs to exactly one persisted identity.
+async fn model_call(
+    state: &crate::AppState,
+    lease: &mut gate::Lease,
+    identity: &automation::Identity,
+    body: Value,
+    revalidate: impl std::future::Future<Output = Result<(), String>>,
+) -> Result<Result<String, Value>, String> {
+    use automation::Health;
+    use memory::CallFailure as F;
+    let call = match memory::Call::new(body) {
+        Ok(call) => call,
+        Err(_) => {
+            return Ok(Err(disposition(
+                "unavailable",
+                "vertex_unavailable",
+                60_000,
+            )))
+        }
+    };
+    if let Some(value) = automation::claim_provider(
+        &state.db,
+        identity,
+        &call.config_fingerprint(),
+        automation::now(),
+    )? {
+        return Ok(Err(value));
+    }
+    let counted = cancellable(lease, &state.processes, call.count()).await;
+    let count = match counted {
+        Ok(Ok(count)) => count,
+        outcome => {
+            let (health, reason) = match outcome {
+                Ok(Err(F::Quota(delay))) => (Health::Quota(delay), "provider_quota"),
+                Ok(Err(F::Unavailable)) => (Health::Repair, "provider_requires_repair"),
+                Err(()) => (Health::Neutral, "preempted"),
+                _ => (Health::Failure, "token_count_failed"),
+            };
+            let delay = automation::health(&state.db, identity, health, automation::now())?;
+            return Ok(Err(automation::response(reason, delay)));
+        }
+    };
+    let Some(tokens) = automation::reservation(count, call.schema_bytes()) else {
+        automation::health(&state.db, identity, Health::Neutral, automation::now())?;
+        return Ok(Err(automation::response("request_token_limit", 0)));
+    };
+    match cancellable(lease, &state.processes, revalidate).await {
+        Ok(Ok(())) => {}
+        outcome => {
+            automation::health(&state.db, identity, Health::Neutral, automation::now())?;
+            return Ok(Err(match outcome {
+                Ok(Err(reason)) => source_error(&reason),
+                _ => automation::response("preempted", 30_000),
+            }));
+        }
+    }
+    if !automation::reserve(&state.db, identity, tokens, automation::now())? {
+        automation::health(&state.db, identity, Health::Neutral, automation::now())?;
+        return Ok(Err(automation::response(
+            "token_budget_exhausted",
+            86_400_000,
+        )));
+    }
+    if state.processes.active_run_count() > 0
+        || crate::worker_host::paused()
+        || permission(&lease.plugin, None).is_err()
+        || lease
+            .sources
+            .iter()
+            .any(|s| permission(&lease.plugin, Some(s)).is_err())
+        || !lease.mark_sent()
+    {
+        automation::health(&state.db, identity, Health::Neutral, automation::now())?;
+        return Ok(Err(automation::response("preempted", 30_000)));
+    }
+    automation::mark_sent(&state.db, identity, automation::now())?;
+    match cancellable(lease, &state.processes, call.generate()).await {
+        Ok(Ok(reply)) => {
+            automation::settle(&state.db, identity, reply.usage)?;
+            // Only transport/protocol failures affect the global circuit.
+            match reply.text {
+                Ok(text) => {
+                    automation::business_response_received(&state.db, identity, automation::now())?;
+                    Ok(Ok(text))
+                }
+                Err(()) => {
+                    let delay = automation::health(
+                        &state.db,
+                        identity,
+                        Health::Failure,
+                        automation::now(),
+                    )?;
+                    Ok(Err(disposition(
+                        "unavailable",
+                        "invalid_model_response",
+                        delay,
+                    )))
+                }
+            }
+        }
+        outcome => {
+            let (health, reason, status) = match outcome {
+                Ok(Err(F::Quota(delay))) => (Health::Quota(delay), "provider_quota", "deferred"),
+                Ok(Err(F::Unavailable)) => {
+                    (Health::Repair, "provider_requires_repair", "unavailable")
+                }
+                Ok(Err(F::Rejected)) => (Health::Failure, "provider_rejected", "deferred"),
+                Ok(Err(F::Invalid)) => (Health::Failure, "invalid_model_response", "unavailable"),
+                Err(()) => (Health::Neutral, "request_outcome_unknown", "deferred"),
+                _ => (Health::Failure, "request_outcome_unknown", "deferred"),
+            };
+            let delay = automation::health(&state.db, identity, health, automation::now())?;
+            Ok(Err(disposition(status, reason, delay)))
+        }
+    }
 }
 struct Prepared {
     loaded: source::Loaded,
@@ -285,8 +546,11 @@ async fn cancellable_read<T>(
         _ = async {
             loop {
                 tokio::time::sleep(Duration::from_millis(100)).await;
-                if registry.active_run_count() > 0 || crate::worker_host::paused() {
+                if crate::worker_host::paused() {
                     gate.cancel(None, false);
+                } else if registry.active_run_count() > 0 {
+                    gate.observe_foreground();
+                    break;
                 }
                 if !gate.valid(epoch) { break; }
             }
@@ -420,6 +684,30 @@ pub(crate) async fn plugin_memory_extract(
     if let Err(reason) = validate_context(&request.context) {
         return Ok(source_error(&reason));
     }
+    let identity = automation::Identity::new(
+        &plugin_id,
+        &request.project_id,
+        "extract",
+        &request.request_id,
+        serde_json::to_value(&request).map_err(|_| "invalid_request")?,
+    );
+    if let Some(cached) = automation::lookup(&state.db, &identity, || {
+        permission(&plugin_id, Some(&request.source.kind))?;
+        source::authorize_review_project(&state.db, &plugin_id, &request.project_id)
+    })? {
+        let db = state.db.clone();
+        let owner = plugin_id.clone();
+        let req = request.clone();
+        return Ok(replay_cached(cached, |snapshot| {
+            validate_cache_read(&state, move |epoch| {
+                validate_extract_replay(&db, &owner, &req, snapshot, epoch)
+            })
+        })
+        .await);
+    }
+    if request.reconcile_only {
+        return Ok(automation::response("request_not_started", 0));
+    }
     let mut lease = match gate::GATE.admit(
         &plugin_id,
         &request.request_id,
@@ -429,12 +717,38 @@ pub(crate) async fn plugin_memory_extract(
         Ok(v) => v,
         Err(ms) => return Ok(disposition("deferred", "foreground_or_cooldown", ms)),
     };
+    lease.sources.push(request.source.kind.clone());
+    if let Some(result) = automation::begin(&state.db, &identity)? {
+        return Ok(result);
+    }
+    let result = extract_admitted(&state, &plugin_id, &request, &identity, &mut lease).await;
+    let stored = result.as_ref().cloned().unwrap_or_else(|_| {
+        if lease.sent() {
+            automation::response("request_outcome_unknown", 60_000)
+        } else {
+            disposition("unavailable", "automation_operation_failed", 60_000)
+        }
+    });
+    automation::complete(&state.db, &identity, &stored)?;
+    if result.is_err() && lease.sent() {
+        Ok(stored)
+    } else {
+        result
+    }
+}
+async fn extract_admitted(
+    state: &crate::AppState,
+    plugin_id: &str,
+    request: &ExtractRequest,
+    identity: &automation::Identity,
+    lease: &mut gate::Lease,
+) -> Result<Value, String> {
     let epoch = lease.epoch;
     let db = state.db.clone();
-    let owner = plugin_id.clone();
+    let owner = plugin_id.to_owned();
     let req = request.clone();
     let task = tauri::async_runtime::spawn_blocking(move || prepare(db, owner, req, epoch));
-    let prepared = match cancellable(&mut lease, &state.processes, task).await {
+    let prepared = match cancellable(lease, &state.processes, task).await {
         Ok(Ok(Ok(v))) => v,
         Ok(Ok(Err(e))) => return Ok(extract_source_error(&e, &request)),
         Ok(Err(_)) => {
@@ -456,39 +770,31 @@ pub(crate) async fn plugin_memory_extract(
     let notes = if prepared.selection.slices.is_empty() {
         Vec::new()
     } else {
-        let outcome = cancellable(
-            &mut lease,
-            &state.processes,
-            tokio::time::timeout(Duration::from_secs(60), memory::extract(&prepared.input)),
+        let raw = match model_call(
+            state,
+            lease,
+            identity,
+            memory::request_body(&prepared.input),
+            async {
+                let db = state.db.clone();
+                let owner = plugin_id.to_owned();
+                let req = request.clone();
+                let checked =
+                    tauri::async_runtime::spawn_blocking(move || prepare(db, owner, req, epoch))
+                        .await
+                        .map_err(|_| "memory_source_task_failed".to_string())??;
+                if checked.digest != prepared.digest
+                    || checked.loaded.fence != prepared.loaded.fence
+                {
+                    return Err("source_changed".into());
+                }
+                Ok(())
+            },
         )
-        .await;
-        let raw = match outcome {
-            Err(()) => return Ok(disposition("deferred", "preempted", 30_000)),
-            Ok(Err(_)) | Ok(Ok(Err(Failure::Retry(None)))) => {
-                return Ok(disposition(
-                    "deferred",
-                    "vertex_retry",
-                    gate::GATE.failure(None),
-                ))
-            }
-            Ok(Ok(Err(Failure::Retry(delay)))) => {
-                return Ok(disposition(
-                    "deferred",
-                    "vertex_retry",
-                    gate::GATE.failure(delay),
-                ))
-            }
-            Ok(Ok(Err(Failure::Unavailable))) => {
-                return Ok(disposition("unavailable", "vertex_unavailable", 60_000))
-            }
-            Ok(Ok(Err(Failure::Invalid))) => {
-                return Ok(disposition(
-                    "unavailable",
-                    "invalid_model_response",
-                    gate::GATE.failure(None),
-                ))
-            }
-            Ok(Ok(Ok(raw))) => raw,
+        .await?
+        {
+            Ok(raw) => raw,
+            Err(result) => return Ok(result),
         };
         match validate_output_version(
             &raw,
@@ -497,20 +803,14 @@ pub(crate) async fn plugin_memory_extract(
             request.version(),
         ) {
             Ok(v) => v,
-            Err(_) => {
-                return Ok(disposition(
-                    "unavailable",
-                    "invalid_model_response",
-                    gate::GATE.failure(None),
-                ))
-            }
+            Err(_) => return Ok(disposition("unavailable", "invalid_model_response", 0)),
         }
     };
     let db = state.db.clone();
-    let owner = plugin_id.clone();
+    let owner = plugin_id.to_owned();
     let req = request.clone();
     let task = tauri::async_runtime::spawn_blocking(move || prepare(db, owner, req, epoch));
-    let rechecked = match cancellable(&mut lease, &state.processes, task).await {
+    let rechecked = match cancellable(lease, &state.processes, task).await {
         Ok(Ok(Ok(v))) => v,
         Ok(Ok(Err(e))) => return Ok(extract_source_error(&e, &request)),
         Ok(Err(_)) => {
@@ -520,14 +820,15 @@ pub(crate) async fn plugin_memory_extract(
                 60_000,
             ))
         }
-        Err(()) => return Ok(disposition("deferred", "preempted", 30_000)),
+        Err(()) => return Ok(interrupted(lease)),
     };
     if !gate::GATE.valid(epoch)
-        || state.processes.active_run_count() > 0
+        || (!lease.sent() && state.processes.active_run_count() > 0)
         || crate::worker_host::paused()
     {
-        return Ok(disposition("deferred", "preempted", 30_000));
+        return Ok(interrupted(lease));
     }
+    permission(plugin_id, Some(&request.source.kind))?;
     if prepared.loaded.fence != rechecked.loaded.fence || prepared.digest != rechecked.digest {
         return Ok(disposition(
             if request.version() == 2 {
@@ -540,6 +841,19 @@ pub(crate) async fn plugin_memory_extract(
         ));
     }
     gate::GATE.success();
+    automation::save_replay(
+        &state.db,
+        identity,
+        serde_json::to_value(ExtractReplay {
+            source_digest: prepared.source_digest.clone(),
+            range: source::replay_range(
+                &prepared.loaded,
+                request.cursor.as_ref(),
+                &prepared.selection.next,
+            )?,
+        })
+        .map_err(|_| "automation_storage_unavailable")?,
+    )?;
     if prepared.selection.slices.is_empty() && !prepared.selection.has_more {
         return Ok(json!({"status":"empty","cursor":prepared.selection.next}));
     }
@@ -569,7 +883,7 @@ mod tests {
     use super::*;
     #[test]
     fn main_owner_enabled_memory_and_exact_source_grants_are_required() {
-        assert!(require("plugin-window-detached", "example-dashboard", None).is_err());
+        assert!(require("plugin-window-detached", "fixture-workbench", None).is_err());
         let grants = vec!["host:memory".into(), "host:chat".into()];
         assert!(check_permission(true, &grants, Some(&SourceKind::Conversation)).is_ok());
         assert!(check_permission(true, &grants, Some(&SourceKind::Coordination)).is_err());

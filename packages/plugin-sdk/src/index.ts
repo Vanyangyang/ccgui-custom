@@ -28,4 +28,6 @@ export * from "./tasks";
 export * from "./task-conversations";
 export * from "./fixed-instructions";
 export * from "./memory-extraction";
+export * from "./memory-review";
+export * from "./handoff";
 export type { ConversationEngine, ConversationSelection, ConversationSnapshot, ConversationCatalog, HostConversationsApi, ConversationViewProps, ConversationViewComponent, ConversationViewAction, PluginImageAttachment, HostImagesApi } from "./conversations";

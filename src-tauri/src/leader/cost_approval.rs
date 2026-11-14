@@ -11,6 +11,9 @@ pub struct TaskCostApproval {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<CacheWindow>,
     pub model: Option<String>,
+    /// Exact reviewed attachment identities, never filesystem paths.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub image_refs: Vec<String>,
 }
 
 // Fixed safety allowance for starting the next request, not measured latency.
@@ -83,7 +86,322 @@ fn held_response(request_id: &str, branch: &LeaderBranch) -> Result<Value, Strin
     }))
 }
 
+fn handoff_pair(source: &LeaderBranch, successor: &LeaderBranch) -> bool {
+    let (Some(to), Some(from)) = (&source.handoff_to, &successor.handoff_from) else { return false; };
+    source.state == "handed_off" && to.branch_id == successor.id && from.branch_id == source.id
+        && to.request_id == from.request_id && to.operation_id == from.operation_id
+        && to.payload_fingerprint == from.payload_fingerprint
+        && source.parent_engine == successor.parent_engine && source.parent_session_id == successor.parent_session_id
+        && same_workspace(source.parent_workspace(), successor.parent_workspace())
+        // A confirmed target selection may change engines. Ownership belongs to
+        // the parent and the mutually bound durable links, not the child engine.
+        && same_workspace(&source.workspace_path, &successor.workspace_path)
+}
+
 impl LeaderManager {
+    /// Resolve public predecessor selectors without weakening direct-parent
+    /// authorization. Both ends of every hop are durable and must agree.
+    pub(super) fn resolve_child_id(&self, inner: &Inner, parent: &LeaderIdentity, id: &str) -> Result<String, String> {
+        let mut current = id.to_string();
+        let mut visited = HashSet::new();
+        loop {
+            if visited.len() >= MAX_DIRECT_BRANCHES {
+                return Err("Task handoff chain exceeds the direct-child limit".into());
+            }
+            if !visited.insert(current.clone()) {
+                return Err("Task handoff chain contains a cycle".into());
+            }
+            let branch = &self.child(inner, parent, &current)?.branch;
+            if let Some(back) = &branch.handoff_from {
+                let predecessor = &self.child(inner, parent, &back.branch_id)?.branch;
+                if !handoff_pair(predecessor, branch) {
+                    return Err("Task handoff relationship is inconsistent".into());
+                }
+            }
+            let Some(link) = &branch.handoff_to else { return Ok(current); };
+            let successor = &self.child(inner, parent, &link.branch_id)?.branch;
+            if !handoff_pair(branch, successor) {
+                return Err("Task handoff relationship is inconsistent".into());
+            }
+            current = successor.id.clone();
+        }
+    }
+
+    pub(super) fn handoff_response(&self, inner: &Inner, request: &Request) -> Result<Value, String> {
+        let actual = self.resolve_child_id(inner, &request.parent, &request.branch_id)?;
+        let original = &self.child(inner, &request.parent, &request.branch_id)?.branch;
+        let successor = &self.child(inner, &request.parent, &actual)?.branch;
+        let mut chain = Vec::new();
+        let mut current = original;
+        while let Some(link) = &current.handoff_to {
+            chain.push(link.clone());
+            current = &inner.branches.get(&link.branch_id).ok_or("Missing handoff successor")?.branch;
+        }
+        Ok(json!({
+            "requestId": request.request_id, "requestState": "handed_off", "status": "handed_off",
+            "originalSubmittedToModel": false, "mayHaveStarted": true,
+            "branch": tool_branch(original, MAX_TOOL_RESPONSE_BYTES / 3)?,
+            "actualBranchId": actual, "handoffChain": chain,
+            "successor": tool_branch(successor, MAX_TOOL_RESPONSE_BYTES / 3)?,
+        }))
+    }
+
+    /// A live process can outlast its delegated reply. Check all identity and
+    /// run reservations, not just the held branch's (deliberately empty) run id.
+    fn handoff_idle(&self, inner: &Inner, record: &BranchRecord) -> Result<(), String> {
+        let branch = &record.branch;
+        let session = branch.session_id.as_deref().ok_or("Task handoff requires a known native session")?;
+        archive::ensure_available(inner, &branch.engine, session, Some(&branch.id))?;
+        if record.stopping || fenced(&branch.state) || self.active(inner, branch)
+            || inner.retiring.contains(&(branch.engine.clone(), session.into()))
+            || self.processes.get(session).is_some()
+            || pending_claim(inner, &branch.engine, session, "")
+            || inner.runs.iter().any(|(id, run)| {
+                (run.branch_id.as_deref() == Some(&branch.id)
+                    || run.engine == branch.engine && run.session_id.as_deref() == Some(session))
+                    && ((!run.retired && run.launch_pending) || self.processes.get(id).is_some()
+                        || inner.pending_bindings.contains_key(id))
+            })
+        {
+            return Err("Task handoff requires the child and descendants to be fully idle".into());
+        }
+        Ok(())
+    }
+
+    /// One durable transition consumes the human-reviewed held assignment and
+    /// reserves its fresh sibling. Returning None is a read-only operation retry.
+    #[cfg(test)]
+    pub(super) fn reserve_handoff(
+        &self, parent: &LeaderIdentity, branch_id: &str, request_id: &str,
+        source_session_id: &str, reviewed_model: Option<&str>, operation_id: &str, summary: &str,
+    ) -> Result<Option<(LeaderBranch, String, String, String)>, String> {
+        self.reserve_handoff_with_selection(parent, branch_id, request_id, source_session_id,
+            reviewed_model, operation_id, summary, None)
+    }
+
+    pub(super) fn reserve_handoff_with_selection(
+        &self, parent: &LeaderIdentity, branch_id: &str, request_id: &str,
+        source_session_id: &str, reviewed_model: Option<&str>, operation_id: &str, summary: &str,
+        target: Option<&crate::plugin_conversations::Selection>,
+    ) -> Result<Option<(LeaderBranch, String, String, String)>, String> {
+        if let Some(target) = target { crate::plugin_conversations::validate_selection(target)?; }
+        text_limit(branch_id, "branch_id", 128)?;
+        text_limit(request_id, "request_id", 128)?;
+        text_limit(source_session_id, "source_session_id", 256)?;
+        text_limit(operation_id, "operation_id", 128)?;
+        if summary.trim().is_empty() || summary.contains('\0') || summary.encode_utf16().count() > 8_000 {
+            return Err("Handoff summary must contain 1-8000 UTF-16 code units and no NUL".into());
+        }
+        let mut inner = self.inner.lock();
+        if inner.shutdown || inner.retiring.contains(&(parent.engine.clone(), parent.session_id.clone())) {
+            return Err("Task handoff is unavailable while the coordinator or parent is retiring".into());
+        }
+        let source = self.child(&inner, parent, branch_id)?.clone();
+        let mut handoff_identity = json!([
+            legacy_key(parent), branch_id, request_id, source_session_id, reviewed_model, operation_id, summary,
+        ]);
+        if !source.branch.images.is_empty() {
+            handoff_identity.as_array_mut().expect("handoff identity").push(encoded(&source.branch.images)?);
+        }
+        // Omission preserves the legacy durable fingerprint exactly.
+        if let Some(target) = target {
+            handoff_identity.as_array_mut().expect("handoff identity").push(json!({ "targetSelection": target }));
+        }
+        let fingerprint = arguments_fingerprint(&handoff_identity)?;
+        if let Some((_, existing)) = inner.branches.iter().find(|(_, record)| {
+            record.branch.handoff_to.as_ref().is_some_and(|link| link.operation_id == operation_id)
+        }) {
+            let link = existing.branch.handoff_to.as_ref().expect("matched handoff");
+            if existing.branch.id != branch_id || !belongs(&existing.branch, parent)
+                || link.payload_fingerprint != fingerprint || link.request_id != request_id
+            {
+                return Err("Handoff operation_id was already used with different approval details".into());
+            }
+            self.resolve_child_id(&inner, parent, branch_id)?;
+            let request = inner.requests.get(&(key(parent), request_id.into()))
+                .ok_or("Handoff request receipt is missing")?;
+            if request.state != "handed_off" || request.branch_id != branch_id {
+                return Err("Handoff operation does not match its durable receipt".into());
+            }
+            return Ok(None);
+        }
+        if source.branch.handoff_to.is_some() {
+            return Err("This child was already handed off by another operation".into());
+        }
+        // This also verifies any predecessor link when handing off a successor.
+        if self.resolve_child_id(&inner, parent, branch_id)? != branch_id {
+            return Err("Handoff must identify the currently held physical child".into());
+        }
+        let request_key = (key(parent), request_id.into());
+        let mut held_request = inner.requests.get(&request_key).cloned()
+            .ok_or("Task cost approval request is missing")?;
+        let approval = source.branch.cost_approval.as_ref().ok_or("Task cost approval is unavailable")?;
+        if held_request.method != "task_send" || held_request.branch_id != branch_id
+            || held_request.state != "awaiting_cost_approval" || approval.request_id != request_id
+            || source.branch.state != "awaiting_cost_approval"
+            || source.branch.run_id.is_some()
+            || source.branch.delegation.as_ref().is_none_or(|delegation| {
+                delegation.request_id != request_id || delegation.state != "awaiting_cost_approval"
+                    || delegation.run_id.is_some() || delegation.task != source.branch.task
+                    || delegation.images != source.branch.images
+            })
+        {
+            return Err("Task cost approval request does not match this child".into());
+        }
+        if source.branch.session_id.as_deref() != Some(source_session_id)
+            || source.branch.model.as_deref() != reviewed_model || approval.model.as_deref() != reviewed_model
+        {
+            return Err("Task handoff source session or reviewed model changed".into());
+        }
+        if approval.image_refs != attachments::refs(&source.branch.images) {
+            return Err("Task handoff reviewed images changed".into());
+        }
+        if approval.model.is_none() && crate::settings::read_settings()?.default_models
+            .get(&source.branch.engine).is_some_and(|model| !model.trim().is_empty())
+        {
+            return Err("Host chat target model changed before task handoff".into());
+        }
+        let original_args = SendArgs {
+            branch_id: held_request.requested_branch_id.clone().unwrap_or_else(|| branch_id.into()),
+            request_id: request_id.into(), message: source.branch.task.clone(),
+            images: source.branch.images.iter().map(|image| image.source.clone()).collect(),
+        };
+        if held_request.arguments_fingerprint.as_deref() != Some(arguments_fingerprint(&encoded(&original_args)?)?.as_str()) {
+            return Err("Held task message no longer matches the approved request".into());
+        }
+        self.handoff_idle(&inner, &source)?;
+        if let Some(target) = target {
+            let engine = crate::engine::engine_by_id(&target.engine).ok_or("Unsupported handoff target engine")?;
+            if !engine.supported_permissions().contains(&source.permission.as_str()) {
+                return Err("Handoff target cannot honor the inherited permission mode".into());
+            }
+            if source.permission == "plan" && matches!(engine.plan_approval(), crate::engine::PlanApproval::Unavailable { .. }) {
+                return Err("Handoff target cannot honor the inherited plan permission mode".into());
+            }
+            if !source.branch.images.is_empty() && !engine.supports_images() {
+                return Err("Handoff target does not support the held images".into());
+            }
+        }
+        // Validate the durable copies before consuming the held request. Never
+        // reread the source files, which may have changed since review began.
+        attachments::paths(&source.branch.images)?;
+        let mut descendants = Vec::new();
+        Self::subtree(&inner, branch_id, &mut HashSet::new(), &mut descendants)?;
+        self.subtree_members(&inner, parent, &descendants, false)?;
+        for id in descendants.iter().filter(|id| id.as_str() != branch_id) {
+            let descendant = inner.branches.get(id).ok_or("Missing descendant")?;
+            if !matches!(descendant.branch.state.as_str(), "completed" | "failed" | "stopped" | "handed_off")
+                || descendant.branch.cost_approval.is_some()
+                || descendant.branch.delegation.as_ref().is_some_and(|d| {
+                    !matches!(d.state.as_str(), "completed" | "failed" | "stopped" | "handed_off")
+                })
+            {
+                return Err("Task handoff requires all descendants to have a known settled outcome".into());
+            }
+            self.handoff_idle(&inner, descendant)?;
+        }
+        if inner.branches.values().filter(|r| belongs(&r.branch, parent) && r.branch.state != "reclaimed").count() >= MAX_DIRECT_BRANCHES {
+            return Err("Task handoff would exceed the retained direct-child limit".into());
+        }
+        self.spawn_workspace(parent, Some(&source.branch.workspace_path))?;
+        let task = format!("[Handoff summary]\n{summary}\n\n[Original pending assignment — preserve all requirements]\n{}", source.branch.task);
+        text_limit(&task, "handoff task", MAX_INPUT_CHARS)?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let spawn_request_id = loop {
+            let candidate = format!("handoff:{}", uuid::Uuid::new_v4());
+            if !inner.requests.contains_key(&(key(parent), candidate.clone())) { break candidate; }
+        };
+        let now = (self.clock)();
+        let mut successor = source.clone();
+        if let Some(target) = target {
+            successor.branch.engine = target.engine.clone();
+            successor.branch.model = Some(target.model.clone());
+            successor.branch.effort = target.effort.clone();
+            successor.branch.provider_id = Some(target.provider_id.clone());
+        }
+        successor.branch.id = id.clone();
+        successor.branch.session_id = None;
+        successor.branch.run_id = Some(run_id.clone());
+        successor.branch.task = task.clone();
+        successor.branch.state = "starting".into();
+        successor.branch.created_at = now;
+        successor.branch.updated_at = now;
+        successor.branch.last_activity_at = now;
+        successor.branch.deadline_at = now + default_ttl(&successor.branch.engine) as i64 * 1000;
+        successor.branch.expired = false;
+        successor.branch.result.clear();
+        successor.branch.result_truncated = false;
+        successor.branch.error = None;
+        successor.branch.cost_approval = None;
+        successor.branch.delegation = None;
+        successor.branch.handoff_to = None;
+        successor.branch.handoff_from = Some(TaskHandoffLink {
+            branch_id: branch_id.into(), request_id: request_id.into(), operation_id: operation_id.into(),
+            payload_fingerprint: fingerprint.clone(),
+        });
+        successor.output = Output::default();
+        successor.questions.clear();
+        successor.plans.clear();
+        successor.stopping = false;
+        successor.dirty = false;
+        delegation::begin(&mut successor.branch, &spawn_request_id);
+        let spawn_args = SpawnArgs {
+            workspace_path: Some(successor.branch.workspace_path.clone()), request_id: spawn_request_id.clone(),
+            engine: successor.branch.engine.clone(), title: successor.branch.title.clone(), task,
+            model: successor.branch.model.clone(), effort: successor.branch.effort.clone(), ttl_seconds: None,
+            images: successor.branch.images.iter().map(|image| image.source.clone()).collect(),
+        };
+        let spawn_request = Request {
+            parent: parent.clone(), request_id: spawn_request_id.clone(), method: "task_spawn".into(),
+            arguments: Value::Null, arguments_fingerprint: Some(arguments_fingerprint(&encoded(&spawn_args)?)?),
+            branch_id: id.clone(), requested_branch_id: None, state: "starting".into(), response: None,
+            error: None, projection: None, projection_invalid: false,
+        };
+        let mut source = source;
+        source.branch.handoff_to = Some(TaskHandoffLink {
+            branch_id: id.clone(), request_id: request_id.into(), operation_id: operation_id.into(),
+            payload_fingerprint: fingerprint,
+        });
+        source.branch.state = "handed_off".into();
+        source.branch.cost_approval = None;
+        source.branch.run_id = None;
+        source.branch.updated_at = now;
+        delegation::sync(&mut source.branch);
+        source.dirty = false;
+        held_request.state = "handed_off".into();
+        held_request.error = None;
+        held_request.response = Some(json!({
+            "requestId": request_id, "requestState": "handed_off", "status": "handed_off",
+            "originalSubmittedToModel": false, "mayHaveStarted": true,
+            "actualBranchId": id, "branch": tool_branch(&source.branch, MAX_TOOL_RESPONSE_BYTES - 8192)?,
+        }));
+        let mut conn = self.db.0.lock();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        write_request(&tx, &held_request)?;
+        write_request(&tx, &spawn_request)?;
+        write_branch(&tx, &source)?;
+        write_branch(&tx, &successor)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        let branch = successor.branch.clone();
+        let permission = successor.permission.clone();
+        inner.branches.insert(branch_id.into(), source);
+        inner.branches.insert(id.clone(), successor);
+        inner.requests.insert(request_key, held_request);
+        inner.requests.insert((key(parent), spawn_request_id.clone()), spawn_request);
+        inner.runs.insert(run_id.clone(), Run {
+            engine: branch.engine.clone(), session_id: None, workspace_path: branch.workspace_path.clone(),
+            permission: permission.clone(), branch_id: Some(id), leader_eligible: true,
+            root_on_start: false, root_identity_bound: false, root_saved_baseline: None,
+            root_foreign_claims: None, isolated_resume_session: None, launch_pending: true, retired: false,
+            last_seq: HashMap::new(), settled_turns: HashSet::new(),
+        });
+        drop(conn);
+        drop(inner);
+        self.emit();
+        Ok(Some((branch, run_id, spawn_request_id, permission)))
+    }
+
     pub(super) fn small_context_source(
         &self,
         branch: &LeaderBranch,
@@ -182,6 +500,7 @@ impl LeaderManager {
         permission: &str,
         args: &SendArgs,
         arguments: &Value,
+        images: Vec<TaskImage>,
         cache: Option<CacheWindow>,
     ) -> Result<Value, String> {
         let mut record = self.child(inner, parent, &args.branch_id)?.clone();
@@ -200,6 +519,7 @@ impl LeaderManager {
         }
         record.permission = permission.into();
         record.branch.task = args.message.clone();
+        record.branch.images = images;
         // No new run exists while waiting. Clearing the previous identity also
         // fences delayed output and finish notifications from that old turn.
         record.branch.run_id = None;
@@ -213,6 +533,7 @@ impl LeaderManager {
             captured_at: record.branch.updated_at,
             cache,
             model: record.branch.model.clone(),
+            image_refs: attachments::refs(&record.branch.images),
         });
         delegation::begin(&mut record.branch, &args.request_id);
         record.output = Output::default();
@@ -227,6 +548,8 @@ impl LeaderManager {
             arguments: Value::Null,
             arguments_fingerprint: Some(arguments_fingerprint(arguments)?),
             branch_id: args.branch_id.clone(),
+            requested_branch_id: arguments.get("branch_id").and_then(Value::as_str)
+                .filter(|id| *id != args.branch_id).map(str::to_owned),
             state: "awaiting_cost_approval".into(),
             response: Some(response.clone()),
             error: None,
@@ -323,6 +646,9 @@ impl LeaderManager {
         if request.method != "task_send" || request.branch_id != branch_id {
             return Err("Task cost approval request does not match this branch".into());
         }
+        if request.state == "handed_off" {
+            return Err("This cost approval was already handed off to a new child".into());
+        }
         if request.state != "awaiting_cost_approval" {
             return Ok(None);
         }
@@ -346,6 +672,13 @@ impl LeaderManager {
         if reviewed_model != approval.model.as_deref() || record.branch.model != approval.model {
             return Err("Host chat target model changed before cost approval".into());
         }
+        if approval.image_refs != attachments::refs(&record.branch.images)
+            || record.branch.delegation.as_ref().is_none_or(|delegation|
+                delegation.task != record.branch.task || delegation.images != record.branch.images)
+        {
+            return Err("Host task images changed before cost approval".into());
+        }
+        attachments::paths(&record.branch.images)?;
         if approval.model.is_none() {
             let model = crate::settings::read_settings()?
                 .default_models
@@ -407,15 +740,20 @@ impl LeaderManager {
             branch_id: branch_id.into(),
             request_id: request_id.into(),
             message: record.branch.task.clone(),
+            images: record.branch.images.iter().map(|image| image.source.clone()).collect(),
         };
-        let arguments = encoded(&args)?;
+        let arguments = encoded(&SendArgs {
+            branch_id: request.requested_branch_id.clone().unwrap_or_else(|| branch_id.into()),
+            ..args.clone()
+        })?;
         if request.arguments_fingerprint.as_deref()
             != Some(arguments_fingerprint(&arguments)?.as_str())
         {
             return Err("Held task message no longer matches the approved request".into());
         }
+        let images = record.branch.images.clone();
         let Reservation::Start((branch, run_id)) =
-            self.start_send(&mut inner, parent, &permission, &args, arguments)?
+            self.start_send(&mut inner, parent, &permission, &args, arguments, images)?
         else {
             return Err("Task cost approval did not reserve a launch".into());
         };

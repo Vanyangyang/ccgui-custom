@@ -21,6 +21,10 @@ struct Record<'a> {
     stage: &'static str,
     http_status: Option<u16>,
     elapsed_ms: u128,
+    timeout_ms: Option<u64>,
+    received_bytes: Option<u64>,
+    sse_events: Option<u64>,
+    last_event: Option<&'static str>,
 }
 
 pub(super) fn format_failure(engine: &str, failure: Failure, elapsed: Duration) -> String {
@@ -44,7 +48,7 @@ fn format_failure_at(engine: &str, failure: Failure, elapsed: Duration, path: &P
     let stage = failure.stage.unwrap_or("handoff_route");
     let call_id = uuid::Uuid::new_v4().to_string();
     let record = Record {
-        version: 1,
+        version: 2,
         call_id: &call_id,
         timestamp_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -55,6 +59,10 @@ fn format_failure_at(engine: &str, failure: Failure, elapsed: Duration, path: &P
         stage,
         http_status: failure.http_status,
         elapsed_ms: elapsed.as_millis(),
+        timeout_ms: failure.timeout_ms,
+        received_bytes: failure.received_bytes,
+        sse_events: failure.sse_events,
+        last_event: failure.last_event,
     };
     // Logging failure must never replace the original error or the local draft.
     let saved = append_log(path, &record).is_ok();
@@ -62,8 +70,10 @@ fn format_failure_at(engine: &str, failure: Failure, elapsed: Duration, path: &P
         .http_status
         .map(|status| format!("; http_status={status}"))
         .unwrap_or_default();
+    let timeout = failure.timeout_ms.map(|millis| format!("; timeout_ms={millis}")).unwrap_or_default();
     format!(
-        "{engine} {message} [stage={stage}{http_status}; diagnostic_id={call_id}{}]",
+        "{engine} {message} [stage={stage}{http_status}; elapsed_ms={}{timeout}; diagnostic_id={call_id}{}]",
+        elapsed.as_millis(),
         if saved {
             ""
         } else {
@@ -73,10 +83,14 @@ fn format_failure_at(engine: &str, failure: Failure, elapsed: Duration, path: &P
 }
 
 fn append_log(path: &Path, record: &Record<'_>) -> std::io::Result<()> {
+    append_record(path, record, MAX_LOG_BYTES)
+}
+
+pub(super) fn append_record(path: &Path, record: &impl Serialize, max_bytes: u64) -> std::io::Result<()> {
     let _guard = LOG_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let mut line = serde_json::to_vec(record)?;
     line.push(b'\n');
-    if line.len() as u64 > MAX_LOG_BYTES {
+    if line.len() as u64 > max_bytes {
         return Err(std::io::Error::other("diagnostic record exceeds its limit"));
     }
     if let Some(parent) = path.parent() {
@@ -87,7 +101,7 @@ fn append_log(path: &Path, record: &Record<'_>) -> std::io::Result<()> {
         .write(true)
         .truncate(false)
         .open(path)?;
-    if file.metadata()?.len().saturating_add(line.len() as u64) > MAX_LOG_BYTES {
+    if file.metadata()?.len().saturating_add(line.len() as u64) > max_bytes {
         file.set_len(0)?;
     }
     // Windows append-only handles cannot truncate. The process-local lock
@@ -111,12 +125,16 @@ mod tests {
                 kind: SideCallError::Failed,
                 stage: Some("sse_response_failed"),
                 http_status: Some(200),
+                timeout_ms: Some(600_000),
+                received_bytes: Some(123),
+                sse_events: Some(2),
+                last_event: Some("failure"),
             },
             Duration::from_millis(20),
             &temp,
         );
         assert!(message.starts_with("codex handoff summary failed"));
-        assert!(message.contains("stage=sse_response_failed; http_status=200; diagnostic_id="));
+        assert!(message.contains("stage=sse_response_failed; http_status=200; elapsed_ms=20; timeout_ms=600000; diagnostic_id="));
         assert!(message.contains("diagnostic_log_unavailable"));
         std::fs::remove_dir_all(temp).unwrap();
     }
@@ -131,7 +149,7 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, vec![b'x'; MAX_LOG_BYTES as usize]).unwrap();
         let record = Record {
-            version: 1,
+            version: 2,
             call_id: "fixture-call",
             timestamp_ms: 1,
             engine: "codex",
@@ -139,6 +157,10 @@ mod tests {
             stage: "final_json",
             http_status: Some(200),
             elapsed_ms: 2,
+            timeout_ms: Some(600_000),
+            received_bytes: Some(1024),
+            sse_events: Some(3),
+            last_event: Some("other"),
         };
         append_log(&path, &record).unwrap();
         append_log(&path, &record).unwrap();
@@ -147,7 +169,12 @@ mod tests {
         assert_eq!(text.lines().count(), 2);
         for line in text.lines() {
             let value: serde_json::Value = serde_json::from_str(line).unwrap();
-            assert_eq!(value.as_object().unwrap().len(), 8);
+            assert_eq!(value.as_object().unwrap().len(), 12);
+            assert_eq!(value["version"], 2);
+            assert_eq!(value["timeout_ms"], 600_000);
+            assert_eq!(value["received_bytes"], 1024);
+            assert_eq!(value["sse_events"], 3);
+            assert_eq!(value["last_event"], "other");
             assert_eq!(value["stage"], "final_json");
             assert_eq!(value["call_id"], "fixture-call");
         }

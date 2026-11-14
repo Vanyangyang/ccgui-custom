@@ -5,7 +5,7 @@ import type { SidechatState } from "@/features/sidechat/store";
 const nativeId = "12345678-1234-1234-1234-123456789abc";
 
 function deferred() { let resolve!: () => void; const promise = new Promise<void>((r) => { resolve = r; }); return { promise, resolve }; }
-function fixture() {
+function fixture(engine: "claude" | "codex" | "agy" = "claude", idleCacheLimits?: { entries: number; bytes: number }) {
   const records = new Map<string, unknown>();
   const states = new Map<string, SidechatState>();
   const listeners = new Set<() => void>();
@@ -17,11 +17,15 @@ function fixture() {
     claim: vi.fn(async () => {}),
     resolveSelection: vi.fn(async (_plugin, selection) => ({ ...selection })),
     resolveImages: vi.fn(async (_plugin: string, ids: readonly string[]) => ids.map((id: string) => `C:/pasted/${id}.png`)),
-    catalog: async () => ({ capabilities: { images: true, fixedInstructions: true }, engines: [{ id: "claude", label: "Claude", available: true, supportsImages: true, models: [{ id: "model", label: "Model" }],
+    catalog: async () => ({ capabilities: { images: true, fixedInstructions: true }, engines: [{ id: engine, label: engine, available: true, supportsImages: true, supportsFixedInstructions: true, models: [{ id: "model", label: "Model" }],
       providers: [{ id: "provider", label: "Provider" }], defaultModel: "model", defaultEffort: "high", defaultProviderId: "provider" }],
       workspaces: [{ id: "w", path: "C:/work", name: "Work" }] }),
     workspace: async (path) => { if (path !== "C:/work") throw new Error("not registered"); return path; },
     read: (key) => states.get(key), restore: (key, state) => { states.set(key, state); },
+    release: vi.fn((key, expected) => {
+      if (states.get(key) !== expected || expected.streaming || expected.runId || expected.draft || expected.draftImages?.length) return false;
+      states.delete(key); return true;
+    }),
     send: vi.fn(async (key, workspacePath, selection, prompt, runId, images) => {
       states.set(key, { open: true, mode: "read-only", engine: selection.engine, workspacePath,
         parentSessionId: null, sideSessionId: nativeId, runId, streaming: true, draft: "", error: null,
@@ -34,18 +38,137 @@ function fixture() {
   const factory = vi.fn(async () => facade);
   const blockers: Array<() => readonly string[]> = [];
   const create = () => createHostConversationBridge("test", storage, { facade: factory,
+    idleCacheLimits,
     checkpoint: { assertAllowed() {}, registerBlocker: (_id, read) => { blockers.push(read); return () => {}; } } });
   const api = create();
-  const open = () => api.open({ threadId: "one", workspacePath: "C:/work", selection: { engine: "claude" } });
+  const open = () => api.open({ threadId: "one", workspacePath: "C:/work", selection: { engine } });
   const request = { threadId: "one", requestId: "r1", expectedRevision: 0, prompt: "hello" };
-  const finish = () => { for (const [key, s] of states) states.set(key, { ...s, streaming: false, runId: null }); notify(); };
+  const finish = () => { for (const [key, s] of states) if (s.streaming) states.set(key, { ...s, streaming: false, runId: null }); notify(); };
   const record = () => [...records.values()][0] as { snapshot: { status: string; revision: number; sessionRef: { sessionId: string } | null }; state?: SidechatState; pendingUser?: { text: string }; launchSelection: unknown; memoryFloorSeq?: number };
   const settled = (status = "completed") => vi.waitFor(() => { expect(record().snapshot.status).toBe(status); expect(blockers[0]()).toEqual([]); });
   return { api, create, open, request, storage, records, states, facade, finish, notify, factory, blockers, record, settled };
 }
 describe("host conversations", () => {
-  it("persists fixed guidance before each launch, restores it cold, and fingerprints updates separately from user text", async () => {
-    const f = fixture(); await f.open();
+  it("bounds durable idle copies and reloads exact Unicode, payloads and continuation identity", async () => {
+    const f = fixture("codex", { entries: 2, bytes: 1024 * 1024 });
+    let expected: Awaited<ReturnType<typeof f.api.inspect>>;
+    for (let i = 0; i < 5; i++) {
+      const id = `history-${i}`;
+      await f.api.open({ threadId: id, workspacePath: "C:/work", selection: { engine: "codex" } });
+      await f.api.send({ threadId: id, requestId: `request-${i}`, expectedRevision: 0, prompt: `中文😀 ${i}` });
+      const [key, state] = [...f.states].find(([key]) => key.endsWith(`:${id}`))!;
+      f.states.set(key, { ...state, messages: [...state.messages, {
+        seq: 2, role: "tool", text: "read", ts: null, args: { path: "文件.ts" }, result: { content: "完整结果😀\n```ts\nconst n = 1;\n```" },
+      }] });
+      f.finish();
+      await vi.waitFor(() => expect(f.blockers[0]()).toEqual([]));
+      const snapshot = await f.api.inspect(id);
+      if (i === 0) expected = snapshot;
+    }
+    await vi.waitFor(() => expect(f.states.size).toBe(2));
+    const nativeSends = vi.mocked(f.facade.send).mock.calls.length;
+    const restored = await f.api.inspect("history-0");
+    expect(restored).toEqual(expected!);
+    expect(f.facade.send).toHaveBeenCalledTimes(nativeSends);
+    expect(await f.api.send({ threadId: "history-0", requestId: "request-0", expectedRevision: 0, prompt: "中文😀 0" })).toEqual(expected!);
+    expect(f.facade.send).toHaveBeenCalledTimes(nativeSends);
+    await f.api.send({ threadId: "history-0", requestId: "continued", expectedRevision: restored.revision, prompt: "继续原会话" });
+    expect((await f.api.inspect("history-0")).messages.slice(0, 2)).toEqual(expected!.messages);
+    expect((await f.api.inspect("history-0")).sessionRef).toEqual(expected!.sessionRef);
+    f.finish(); await vi.waitFor(() => expect(f.blockers[0]()).toEqual([]));
+  });
+  it("does not keep a single oversized persisted discussion resident", async () => {
+    const f = fixture("codex", { entries: 8, bytes: 2048 });
+    await f.open(); await f.api.send({ ...f.request, prompt: "大段原文😀".repeat(500) });
+    f.finish(); await f.settled();
+    await vi.waitFor(() => expect(f.states.size).toBe(0));
+    expect((await f.api.inspect("one")).messages[0]).toMatchObject({ text: "大段原文😀".repeat(500) });
+    await vi.waitFor(() => expect(f.states.size).toBe(0));
+  });
+  it("keeps running and unacknowledged writes even when the idle budget is zero", async () => {
+    const f = fixture("codex", { entries: 0, bytes: 0 });
+    await f.open(); await f.api.send(f.request);
+    expect(f.states.size).toBe(1);
+    expect(f.facade.release).not.toHaveBeenCalled();
+    const gate = deferred(), write = f.storage.set.getMockImplementation()!;
+    f.storage.set.mockImplementationOnce(async (...args) => { await gate.promise; return write(...args); });
+    f.finish();
+    await Promise.resolve(); await Promise.resolve();
+    expect(f.states.size).toBe(1);
+    expect(f.blockers[0]()).not.toEqual([]);
+    gate.resolve(); await f.settled();
+    await vi.waitFor(() => expect(f.states.size).toBe(0));
+  });
+  it("retains a changed state until it has a matching durable write", async () => {
+    const f = fixture("codex", { entries: 1, bytes: 1024 * 1024 });
+    await f.open(); await f.api.send(f.request); f.finish(); await f.settled();
+    const [key, state] = [...f.states][0];
+    f.states.set(key, { ...state, draft: "未发送的修改" });
+    await f.api.open({ threadId: "other", workspacePath: "C:/work", selection: { engine: "codex" } });
+    await f.api.inspect("one");
+    expect(f.states.get(key)?.draft).toBe("未发送的修改");
+    expect(f.facade.release).not.toHaveBeenCalledWith(key, expect.anything());
+  });
+  it("never releases a terminal discussion whose durable write failed", async () => {
+    const f = fixture("codex", { entries: 0, bytes: 0 });
+    await f.open(); await f.api.send(f.request);
+    f.storage.set.mockRejectedValue(new Error("fixture disk full"));
+    f.finish();
+    await vi.waitFor(async () => expect((await f.api.inspect("one")).status).toBe("unknown"));
+    expect(f.states.size).toBe(1);
+    expect(f.facade.release).not.toHaveBeenCalled();
+    expect(f.facade.stop).not.toHaveBeenCalled();
+    expect((await f.api.inspect("one")).messages[0]).toMatchObject({ text: "hello" });
+  });
+  it("keeps evicted archived-workspace history readable without authorizing a new operation", async () => {
+    const f = fixture("codex", { entries: 0, bytes: 0 });
+    await f.open(); await f.api.send(f.request); f.finish(); await f.settled();
+    await vi.waitFor(() => expect(f.states.size).toBe(0));
+    f.facade.workspace = async () => { throw new Error("workspace archived"); };
+    expect((await f.api.inspect("one")).messages).toHaveLength(1);
+    expect((await f.api.send(f.request)).messages).toHaveLength(1);
+    expect(f.facade.send).toHaveBeenCalledTimes(1);
+    await expect(f.api.send({ ...f.request, requestId: "new-request", expectedRevision: 1 })).rejects.toThrow("archived");
+    await expect(f.api.openFile("one", "file.ts")).rejects.toThrow("archived");
+    expect(f.facade.openFile).not.toHaveBeenCalled();
+    expect(f.facade.send).toHaveBeenCalledTimes(1);
+  });
+  it("pins an entry across an awaited native validation while another discussion completes", async () => {
+    const f = fixture("codex", { entries: 0, bytes: 0 });
+    await f.open(); await f.api.send(f.request);
+    await f.api.open({ threadId: "other", workspacePath: "C:/work", selection: { engine: "codex" } });
+    await f.api.send({ ...f.request, threadId: "other", requestId: "other-request" });
+    const gate = deferred(), workspace = f.facade.workspace;
+    f.facade.workspace = vi.fn(async path => { await gate.promise; return workspace(path); });
+    const opening = f.api.openFile("one", "file.ts");
+    await vi.waitFor(() => expect(f.facade.workspace).toHaveBeenCalled());
+    f.finish(); await vi.waitFor(() => expect(f.blockers[0]()).toEqual([]));
+    expect([...f.states.keys()].some(key => key.endsWith(":one"))).toBe(true);
+    expect([...f.states.keys()].some(key => key.endsWith(":other"))).toBe(false);
+    gate.resolve(); await opening;
+    await vi.waitFor(() => expect(f.states.size).toBe(0));
+    expect(f.facade.openFile).toHaveBeenCalledTimes(1);
+  });
+  it("opens, sends and restores AGY with a pinned provider and model-defined effort", async () => {
+    const f = fixture();
+    const agy = { engine: "agy" as const, model: "gemini-4-argon-high", providerId: "agy-channel" };
+    f.facade.catalog = async () => ({ engines: [{ id: "agy", label: "AGY", available: true, supportsImages: true,
+      models: [{ id: agy.model, label: "Gemini 4 Argon High" }], providers: [{ id: agy.providerId, label: "AGY channel" }],
+      efforts: [], defaultModel: agy.model, defaultEffort: null, defaultProviderId: agy.providerId }], workspaces: [] });
+    const opened = await f.api.open({ threadId: "one", workspacePath: "C:/work", selection: agy });
+    expect(opened.effectiveSelection).toEqual(agy);
+    await f.api.send(f.request);
+    expect(f.facade.send).toHaveBeenCalledWith(expect.any(String), "C:/work", agy, "hello", expect.any(String));
+    f.finish(); await f.settled(); f.states.clear();
+    const cold = f.create();
+    expect((await cold.inspect("one")).effectiveSelection).toEqual(agy);
+    await cold.send({ ...f.request, requestId: "agy-resume", expectedRevision: 1 });
+    expect(f.facade.send).toHaveBeenCalledTimes(2);
+    f.finish(); await f.settled();
+    await expect(f.api.open({ threadId: "invalid", workspacePath: "C:/work", selection: { ...agy, effort: "high" } })).rejects.toThrow(/effort/);
+  });
+  it.each(["claude", "codex", "agy"] as const)("%s persists fixed guidance before each launch, restores it cold, and fingerprints updates separately from user text", async engine => {
+    const f = fixture(engine); await f.open();
     const v1 = { version: "discussion-v1", text: "Keep the user's independent judgement. 中文😀" };
     const v2 = { version: "discussion-v2", text: "Updated discussion policy." };
     const original = f.facade.send;
@@ -71,9 +194,20 @@ describe("host conversations", () => {
   });
   it("does not accept shortened prompts with instructions when the native channel is unavailable", async () => {
     const f = fixture(); await f.open(); const catalog = await f.facade.catalog();
-    catalog.capabilities!.fixedInstructions = false; vi.spyOn(f.facade, "catalog").mockResolvedValue(catalog);
+    catalog.engines[0].supportsFixedInstructions = false; vi.spyOn(f.facade, "catalog").mockResolvedValue(catalog);
     await expect(f.api.send({ ...f.request, fixedInstructions: { version: "v1", text: "policy" } })).rejects.toThrow("unavailable");
     expect((await f.api.inspect("one")).revision).toBe(0); expect(f.facade.send).not.toHaveBeenCalled();
+  });
+  it("rejects restored AGY guidance on an old host when the continuation omits the profile", async () => {
+    const f = fixture("agy"); await f.open();
+    await f.api.send({ ...f.request, fixedInstructions: { version: "v1", text: "policy" } });
+    f.finish(); await f.settled(); f.states.clear();
+    const catalog = await f.facade.catalog(); catalog.engines[0].supportsFixedInstructions = false;
+    vi.spyOn(f.facade, "catalog").mockResolvedValue(catalog);
+    const cold = f.create();
+    await expect(cold.send({ ...f.request, requestId: "resume", expectedRevision: 1 })).rejects.toThrow("unavailable");
+    expect(f.facade.send).toHaveBeenCalledTimes(1);
+    expect((await cold.inspect("one")).revision).toBe(1);
   });
   for (const status of ["failed", "cancelled"] as const) it(`retains ${status} rows but fences them out of later background extraction`, async () => {
     const f = fixture(); await f.open(); await f.api.send(f.request);

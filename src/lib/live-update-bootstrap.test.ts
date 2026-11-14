@@ -20,6 +20,8 @@ const responder = vi.fn<() => Promise<() => void>>();
 const disposeResponder = vi.fn();
 const pluginIds = vi.fn((): string[] => []);
 const prewarm = vi.fn<() => Promise<void>>();
+const taskPluginIds = vi.fn((): string[] => []);
+const prewarmTasks = vi.fn<() => Promise<void>>();
 
 const checkpoint = (): RuntimeCheckpoint => ({
   version: 1,
@@ -51,6 +53,8 @@ beforeEach(async () => {
   responder.mockReset().mockImplementation(async () => { order.push("responder:installed"); return disposeResponder; });
   pluginIds.mockReset().mockReturnValue([]);
   prewarm.mockReset().mockResolvedValue(undefined);
+  taskPluginIds.mockReset().mockReturnValue([]);
+  prewarmTasks.mockReset().mockResolvedValue(undefined);
 
   vi.doMock("@tauri-apps/api/core", () => ({ invoke: native }));
   vi.doMock("./transport", () => ({ isWeb: web, invoke: remote, initializeWorkerEvents: workerInitialize, resumeWorkerEvents: replay }));
@@ -78,7 +82,8 @@ beforeEach(async () => {
   });
   vi.doMock("./runtime-observer", () => ({ installRuntimeObserverResponder: responder }));
   vi.doMock("@/features/plugins/runtime/chat-bridge", () => ({ pendingHostChatPluginIds: pluginIds }));
-  vi.doMock("@/features/plugins/runtime/loader", () => ({ prewarmHostChatBridges: prewarm }));
+  vi.doMock("@/features/plugins/runtime/task-bridge", () => ({ pendingHostTaskPluginIds: taskPluginIds }));
+  vi.doMock("@/features/plugins/runtime/loader", () => ({ prewarmHostChatBridges: prewarm, prewarmHostTaskBridges: prewarmTasks }));
 });
 
 afterEach(() => {
@@ -96,6 +101,34 @@ async function prepareMountedRecovery() {
 }
 
 describe("live update bootstrap ownership boundaries", () => {
+  it("waits for the task plugin owner to restore before replay and health confirmation", async () => {
+    const saved = recovery();
+    const participantId = "host-task-bridge:task-plugin";
+    saved.checkpoint.participants[participantId] = { version: 1, pluginId: "task-plugin" };
+    native.mockImplementation(async command => command === "live_update_bootstrap" ? saved : undefined);
+    taskPluginIds.mockReturnValue(["task-plugin"]);
+    const ownerGate = Promise.withResolvers<void>();
+    const restoreTask = vi.fn();
+    prewarmTasks.mockImplementation(async () => {
+      await ownerGate.promise;
+      coordinator.register({ id: participantId, capture: () => ({}), restore: restoreTask });
+    });
+    const finish = await prepareMountedRecovery();
+    const finishing = finish();
+    await vi.waitFor(() => expect(prewarmTasks).toHaveBeenCalledExactlyOnceWith(["task-plugin"]));
+    expect(taskPluginIds).toHaveBeenCalledWith(saved.checkpoint);
+    expect(replay).not.toHaveBeenCalled();
+    expect(confirmCalls()).toHaveLength(0);
+    expect(coordinator.isPaused()).toBe(true);
+    ownerGate.resolve();
+    await finishing;
+    expect(restoreTask).toHaveBeenCalledExactlyOnceWith(saved.checkpoint.participants[participantId]);
+    expect(replay).toHaveBeenCalledOnce();
+    expect(confirmCalls()).toHaveLength(1);
+    expect(coordinator.isPaused()).toBe(false);
+    expect(document.documentElement.inert).toBe(false);
+  });
+
   it("retains a retired Spellcast checkpoint without waiting for or reactivating its plugin", async () => {
     const saved = recovery();
     const retiredId = "host-chat-bridge:spellcast-canvas-bridge";

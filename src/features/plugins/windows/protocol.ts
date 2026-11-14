@@ -2,6 +2,10 @@ import { invoke, listen } from "@/lib/transport";
 
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 export interface DetachedSnapshot { revision: number; state: JsonValue }
+export type JsonChange = { op: "set"; path: (string | number)[]; value: JsonValue } | { op: "remove"; path: (string | number)[] };
+export type SnapshotUpdate = { kind: "full"; snapshot: DetachedSnapshot }
+  | { kind: "patch"; baseRevision: number; revision: number; changes: JsonChange[] }
+  | { kind: "unchanged"; revision: number };
 export interface DetachedAction { name: string; args: JsonValue[] }
 export interface DetachedLabels { returnToMain: string; ownerUnavailable: string; actionFailed: string; loading: string }
 export interface WindowIdentity { windowId: string; registrationId: string }
@@ -37,7 +41,10 @@ export const EVENTS = {
   returned: "plugin-window://returned", closeRequested: "plugin-window://close-requested",
   returnBlocked: "plugin-window://return-blocked",
 } as const;
-export const MAX_JSON_BYTES = 8 * 1024 * 1024;
+// Snapshot state can contain a long native transcript. Keep action results on
+// their separate, smaller budget so enlarging the view does not enlarge inputs.
+export const MAX_JSON_BYTES = 64 * 1024 * 1024;
+export const MAX_RESULT_BYTES = 8 * 1024 * 1024;
 export const MAX_ACTION_BYTES = 64 * 1024;
 
 /** Reject lossy JSON conversions (undefined, dates, cycles, NaN), then detach references. */
@@ -78,10 +85,21 @@ export function jsonKey(value: JsonValue): string {
   if (value !== null && typeof value === "object") return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${jsonKey(value[key])}`).join(",")}}`;
   return JSON.stringify(value);
 }
+/** Compare validated JSON without constructing another serialization of its history. */
+export function equalJson(a: JsonValue, b: JsonValue): boolean {
+  if (a === b) return true;
+  if (a === null || b === null || typeof a !== "object" || typeof b !== "object") return false;
+  if (Array.isArray(a)) {
+    return Array.isArray(b) && a.length === b.length && a.every((value, index) => equalJson(value, b[index]));
+  }
+  if (Array.isArray(b)) return false;
+  const keys = Object.keys(a);
+  return keys.length === Object.keys(b).length && keys.every(key => Object.hasOwn(b, key) && equalJson(a[key], b[key]));
+}
 export function mergeSnapshot(current: DetachedSnapshot | undefined, incoming: DetachedSnapshot): DetachedSnapshot {
   const next = copySnapshot(incoming);
   if (!current || next.revision > current.revision) return next;
-  if (next.revision === current.revision && jsonKey(next.state) !== jsonKey(current.state))
+  if (next.revision === current.revision && !equalJson(next.state, current.state))
     throw new Error("Conflicting detached snapshot revision");
   return current;
 }

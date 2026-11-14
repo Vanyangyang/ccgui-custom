@@ -24,8 +24,10 @@ import { isCrossSessionRecordUnread, useCrossSessionActivityStore } from "@/feat
 import { CrossSessionQueue } from "@/features/chat/components/CrossSessionQueue";
 
 const runtime = vi.hoisted(() => ({ web: false }));
+// Parent continuation has its own unmocked runtime integration coverage.
+vi.mock("./parent-wakeup", () => ({ startParentWakeupRuntime: () => ({ refresh: async () => {}, dispose() {} }) }));
 vi.mock("@/lib/transport", () => ({ get isWeb() { return runtime.web; }, invoke: vi.fn(), listen: vi.fn(async () => () => {}) }));
-vi.mock("@/lib/ipc", () => ({ ipc: { loadSessionPage: vi.fn(), officialConfigRead: vi.fn(async () => [{ path: "/global/.claude/settings.json", exists: true, format: "json", content: '{"autoCompactWindow":750000}' }]), rescanSessions: vi.fn(async () => {}), usageRecord: vi.fn(async () => {}), computerUseSetActive: vi.fn(async () => {}), remoteControlActive: vi.fn(async () => false), listPlanReviews: vi.fn(async () => []) } }));
+vi.mock("@/lib/ipc", () => ({ ipc: { loadSessionPage: vi.fn(), grantScope: vi.fn(async () => "/granted"), officialConfigRead: vi.fn(async () => [{ path: "/global/.claude/settings.json", exists: true, format: "json", content: '{"autoCompactWindow":750000}' }]), rescanSessions: vi.fn(async () => {}), usageRecord: vi.fn(async () => {}), computerUseSetActive: vi.fn(async () => {}), remoteControlActive: vi.fn(async () => false), listPlanReviews: vi.fn(async () => []) } }));
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({ t: (key: string, options?: { title?: string; count?: number; time?: string; tokens?: string; max?: string; percent?: string }) =>
     key === "leader.deleteGroupConfirm" ? `${key}:${options?.title}:${options?.count}` : options?.time ? `${key}:${options.time}` : key === "leader.contextUsage" ? `${key}:${options?.tokens}/${options?.max}:${options?.percent}` : key }),
@@ -65,6 +67,7 @@ describe("Leader sidebar tree", () => {
     localStorage.setItem("ccgui-next.sidebarChatListMode:v1", mode);
     const hotCache = { startedAt: now - 60_000, observedAt: now - 50_000, ttlSeconds: 3600, source: "anthropic-usage" as const };
     const coldCache = { startedAt: now - 600_000, observedAt: now - 590_000, ttlSeconds: 300, source: "anthropic-usage" as const };
+    const cursorCache = { startedAt: now - 120_000, observedAt: now - 110_000, ttlSeconds: 300, source: "cursor-policy" as const };
     const native: LeaderSnapshot = { leaders: [parent], branches: [
       { ...branch("child", "claude"), state: "completed" },
       branch("grandchild", "codex", "child", "claude"),
@@ -77,14 +80,15 @@ describe("Leader sidebar tree", () => {
       { id: "claude/child", engine: "claude", label: "child conversation", time: "child-age", promptCache: coldCache },
       { id: "codex/grandchild", engine: "codex", label: "grandchild conversation", time: "grandchild-age", promptCache: { ...hotCache, ttlSeconds: 1800, source: "openai-policy" } },
       { id: "agy/unknown", engine: "agy", label: "unknown conversation", time: "unknown-age" },
-      { id: "cursor/cursor", engine: "cursor", label: "cursor conversation", time: "cursor-age", promptCache: { ...hotCache, ttlSeconds: 300, source: "cursor-policy" } },
+      { id: "cursor/cursor", engine: "cursor", label: "cursor conversation", time: "cursor-age", promptCache: cursorCache },
     ];
     const grouped = groupLeaderThreads(threads, native, "/branches");
     await act(async () => root.render(<AiChatSidebar
       repos={[{ id: "ws", label: "workspace", defaultOpen: true, threads: grouped }]}
       activeThreadId="codex/grandchild"
     />));
-    const row = (title: string) => node.querySelector<HTMLElement>(`[title="${title}"]`)!.closest("button")!.parentElement!;
+    const row = (title: string) => [...node.querySelectorAll<HTMLButtonElement>("button[data-thread-select]")]
+      .find((button) => button.title.split("\n")[0] === title)!.parentElement!;
     const chip = (title: string) => row(title).querySelector<HTMLElement>("[data-cache-heat]");
     expect(chip("root conversation")?.dataset.cacheHeat).toBe("hot");
     const childChip = chip("child conversation");
@@ -101,8 +105,7 @@ describe("Leader sidebar tree", () => {
     const cursorChip = chip("cursor conversation");
     expect(cursorChip?.dataset.cacheHeat).toBe("hot");
     expect(cursorChip?.textContent).toBe("cursor-age");
-    expect(row("cursor conversation").querySelector('[data-cache-heat-ratio="0.8"]')).not.toBeNull();
-    expect(row("cursor conversation").textContent).toContain("cursor-age");
+    expect(cursorChip?.classList.contains("group-hover:hidden")).toBe(false);
     expect(row("cursor conversation").textContent).toContain("leader.state.stopped");
     expect(chip("task-pending")).toBeNull();
     expect(row("task-pending").textContent).toContain("leader.state.starting");
@@ -205,12 +208,21 @@ describe("Leader sidebar tree", () => {
     const grouped = groupLeaderThreads(rows(), snapshot(), "/branches");
     expect(grouped).toHaveLength(1);
     expect(grouped[0].children?.[0].children?.[0].id).toBe("claude/grandchild");
-    expect(paginateThreads(grouped, 1, 0).visibleThreads[0].children).toHaveLength(1);
+    const groupedPage = paginateThreads(grouped, 1, 0);
+    expect(groupedPage.visibleThreads).toEqual(grouped);
+    expect(groupedPage.visibleThreads[0].children).toHaveLength(1);
+    expect(groupedPage.hiddenCount).toBe(0);
     const flat = rows();
-    // Managed children stay with their root's workspace and must not appear
-    // again as ordinary rows in an unrelated workspace.
-    expect(groupLeaderThreads(flat, snapshot(), "/other")).toEqual([flat[0]]);
+    expect(paginateThreads(flat, 1, 0).visibleThreads).toEqual([flat[0]]);
     expect(paginateThreads(flat, 1, 0).hiddenCount).toBe(2);
+
+    const localRoot = { id: "claude/local", label: "local conversation", workspacePath: "/other", time: "" };
+    const otherWorkspaceRows = [localRoot, ...rows().slice(1).map((row) => ({ ...row, workspacePath: "/other" }))];
+    const crossWorkspace = snapshot();
+    crossWorkspace.branches = crossWorkspace.branches.map((branch) => ({
+      ...branch, parentWorkspacePath: branch.parentSessionId === "root" ? "/branches" : "/other", workspacePath: "/other",
+    }));
+    expect(groupLeaderThreads(otherWorkspaceRows, crossWorkspace, "/other")).toEqual([localRoot]);
   });
   it("reconstitutes a missing parent and keeps pending branches unopenable", () => {
     const pending = { ...branch("pending"), sessionId: null, state: "starting" as const };
@@ -256,7 +268,8 @@ describe("Leader TTL and context management display", () => {
     const label = "Very long task title 中文 🚀 ".repeat(20);
     const threads = groupLeaderThreads([rows()[0], { ...rows()[1], label }], { leaders: [parent], branches: [expired] }, "/branches");
     await act(async () => root.render(<AiChatSidebar repos={[{ id: "ws", label: "workspace", threads }]} activeThreadId="codex/child" />));
-    const title = [...node.querySelectorAll<HTMLElement>("[title]")].find((element) => element.title === label)!;
+    const title = [...node.querySelectorAll<HTMLElement>("button[data-thread-select] > span[title]")]
+      .find((element) => element.title.split("\n")[0] === label)!;
     expect(title.className).toContain("truncate"); expect(title.className).toContain("min-w-0");
     const ttl = [...node.querySelectorAll<HTMLElement>("[title]")].find((element) => element.title.includes("leader.expiredDeadline"))!;
     expect(ttl.title).toContain(new Date(expired.deadlineAt).toLocaleString()); expect(ttl.title).toContain("retained failure");
@@ -461,6 +474,60 @@ describe("Leader over the remote browser transport", () => {
     expect(useLeaderStore.getState().snapshot).toBe(next);
     expect(refreshSessions).toHaveBeenCalledTimes(action === "restore" ? 1 : 0);
   });
+
+  it("uses the checked archive command for cleanup and never falls back when the host lacks it", async () => {
+    const expected = { branchIds: ["child"], members: [parent, { engine: "codex", sessionId: "child", workspacePath: "/branches" }], lastActivityAt: 123 };
+    const before = useLeaderStore.getState().snapshot;
+    vi.mocked(invoke).mockRejectedValueOnce(new Error("unknown command"));
+    await expect(useLeaderStore.getState().groupAction(parent, "archive", expected)).rejects.toThrow("unknown command");
+    expect(invoke).toHaveBeenCalledExactlyOnceWith("task_group_archive_checked", { ...parent, expected });
+    expect(useLeaderStore.getState().snapshot).toBe(before);
+    expect(useLeaderStore.getState().error).toContain("unknown command");
+    vi.mocked(invoke).mockClear();
+    const missing: LeaderSnapshot = { leaders: [parent], branches: [], archivedGroups: [] };
+    vi.mocked(invoke).mockResolvedValueOnce(missing);
+    await expect(useLeaderStore.getState().groupAction(parent, "archive", expected)).rejects.toThrow("CLEANUP_GROUP_CHANGED");
+    expect(invoke).toHaveBeenCalledExactlyOnceWith("task_group_archive_checked", { ...parent, expected });
+    expect(useLeaderStore.getState().snapshot).toBe(missing);
+    vi.mocked(invoke).mockClear();
+    const committed: LeaderSnapshot = { leaders: [parent], branches: [branch("child")], archivedGroups: [{
+      root: parent, title: "Task", archivedAt: 123, members: expected.members, branchIds: expected.branchIds,
+    }] };
+    vi.mocked(invoke).mockResolvedValueOnce(committed);
+    await useLeaderStore.getState().groupAction(parent, "archive", expected);
+    expect(invoke).toHaveBeenCalledExactlyOnceWith("task_group_archive_checked", { ...parent, expected });
+    expect(useLeaderStore.getState().snapshot).toBe(committed);
+  });
+
+  it("archives one child subtree through its own checked command and restores it by its chat", async () => {
+    const child = { engine: "codex", sessionId: "child", workspacePath: "/branches" };
+    const grandchild = { engine: "claude", sessionId: "grandchild", workspacePath: "/branches" };
+    const expected = { branchIds: ["child", "grandchild"], members: [child, grandchild], lastActivityAt: 123 };
+    useLeaderStore.setState({ snapshot: snapshot() });
+    useChatStore.setState({ sessions: [child, grandchild].map((member) => ({ ...member, title: member.sessionId } as SessionMeta)) });
+    vi.mocked(invoke).mockResolvedValueOnce({ ...snapshot(), archivedGroups: [] });
+    await expect(useLeaderStore.getState().archiveSubtree(parent, "child", expected)).rejects.toThrow("CLEANUP_GROUP_CHANGED");
+    expect(invoke).toHaveBeenCalledExactlyOnceWith("task_subtree_archive_checked", {
+      parentEngine: "claude", parentSessionId: "root", workspacePath: "/branches", branchId: "child", expected,
+    });
+    expect(useChatStore.getState().sessions).toHaveLength(2);
+    const record: LeaderArchivedGroup = { root: child, title: "Child", archivedAt: 123, members: [child, grandchild], branchIds: ["grandchild"] };
+    const committed: LeaderSnapshot = { ...snapshot(), archivedGroups: [record] };
+    vi.mocked(invoke).mockClear().mockResolvedValueOnce(committed);
+    await useLeaderStore.getState().archiveSubtree(parent, "child", expected);
+    expect(useLeaderStore.getState().snapshot).toBe(committed);
+    expect(useChatStore.getState().sessions).toEqual([]);
+    expect(useChatStore.getState().archivedSessionKeys).toMatchObject({ "codex/child": true, "claude/grandchild": true });
+    // A child-rooted record restores by its chat, not through the topmost root.
+    vi.spyOn(useChatStore.getState(), "refreshSessions").mockResolvedValue();
+    vi.mocked(invoke).mockClear().mockResolvedValueOnce(snapshot());
+    await useLeaderStore.getState().groupAction(child, "restore");
+    expect(invoke).toHaveBeenCalledExactlyOnceWith("task_group_action", { ...child, action: "restore" });
+    // Archiving still requires the topmost root.
+    vi.mocked(invoke).mockClear();
+    await expect(useLeaderStore.getState().groupAction(child, "archive")).rejects.toThrow();
+    expect(invoke).not.toHaveBeenCalled();
+  });
 });
 
 describe("Leader runtime connection lifecycle", () => {
@@ -525,6 +592,69 @@ describe("Leader runtime connection lifecycle", () => {
 });
 
 describe("native-managed background events", () => {
+  it("shows every parent assignment in an existing child, including identical follow-ups", () => {
+    const key = "agy/follow-up-visible";
+    const previous = [{ seq: 1, role: "user", text: "之前的任务", ts: null }, { seq: 2, role: "assistant", text: "之前的结果", ts: null }];
+    useChatStore.setState({ bySession: { [key]: { ...EMPTY_SESSION, messages: previous } } });
+    const source = { engine: "codex", sessionId: "real-parent", workspacePath: "/parent" };
+    const assignment = (runId: string) => ({ engine: "agy", sessionId: "follow-up-visible", runId, seq: 1, kind: "session" as const, data: "follow-up-visible",
+      leader: { branchId: "follow-up-visible-branch", workspacePath: "/branches", title: "child", assignment: "继续核对🙂", assignmentSource: source } });
+    const first = assignment("follow-up-visible-1"), second = assignment("follow-up-visible-2");
+    handleEngineEvents([first, first, { ...first, kind: "delta", data: "第一轮回复" }, { ...first, kind: "done", data: { usage: null } }], deps());
+    handleEngineEvents([second, second, { ...second, kind: "thinking", data: "核查过程" },
+      { ...second, kind: "message", data: { role: "tool", text: "read_file" } },
+      { ...second, kind: "delta", data: "第二轮回复" }, { ...second, kind: "done", data: { usage: null } }], deps());
+    const messages = useChatStore.getState().bySession[key].messages;
+    expect(messages.map(message => message.text)).toEqual(["之前的任务", "之前的结果", "继续核对🙂", "第一轮回复", "继续核对🙂", "核查过程", "read_file", "第二轮回复"]);
+    expect(messages[0]).toBe(previous[0]); expect(messages[1]).toBe(previous[1]);
+    expect(messages.filter(message => message.text === "继续核对🙂").map(message => message.internalSource)).toEqual([source, source]);
+    expect(new Set(messages.map(message => message.seq)).size).toBe(messages.length);
+  });
+
+  it("inserts a late assignment before already flushed output of its run", () => {
+    const key = "claude/late-follow-up-visible";
+    useChatStore.setState({ bySession: { [key]: { ...EMPTY_SESSION, messages: [
+      { seq: 1, role: "user", text: "旧任务", ts: null }, { seq: 2, role: "assistant", text: "旧结果", ts: null },
+    ] } } });
+    const event = { engine: "claude", sessionId: "late-follow-up-visible", runId: "late-follow-up-visible-run", seq: 1, kind: "delta" as const, data: "新回复前文",
+      leader: { branchId: "late-follow-up-visible-branch", workspacePath: "/branches", title: "late" } };
+    // The tool boundary flushes and seals the early text before session metadata arrives.
+    handleEngineEvents([event, { ...event, kind: "message", data: { role: "tool", text: "read_file" } },
+      { ...event, kind: "session", data: event.sessionId, leader: { ...event.leader, assignment: "新任务" } },
+      { ...event, kind: "delta", data: "新回复后文" }, { ...event, kind: "done", data: { usage: null } }], deps());
+    const messages = useChatStore.getState().bySession[key].messages;
+    expect(messages.map(message => message.text)).toEqual(["旧任务", "旧结果", "新任务", "新回复前文", "read_file", "新回复后文"]);
+    expect(new Set(messages.map(message => message.seq)).size).toBe(messages.length);
+  });
+
+  it("keeps an early permission card's identity valid when its assignment arrives late", async () => {
+    const key = "claude/late-input-grant";
+    let resolveScope!: (value: string) => void;
+    vi.mocked(ipc.grantScope).mockImplementationOnce(() => new Promise(resolve => { resolveScope = resolve; }));
+    const event = { engine: "claude", sessionId: "late-input-grant", runId: "late-input-grant-run", seq: 1, kind: "permission_denied" as const,
+      data: { path: "/outside/file.ts", message: "Permission required" }, leader: { branchId: "late-input-grant", workspacePath: "/branches", title: "late" } };
+    handleEngineEvents([event], deps());
+    const grant = useChatStore.getState().bySession[key].messages[0];
+    handleEngineEvents([{ ...event, kind: "session", data: event.sessionId, leader: { ...event.leader, assignment: "检查权限" } }], deps());
+    expect(useChatStore.getState().bySession[key].messages[1]).toBe(grant);
+    resolveScope("/outside");
+    await Promise.resolve();
+    const messages = useChatStore.getState().bySession[key].messages;
+    expect(messages.map(message => message.text)).toEqual(["检查权限", "Permission required"]);
+    expect(messages[1].seq).toBe(grant.seq);
+    expect(messages[1].grant?.dir).toBe("/outside");
+  });
+
+  it.each(["settledRunIds", "retiredNativeRunIds"] as const)("does not insert a late assignment from a run in %s", fence => {
+    const key = `claude/fenced-input-${fence}`;
+    const runId = `fenced-input-${fence}-run`;
+    const messages = [{ seq: 1, role: "user", text: "保留原记录", ts: null }];
+    useChatStore.setState({ bySession: { [key]: { ...EMPTY_SESSION, messages, [fence]: [runId] } } });
+    handleEngineEvents([{ engine: "claude", sessionId: `fenced-input-${fence}`, runId, seq: 1, kind: "session", data: `fenced-input-${fence}`,
+      leader: { branchId: `fenced-input-${fence}`, workspacePath: "/branches", title: "stale", assignment: "旧任务不得重复" } }], deps());
+    expect(useChatStore.getState().bySession[key].messages).toBe(messages);
+  });
+
   it("adopts two same-engine children without taking a foreground draft or opening tabs", () => {
     const draft = { ...EMPTY_SESSION, messages: [{ seq: 1, role: "user", text: "my unsent task", ts: null }] };
     const active = { engine: "codex", sessionId: null, workspacePath: "/foreground" };
@@ -580,11 +710,36 @@ describe("native-managed background events", () => {
       set(s => ({ bySession: { ...s.bySession, [key]: { ...s.bySession[key], streaming: false } } }));
       await vi.waitFor(() => expect(state.bySession[key].messages).toBe(history.messages));
       expect(state.bySession[key].messages.filter(m => m.role === "user")).toHaveLength(1);
+      expect(state.bySession[key].managedAssignmentRuns).toContain("hydrating-run");
+      handleEngineEvents([{ engine: "codex", sessionId: "hydrating", runId: "hydrating-run", seq: 1, kind: "session", data: "hydrating",
+        leader: { branchId: "hydrating-branch", workspacePath: "/branches", title: "hydrating", assignment: "task" } }], { ...deps(), get: () => state, set });
+      expect(state.bySession[key].messages).toBe(history.messages);
     } finally { teardowns.forEach(off => off()); }
   });
 });
 
 describe("parent management and lifecycle", () => {
+  it("uses the native committed member list when a group changes during archive", async () => {
+    const groupRoot = { ...parent, sessionId: "archive-race-root" };
+    const first = { ...branch("archive-race-first"), parentSessionId: groupRoot.sessionId, state: "completed" as const };
+    const late = { ...branch("archive-race-late"), parentSessionId: groupRoot.sessionId, state: "completed" as const };
+    const lateIdentity = { engine: late.engine, sessionId: late.sessionId!, workspacePath: late.workspacePath };
+    const before: LeaderSnapshot = { leaders: [groupRoot], branches: [first] };
+    const committed: LeaderSnapshot = { leaders: [groupRoot], branches: [first, late], archivedGroups: [{
+      root: groupRoot, title: "Group", archivedAt: 1,
+      members: [groupRoot, { engine: first.engine, sessionId: first.sessionId!, workspacePath: first.workspacePath }, lateIdentity],
+      branchIds: [first.id, late.id],
+    }] };
+    const lateKey = `${late.engine}/${late.sessionId}`;
+    useLeaderStore.setState({ snapshot: before });
+    useChatStore.setState({ openTabs: [lateIdentity], active: lateIdentity, bySession: { [lateKey]: { ...EMPTY_SESSION } }, drafts: { [lateKey]: "late draft" } });
+    vi.mocked(invoke).mockResolvedValueOnce(committed);
+    await useLeaderStore.getState().groupAction(groupRoot, "archive");
+    expect(useChatStore.getState().openTabs).toEqual([]);
+    expect(useChatStore.getState().archivedSessionKeys[lateKey]).toBe(true);
+    expect(useChatStore.getState().drafts[lateKey]).toBe("late draft");
+  });
+
   it("archives all generations and the root in one batch, restores without tombstones or stealing focus", async () => {
     const child = { ...branch("archive-clean-child"), state: "completed" as const, result: "saved result" };
     const grandchild = { ...branch("archive-clean-grandchild", "claude", child.sessionId!, child.engine), state: "stopped" as const };
@@ -608,13 +763,14 @@ describe("parent management and lifecycle", () => {
       expect(invoke).toHaveBeenLastCalledWith("task_group_action", { ...groupRoot, action: "archive" });
       expect(useChatStore.getState().openTabs).toEqual([survivor]); expect(useChatStore.getState().active).toMatchObject(survivor);
       expect(activated).toHaveBeenCalledExactlyOnceWith({ engine: survivor.engine, sessionId: survivor.sessionId });
-      for (const key of keys) { expect(useChatStore.getState().bySession[key]).toBeUndefined(); expect(useChatStore.getState().drafts[key]).toBeUndefined(); expect(isReclaimedLeaderSession(key)).toBe(false); }
+      for (const key of keys) { expect(useChatStore.getState().bySession[key]).toBeUndefined(); expect(useChatStore.getState().drafts[key]).toBe("unsent"); expect(isReclaimedLeaderSession(key)).toBe(false); }
       expect(leaderEventAllowed(child.id, keys[1])).toBe(true);
       expect(useLeaderStore.getState().snapshot.branches).toBe(before.branches);
       activated.mockClear(); vi.mocked(invoke).mockResolvedValueOnce({ ...before, archivedGroups: [] });
       await useLeaderStore.getState().groupAction(groupRoot, "restore");
       expect(ipc.rescanSessions).toHaveBeenCalledOnce(); expect(refreshSessions).toHaveBeenCalledOnce();
       expect(useChatStore.getState().archivedSessionKeys).toEqual({}); expect(useChatStore.getState().active).toMatchObject(survivor);
+      for (const key of keys) expect(useChatStore.getState().drafts[key]).toBe("unsent");
       expect(activated).not.toHaveBeenCalled(); expect(ipc.loadSessionPage).not.toHaveBeenCalled();
       expect(groupLeaderThreads([], useLeaderStore.getState().snapshot, "/branches")[0].children?.[0].selectable).toBe(true);
     } finally { offActivated(); off(); }

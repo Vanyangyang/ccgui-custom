@@ -22,6 +22,16 @@ beforeEach(() => {
 afterEach(() => vi.restoreAllMocks());
 
 describe("controlled host discussions", () => {
+  it("dispatches AGY as a controlled read-only discussion with its exact model and provider", async () => {
+    const runId = "sidechat-controlled-agy";
+    await state().sendSidechatMessage({ ...args, engine: "agy", sessionKey: "host-agy", parentSessionId: null,
+      strictBusy: true, requestedRunId: runId, prompt: "inspect only", model: "gemini-4-argon-high", providerId: "agy-channel" });
+    expect(ipc.sendSideMessage).toHaveBeenCalledWith(expect.objectContaining({ engine: "agy", model: "gemini-4-argon-high",
+      providerId: "agy-channel", effort: null, permission: null, parentSessionId: null, runId }));
+    expect(state().sidechatBySession["host-agy"].mode).toBe("read-only");
+    handleSideRunEvent({ runId, seq: 100, kind: "done", data: { sessionId: "side" }, engine: "agy", sessionId: null });
+    expect(state().sidechatBySession["host-agy"].streaming).toBe(false);
+  });
   it("keeps a controlled uncertain delivery routed until its exact native terminal event", async () => {
     const runId = "sidechat-controlled-uncertain";
     vi.mocked(ipc.sendSideMessage).mockRejectedValueOnce({ outcomeUnknown: true, code: "request-uncertain" });

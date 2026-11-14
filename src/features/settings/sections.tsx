@@ -15,6 +15,8 @@ import Smartphone from "lucide-react/dist/esm/icons/smartphone";
 import ChartColumn from "lucide-react/dist/esm/icons/chart-column";
 import Sparkles from "lucide-react/dist/esm/icons/sparkles";
 import Plug from "lucide-react/dist/esm/icons/plug";
+import LayoutGrid from "lucide-react/dist/esm/icons/layout-grid";
+import Webhook from "lucide-react/dist/esm/icons/webhook";
 // 电脑操控入口：暂时隐藏，恢复时取消注释。
 // import MousePointer2 from "lucide-react/dist/esm/icons/mouse-pointer-2";
 import i18n from "@/lib/i18n";
@@ -182,6 +184,16 @@ const LazyMcpSection = lazySection(() =>
     default: module.McpSection,
   })),
 );
+const LazyCliPluginsSection = lazySection(() =>
+  import("@/features/cli-plugins/CliPluginsSection").then((module) => ({
+    default: module.CliPluginsSection,
+  })),
+);
+const LazyCliHooksSection = lazySection(() =>
+  import("@/features/cli-hooks/CliHooksSection").then((module) => ({
+    default: module.CliHooksSection,
+  })),
+);
 const LazyLeaderSection = lazySection(() =>
   import("./LeaderSection").then((module) => ({ default: module.LeaderSection })),
 );
@@ -218,6 +230,24 @@ settingsRegistry.register({
   group: "capabilities",
   order: 1,
   component: LazyMcpSection,
+});
+settingsRegistry.register({
+  id: "cliPlugins",
+  key: "cliPlugins",
+  label: () => i18n.t("settings.cliPlugins"),
+  icon: LayoutGrid,
+  group: "capabilities",
+  order: 2,
+  component: LazyCliPluginsSection,
+});
+settingsRegistry.register({
+  id: "cliHooks",
+  key: "cliHooks",
+  label: () => i18n.t("settings.cliHooks"),
+  icon: Webhook,
+  group: "capabilities",
+  order: 3,
+  component: LazyCliHooksSection,
 });
 // 电脑操控入口：暂时隐藏，恢复时取消注释。
 // settingsRegistry.register({

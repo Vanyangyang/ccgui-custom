@@ -22,7 +22,7 @@ import { EFFORT_LABEL_KEYS, getDefaultEffort, getEffortLevels, normalizeEffortLe
 import { EngineFlyout, EngineModelPanel, type ChannelOption } from "./engine-model-panel";
 import { cursorTriggerLabel, useCursorModelPrefs } from "./cursor-model-picker";
 import type { CursorModel } from "./cursor-models";
-import { encodedModelEffort, modelBaseLabel } from "./model-effort";
+import { AGY_ENCODED_EFFORT_LEVELS, encodedModelEffort, modelBaseLabel, modelHasNoEffort } from "./model-effort";
 
 export type { EffortLevel } from "./effort-levels";
 
@@ -219,9 +219,11 @@ function CliMenuTrigger({
   // Snapshot width on open; clear on close. Shorter model labels then can't
   // shrink the trigger mid-session and slide the popover.
   const lockedMinWidth = useLockedMinWidth(isOpen, triggerRef);
-  const hasEffort = supportsEffort(engine);
+  const hasEffort = supportsEffort(engine) && !modelHasNoEffort(engine, modelId);
   const encodedEffort = encodedModelEffort(engine, modelId);
   const displayEffort = encodedEffort ?? normalizeEffortLevel(engine, effort);
+  // A catalog-encoded tier can exceed the engine's independent effort choices.
+  const displayEffortLevels = encodedEffort ? AGY_ENCODED_EFFORT_LEVELS : getEffortLevels(engine);
   const modelLabel = model ? modelBaseLabel(engine, model) : undefined;
   const showUltracode = selectionScope === "chat" && engine === "claude" && claudeUltracode;
   return (
@@ -250,7 +252,7 @@ function CliMenuTrigger({
             </span>
             {/* Reserve the widest localized level so the right-aligned popover stays put. */}
             <span className={cx("inline-grid shrink-0", !encodedEffort && "max-md:hidden")}>
-              {getEffortLevels(engine).map(level => (
+              {displayEffortLevels.map(level => (
                 <span key={level} aria-hidden={level !== displayEffort} className={cx("col-start-1 row-start-1", level !== displayEffort && "invisible")}>
                   {t(EFFORT_LABEL_KEYS[level])}
                 </span>

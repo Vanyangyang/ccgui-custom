@@ -15,6 +15,9 @@ export interface HostConversationFacade {
   workspace(path: string): Promise<string>;
   read(key: string): SidechatState | undefined;
   restore(key: string, state: SidechatState): void;
+  /** Release only an exact, idle, durably saved private discussion. No native
+   * cleanup or cancellation: the controller restores its complete saved state. */
+  release?(key: string, expected: SidechatState): boolean;
   send(key: string, workspacePath: string, selection: ConversationSelection, prompt: string, runId: string, images?: string[]): Promise<void>;
   stop(key: string, runId: string): Promise<void>;
   openFile(workspacePath: string, path: string): Promise<void>;
@@ -51,19 +54,20 @@ export function desktopConversationFacade(): Promise<HostConversationFacade> {
       async catalog() {
         const config = await ipc.getCliConfig();
         const engines: ConversationCatalog["engines"] = [];
-        for (const id of ["claude", "codex"] as const) {
+        for (const id of ["claude", "codex", "agy"] as const) {
           const info = task.engines().find((e) => e.id === id);
           if (!info?.available || !info.enabled) continue;
           const section = config[id];
-          engines.push({ id, label: id === "claude" ? "Claude" : "Codex", available: true,
+          engines.push({ id, label: id === "claude" ? "Claude" : id === "codex" ? "Codex" : "AGY", available: true,
             supportsImages: info.supportsImages === true,
+            supportsFixedInstructions: await nativeFixedInstructionsSupported(id),
             models: (await task.models(id)).map((m) => ({ id: m.id, label: m.name || m.id })),
             providers: [{ id: "__local_settings_json__", label: i18n.t("settings.cliOfficial") },
               ...Object.entries(section.providers).filter(([key]) => key !== "__local_settings_json__").map(([key, raw]) => ({
                 id: key, label: raw && typeof raw === "object" && "name" in raw && typeof raw.name === "string" ? raw.name : key,
               }))],
-            efforts: getEffortLevels(id).map(effort => ({ id: effort, label: i18n.t(EFFORT_LABEL_KEYS[effort]) })),
-            defaultModel: info.defaultModel, defaultEffort: normalizeEffortLevel(id, info.defaultEffort) || getDefaultEffort(id),
+            efforts: id === "agy" ? [] : getEffortLevels(id).map(effort => ({ id: effort, label: i18n.t(EFFORT_LABEL_KEYS[effort]) })),
+            defaultModel: info.defaultModel, defaultEffort: id === "agy" ? null : normalizeEffortLevel(id, info.defaultEffort) || getDefaultEffort(id),
             defaultProviderId: section.current || "__local_settings_json__",
           });
         }
@@ -79,6 +83,18 @@ export function desktopConversationFacade(): Promise<HostConversationFacade> {
       restore(key, state) {
         if (useSidechatStore.getState().sidechatBySession[key]) return;
         useSidechatStore.setState((s) => ({ sidechatBySession: { ...s.sidechatBySession, [key]: state } }));
+      },
+      release(key, expected) {
+        let released = false;
+        useSidechatStore.setState((s) => {
+          const current = s.sidechatBySession[key];
+          if (current !== expected || current.streaming || current.runId || current.draft || current.draftImages?.length) return s;
+          const next = { ...s.sidechatBySession };
+          delete next[key];
+          released = true;
+          return { sidechatBySession: next };
+        });
+        return released;
       },
       async send(key, workspacePath, selection, prompt, runId, images) {
         await useSidechatStore.getState().sendSidechatMessage({ sessionKey: key,

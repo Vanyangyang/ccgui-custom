@@ -60,7 +60,7 @@ export function recallContextWindow(
  * https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/start/get-started-with-gemini-4
  * Verified 2026-10-16: the 1,048,576 tokens are shared by input and output. */
 function publishedApiWindow(engine: string, model?: string | null): number | undefined {
-  return engine === "agy" && model === "gemini-4-argon" ? 1_048_576 : undefined;
+  return engine === "agy" && (model === "gemini-4-argon" || model === "gemini-4-carbon") ? 1_048_576 : undefined;
 }
 
 /** A live report wins, then memory, the catalog, documented API capacity,

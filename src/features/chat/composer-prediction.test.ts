@@ -5,9 +5,11 @@ import {
   clearComposerPrediction,
   extractPredictionTurns,
   getComposerPrediction,
+  getComposerPredictionSnapshot,
   migrateComposerPredictionSessionKey,
   requestComposerPrediction,
   setComposerPredictionEnabled,
+  setComposerPrediction,
 } from "./composer-prediction";
 import { handleEngineEvents, type EngineEventDeps } from "./store/engine-events";
 import { EMPTY_SESSION } from "./store/stream";
@@ -18,6 +20,34 @@ describe("composer-prediction across channels", () => {
     clearAllComposerPredictions();
     setComposerPredictionEnabled(true);
     vi.restoreAllMocks();
+  });
+
+  it("gives each newly generated prediction a stable identity across migration and rejects a previous generation", () => {
+    setComposerPrediction("from", "继续讨论🙂");
+    const first = getComposerPredictionSnapshot("from");
+    expect(first).toMatchObject({ text: "继续讨论🙂", id: expect.any(Number) });
+    setComposerPrediction("from", "继续讨论🙂");
+    expect(getComposerPredictionSnapshot("from")).toEqual(first);
+    migrateComposerPredictionSessionKey("from", "to");
+    expect(getComposerPredictionSnapshot("to")).toEqual(first);
+    clearComposerPrediction("to");
+    setComposerPrediction("to", "继续讨论🙂");
+    expect(getComposerPredictionSnapshot("to")?.id).not.toBe(first?.id);
+    setComposerPredictionEnabled(false);
+    expect(getComposerPredictionSnapshot("to")).toBeNull();
+  });
+
+  it("ignores a late request after the setting is disabled and a new request starts for the same session", async () => {
+    const old = Promise.withResolvers<string | null>(), current = Promise.withResolvers<string | null>();
+    vi.spyOn(ipc, "predictNextPrompt").mockReturnValueOnce(old.promise).mockReturnValueOnce(current.promise);
+    const messages = [{ seq: 1, ts: null, role: "user" as const, text: "讨论玩法" }, { seq: 2, ts: null, role: "assistant" as const, text: "先验证流程。" }];
+    requestComposerPrediction("session", messages);
+    setComposerPredictionEnabled(false); setComposerPredictionEnabled(true);
+    requestComposerPrediction("session", messages);
+    old.resolve("旧预测"); await Promise.resolve();
+    expect(getComposerPrediction("session")).toBeNull();
+    current.resolve("继续验证流程"); await Promise.resolve();
+    expect(getComposerPrediction("session")).toBe("继续验证流程");
   });
 
   it("extracts user and final assistant turns while ignoring slash commands and incomplete turns", () => {

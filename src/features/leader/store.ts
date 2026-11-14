@@ -2,7 +2,7 @@ import { create } from "zustand";
 import { invoke, isWeb } from "@/lib/transport";
 import { errorText } from "@/lib/errors";
 import i18n from "@/lib/i18n";
-import { isDirectChild, leaderBranchSubtree, leaderGroupRoot, leaderGroupBranches, parentWorkspacePath, sameIdentity, type LeaderBranch, type LeaderIdentity, type LeaderSnapshot } from "./types";
+import { archivedBranchIds, archivedGroupBranches, isDirectChild, leaderBranchSubtree, leaderGroupRoot, leaderGroupBranches, parentWorkspacePath, sameIdentity, type GroupCleanupExpectation, type LeaderBranch, type LeaderIdentity, type LeaderSnapshot } from "./types";
 import { useChatStore, sessionKey } from "@/features/chat/store";
 import { ipc } from "@/lib/ipc";
 import { removeLeaderSessions } from "./session-cleanup";
@@ -16,7 +16,10 @@ interface LeaderStore {
   busy: boolean;
   refresh: () => Promise<void>;
   act: (parent: LeaderIdentity, branchId: string, action: "stop" | "renew" | "reclaim", ttlSeconds?: number) => Promise<LeaderBranch>;
-  groupAction: (root: LeaderIdentity, action: "archive" | "restore" | "delete") => Promise<void>;
+  /** Restore and delete also accept a child-rooted archive record's root. */
+  groupAction: (root: LeaderIdentity, action: "archive" | "restore" | "delete", expected?: GroupCleanupExpectation) => Promise<void>;
+  /** Cleanup archive of one expired child subtree; its parent stays live. */
+  archiveSubtree: (parent: LeaderIdentity, branchId: string, expected: GroupCleanupExpectation) => Promise<void>;
   deleteBranch: (parent: LeaderIdentity, branchId: string, expectedBranchIds?: string[]) => Promise<void>;
 }
 
@@ -24,7 +27,8 @@ interface LeaderStore {
 export function branchDeletionState(snapshot: LeaderSnapshot, branchId: string, chat = useChatStore.getState()) {
   const branches = leaderBranchSubtree(snapshot, branchId);
   const members = branches.flatMap((b) => b.sessionId ? [{ engine: b.engine, sessionId: b.sessionId, workspacePath: b.workspacePath }] : []);
-  const available = !isWeb && branches.length > 0 && !snapshot.archivedGroups?.some((g) => branches.some((b) => g.branchIds.includes(b.id)))
+  const archived = archivedBranchIds(snapshot);
+  const available = !isWeb && branches.length > 0 && !branches.some((b) => archived.has(b.id))
     && !members.some((m) => chat.archivedSessionKeys[sessionKey(m.engine, m.sessionId, m.workspacePath)] || chat.sessions.some((s) => sameIdentity(s, m) && s.remote));
   const active = branches.some((b) => ["starting", "running", "waiting", "awaiting_cost_approval", "reclaiming"].includes(b.state)) || members.some((m) => {
     const key = sessionKey(m.engine, m.sessionId, m.workspacePath), session = chat.bySession[key];
@@ -113,21 +117,35 @@ export const useLeaderStore = create<LeaderStore>((set, get) => ({
       set({ error: errorText(error) }); throw error;
     } finally { set({ busy: false }); }
   },
-  groupAction: async (root, action) => {
+  groupAction: async (root, action, expected) => {
     if (get().busy) throw new Error(i18n.t("leader.busy"));
-    if (!sameIdentity(root, leaderGroupRoot(get().snapshot, root))) {
+    if (expected && action !== "archive") throw new Error("Cleanup expectations apply only to archive");
+    const archivedRecord = action !== "archive" && get().snapshot.archivedGroups?.some((group) => sameIdentity(group.root, root));
+    if (!archivedRecord && !sameIdentity(root, leaderGroupRoot(get().snapshot, root))) {
       const error = i18n.t("leader.rootOnly"); set({ error }); throw new Error(error);
     }
     ++revision;
     set({ busy: true, error: null });
     const before = get().snapshot;
     const archived = before.archivedGroups?.find((group) => sameIdentity(group.root, root));
-    const branches = archived ? before.branches.filter((branch) => archived.branchIds.includes(branch.id)) : leaderGroupBranches(before, root);
+    const branches = archived ? archivedGroupBranches(before, archived) : leaderGroupBranches(before, root);
     const members = [root, ...(archived?.members ?? branches.flatMap((branch) => branch.sessionId ? [{ engine: branch.engine, sessionId: branch.sessionId, workspacePath: branch.workspacePath }] : []))];
     try {
-      const snapshot = await invoke<LeaderSnapshot>("task_group_action", { ...root, action });
+      const snapshot = expected
+        ? await invoke<LeaderSnapshot>("task_group_archive_checked", { ...root, expected })
+        : await invoke<LeaderSnapshot>("task_group_action", { ...root, action });
       ++revision;
-      if (action !== "restore") removeLeaderSessions(members, branches, action === "delete");
+      if (action !== "restore") {
+        // The native transaction may have committed a newer complete group
+        // than the snapshot used to start the action.
+        const committed = action === "archive" ? snapshot.archivedGroups?.find((group) => sameIdentity(group.root, root)) : undefined;
+        if (expected && !committed) {
+          set({ snapshot });
+          throw new Error("CLEANUP_GROUP_CHANGED: Task group archive was not present in the returned snapshot");
+        }
+        const committedBranches = committed ? archivedGroupBranches(snapshot, committed) : branches;
+        removeLeaderSessions(committed?.members ?? members, committedBranches, action === "delete", action === "archive");
+      }
       set({ snapshot });
       if (action === "restore") {
         useChatStore.setState((s) => {
@@ -156,6 +174,30 @@ export const useLeaderStore = create<LeaderStore>((set, get) => ({
       }
       set({ error: errorText(error) }); throw error;
     }
+    finally { set({ busy: false }); }
+  },
+  archiveSubtree: async (parent, branchId, expected) => {
+    if (get().busy) throw new Error(i18n.t("leader.busy"));
+    ++revision;
+    set({ busy: true, error: null });
+    try {
+      const snapshot = await invoke<LeaderSnapshot>("task_subtree_archive_checked", {
+        parentEngine: parent.engine, parentSessionId: parent.sessionId, workspacePath: parent.workspacePath, branchId, expected,
+      });
+      ++revision;
+      const top = snapshot.branches.find((branch) => branch.id === branchId);
+      const committed = top?.sessionId ? snapshot.archivedGroups?.find((group) => sameIdentity(group.root, {
+        engine: top.engine, sessionId: top.sessionId!, workspacePath: top.workspacePath,
+      })) : undefined;
+      if (!committed) {
+        set({ snapshot });
+        throw new Error("CLEANUP_GROUP_CHANGED: Child task archive was not present in the returned snapshot");
+      }
+      // Clear exactly what the native transaction committed, including any
+      // nested archive it absorbed.
+      removeLeaderSessions(committed.members, archivedGroupBranches(snapshot, committed), false, true);
+      set({ snapshot });
+    } catch (error) { set({ error: errorText(error) }); throw error; }
     finally { set({ busy: false }); }
   },
 }));

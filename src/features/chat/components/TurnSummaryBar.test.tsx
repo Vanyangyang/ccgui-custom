@@ -21,18 +21,48 @@ describe("turn summary presentation", () => {
     await act(async () => root.unmount());
     container.remove();
   });
-  it("keeps reported numbers visible and names the whole-turn throughput", async () => {
-    await act(async () => root.render(<TurnSummaryBar message={{ ...message, durationMs: 10_000,
-      usage: { input_tokens: 100, cache_read_input_tokens: 900, output_tokens: 200, reasoning_output_tokens: 50 },
+
+  it("renders unified speed chip with active-time breakdown tooltip when turn_throughput is present", async () => {
+    await act(async () => root.render(<TurnSummaryBar message={{
+      ...message,
+      durationMs: 9_200,
+      usage: {
+        usage_scope: "turn",
+        input_tokens: 100,
+        cache_read_input_tokens: 900,
+        output_tokens: 100,
+        thinking_tokens: 50,
+        turn_throughput: {
+          output_tokens: 100,
+          elapsed_ms: 2_000,
+          wall_ms: 9_200,
+          tool_ms: 5_400,
+          wait_ms: 0,
+          startup_ms: 1_800,
+        },
+      },
     }} tools={3} />));
     expect(container.querySelector('[aria-label="本轮小结"]')).not.toBeNull();
-    expect(container.textContent).toContain("↑1k ↓200");
+    expect(container.textContent).toContain("↑1k ↓100");
     expect(container.textContent).toContain("90%");
-    expect(container.textContent).toContain("整轮效率 20 tok/s");
-    expect(container.querySelector('[title*="不是模型生成速度"]')?.getAttribute("title")).toContain("含工具、等待与思考");
+    expect(container.textContent).toContain("50 tok/s");
+    expect(container.textContent).not.toContain("整轮效率");
+    const speedTip = container.querySelector('[title*="模型推理速率"]')?.getAttribute("title") ?? "";
+    expect(speedTip).toContain("模型推理 2.0s · 工具 5.4s · 启动 1.8s · 总耗时 9.2s");
     expect(container.querySelector('[title*="思考 50 token"]')).not.toBeNull();
     expect(container.textContent).not.toContain("chat.");
   });
+
+  it("falls back honestly to whole-turn tooltip on older records without turn_throughput", async () => {
+    await act(async () => root.render(<TurnSummaryBar message={{
+      ...message,
+      durationMs: 10_000,
+      usage: { input_tokens: 100, cache_read_input_tokens: 900, output_tokens: 200, reasoning_output_tokens: 50 },
+    }} tools={3} />));
+    expect(container.textContent).toContain("20 tok/s");
+    expect(container.querySelector('[title*="旧记录未拆分工具耗时"]')?.getAttribute("title")).toContain("含工具、等待与思考");
+  });
+
   it("renders Codex last-request usage as partial and uses verified turn throughput when present", async () => {
     await act(async () => root.render(<TurnSummaryBar message={{
       ...message,
@@ -48,7 +78,7 @@ describe("turn summary presentation", () => {
     }} tools={4} />));
     expect(container.textContent).toContain("已上报 ↑45k ↓6k");
     expect(container.textContent).not.toContain("80%");
-    expect(container.textContent).toContain("整轮效率 20 tok/s");
+    expect(container.textContent).toContain("20 tok/s");
 
     await act(async () => {
       await i18n.changeLanguage("en");
@@ -68,10 +98,12 @@ describe("turn summary presentation", () => {
     expect(container.textContent).not.toContain("tok/s");
     expect(container.textContent).not.toContain("80%");
   });
+
   it("renders no empty capsule or placeholder for missing data", async () => {
     await act(async () => root.render(<TurnSummaryBar message={message} tools={0} />));
     expect(container.innerHTML).toBe("");
   });
+
   it("shows interrupted reported usage without presenting an efficiency or cache percentage", async () => {
     await act(async () => root.render(<TurnSummaryBar message={{
       ...message, durationMs: 10_000,

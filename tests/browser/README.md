@@ -1,5 +1,31 @@
 # Chat streaming regression
 
+## Plugin conversation virtualization
+
+Run `pnpm build`, then `node tests/browser/conversation-surface.mjs` from the
+repository root. It bundles the production `ConversationSurface` with synthetic
+messages, serves assets through intercepted loopback requests, and rejects native
+IPC and external network requests. Chrome is headless; only its owned browser is
+closed. `CONVERSATION_SURFACE_BROWSER` can select the executable.
+
+The fixture checks 1,201 messages with bounded mounted rows, earliest/latest
+access, pending form state, tool expansion after unmount, long Markdown and exact
+copy text, streaming follow behavior, source changes, narrow layouts and the
+short-to-virtual threshold. Inspect `.artifacts/conversation-surface/<time>/report.json`
+for `passed: true`, `errors: []` and `cleanup: true`. This measures browser DOM
+retention and interaction, not native WebView2 RAM or production update acceptance.
+
+## Host Handoff confirmation
+
+Run `pnpm build`, then `node scripts/test-host-confirmation.mjs`. The runner
+bundles the production confirmation component with synthetic content and serves
+the actual built theme CSS on a verified-free loopback port (1433 by default).
+It checks light/dark themes at 380×620 and 760×720, bounded scrolling and fixed
+actions, Unicode/Markdown rendering, inert links/images, Escape/default Enter
+cancellation and one affirmative keyboard submission. Reports and screenshots
+are written below `.artifacts/host-confirmation/`; require `passed: true`, no
+console/page errors or external requests, and `cleanup: true`.
+
 ## Project views and read-only image preview
 
 Run `node scripts/test-project-views.mjs` from the repository root. The runner
@@ -18,6 +44,8 @@ must not overflow horizontally; console/page errors fail the run. Require
 `passed: true` and `cleanup: true`, and inspect the narrow screenshots for
 readability. This is browser component acceptance, not a real native save
 dialog, CLI permission test, or production project import.
+
+## Feature guides and interaction fixtures
 
 Open `/tests/browser/onboarding.html` for the production feature guide and
 Sidechat toolbar button, with synthetic input/settings/image/notice controls.
@@ -431,6 +459,16 @@ IPC call are mocked before imports; no native config, model, or Tauri app is use
 Use `?engine=agy&manual=1` to check grouped model variants: choosing a level
 changes the complete model ID and the composer summary, without changing the
 independent effort value. The custom model retains separate effort controls.
+Gemini 4 Hydrogen must have one row with low/medium/high/xhigh in that order;
+selecting XHigh shows 极高 (Chinese) / XHigh (English) in the composer summary,
+keeps `gemini-4-hydrogen-xhigh` as the selected ID, and hides independent effort.
+At narrow widths, tier buttons may wrap below the readable model name; they must
+not collapse its label or overflow the panel.
+Without `manual=1`, `?engine=agy` cycles all four Hydrogen model IDs and checks
+that the trigger width and popover position stay fixed, including XHigh.
+In manual mode, switching from Hydrogen to Orchestrator removes both the
+independent effort controls and the summary's effort label; selecting Custom
+model again restores its three independent effort choices.
 Use `?engine=codex&manual=1&lang=en` to check all six named choices and Fast mode.
 
 Open `/tests/browser/usage-pane.html` to check the usage page against a seeded

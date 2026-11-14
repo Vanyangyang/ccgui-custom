@@ -7,10 +7,12 @@ import {
   applyPlanSettled,
 } from "./plan-review";
 import { errorText } from "@/lib/errors";
-import { encodedModelEffort } from "@/components/application/ai-chat/model-effort";
+import { supportsIndependentModelEffort } from "@/components/application/ai-chat/model-effort";
 import { desktopTaskMayContinue } from "../run-error";
 import { abortAutoReviews, readAutoReview, upsertAutoReview } from "./auto-review";
-import { dedupeTabs, persistTabs, sessionKey } from "./persistence";
+import { dedupeTabs, parseDraftSessionKey, persistTabs, sessionKey } from "./persistence";
+import { hasPendingHostEngine, hostPendingKey, pendingHostOrigin } from "./host-pending-chat";
+import { workspaceCatalogPathKey } from "@/lib/workspace-path";
 import {
   EMPTY_SESSION,
   adoptedDraftKeys,
@@ -49,15 +51,15 @@ import {
   takeAskEditor,
   type AskLoop,
 } from "./ask-loop";
-import { mergeUsage, parseUsage, reportedContextWindow, type ParsedUsage } from "../usage";
+import { hasAcpContextUsage, mergeUsage, parseUsage, reportedContextWindow, type ParsedUsage } from "../usage";
 import { usageTrackingEnabled } from "@/features/settings/usage-tracking";
 import { migrateSelectedAgent } from "@/features/agents/selected-agent";
 import { handleSideRunEvent, isSideRunEvent, migrateSidechatSessionKey } from "@/features/sidechat/store";
-import { claimLeaderAssignment, emitLeaderStreamDelta, isReclaimedLeaderSession, leaderEventAllowed, markLeaderSession, rememberLeaderSession } from "@/features/leader/event-state";
-import { beginNativeRun, mergeNativeTaskSnapshot, readNativeTasks } from "./native-tasks";
+import { emitLeaderStreamDelta, isReclaimedLeaderSession, leaderEventAllowed, markLeaderSession, rememberLeaderSession } from "@/features/leader/event-state";
+import { beginNativeRun, mergeNativeTaskSnapshot, readNativeTasks, supportsNativeTasks } from "./native-tasks";
 import { followUpGuardActive, runsEffort, runsModel } from "./live-follow-up";
 import { persistClaudeUltracode } from "./claude-ultracode";
-import { beginThroughput, mergeThroughput, parseThroughput, settleThroughput, updateThroughput, type ThroughputState } from "../throughput";
+import { averageTps, beginThroughput, MAX_PLAUSIBLE_TPS, mergeThroughput, MIN_COMPLETE_WINDOW_MS, parseThroughput, settleThroughput, updateThroughput, type ThroughputSample, type ThroughputState } from "../throughput";
 import {
   clearComposerPrediction,
   migrateComposerPredictionSessionKey,
@@ -79,11 +81,17 @@ export function startThroughput(runId: string): ThroughputState {
   return beginThroughput(runId, throughputEventSeqs.get(runId) ?? -1);
 }
 
+const THROUGHPUT_SOURCE_BY_ENGINE: Record<string, ThroughputSample["source"]> = {
+  claude: "claude",
+  codex: "codex_app_server",
+  agy: "agy",
+  cursor: "cursor",
+};
+
 function onThroughput(event: ChatEngineEvent, key: string, deps: EngineEventDeps) {
   const sample = parseThroughput(event.data);
-  if (!sample || !((event.engine === "claude" && sample.source === "claude") ||
-    (event.engine === "codex" && sample.source === "codex_app_server") ||
-    (event.engine === "agy" && sample.source === "agy"))) return;
+  const expectedSource = THROUGHPUT_SOURCE_BY_ENGINE[event.engine];
+  if (!sample || !expectedSource || sample.source !== expectedSource) return;
   const current = deps.get().bySession[key];
   if (current?.retiredNativeRunIds?.includes(event.runId)) return;
   // Sidecars cannot replace another run or revive the session's streaming flag.
@@ -223,7 +231,7 @@ function stampedEffort(
     (t) => sessionKey(t.engine, t.sessionId, t.workspacePath) === key,
   );
   const model = stampedModel(deps, engine, key);
-  if (model && encodedModelEffort(engine, model)) return null;
+  if (model && !supportsIndependentModelEffort(engine, model)) return null;
   return resolveSessionEffort(tab, s.bySession[key], s.efforts[engine], s.models[engine]) || null;
 }
 
@@ -240,7 +248,7 @@ function onModel(
   const current = deps.get().bySession[key]?.activeModel ?? "";
   const model =
     current === reported || current.endsWith(`/${reported}`) ? current : reported;
-  const clearEffort = Boolean(encodedModelEffort(event.engine, model));
+  const clearEffort = !supportsIndependentModelEffort(event.engine, model);
   updatePendingStreamModel(key, model, clearEffort ? null : undefined);
   deps.set((s) => {
     const cur = s.bySession[key];
@@ -296,7 +304,7 @@ function onEffort(
   deps.set((s) => {
     const cur = s.bySession[key];
     if (!cur || cur.activeEffort === reported) return {};
-    if (cur.activeModel && encodedModelEffort(event.engine, cur.activeModel)) return {};
+    if (cur.activeModel && !supportsIndependentModelEffort(event.engine, cur.activeModel)) return {};
     // Same as onModel: the report is what the live process runs, recorded
     // beside the launch spelling.
     let liveLaunch = cur.liveLaunch;
@@ -457,10 +465,14 @@ export function rememberProviderForRun(
   if (provider) pendingSessionProviders.set(key, provider);
 }
 
+export function forgetPendingSessionSelection(key: string): void {
+  pendingSessionModels.delete(key); pendingSessionEfforts.delete(key); pendingSessionProviders.delete(key);
+}
+
 function onSession(
-  event: ChatEngineEvent,
+  event: Pick<ChatEngineEvent, "engine" | "runId" | "data" | "leader">,
   key: string,
-  deps: EngineEventDeps,
+  deps: Pick<EngineEventDeps, "set" | "get" | "upsertSessionMeta">,
 ) {
   if (event.leader) return; // Managed sessions were adopted before run routing.
   const nativeId = event.data as string;
@@ -468,6 +480,14 @@ function onSession(
   // active tab. A first message sent on a background tab must not adopt the
   // foreground tab's workspace (the session would be orphaned there).
   const state = deps.get();
+  const isolatedKey = hostPendingKey(event.engine, event.runId);
+  const pendingHost = pendingHostOrigin(isolatedKey, state.bySession[isolatedKey]);
+  const retainedHost = state.bySession[key]?.hostTaskOrigin;
+  const hostOrigin = pendingHost ?? (retainedHost?.engine === event.engine && retainedHost.runId === event.runId ? retainedHost : undefined);
+  // A routed private start must never fall back to the user's active/pending tab.
+  if (state.bySession[key]?.hostTaskOrigin && key.includes(":@host-task/") && !hostOrigin) return;
+  if (hostOrigin && (typeof nativeId !== "string" || !nativeId || nativeId.length > 256 || /[\s\u0000-\u001f]/.test(nativeId))) return;
+  if (hostOrigin?.sessionId && hostOrigin.sessionId !== nativeId) return;
   const origin = pendingSessionOrigins.get(event.runId);
   pendingSessionOrigins.delete(event.runId);
   const originSession = origin ? state.bySession[origin.pendingKey] : undefined;
@@ -476,6 +496,11 @@ function onSession(
   const owner = state.openTabs.find(
     (t) => sessionKey(t.engine, t.sessionId, t.workspacePath) === key,
   );
+  const routedDraft = !hostOrigin && runRouting.get(event.runId) === key ? parseDraftSessionKey(key) : null;
+  const ownsDraftRoute = routedDraft?.engine === event.engine && !routedDraft.workspacePath.startsWith("@host-task/");
+  // A closed user tab still owns its explicit pending route. Session-id-only
+  // observed routes do not prove ownership of any user's pending draft.
+  if (!hostOrigin && !owner && !ownsOrigin && !ownsDraftRoute && hasPendingHostEngine(state.bySession, event.engine)) return;
   const pendingCandidates = state.openTabs.filter(
     (t) =>
       t.engine === event.engine &&
@@ -491,7 +516,7 @@ function onSession(
   const tab =
     originTab ?? owner ?? (pendingCandidates.length === 1 ? pendingCandidates[0] : undefined);
   const workspacePath =
-    tab?.workspacePath ?? deps.get().active?.workspacePath ?? "";
+    hostOrigin?.workspacePath ?? (ownsDraftRoute ? routedDraft.workspacePath : undefined) ?? tab?.workspacePath ?? deps.get().active?.workspacePath ?? "";
   const newKey = sessionKey(event.engine, nativeId, workspacePath);
   // The event can resolve straight to the native key when it beat the send
   // response (the run had no routing entry yet). The turn rows and streaming
@@ -500,13 +525,20 @@ function onSession(
   const pendingKey = sessionKey(event.engine, null, workspacePath);
   const ownsPlaceholder = ownsOrigin && origin!.nativeKey === newKey && origin!.pendingKey === pendingKey;
   const fromKey =
-    key === pendingKey ||
+    hostOrigin ? (pendingHost ? isolatedKey : key) : key === pendingKey ||
     (pendingKey !== newKey &&
       (!deps.get().bySession[newKey] || ownsPlaceholder) &&
       deps.get().bySession[pendingKey] !== undefined)
       ? pendingKey
       : key;
-  if (fromKey !== newKey) {
+  if (hostOrigin) {
+    const existing = state.bySession[newKey], source = state.bySession[fromKey];
+    if (state.openTabs.some(t => t.engine === event.engine && t.sessionId === nativeId && workspaceCatalogPathKey(t.workspacePath) !== workspaceCatalogPathKey(workspacePath)) ||
+      state.sessions.some(s => s.engine === event.engine && s.sessionId === nativeId && workspaceCatalogPathKey(s.workspacePath) !== workspaceCatalogPathKey(workspacePath)) ||
+      existing && existing !== source && existing.hostTaskOrigin?.runId !== event.runId &&
+        localSessionRun(existing) !== event.runId && !existing.settledRunIds?.includes(event.runId)) return;
+  }
+  if (!hostOrigin && fromKey !== newKey) {
     adoptedDraftKeys.set(fromKey, newKey);
   }
   if (event.engine === "claude") {
@@ -515,7 +547,7 @@ function onSession(
   }
 
   const sentModel =
-    pendingSessionModels.get(fromKey) ?? pendingSessionModels.get(key);
+    pendingSessionModels.get(fromKey) ?? pendingSessionModels.get(key) ?? (hostOrigin ? state.bySession[fromKey]?.activeModel : undefined);
   if (sentModel) {
     pendingSessionModels.delete(fromKey);
     pendingSessionModels.delete(key);
@@ -524,7 +556,7 @@ function onSession(
       ?.catch(() => {});
   }
   const sentEffort =
-    pendingSessionEfforts.get(fromKey) ?? pendingSessionEfforts.get(key);
+    pendingSessionEfforts.get(fromKey) ?? pendingSessionEfforts.get(key) ?? (hostOrigin ? state.bySession[fromKey]?.activeEffort : undefined);
   if (sentEffort) {
     pendingSessionEfforts.delete(fromKey);
     pendingSessionEfforts.delete(key);
@@ -533,7 +565,7 @@ function onSession(
       ?.catch(() => {});
   }
   const sentProvider =
-    pendingSessionProviders.get(fromKey) ?? pendingSessionProviders.get(key);
+    pendingSessionProviders.get(fromKey) ?? pendingSessionProviders.get(key) ?? (hostOrigin ? state.bySession[fromKey]?.activeProvider : undefined);
   if (sentProvider) {
     pendingSessionProviders.delete(fromKey);
     pendingSessionProviders.delete(key);
@@ -542,12 +574,16 @@ function onSession(
       ?.catch(() => {});
   }
 
-  routeAndReconcileRun(deps.set, event.runId, newKey);
+  if (!hostOrigin || !(settledRuns.has(event.runId) || state.bySession[fromKey]?.settledRunIds?.includes(event.runId))) routeAndReconcileRun(deps.set, event.runId, newKey);
+  if (hostOrigin && settledRunOutcomes.get(event.runId)?.key === fromKey) {
+    settledRunOutcomes.set(event.runId, { ...settledRunOutcomes.get(event.runId)!, key: newKey });
+  }
   // Unflushed stream chunks sit under the pre-migration key; move them too.
   migratePendingStream(fromKey, newKey);
+  if (fromKey !== newKey && retryingKeys.delete(fromKey)) retryingKeys.add(newKey);
   // Migrate pending key -> native key and stamp the owning pending tab atomically.
   deps.set((s) => {
-    const shouldAdoptPendingTab = fromKey === pendingKey;
+    const shouldAdoptPendingTab = !hostOrigin && fromKey === pendingKey;
     // The pending tab owning this run adopts the native id. Stamp only the
     // first match: blanketing every pending tab of this engine+workspace
     // would turn a second "new chat" tab into a duplicate of this session
@@ -566,7 +602,8 @@ function onSession(
         }
         stamped = true;
         return { ...t, sessionId: nativeId, effort: undefined, provider: undefined, claudeUltracode: undefined };
-      }),
+      }).concat(hostOrigin && !s.openTabs.some(t => t.engine === event.engine && t.sessionId === nativeId)
+        ? [{ engine: event.engine, sessionId: nativeId, workspacePath }] : []),
     );
     const activeNext =
       shouldAdoptPendingTab &&
@@ -597,6 +634,7 @@ function onSession(
       [newKey]: {
         ...cur,
         ...prev,
+        ...(hostOrigin ? { hostTaskOrigin: { ...hostOrigin, sessionId: nativeId } } : {}),
         draftLaunching: undefined,
         messages,
         usage: cur?.usage ?? prev.usage,
@@ -616,8 +654,9 @@ function onSession(
       },
     };
     if (fromKey !== newKey) delete bySession[fromKey];
-    const drafts = { ...s.drafts };
-    if (fromKey !== newKey && fromKey in drafts) {
+    let drafts = s.drafts;
+    if (!hostOrigin && fromKey !== newKey && fromKey in drafts) {
+      drafts = { ...drafts };
       if (drafts[fromKey] || !(newKey in drafts)) {
         drafts[newKey] = drafts[fromKey];
       }
@@ -625,13 +664,21 @@ function onSession(
     }
     const streamingByKey = moveStreamingFlag(s.streamingByKey, fromKey, newKey);
     const retryingByKey = moveRetryingFlag(s.retryingByKey, fromKey, newKey);
-    return { bySession, drafts, streamingByKey, retryingByKey, openTabs, active: activeNext };
+    const unseen = hostOrigin && fromKey !== newKey && fromKey in s.unseen ? { ...s.unseen } : s.unseen;
+    if (unseen !== s.unseen) {
+      if (unseen[fromKey]) unseen[newKey] = true;
+      delete unseen[fromKey];
+    }
+    return { bySession, drafts, streamingByKey, retryingByKey, openTabs, active: activeNext,
+      ...(hostOrigin ? { unseen } : {}) };
   });
   // The pinned agent followed the draft key; move it onto the native id so
   // the next send in this tab injects it again.
-  migrateSelectedAgent(workspacePath, nativeId);
-  migrateSidechatSessionKey(fromKey, newKey, nativeId);
-  migrateComposerPredictionSessionKey(fromKey, newKey);
+  if (!hostOrigin) {
+    if (fromKey === pendingKey) migrateSelectedAgent(workspacePath, nativeId);
+    migrateSidechatSessionKey(fromKey, newKey, nativeId);
+    migrateComposerPredictionSessionKey(fromKey, newKey);
+  }
   // Sidebar row + tab title pick the new session up immediately instead of
   // waiting for the post-turn rescan.
   const firstUser = (deps.get().bySession[newKey]?.messages ?? []).find(
@@ -645,6 +692,27 @@ function onSession(
       firstUser ? firstLineTitle(firstUser.text) : "",
     ),
   );
+}
+
+/** The native ACK and session event share the same exact-source adoption. */
+export function adoptHostPendingSession(
+  deps: Pick<EngineEventDeps, "set" | "get">, engine: string, runId: string, nativeId: string,
+): boolean {
+  const pendingKey = hostPendingKey(engine, runId), nativeKey = sessionKey(engine, nativeId, "");
+  const bound = deps.get().bySession[nativeKey]?.hostTaskOrigin;
+  if (bound?.engine === engine && bound.runId === runId && bound.sessionId === nativeId) {
+    // Stop can finish on the provisional key after the session event migrated
+    // its state. Remove only that private remnant, never a user's draft key.
+    if (deps.get().bySession[pendingKey]) deps.set(s => {
+      const bySession = { ...s.bySession }; delete bySession[pendingKey];
+      return { bySession, streamingByKey: setStreamingFlag(s.streamingByKey, pendingKey, false) };
+    });
+    return true;
+  }
+  if (!pendingHostOrigin(pendingKey, deps.get().bySession[pendingKey])) return false;
+  onSession({ engine, runId, data: nativeId }, pendingKey, { ...deps, upsertSessionMeta: meta => upsertSessionMetaInto(deps.set, meta) });
+  const result = deps.get().bySession[nativeKey]?.hostTaskOrigin;
+  return result?.runId === runId && result.sessionId === nativeId;
 }
 
 /** Runs whose turn already wrote ledger rows report by report. Every report
@@ -764,7 +832,10 @@ function onUsage(
   deps: EngineEventDeps,
 ) {
   const parsed = parseUsage(event.data);
-  const totals = parsed ? addTurnUsage(event.runId, parsed) : null;
+  // Claude's live snapshots (including compact boundaries) are occupancy,
+  // not additive bills. Only result.usage reports the whole response's cost.
+  const billable = parsed && event.engine !== "claude";
+  const totals = billable ? addTurnUsage(event.runId, parsed) : null;
   // A compaction report carries only the new occupancy, so the window is
   // taken from the last snapshot that had one: the gauge must not drop to
   // the assumed 200k just because this report is narrower (see mergeUsage).
@@ -773,7 +844,7 @@ function onUsage(
     usage: mergeUsage(event.data, prev),
     ...(totals ? { turnUsage: usageSnapshot(totals) } : {}),
   });
-  if (parsed) recordUsageReport(deps, event, key, parsed);
+  if (billable) recordUsageReport(deps, event, key, parsed);
 }
 
 /** Fold one report into its run's running total. */
@@ -801,75 +872,112 @@ function addTurnUsage(runId: string, parsed: ParsedUsage): ParsedUsage {
 function stripTurnThroughput(usage: unknown): unknown {
   if (!usage || typeof usage !== "object" || Array.isArray(usage)) return usage;
   const raw = usage as Record<string, unknown>;
-  if (!("turn_throughput" in raw)) return usage;
+  if (!("turn_throughput" in raw) && !("turn_throughput_reason" in raw)) return usage;
   const rest = { ...raw };
   delete rest.turn_throughput;
+  delete rest.turn_throughput_reason;
   return rest;
 }
 
-/** 【Codex回合吞吐提取】仅接受与当前 run/回合严格匹配、已进入 complete 终态且无排除原因的 Codex 吞吐样本。 */
-function settledCodexTurnThroughput(
+interface TurnThroughputPayload {
+  output_tokens: number;
+  elapsed_ms: number;
+  wall_ms?: number;
+  tool_ms?: number;
+  wait_ms?: number;
+  startup_ms?: number;
+}
+
+interface SettledTurnThroughput {
+  throughput: TurnThroughputPayload | null;
+  excludedReason: string | null;
+}
+
+/** 提取与当前 run/回合严格匹配的终态活跃模型吞吐样本（Claude / Codex / AGY / Cursor 统一口径）。 */
+function settledTurnThroughput(
   event: ChatEngineEvent,
   before: ThroughputState | null | undefined,
   settled: ThroughputState | null | undefined,
   interrupted: boolean,
   responseAlreadyComplete: boolean,
   rawDoneUsage: Record<string, unknown> | null,
-): { output_tokens: number; elapsed_ms: number } | null {
-  if (event.engine !== "codex" || interrupted || responseAlreadyComplete) return null;
+): SettledTurnThroughput {
+  const expectedSource = THROUGHPUT_SOURCE_BY_ENGINE[event.engine];
+  if (!expectedSource || interrupted || responseAlreadyComplete) {
+    return { throughput: null, excludedReason: null };
+  }
   if (before) {
-    if (before.runId !== event.runId || before.ended || before.seq >= event.seq) return null;
-    const sample = settled?.sample;
-    if (
-      !sample ||
-      sample.source !== "codex_app_server" ||
-      sample.status !== "complete" ||
-      sample.turnReason != null ||
-      typeof sample.outputTokens !== "number" ||
-      !Number.isSafeInteger(sample.outputTokens) ||
-      sample.outputTokens < 0 ||
-      typeof sample.elapsedMs !== "number" ||
-      !Number.isFinite(sample.elapsedMs) ||
-      sample.elapsedMs <= 0
-    ) {
-      return null;
+    if (before.runId !== event.runId || before.ended || before.seq >= event.seq) {
+      return { throughput: null, excludedReason: null };
     }
-    return { output_tokens: sample.outputTokens, elapsed_ms: sample.elapsedMs };
+    const sample = settled?.sample;
+    if (!sample || sample.source !== expectedSource) {
+      return { throughput: null, excludedReason: null };
+    }
+    if (sample.status !== "complete") {
+      return { throughput: null, excludedReason: null };
+    }
+    if (averageTps(sample) === null || sample.outputTokens == null || sample.elapsedMs == null) {
+      return { throughput: null, excludedReason: sample.turnReason ?? "excluded" };
+    }
+    return {
+      throughput: {
+        output_tokens: sample.outputTokens,
+        elapsed_ms: sample.elapsedMs,
+        ...(sample.breakdown
+          ? {
+              wall_ms: sample.breakdown.wallMs,
+              tool_ms: sample.breakdown.toolMs,
+              wait_ms: sample.breakdown.waitMs,
+              startup_ms: sample.breakdown.startupMs,
+            }
+          : {}),
+      },
+      excludedReason: null,
+    };
   }
   const candidate = rawDoneUsage?.turn_throughput;
-  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return null;
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+    return { throughput: null, excludedReason: null };
+  }
   const rec = candidate as Record<string, unknown>;
   const outputTokens = rec.output_tokens ?? rec.outputTokens;
   const elapsedMs = rec.elapsed_ms ?? rec.elapsedMs;
   if (
     typeof outputTokens !== "number" ||
     !Number.isSafeInteger(outputTokens) ||
-    outputTokens < 0 ||
+    outputTokens <= 0 ||
     typeof elapsedMs !== "number" ||
     !Number.isFinite(elapsedMs) ||
-    elapsedMs <= 0
+    elapsedMs < MIN_COMPLETE_WINDOW_MS ||
+    outputTokens / (elapsedMs / 1000) > MAX_PLAUSIBLE_TPS
   ) {
-    return null;
+    return { throughput: null, excludedReason: null };
   }
-  return { output_tokens: outputTokens, elapsed_ms: elapsedMs };
+  return {
+    throughput: { output_tokens: outputTokens, elapsed_ms: elapsedMs },
+    excludedReason: null,
+  };
 }
 
 /** Keep response scope and terminal status on the message, separately from
- *  context occupancy and billing. Codex paired statistics stay response-local. */
+ *  context occupancy and billing. Paired throughput statistics stay response-local. */
 function usageForTurnRow(
   usage: unknown,
-  codexTurnThroughput?: { output_tokens: number; elapsed_ms: number } | null,
+  settledThroughput?: SettledTurnThroughput,
   engine?: string,
   hasTurnTotals = false,
   partial = false,
 ): unknown {
+  const turnThroughput = settledThroughput?.throughput ?? null;
+  const excludedReason = !partial ? (settledThroughput?.excludedReason ?? null) : null;
   const turnStatus = partial ? "partial" : "complete";
   const isCodexLastRequest = engine === "codex" && !hasTurnTotals;
   if (!usage || typeof usage !== "object" || Array.isArray(usage)) {
-    if (codexTurnThroughput) {
+    if (engine === "codex" && turnThroughput) {
       return {
         usage_scope: "last_request",
-        turn_throughput: codexTurnThroughput,
+        turn_throughput: turnThroughput,
         turn_status: turnStatus,
       };
     }
@@ -878,15 +986,16 @@ function usageForTurnRow(
   }
   const raw = usage as Record<string, unknown>;
   const stripContext = raw.context_usage_kind === "current_context";
-  const stripOldThroughput = "turn_throughput" in raw && !codexTurnThroughput;
+  const stripOldThroughput = "turn_throughput" in raw && !turnThroughput;
+  const stripOldReason = "turn_throughput_reason" in raw && !excludedReason;
   const needsLastRequestScope =
     isCodexLastRequest &&
     raw.usage_scope !== "turn" &&
     raw.usage_scope !== "unknown" &&
     raw.usage_scope !== "last_request";
-  const needsTurnScope = engine === "claude" && raw.usage_scope === undefined;
-  if (!stripContext && !stripOldThroughput && !needsLastRequestScope && !needsTurnScope
-    && !codexTurnThroughput && raw.turn_status === turnStatus) {
+  const needsTurnScope = (engine === "claude" || engine === "cursor") && raw.usage_scope === undefined;
+  if (!stripContext && !stripOldThroughput && !stripOldReason && !needsLastRequestScope && !needsTurnScope
+    && !turnThroughput && !excludedReason && raw.turn_status === turnStatus) {
     return usage;
   }
   const rest: Record<string, unknown> = { ...raw, turn_status: turnStatus };
@@ -895,14 +1004,17 @@ function usageForTurnRow(
     delete rest.context_usage;
   }
   delete rest.turn_throughput;
+  delete rest.turn_throughput_reason;
   if (needsLastRequestScope) {
     rest.usage_scope = "last_request";
   } else if (needsTurnScope) {
-    // Unlike transcript assistant records, Claude's result is a turn total.
+    // Unlike transcript assistant records, Claude/Cursor result usage is a turn total.
     rest.usage_scope = "turn";
   }
-  if (codexTurnThroughput) {
-    rest.turn_throughput = codexTurnThroughput;
+  if (turnThroughput) {
+    rest.turn_throughput = turnThroughput;
+  } else if (excludedReason) {
+    rest.turn_throughput_reason = excludedReason;
   }
   return rest;
 }
@@ -956,7 +1068,7 @@ function writeUsageRow(
       engine: event.engine,
       model: stampedModel(deps, event.engine, key),
       sessionId: event.sessionId ?? tab?.sessionId ?? null,
-      workspacePath: tab?.workspacePath ?? state.active?.workspacePath ?? null,
+      workspacePath: tab?.workspacePath ?? state.bySession[key]?.hostTaskOrigin?.workspacePath ?? state.active?.workspacePath ?? null,
       input: parsed.input,
       output: parsed.output,
       cacheRead: parsed.cacheRead,
@@ -1015,6 +1127,15 @@ function onError(
         }
       }
     }
+    const nativeTasks =
+      cur.nativeTaskRunId === event.runId &&
+      cur.nativeTasks?.some((t) => t.status === "running" || t.status === "paused")
+        ? cur.nativeTasks.map((t) =>
+            t.status === "running" || t.status === "paused"
+              ? { ...t, status: "unknown" as const }
+              : t,
+          )
+        : cur.nativeTasks;
     return {
       bySession: {
         ...s.bySession,
@@ -1028,6 +1149,7 @@ function onError(
           throughput: settleThroughput(cur.throughput, event.runId, true, event.seq),
           handoff: null,
           nativeActivity: null,
+          nativeTasks,
           followUpAt: null,
           queueParked: desktopUnconfirmed,
           interruptRequestedAt: null,
@@ -1554,8 +1676,13 @@ function onDone(event: ChatEngineEvent, key: string, deps: EngineEventDeps, resp
     : contextReported
       ? mergeUsage(cleanDoneUsage, stripTurnThroughput(prev.usage))
       : stripTurnThroughput(prev.usage ?? null);
+  const claudeLiveContext = event.engine === "claude" &&
+    (prev.usage as Record<string, unknown> | null)?.usage_scope === "last_request";
+  if (claudeLiveContext) settledUsage = stripTurnThroughput(prev.usage);
+  if (hasAcpContextUsage(cleanDoneUsage)) settledUsage = mergeUsage(cleanDoneUsage, settledUsage);
   const finalWindow = reportedContextWindow(cleanDoneUsage);
-  if (finalWindow && settledUsage && typeof settledUsage === "object") {
+  if (finalWindow && settledUsage && typeof settledUsage === "object" &&
+    (!hasAcpContextUsage(settledUsage) || hasAcpContextUsage(cleanDoneUsage))) {
     settledUsage = { ...settledUsage, model_context_window: finalWindow };
   }
   // The row tells the reader what the reply cost: every report of this run
@@ -1563,7 +1690,7 @@ function onDone(event: ChatEngineEvent, key: string, deps: EngineEventDeps, resp
   turnUsageTotals.delete(event.runId);
   const finalUsage = turnTotals
     ? mergeUsage(usageSnapshot(turnTotals), settledUsage)
-    : settledUsage;
+    : claudeLiveContext ? mergeUsage(cleanDoneUsage, settledUsage) : settledUsage;
   // What the ledger may count: only tokens this turn reported, never the
   // occupancy carried over from an earlier reply.
   const ledgerUsage = tokensReported ? finalUsage : null;
@@ -1596,7 +1723,7 @@ function onDone(event: ChatEngineEvent, key: string, deps: EngineEventDeps, resp
     const partial = interrupted || Boolean(cur.throughput?.runId === event.runId
       && !cur.throughput.ended && cur.throughput.seq < event.seq
       && cur.throughput.sample?.status === "partial");
-    const codexTurnThroughput = settledCodexTurnThroughput(
+    const turnThroughput = settledTurnThroughput(
       event,
       cur.throughput,
       settledThroughput,
@@ -1606,7 +1733,7 @@ function onDone(event: ChatEngineEvent, key: string, deps: EngineEventDeps, resp
     );
     const rowUsage = usageForTurnRow(
       tokensReported ? finalUsage : null,
-      codexTurnThroughput,
+      turnThroughput,
       event.engine,
       turnTotals !== undefined,
       partial,
@@ -1631,7 +1758,7 @@ function onDone(event: ChatEngineEvent, key: string, deps: EngineEventDeps, resp
             ...messages[i],
             ...(rowUsage ? { usage: rowUsage } : {}),
             ...(durationMs != null ? { durationMs } : {}),
-            ...(effort ? { effort } : model && encodedModelEffort(event.engine, model) ? { effort: null } : {}),
+            ...(effort ? { effort } : model && !supportsIndependentModelEffort(event.engine, model) ? { effort: null } : {}),
             ...(model ? { model } : {}),
           },
           ...messages.slice(i + 1),
@@ -1710,7 +1837,7 @@ function onDone(event: ChatEngineEvent, key: string, deps: EngineEventDeps, resp
     // The final done can be far away (background wait, auto-continuations), so
     // the meter's occupancy correction cannot wait for it. A stopped session
     // is re-read by the stop path itself.
-    if (event.engine === "claude" && !prev.interrupted) scheduleUsageReread(deps, event.runId, key);
+    if (supportsNativeTasks(event.engine) && !prev.interrupted) scheduleUsageReread(deps, event.runId, key);
     return;
   }
   // The run is over: drop its routing entry so the map cannot grow forever.
@@ -1769,7 +1896,7 @@ function adoptObservedRun(
   deps: EngineEventDeps,
 ) {
   const cur = deps.get().bySession[key];
-  if (!cur && event.sessionId && key === sessionKey(event.engine, event.sessionId, "")) {
+  if (!cur && event.sessionId && key === sessionKey(event.engine, event.sessionId, "") && !hasPendingHostEngine(deps.get().bySession, event.engine)) {
     const state = deps.get();
     const pending = state.openTabs.filter((tab) => tab.engine === event.engine && tab.sessionId === null)
       .map((tab) => {
@@ -1796,7 +1923,7 @@ function adoptObservedRun(
     // steer, even when an old route still exists under this session.
     patchSession(deps.set, key, { codexRunId: undefined, liveLaunch: undefined });
   }
-  if (event.engine === "claude" && cur?.nativeTaskRunId !== event.runId) {
+  if (supportsNativeTasks(event.engine) && cur?.nativeTaskRunId !== event.runId) {
     if (cur?.nativeTaskRunId) {
       // The superseded run must not remain an orphan whose later sweep could
       // clear the newer run's streaming flag under the same session key.
@@ -1883,15 +2010,37 @@ function adoptLeaderSession(event: ChatEngineEvent, nativeId: string | null, dep
   const key = sessionKey(event.engine, nativeId, event.leader.workspacePath);
   rememberLeaderSession(key);
   const existing = deps.get().bySession[key];
+  // Adoption precedes the dispatcher's normal terminal fences. A late session
+  // envelope must not insert an old input before that later check rejects it.
+  if (existing?.settledRunIds?.includes(event.runId) || existing?.retiredNativeRunIds?.includes(event.runId)) return;
   const assignment = event.kind === "session" ? event.leader.assignment : undefined;
-  const addAssignment = !!assignment && claimLeaderAssignment(key);
+  const addAssignment = !!assignment && !existing?.managedAssignmentRuns?.includes(event.runId);
+  const newRun = existing?.managedInputStart?.runId !== event.runId;
   if (!existing) markLeaderSession(key);
-  if (!existing || addAssignment) {
+  if (!existing || addAssignment || newRun) {
     deps.set((s) => {
       const current = s.bySession[key] ?? { ...EMPTY_SESSION, messages: [] };
-      const messages = addAssignment && !current.messages.some((m) => m.role === "user")
-        ? [{ seq: 0, role: "user", text: assignment!, ts: null }, ...current.messages] : current.messages;
-      return { bySession: { ...s.bySession, [key]: { ...current, messages } } };
+      const start = current.managedInputStart?.runId === event.runId ? current.managedInputStart
+        : { runId: event.runId, firstSeq: current.messages.length ? current.messages.at(-1)!.seq + 1 : 0 };
+      let messages = current.messages;
+      let received = current.managedAssignmentRuns;
+      if (assignment && !received?.includes(event.runId)) {
+        const offset = messages.findIndex(message => message.seq >= start.firstSeq);
+        const index = offset < 0 ? messages.length : offset;
+        // A late input gets a separate local identity. Renumbering output would
+        // invalidate in-flight permission/question callbacks and sealed replies.
+        // Only middle insertions use negative ids: all tail appenders keep
+        // allocating positive ids from the unchanged last native row.
+        const seq = index < messages.length ? messages.reduce((min, message) => Math.min(min, message.seq), 0) - 1 : start.firstSeq;
+        messages = [...messages.slice(0, index), {
+          seq, role: "user", text: assignment, ts: null,
+          ...(event.leader!.assignmentSource ? { internalSource: { ...event.leader!.assignmentSource } } : {}),
+        }, ...messages.slice(index)];
+        received = [...(received ?? []), event.runId].slice(-128);
+      }
+      return { bySession: { ...s.bySession, [key]: { ...current, messages,
+        managedInputStart: start, ...(received ? { managedAssignmentRuns: received } : {}),
+      } } };
     });
   }
   if (!deps.get().sessions.some((s) => s.engine === event.engine && s.sessionId === nativeId)) {
@@ -1940,6 +2089,7 @@ export function handleEngineEvents(
       flushTools();
     }
     const settled = settledRuns.get(event.runId);
+    const lateHostIdentity = event.kind === "session" && !!pendingHostOrigin(hostPendingKey(event.engine, event.runId), deps.get().bySession[hostPendingKey(event.engine, event.runId)]);
     // Plans outlive their run's terminal event: expire_parked_plans settles
     // parked approvals after done/error at teardown (either order for a
     // kill), so plan events must reach the switch even then.
@@ -1953,7 +2103,7 @@ export function handleEngineEvents(
     if (
       settled &&
       !(
-        event.kind === "tasks" ||
+        lateHostIdentity || event.kind === "tasks" ||
         event.kind === "usage" ||
         event.kind === "throughput" ||
         event.kind === "plan_review_settled" ||
@@ -1968,10 +2118,16 @@ export function handleEngineEvents(
     )
       continue;
     if (!settled) adoptLeaderSession(event, managedId, deps);
-    const state = deps.get();
+    let state = deps.get();
     let key = runRouting.get(event.runId) ?? Object.keys(state.bySession).find(
       (candidate) => state.bySession[candidate]?.settledRunIds?.includes(event.runId),
     );
+    const hostKey = hostPendingKey(event.engine, event.runId);
+    if (pendingHostOrigin(hostKey, state.bySession[hostKey]) && event.sessionId && event.kind !== "session") {
+      if (!adoptHostPendingSession(deps, event.engine, event.runId, event.sessionId)) continue;
+      key = sessionKey(event.engine, event.sessionId, "");
+      state = deps.get();
+    }
     if (key) touchRun(event.runId);
     if (!key && event.kind === "auto_review" && event.sessionId) {
       const exactKey = sessionKey(event.engine, event.sessionId, "");
@@ -1988,6 +2144,14 @@ export function handleEngineEvents(
       }
     }
     if (!key) continue;
+    const ownedHost = deps.get().bySession[key]?.hostTaskOrigin;
+    if (ownedHost?.runId === event.runId && ownedHost.engine !== event.engine) continue;
+    if (lateHostIdentity) {
+      // Late identity binds the already-settled private state; it is not new
+      // activity and must not pass through the ordinary run-resume path.
+      onSession(event, key, deps);
+      continue;
+    }
     if (isReclaimedLeaderSession(key)) continue;
     const session = state.bySession[key];
     if (event.kind === "auto_review") {
@@ -2000,8 +2164,8 @@ export function handleEngineEvents(
       onThroughput(event, key, deps);
       continue;
     }
-    const retiredRun = event.engine === "claude" && !!session?.retiredNativeRunIds?.includes(event.runId);
-    const stoppedRun = event.engine === "claude" && !!session?.interrupted && session.nativeTaskRunId === event.runId;
+    const retiredRun = supportsNativeTasks(event.engine) && !!session?.retiredNativeRunIds?.includes(event.runId);
+    const stoppedRun = supportsNativeTasks(event.engine) && !!session?.interrupted && session.nativeTaskRunId === event.runId;
     // Card bookkeeping outlives its run: the reader teardown settles parked
     // questions/plans under the killed run's id (before its terminal done), so
     // these must still reach their cards after a Stop or a takeover by a newer
@@ -2020,6 +2184,7 @@ export function handleEngineEvents(
       continue;
     }
     if (event.kind === "done" || event.kind === "error") {
+      if (pendingHostOrigin(key, session)) forgetPendingSessionSelection(key);
       pendingSessionOrigins.delete(event.runId);
       settledRuns.set(event.runId, event.kind);
       const ownsCurrentTurn = session?.nativeTaskRunId === event.runId || session?.throughput?.runId === event.runId;

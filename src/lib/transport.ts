@@ -24,6 +24,7 @@ interface PendingReq {
   frame: string;
   command: string;
   replayable: boolean;
+  readOnly: boolean;
   sentOn: WebSocket | null;
   timeout?: ReturnType<typeof setTimeout>;
   requestId?: string;
@@ -48,11 +49,68 @@ class WebBridge {
   private pending = new Map<number, PendingReq>();
   private listeners = new Map<string, Set<Listener>>();
   private retryMs = 1000;
+  private retryTimer: ReturnType<typeof setTimeout> | undefined;
+  private disposed = false;
   private versionValue: string | null = null;
   private versionWaiters: ((v: string | null) => void)[] = [];
 
+  private hasConsumers(): boolean {
+    return this.listeners.size > 0 || this.pending.size > 0 || this.versionWaiters.length > 0;
+  }
+
+  private retireClosingSocket(): void {
+    const ws = this.ws;
+    if (ws && ws.readyState !== WebSocket.OPEN && ws.readyState !== WebSocket.CONNECTING) {
+      // The close event may still be queued. Settle this connection's legacy
+      // requests before a replacement handshake can consider them for replay.
+      this.onClose(ws);
+    }
+  }
+
+  private cancelRetry(): void {
+    clearTimeout(this.retryTimer);
+    this.retryTimer = undefined;
+  }
+
+  private closeSocket(): void {
+    const ws = this.ws;
+    this.ws = null;
+    this.readySocket = null;
+    this.openGate = null;
+    this.openResolve?.();
+    this.openResolve = null;
+    if (ws) {
+      ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null;
+      ws.close();
+    }
+  }
+
+  private releaseIfIdle(): void {
+    if (this.hasConsumers()) return;
+    this.cancelRetry();
+    // Keep an authenticated idle socket reusable, but do not finish an
+    // abandoned handshake or reconnect a socket with no remaining consumers.
+    if (this.ws && this.readySocket !== this.ws) this.closeSocket();
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    this.cancelRetry();
+    this.closeSocket();
+    for (const entry of this.pending.values()) {
+      clearTimeout(entry.timeout);
+      entry.reject(new TransportRequestError(entry.sentOn && !entry.readOnly ? "request-uncertain" : "transport-disconnected", entry.command, entry.requestId));
+    }
+    this.pending.clear();
+    this.listeners.clear();
+    for (const waiter of this.versionWaiters.splice(0)) waiter(null);
+  }
+
   /** Connect if needed; resolves after the authenticated hello handshake. */
   private ensure(): Promise<void> {
+    this.retireClosingSocket();
+    if (this.disposed || !this.hasConsumers()) return Promise.resolve();
+    this.cancelRetry();
     if (
       this.ws &&
       (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)
@@ -68,6 +126,7 @@ class WebBridge {
     this.openGate = promise;
     this.openResolve = resolve;
     ws.onopen = () => {
+      if (this.ws !== ws || this.disposed) return;
       this.retryMs = 1000;
     };
     // Frames arrive as text through the relay only after the Worker learns the
@@ -112,6 +171,7 @@ class WebBridge {
       // Subscribers reload snapshots after every handshake, including reconnects
       // where state-change events may have been missed while offline.
       for (const cb of this.listeners.get("transport://connected") ?? []) cb(null);
+      this.releaseIfIdle();
       return;
     }
     if (msg.type === "response") {
@@ -122,6 +182,7 @@ class WebBridge {
       clearTimeout(entry.timeout);
       if (msg.ok) entry.resolve(msg.payload);
       else entry.reject(new Error(String(msg.error ?? "unknown error")));
+      this.releaseIfIdle();
       return;
     }
     if (msg.type === "event" && typeof msg.name === "string") {
@@ -149,13 +210,21 @@ class WebBridge {
     if (this.versionValue === null) {
       for (const w of this.versionWaiters.splice(0)) w(null);
     }
-    // Keep retrying: the desktop may have restarted the bridge.
+    // Only live consumers need a retry. Component teardown can release the
+    // final subscription after onclose has already scheduled this timer.
+    if (this.disposed || !this.hasConsumers()) { this.cancelRetry(); return; }
     const delay = this.retryMs;
     this.retryMs = Math.min(this.retryMs * 2, RETRY_MAX_MS);
-    setTimeout(() => void this.ensure(), delay);
+    this.cancelRetry();
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = undefined;
+      if (!this.disposed && this.hasConsumers()) void this.ensure();
+    }, delay);
   }
 
   async invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+    // Retire old work before registering this new request on the replacement.
+    this.retireClosingSocket();
     const id = this.nextId++;
     const { promise, resolve, reject } = Promise.withResolvers<T>();
     const request = args?.request as Record<string, unknown> | undefined;
@@ -167,6 +236,7 @@ class WebBridge {
       frame: JSON.stringify({ type: "invoke", id, cmd, args: args ?? {} }),
       command: cmd,
       replayable,
+      readOnly: readOnlyWorkerRequest,
       sentOn: null,
       requestId: typeof requestId === "string" ? requestId : undefined,
       resolve: resolve as (v: unknown) => void,
@@ -191,6 +261,7 @@ class WebBridge {
       entry.timeout = setTimeout(() => {
         if (!this.pending.delete(id)) return;
         entry.reject(new TransportRequestError(entry.sentOn && !readOnlyWorkerRequest ? "request-uncertain" : "transport-disconnected", cmd, entry.requestId));
+        this.releaseIfIdle();
       }, WORKER_REQUEST_TIMEOUT_MS);
     }
     this.pending.set(id, entry);
@@ -198,6 +269,7 @@ class WebBridge {
       if (!this.pending.delete(id)) return;
       clearTimeout(entry.timeout);
       entry.reject(new TransportRequestError(entry.sentOn && !readOnlyWorkerRequest ? "request-uncertain" : "transport-disconnected", cmd, entry.requestId));
+      this.releaseIfIdle();
     });
     return promise;
   }
@@ -220,22 +292,25 @@ class WebBridge {
   }
 
   async listen(name: string, cb: Listener): Promise<UnlistenFn> {
-    void this.ensure();
+    this.retireClosingSocket();
     let subs = this.listeners.get(name);
     if (!subs) {
       subs = new Set();
       this.listeners.set(name, subs);
     }
     subs.add(cb);
+    void this.ensure();
     return () => {
       const set = this.listeners.get(name);
       if (!set) return;
       set.delete(cb);
       if (set.size === 0) this.listeners.delete(name);
+      this.releaseIfIdle();
     };
   }
 
   serverVersion(): Promise<string | null> {
+    this.retireClosingSocket();
     if (this.versionValue !== null) return Promise.resolve(this.versionValue);
     const { promise, resolve } = Promise.withResolvers<string | null>();
     this.versionWaiters.push(resolve);
@@ -245,6 +320,20 @@ class WebBridge {
 }
 
 let bridge: WebBridge | null = null;
+// HMR retires the entire module, including already-resolved await continuations.
+// Explicit bridge disposal alone intentionally leaves this module reusable.
+let moduleDisposed = false;
+
+function assertTransportActive(command: string): void {
+  if (moduleDisposed) throw new TransportRequestError("transport-disconnected", command);
+}
+
+/** Release the browser bridge when its owning runtime is disposed. */
+export function disposeWebBridge(): void {
+  const previous = bridge;
+  bridge = null;
+  previous?.dispose();
+}
 let workerSupport: boolean | undefined;
 let workerProbe: Promise<boolean> | undefined;
 
@@ -254,13 +343,14 @@ function isMissingWorkerCommand(error: unknown, command: string): boolean {
 }
 
 async function rawInvoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  assertTransportActive(cmd);
   if (workerSupport === false && cmd.startsWith("runtime_worker_")) throw new Error("Worker protocol is unavailable on this host");
   try {
     const value = await (!isWeb ? tauriInvoke<T>(cmd, args) : (bridge ??= new WebBridge()).invoke<T>(cmd, args));
-    if (cmd === "runtime_worker_sources") workerSupport = true;
+    if (!moduleDisposed && cmd === "runtime_worker_sources") workerSupport = true;
     return value;
   } catch (error) {
-    if (cmd.startsWith("runtime_worker_") && cmd !== "runtime_worker_plan_review" && isMissingWorkerCommand(error, cmd)) {
+    if (!moduleDisposed && cmd.startsWith("runtime_worker_") && cmd !== "runtime_worker_plan_review" && isMissingWorkerCommand(error, cmd)) {
       workerSupport = false;
       workerEvents?.dispose();
       workerEvents = undefined;
@@ -270,6 +360,7 @@ async function rawInvoke<T>(cmd: string, args?: Record<string, unknown>): Promis
 }
 
 async function supportsWorkers(): Promise<boolean> {
+  assertTransportActive("runtime_worker_sources");
   if (workerSupport !== undefined) return workerSupport;
   return workerProbe ??= rawInvoke("runtime_worker_sources").then(() => true).catch(error => {
     workerProbe = undefined;
@@ -278,9 +369,16 @@ async function supportsWorkers(): Promise<boolean> {
   });
 }
 
-function rawListen(name: string, cb: Listener): Promise<UnlistenFn> {
-  if (!isWeb) return tauriListen<unknown>(name, event => cb(event.payload));
-  return (bridge ??= new WebBridge()).listen(name, cb);
+async function rawListen(name: string, cb: Listener): Promise<UnlistenFn> {
+  assertTransportActive(`listen:${name}`);
+  const callback: Listener = payload => { if (!moduleDisposed) cb(payload); };
+  const unlisten = await (!isWeb ? tauriListen<unknown>(name, event => callback(event.payload))
+    : (bridge ??= new WebBridge()).listen(name, callback));
+  if (moduleDisposed) {
+    await unlisten();
+    assertTransportActive(`listen:${name}`);
+  }
+  return unlisten;
 }
 
 const publicListeners = new Map<string, Set<Listener>>();
@@ -293,6 +391,7 @@ let attachmentRetry: ReturnType<typeof setTimeout> | undefined;
 let attachingRuns: Promise<void> | undefined;
 
 function deliver(name: string, payload: unknown, identity?: WorkerEnvelopeIdentity): void {
+  if (moduleDisposed) return;
   if (!identity) { for (const cb of [...(publicListeners.get(name) ?? [])]) cb(payload); return; }
   const key = JSON.stringify([identity.streamId, identity.seq]);
   let receipt = deliveryReceipts.get(key);
@@ -317,11 +416,13 @@ function deliver(name: string, payload: unknown, identity?: WorkerEnvelopeIdenti
 }
 
 function reportWorkerError(code: string, message: string, streamId?: string): void {
+  if (moduleDisposed) return;
   console.error("Worker event transport:", code, streamId ?? "");
   try { deliver("transport://worker-error", { code, message, streamId }); } catch { /* Reporting cannot turn an accepted send into a retry. */ }
 }
 
 function workers(): WorkerEventTransport {
+  assertTransportActive("runtime_worker_sources");
   return workerEvents ??= new WorkerEventTransport({
     rawInvoke,
     rawListen,
@@ -349,6 +450,7 @@ export async function pauseWorkerEvents(): Promise<WorkerCursors> {
 }
 
 export function resumeWorkerEvents(): Promise<void> {
+  if (moduleDisposed) return Promise.reject(new TransportRequestError("transport-disconnected", "runtime_worker_sources"));
   if (workerSupport === false) return Promise.resolve();
   return workerEvents?.resume() ?? Promise.resolve();
 }
@@ -381,6 +483,7 @@ async function attachRequestedRunSources(runIds: string[], requireAll: boolean):
 }
 
 function retryRunAttachments(): Promise<void> {
+  if (moduleDisposed) return Promise.resolve();
   if (attachingRuns) return attachingRuns;
   if (attachmentRetry !== undefined) clearTimeout(attachmentRetry);
   attachmentRetry = undefined;
@@ -392,7 +495,7 @@ function retryRunAttachments(): Promise<void> {
     reportWorkerError("accepted-run-attach-failed", "The run was accepted, but its event view could not attach; attachment will retry");
   }).finally(() => {
     attachingRuns = undefined;
-    if (pendingRunAttachments.size) {
+    if (!moduleDisposed && pendingRunAttachments.size) {
       attachmentRetry = setTimeout(() => { attachmentRetry = undefined; void retryRunAttachments(); }, 2_000);
       (attachmentRetry as unknown as { unref?: () => void }).unref?.();
     }
@@ -410,6 +513,7 @@ let workerPlanSupport: boolean | undefined;
 
 /** Drop-in for @tauri-apps/api/core invoke, with stable worker mutation identities. */
 export async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  assertTransportActive(cmd);
   if (cmd === "respond_plan_review") {
     if (workerPlanSupport === false || !await supportsWorkers()) return rawInvoke<T>(cmd, args);
     let result: WorkerResponse<T>;
@@ -446,7 +550,7 @@ export async function invoke<T>(cmd: string, args?: Record<string, unknown>): Pr
     if (result?.handled === true && result.value !== undefined) {
       const acceptedId = result.value && typeof result.value === "object" && "runId" in result.value && typeof result.value.runId === "string"
         ? result.value.runId : runId;
-      if (typeof acceptedId === "string" && acceptedId.length) {
+      if (!moduleDisposed && typeof acceptedId === "string" && acceptedId.length) {
         if (pendingRunAttachments.size < 4096 || pendingRunAttachments.has(acceptedId)) {
           pendingRunAttachments.add(acceptedId);
           // Delivery recovery is separate from start acceptance. Never fall back
@@ -492,6 +596,7 @@ export async function listen<T>(
   name: string,
   cb: (e: { payload: T }) => void,
 ): Promise<UnlistenFn> {
+  assertTransportActive(`listen:${name}`);
   const callback: Listener = payload => cb({ payload: payload as T });
   const subscribers = publicListeners.get(name) ?? new Set<Listener>();
   subscribers.add(callback);
@@ -499,6 +604,7 @@ export async function listen<T>(
   let unlisten: UnlistenFn | undefined;
   const ready = (async () => {
     unlisten = await rawListen(name, callback);
+    assertTransportActive(`listen:${name}`);
     if (name === "engine://event" && workerSupport !== false) {
       try { await workers().start(); }
       catch (error) {
@@ -507,7 +613,7 @@ export async function listen<T>(
     }
   })();
   if (name === "engine://event") engineListenerReady = ready;
-  try { await ready; }
+  try { await ready; assertTransportActive(`listen:${name}`); }
   catch (error) {
     unlisten?.(); subscribers.delete(callback);
     if (engineListenerReady === ready) engineListenerReady = undefined;
@@ -525,15 +631,18 @@ export async function listen<T>(
 }
 
 if (import.meta.hot) import.meta.hot.dispose(() => {
+  moduleDisposed = true;
   workerEvents?.dispose();
+  disposeWebBridge();
   if (attachmentRetry !== undefined) clearTimeout(attachmentRetry);
   pendingRunAttachments.clear();
+  publicListeners.clear();
   deliveryReceipts.clear();
   receiptCallbacks = 0;
 });
 
 /** Version reported by the bridge hello frame; null when unavailable. */
 export function serverVersion(): Promise<string | null> {
-  if (!isWeb) return Promise.resolve(null);
+  if (!isWeb || moduleDisposed) return Promise.resolve(null);
   return (bridge ??= new WebBridge()).serverVersion();
 }

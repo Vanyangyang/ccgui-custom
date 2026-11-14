@@ -1,5 +1,8 @@
-//! User-initiated Google Cloud Billing connection. No bundled account or balance.
-//! A visible dedicated WebView lets the user sign in and choose their account.
+//! Google Cloud Billing connection. No bundled account or balance.
+//! The first connection is user-initiated in a visible dedicated WebView where the
+//! user signs in and chooses their account. Later refreshes reuse that WebView's
+//! persistent Google session off-screen and only surface the window when Google
+//! needs the user (sign-in, organization choice); stale balances refresh silently.
 //! Only credit rows from that account's official Credits page are saved locally.
 //! This login does not grant Vertex API access; API calls use the user's local key.
 
@@ -37,6 +40,9 @@ pub struct AgyVertexCreditsSnapshot {
     pub collected_at: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
+    /// Why the last silent refresh could not update an otherwise valid balance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_error: Option<String>,
 }
 
 impl Default for AgyVertexCreditsSnapshot {
@@ -50,6 +56,7 @@ impl Default for AgyVertexCreditsSnapshot {
             gdp_monthly_remaining_percent: None,
             collected_at: None,
             error_code: Some("not_connected".into()),
+            refresh_error: None,
         }
     }
 }
@@ -102,6 +109,8 @@ pub enum ScrapeSignal {
     LoginRequired,
     PermissionDenied,
     NoCredits,
+    /// Navigated to a non-sign-in page; clears a pending sign-in.
+    LoginCleared,
     Scraped(ScrapedCreditsPayload),
 }
 
@@ -375,6 +384,9 @@ fn sanitize_snapshot(mut value: AgyVertexCreditsSnapshot) -> AgyVertexCreditsSna
     }
     value.free_trial_remaining_percent = value.free_trial_remaining_percent.filter(|n| *n <= 100);
     value.gdp_monthly_remaining_percent = value.gdp_monthly_remaining_percent.filter(|n| *n <= 100);
+    value.refresh_error = value
+        .refresh_error
+        .filter(|code| matches!(code.as_str(), "login_required" | "scrape_timeout"));
     value
 }
 
@@ -438,6 +450,7 @@ fn snapshot_from_payload(
         gdp_monthly_remaining_percent: payload.gdp_monthly_remaining_percent,
         collected_at: Some(now),
         error_code: None,
+        refresh_error: None,
     });
     (value.free_trial_credit.is_some() || value.gdp_monthly_credit.is_some()).then_some(value)
 }
@@ -492,7 +505,120 @@ fn failed(code: &str) -> AgyVertexCreditsSnapshot {
     }
 }
 
-async fn sync_via_webview(app: &AppHandle) -> AgyVertexCreditsSnapshot {
+/// A credits page of a known account; opened first so a valid Google session
+/// needs no clicks at all.
+fn start_credits_url(account: &str) -> String {
+    format!("https://console.cloud.google.com/billing/{account}/credits/all")
+}
+
+const FULL_DEADLINE: Duration = Duration::from_secs(300);
+/// Balances older than this refresh silently; the backoff bounds retries.
+const AUTO_MAX_AGE: u64 = 6 * 3600;
+const AUTO_BACKOFF: Duration = Duration::from_secs(3600);
+/// Passing through accounts.google.com is normal Google session plumbing; only a
+/// sign-in page that stays up means the user must act.
+const LOGIN_GRACE: Duration = Duration::from_secs(8);
+/// Physical coordinate of a silent attempt's window, outside any monitor.
+const OFFSCREEN: i32 = -32000;
+
+static LAST_AUTO: LazyLock<Mutex<Option<std::time::Instant>>> =
+    LazyLock::new(|| Mutex::new(None));
+static AUTO_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// How one WebView attempt runs. The window starts off-screen when it targets a
+/// known account and is brought forward only if Google needs the user.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Plan {
+    account: Option<String>,
+    hidden: bool,
+    /// Auto refreshes never interrupt the user: they give up instead of revealing.
+    can_reveal: bool,
+    reveal_after: Duration,
+    deadline: Duration,
+}
+
+impl Plan {
+    fn auto(account: String) -> Self {
+        Self {
+            account: Some(account),
+            hidden: true,
+            can_reveal: false,
+            reveal_after: Duration::MAX,
+            deadline: Duration::from_secs(45),
+        }
+    }
+    fn manual_targeted(account: String) -> Self {
+        Self {
+            account: Some(account),
+            hidden: true,
+            can_reveal: true,
+            reveal_after: Duration::from_secs(20),
+            deadline: Duration::from_secs(40),
+        }
+    }
+    fn manual_projects() -> Self {
+        Self {
+            account: None,
+            hidden: false,
+            can_reveal: true,
+            reveal_after: Duration::ZERO,
+            deadline: FULL_DEADLINE,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Step {
+    Wait,
+    Reveal,
+    LoginRequired,
+    Timeout,
+}
+
+/// `login_pending` is how long a Google sign-in page has been showing.
+fn next_step(
+    plan: &Plan,
+    elapsed: Duration,
+    login_pending: Option<Duration>,
+    login_seen: bool,
+    revealed: bool,
+) -> Step {
+    let login_stuck = login_pending.is_some_and(|waited| waited >= LOGIN_GRACE);
+    if login_stuck && !plan.can_reveal {
+        return Step::LoginRequired;
+    }
+    // A sign-in the user is working through gets the full window.
+    let limit = if login_seen && plan.can_reveal {
+        FULL_DEADLINE
+    } else {
+        plan.deadline
+    };
+    if elapsed >= limit {
+        return Step::Timeout;
+    }
+    if plan.hidden && !revealed && plan.can_reveal && (login_stuck || elapsed >= plan.reveal_after)
+    {
+        return Step::Reveal;
+    }
+    Step::Wait
+}
+
+fn reveal(app: &AppHandle, window: &tauri::WebviewWindow) {
+    let _ = window.set_skip_taskbar(false);
+    let target = app.primary_monitor().ok().flatten().and_then(|monitor| {
+        let size = window.outer_size().ok()?;
+        let origin = monitor.position();
+        let free = monitor.size();
+        Some(tauri::PhysicalPosition::new(
+            origin.x + (free.width as i32 - size.width as i32).max(0) / 2,
+            origin.y + (free.height as i32 - size.height as i32).max(0) / 2,
+        ))
+    });
+    let _ = window.set_position(target.unwrap_or(tauri::PhysicalPosition::new(100, 100)));
+    let _ = window.set_focus();
+}
+
+async fn sync_via_webview(app: &AppHandle, plan: &Plan) -> AgyVertexCreditsSnapshot {
     if let Some(existing) = app.get_webview_window(WINDOW_LABEL) {
         let _ = existing.close();
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -500,24 +626,30 @@ async fn sync_via_webview(app: &AppHandle) -> AgyVertexCreditsSnapshot {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ScrapeSignal>();
     let tx_title = tx.clone();
     let tx_nav = tx.clone();
+    let start_url = plan
+        .account
+        .as_deref()
+        .map(start_credits_url)
+        .unwrap_or_else(|| BILLING_PROJECTS_URL.to_owned());
     let mut builder = tauri::WebviewWindowBuilder::new(
         app,
         WINDOW_LABEL,
-        WebviewUrl::External(Url::parse(BILLING_PROJECTS_URL).expect("static Google URL")),
+        WebviewUrl::External(Url::parse(&start_url).expect("static Google URL")),
     )
     .title("Google Cloud Billing — CCGUI credits sync")
     .inner_size(1040.0, 720.0)
-    .center()
-    .visible(true)
+    .visible(!plan.hidden)
     .initialization_script(scrape_script(
         crate::engine::agy_vertex::target_metadata()
             .map(|(project, _, _)| project)
             .as_deref(),
     ))
     .on_navigation(move |url| {
-        if is_google_login_url(url) {
-            let _ = tx_nav.send(ScrapeSignal::LoginRequired);
-        }
+        let _ = tx_nav.send(if is_google_login_url(url) {
+            ScrapeSignal::LoginRequired
+        } else {
+            ScrapeSignal::LoginCleared
+        });
         url.scheme() == "https"
             && url
                 .host_str()
@@ -530,6 +662,15 @@ async fn sync_via_webview(app: &AppHandle) -> AgyVertexCreditsSnapshot {
             }
         }
     });
+    // Off-screen rather than hidden: a hidden WebView2 reports the page as not
+    // visible and Google's console may stop rendering the credits table. The
+    // window is created invisible and moved after creation, because tao replaces
+    // a creation position outside every monitor with the default on-screen spot.
+    builder = if plan.hidden {
+        builder.skip_taskbar(true).focused(false)
+    } else {
+        builder.center()
+    };
     let data_dir = webview_data_dir();
     #[cfg(not(target_os = "macos"))]
     {
@@ -545,7 +686,20 @@ async fn sync_via_webview(app: &AppHandle) -> AgyVertexCreditsSnapshot {
         Ok(w) => w,
         Err(_) => return failed("webview_create_failed"),
     };
-    let _ = window.set_focus();
+    if plan.hidden {
+        // Never show a window that is not off-screen: that is the pop-up this avoids.
+        if window
+            .set_position(tauri::PhysicalPosition::new(OFFSCREEN, OFFSCREEN))
+            .is_err()
+        {
+            let _ = window.close();
+            return failed("webview_create_failed");
+        }
+        // Shown without activation (`focused(false)`), so it takes no focus.
+        let _ = window.show();
+    } else {
+        let _ = window.set_focus();
+    }
     let destroyed = Arc::new(AtomicBool::new(false));
     let destroyed_flag = Arc::clone(&destroyed);
     window.on_window_event(move |event| {
@@ -553,23 +707,41 @@ async fn sync_via_webview(app: &AppHandle) -> AgyVertexCreditsSnapshot {
             destroyed_flag.store(true, Ordering::SeqCst);
         }
     });
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+    let started = tokio::time::Instant::now();
+    let mut login_since: Option<tokio::time::Instant> = None;
     let mut login_seen = false;
+    let mut revealed = !plan.hidden;
     let result = loop {
         if destroyed.load(Ordering::SeqCst) {
             break failed("sync_cancelled");
         }
-        if tokio::time::Instant::now() >= deadline {
-            break failed(if login_seen {
-                "login_timeout"
-            } else {
-                "scrape_timeout"
-            });
+        match next_step(
+            plan,
+            started.elapsed(),
+            login_since.map(|since| since.elapsed()),
+            login_seen,
+            revealed,
+        ) {
+            Step::Timeout => {
+                break failed(if login_seen {
+                    "login_timeout"
+                } else {
+                    "scrape_timeout"
+                })
+            }
+            Step::LoginRequired => break failed("login_required"),
+            Step::Reveal => {
+                reveal(app, &window);
+                revealed = true;
+            }
+            Step::Wait => {}
         }
         match tokio::time::timeout(Duration::from_millis(250), rx.recv()).await {
             Ok(Some(ScrapeSignal::LoginRequired)) => {
                 login_seen = true;
+                login_since.get_or_insert_with(tokio::time::Instant::now);
             }
+            Ok(Some(ScrapeSignal::LoginCleared)) => login_since = None,
             Ok(Some(ScrapeSignal::PermissionDenied)) => break failed("permission_denied"),
             Ok(Some(ScrapeSignal::NoCredits)) => break failed("no_credits"),
             Ok(Some(ScrapeSignal::Scraped(payload))) => {
@@ -585,21 +757,132 @@ async fn sync_via_webview(app: &AppHandle) -> AgyVertexCreditsSnapshot {
     result
 }
 
+/// Pure so the schedule is testable: refresh only a connected, healthy balance
+/// that is old, and at most once per backoff period.
+fn auto_due(
+    cached: &AgyVertexCreditsSnapshot,
+    now: u64,
+    since_last_attempt: Option<Duration>,
+) -> bool {
+    cached.error_code.is_none()
+        && cached
+            .billing_account_id
+            .as_deref()
+            .is_some_and(valid_account)
+        && cached
+            .collected_at
+            .is_some_and(|at| now.saturating_sub(at) >= AUTO_MAX_AGE)
+        && since_last_attempt.is_none_or(|elapsed| elapsed >= AUTO_BACKOFF)
+}
+
+struct AutoActive;
+impl AutoActive {
+    fn begin() -> Self {
+        AUTO_ACTIVE.store(true, Ordering::SeqCst);
+        Self
+    }
+}
+impl Drop for AutoActive {
+    fn drop(&mut self) {
+        AUTO_ACTIVE.store(false, Ordering::SeqCst);
+    }
+}
+
+async fn auto_refresh(app: &AppHandle) -> Result<AgyVertexCreditsSnapshot, String> {
+    let cached = read_cached();
+    let since_last = LAST_AUTO
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .map(|at| at.elapsed());
+    if !auto_due(&cached, now_seconds(), since_last) {
+        return Ok(cached);
+    }
+    let Ok(_guard) = SYNC_LOCK.try_lock() else {
+        return Ok(cached);
+    };
+    *LAST_AUTO.lock().unwrap_or_else(|p| p.into_inner()) = Some(std::time::Instant::now());
+    let account = cached.billing_account_id.clone().unwrap_or_default();
+    let _active = AutoActive::begin();
+    let result = sync_via_webview(app, &Plan::auto(account)).await;
+    match result.error_code.as_deref() {
+        None => {
+            store_cached(app, &result)?;
+            Ok(result)
+        }
+        // The user took over with a manual sync; it owns the result.
+        Some("sync_cancelled") => Ok(read_cached()),
+        // The account itself lost access or credits: show that truth.
+        Some("permission_denied" | "no_credits") => {
+            store_cached(app, &result)?;
+            Ok(result)
+        }
+        // Anything else leaves the last good balance visible and says why it is old.
+        Some(code) => {
+            let mut kept = cached;
+            kept.refresh_error = Some(if code == "login_required" {
+                "login_required".into()
+            } else {
+                "scrape_timeout".into()
+            });
+            store_cached(app, &kept)?;
+            Ok(kept)
+        }
+    }
+}
+
+async fn manual_sync_lock(
+    app: &AppHandle,
+) -> Result<tokio::sync::MutexGuard<'static, ()>, String> {
+    if let Ok(guard) = SYNC_LOCK.try_lock() {
+        return Ok(guard);
+    }
+    // A silent refresh is the only attempt the user did not start: yield to them.
+    if AUTO_ACTIVE.load(Ordering::SeqCst) {
+        if let Some(window) = app.get_webview_window(WINDOW_LABEL) {
+            let _ = window.close();
+        }
+        if let Ok(guard) = tokio::time::timeout(Duration::from_secs(5), SYNC_LOCK.lock()).await {
+            return Ok(guard);
+        }
+    }
+    // Do not queue a second login window behind an already active connection flow.
+    Err("vertex_sync_in_progress".into())
+}
+
 #[tauri::command]
 pub async fn agy_vertex_credits_read(
     app: AppHandle,
     force: Option<bool>,
+    silent: Option<bool>,
 ) -> Result<AgyVertexCreditsSnapshot, String> {
     if !force.unwrap_or(false) {
+        if silent.unwrap_or(false) {
+            return auto_refresh(&app).await;
+        }
         return Ok(read_cached());
     }
-    // Do not queue a second login window behind an already active connection flow.
-    let Ok(_guard) = SYNC_LOCK.try_lock() else {
-        return Err("vertex_sync_in_progress".into());
-    };
+    let _guard = manual_sync_lock(&app).await?;
+    // The known account lets a valid Google session refresh without any clicks.
+    let known = read_cached()
+        .billing_account_id
+        .filter(|account| valid_account(account));
     // If invalidation cannot be persisted, do not start an account switch.
     store_cached(&app, &failed("syncing"))?;
-    let snapshot = sync_via_webview(&app).await;
+    let snapshot = match known {
+        Some(account) => {
+            let first = sync_via_webview(&app, &Plan::manual_targeted(account)).await;
+            // The remembered account may be gone or inaccessible: let the user choose.
+            if matches!(
+                first.error_code.as_deref(),
+                Some("permission_denied" | "scrape_timeout")
+            ) {
+                sync_via_webview(&app, &Plan::manual_projects()).await
+            } else {
+                first
+            }
+        }
+        None => sync_via_webview(&app, &Plan::manual_projects()).await,
+    };
     store_cached(&app, &snapshot)?;
     Ok(snapshot)
 }
@@ -734,6 +1017,84 @@ mod tests {
             assert_eq!(load_from_path(&path), AgyVertexCreditsSnapshot::default());
         }
         std::fs::remove_file(&path).unwrap();
+    }
+    #[test]
+    fn silent_refresh_runs_only_for_old_healthy_connected_balances_and_backs_off() {
+        let healthy = |collected_at| {
+            sanitize_snapshot(AgyVertexCreditsSnapshot {
+                billing_account_id: Some(ACCOUNT.into()),
+                gdp_monthly_credit: Some("$1.00".into()),
+                collected_at: Some(collected_at),
+                error_code: None,
+                ..Default::default()
+            })
+        };
+        let now = 10 * AUTO_MAX_AGE;
+        assert!(auto_due(&healthy(now - AUTO_MAX_AGE), now, None));
+        assert!(!auto_due(&healthy(now - AUTO_MAX_AGE + 1), now, None));
+        assert!(!auto_due(&healthy(0), now, Some(AUTO_BACKOFF - Duration::from_secs(1))));
+        assert!(auto_due(&healthy(0), now, Some(AUTO_BACKOFF)));
+        // Never connect on the user's behalf, and never retry over a recorded failure.
+        assert!(!auto_due(&AgyVertexCreditsSnapshot::default(), now, None));
+        assert!(!auto_due(&failed("permission_denied"), now, None));
+        // A clock set before the sample must not look infinitely old.
+        assert!(!auto_due(&healthy(now + 5), now, None));
+    }
+    #[test]
+    fn silent_refresh_never_reveals_but_manual_reveals_when_google_needs_the_user() {
+        let auto = Plan::auto(ACCOUNT.into());
+        let secs = Duration::from_secs;
+        assert_eq!(next_step(&auto, secs(10), None, false, false), Step::Wait);
+        // Brief pass-through of accounts.google.com is session plumbing, not a login.
+        assert_eq!(next_step(&auto, secs(10), Some(secs(2)), true, false), Step::Wait);
+        assert_eq!(
+            next_step(&auto, secs(10), Some(LOGIN_GRACE), true, false),
+            Step::LoginRequired
+        );
+        assert_eq!(next_step(&auto, secs(45), None, false, false), Step::Timeout);
+
+        let manual = Plan::manual_targeted(ACCOUNT.into());
+        assert_eq!(next_step(&manual, secs(5), None, false, false), Step::Wait);
+        assert_eq!(next_step(&manual, secs(20), None, false, false), Step::Reveal);
+        assert_eq!(
+            next_step(&manual, secs(3), Some(LOGIN_GRACE), true, false),
+            Step::Reveal
+        );
+        assert_eq!(next_step(&manual, secs(25), None, false, true), Step::Wait);
+        assert_eq!(next_step(&manual, secs(40), None, false, true), Step::Timeout);
+        // A sign-in in progress is not cut off at the short deadline.
+        assert_eq!(
+            next_step(&manual, secs(100), Some(secs(90)), true, true),
+            Step::Wait
+        );
+        assert_eq!(next_step(&manual, secs(300), None, true, true), Step::Timeout);
+
+        let projects = Plan::manual_projects();
+        assert!(!projects.hidden);
+        assert_eq!(next_step(&projects, secs(299), None, false, true), Step::Wait);
+        assert_eq!(next_step(&projects, secs(300), None, false, true), Step::Timeout);
+    }
+    #[test]
+    fn known_account_starts_on_its_credits_page_and_refresh_error_is_bounded() {
+        assert_eq!(
+            Url::parse(&start_credits_url(ACCOUNT)).unwrap().host_str(),
+            Some("console.cloud.google.com")
+        );
+        assert!(account_from_url(&Url::parse(&start_credits_url(ACCOUNT)).unwrap(), true).is_some());
+        let mut kept = snapshot_from_payload(
+            &ScrapedCreditsPayload {
+                status: "ok".into(),
+                billing_account_id: Some(ACCOUNT.into()),
+                gdp_monthly_credit: Some("$5.00".into()),
+                ..Default::default()
+            },
+            123,
+        )
+        .unwrap();
+        kept.refresh_error = Some("login_required".into());
+        assert_eq!(sanitize_snapshot(kept.clone()).refresh_error.as_deref(), Some("login_required"));
+        kept.refresh_error = Some("<script>".into());
+        assert_eq!(sanitize_snapshot(kept).refresh_error, None);
     }
     #[test]
     fn invalid_amounts_and_percentages_do_not_become_credits() {

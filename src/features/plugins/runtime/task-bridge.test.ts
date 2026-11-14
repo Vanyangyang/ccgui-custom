@@ -1,5 +1,6 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
-import type { HostTaskReceipt, HostTaskSubmission } from "@ccgui/plugin-sdk";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import i18n from "@/lib/i18n";
+import type { HostTaskCostApproval, HostTaskReceipt, HostTaskSubmission } from "@ccgui/plugin-sdk";
 import type { EngineEventPayload } from "@/lib/events";
 import type { SessionMeta } from "@/lib/ipc";
 import { createRuntimeCheckpointCoordinator } from "@/lib/runtime-checkpoint";
@@ -34,7 +35,8 @@ function fakeFacade() {
   const key = (ref: TaskSessionRef) => `${ref.engine}/${ref.sessionId}`;
   const facade = {
     ready: vi.fn(async () => {}),
-    fixedInstructionsSupported: vi.fn(async () => true),
+    fixedInstructionsSupported: vi.fn(async (_engine?: string) => true),
+    codexServiceTierOverrideSupported: vi.fn(async () => true),
     activeEngine: () => activeEng,
     engines: (): ReturnType<HostTaskFacade["engines"]> => [
       { id: "claude", available: true, enabled: true, supportsImages: true, defaultModel: claudeDefaultModel, defaultEffort: claudeDefaultEffort },
@@ -85,7 +87,7 @@ function fakeFacade() {
       { seq: 1, role: "user", text: "old question", ts: null }, { seq: 2, role: "tool", text: "noise", ts: null },
       { seq: 3, role: "assistant", text: "a".repeat(5000), ts: null },
     ], nextBefore: null })),
-    projects: async () => [{ id: "p1", name: "EXAMPLE", defaultPath: GAME, sourcePluginId: null,
+    projects: async () => [{ id: "p1", name: "SAMPLE-PROJECT", defaultPath: GAME, sourcePluginId: null,
       members: [{ id: "m1", path: GAME, label: "root", role: "development" as const, status: "available" as const },
         { id: "m2", path: `${GAME}/game`, label: "game", role: "development" as const, status: "available" as const }] }],
     models: async () => [{ id: "opus", name: "Opus", provider: "anthropic" }],
@@ -138,7 +140,10 @@ function bridgeFor(
     storage?: ReturnType<typeof storageFor>;
     invoke?: (c: string, a: Record<string, unknown>) => Promise<unknown>;
     loadClaims?: () => Promise<unknown>;
+    attachmentCapabilities?: () => Promise<unknown>;
     checkpoint?: ReturnType<typeof createRuntimeCheckpointCoordinator>;
+    confirmCostReview?: (approval: HostTaskCostApproval, decision: "approve" | "cancel" | "handoff") => Promise<boolean>;
+    confirmManagedHandoff?: (approval: HostTaskCostApproval, summary: string) => Promise<boolean>;
   } = {},
 ) {
   const storage = options.storage ?? storageFor();
@@ -146,6 +151,9 @@ function bridgeFor(
     facade: async () => fake.facade,
     invoke: options.invoke ?? (async () => { throw new Error("no planner"); }),
     loadClaims: options.loadClaims,
+    attachmentCapabilities: options.attachmentCapabilities ?? (async () => ({ version: 1, exclusiveSessionReservations: true })),
+    confirmCostReview: options.confirmCostReview,
+    confirmManagedHandoff: options.confirmManagedHandoff,
     runId: () => `run-${++runCounter}`,
     ...(options.checkpoint
       ? { checkpoint: options.checkpoint }
@@ -156,7 +164,7 @@ function bridgeFor(
 }
 
 const submission = (requestId: string, extra: Partial<HostTaskSubmission> = {}): HostTaskSubmission => ({
-  requestId, taskId: "task-1", slotKey: "impl", projectId: "example-project", workspacePath: GAME, prompt: `do ${requestId}`,
+  requestId, taskId: "task-1", slotKey: "impl", projectId: "sample-project", workspacePath: GAME, prompt: `do ${requestId}`,
   sessionMode: "auto", ...extra,
 });
 const ev = (runId: string, seq: number, kind: string, data: unknown, sessionId: string | null = null, engine = "claude") =>
@@ -165,11 +173,554 @@ async function settle(bridge: ReturnType<typeof createHostTaskBridge>) {
   for (let i = 0; i < 8; i++) { await bridge.ready(); await new Promise((r) => setTimeout(r, 0)); }
 }
 
+describe("existing conversation attachment", () => {
+  let previousLanguage: string;
+  beforeEach(async () => { previousLanguage = i18n.language; await i18n.changeLanguage("en"); });
+  afterEach(async () => { await i18n.changeLanguage(previousLanguage); });
+  const ref = { engine: "claude", sessionId: S1, workspacePath: GAME };
+  const request = (requestId = "attached") => ({ requestId, taskId: "topic", projectId: "p1", slotKey: "coordinator", session: ref, writePaths: [] });
+  function fixture(status: TaskTimelineStatus = "idle") {
+    const fake = fakeFacade(); fake.addSession(ref, status);
+    const facade: HostTaskFacade = fake.facade;
+    facade.leaderBranches = async () => [];
+    facade.observeLifecycle = vi.fn(async () => ({ archived: false, idle: status === "idle", isCurrent: () => true }));
+    facade.conversationLaunch = () => ({ model: "native-model", effort: "high", providerId: "native-channel" });
+    facade.conversationState = () => ({ messages: [{ seq: 1, role: "user", text: "original prompt", ts: null }], status, runId: status === "idle" ? null : "original-run", canDeliver: status === "idle" });
+    return { fake, facade, ...bridgeFor(fake) };
+  }
+  it.each([null, { version: 1 }, { version: 2, exclusiveSessionReservations: true }])("requires explicit native reservation support (%j)", async proof => {
+    const f = fixture(), old = bridgeFor(f.fake, { pluginId: "old-native", attachmentCapabilities: async () => proof });
+    expect((await old.bridge.catalog()).capabilities?.existingConversationAttachment).toBe(false);
+    await expect(old.bridge.attachConversation(request())).rejects.toThrow(/updated native/);
+    expect(await old.bridge.receipt(request().requestId)).toBeNull();
+    expect(f.fake.facade.sendNew).not.toHaveBeenCalled();
+  });
+  it("rejects a workspace outside the exact selected project before claiming it", async () => {
+    const f = fixture();
+    await expect(f.bridge.attachConversation({ ...request(), projectId: "different-project" })).rejects.toThrow(/selected project/);
+    expect(await f.bridge.receipt(request().requestId)).toBeNull();
+    await expect(f.bridge.attachConversation(request())).resolves.toMatchObject({ status: "attached" });
+  });
+  it.each(["idle", "busy", "awaiting_permission"] as const)("associates %s native chat without an initial send", async status => {
+    const f = fixture(status);
+    expect((await f.bridge.catalog()).capabilities?.existingConversationAttachment).toBe(true);
+    expect(await f.bridge.attachConversation(request())).toMatchObject({ status: "attached", runId: null, sessionDecision: "attached", session: ref });
+    await settle(f.bridge);
+    const snapshot = await f.bridge.conversation("attached");
+    expect(snapshot.messages[0]).toMatchObject({ text: "original prompt" });
+    expect(snapshot.nativeStatus).toBe(status);
+    expect(f.fake.facade.sendExisting).not.toHaveBeenCalled(); expect(f.fake.facade.sendNew).not.toHaveBeenCalled();
+    expect(f.fake.facade.openDraft).not.toHaveBeenCalled(); expect(f.fake.facade.focus).not.toHaveBeenCalled();
+  });
+  it("is idempotent only for the identical request and rejects another owner", async () => {
+    const f = fixture(); const receipt = await f.bridge.attachConversation(request());
+    expect(await f.bridge.attachConversation(request())).toEqual(receipt);
+    await expect(f.bridge.attachConversation({ ...request(), taskId: "different" })).rejects.toThrow(/different/);
+    await expect(f.bridge.attachConversation(request("second"))).rejects.toThrow(/exclusive|reserved/i);
+    const other = bridgeFor(f.fake, { pluginId: "other" }).bridge;
+    await expect(other.attachConversation(request("other"))).rejects.toThrow(/exclusive|reserved/i);
+  });
+  it("resolves comparison-only path spelling back to native metadata before lifecycle, storage and cold retries", async () => {
+    const f = fixture("busy"), original = request();
+    const alias = { ...original, session: { ...ref, workspacePath: GAME.toUpperCase().replaceAll("/", "\\") + "\\" } };
+    f.facade.observeLifecycle = vi.fn(async target => {
+      if (target.workspacePath !== GAME) throw new Error("Task lifecycle workspace is missing or ambiguous");
+      return { archived: false, idle: false, isCurrent: () => true };
+    });
+    const receipt = await f.bridge.attachConversation(alias);
+    expect(receipt.session).toEqual(ref);
+    expect(f.facade.observeLifecycle).toHaveBeenCalledWith(ref, { forAttachment: true });
+    expect(await f.bridge.attachConversation(original)).toEqual(receipt);
+    await settle(f.bridge); f.bridge.dispose();
+    const restored = bridgeFor(f.fake, { storage: f.storage }).bridge;
+    expect(await restored.attachConversation(alias)).toEqual(receipt);
+    expect(f.fake.facade.sendExisting).not.toHaveBeenCalled(); expect(f.fake.facade.sendNew).not.toHaveBeenCalled();
+  });
+  it.each(["duplicate", "remote", "different-workspace"])("rejects %s native metadata before lifecycle or persistence", async change => {
+    const f = fixture(), source = f.facade.sessions()[0];
+    await f.bridge.ready(); f.storage.set.mockClear();
+    f.facade.sessions = () => change === "duplicate" ? [source, { ...source }] :
+      [{ ...source, ...(change === "remote" ? { remote: true } : { workspacePath: TOOL }) }];
+    await expect(f.bridge.attachConversation(request())).rejects.toThrow(/workspace|identity/i);
+    expect(f.facade.observeLifecycle).not.toHaveBeenCalled(); expect(f.storage.set).not.toHaveBeenCalled();
+  });
+  it("retains an existing fingerprint when source metadata changes or disappears, but refuses a changed request", async () => {
+    const f = fixture(), original = request(), receipt = await f.bridge.attachConversation(original);
+    const source = f.facade.sessions()[0];
+    f.facade.sessions = () => [{ ...source, workspacePath: GAME.toUpperCase() }];
+    expect(await f.bridge.attachConversation(original)).toEqual(receipt);
+    f.facade.sessions = () => [];
+    expect(await f.bridge.attachConversation({ ...original, session: { ...ref, workspacePath: GAME.toUpperCase() } })).toEqual(receipt);
+    for (const altered of [{ projectId: "other-project" }, { writePaths: ["src"] }, { session: { ...ref, sessionId: S2 } }, { session: { ...ref, workspacePath: TOOL } }]) {
+      await expect(f.bridge.attachConversation({ ...original, ...altered })).rejects.toThrow(/different/);
+    }
+    expect(f.fake.facade.sendExisting).not.toHaveBeenCalled(); expect(f.fake.facade.sendNew).not.toHaveBeenCalled();
+  });
+  it("fingerprints the original declared paths, even when different inputs normalize identically", async () => {
+    const f = fixture(), original = { ...request(), writePaths: ["src", "src"] };
+    await f.bridge.attachConversation(original);
+    await expect(f.bridge.attachConversation({ ...original, writePaths: ["src"] })).rejects.toThrow(/different/);
+    await settle(f.bridge); f.bridge.dispose();
+    const restored = bridgeFor(f.fake, { storage: f.storage }).bridge;
+    expect(await restored.attachConversation(original)).toMatchObject({ status: "attached" });
+  });
+  it("rejects workspace mismatch, managed children and unknown lifecycle", async () => {
+    const f = fixture();
+    await expect(f.bridge.attachConversation({ ...request(), session: { ...ref, workspacePath: TOOL } })).rejects.toThrow();
+    f.fake.addSession({ ...ref, sessionId: S2 });
+    f.facade.leaderBranches = async () => [{ parentEngine: "claude", parentSessionId: S1, engine: "claude", sessionId: S2, workspacePath: GAME, state: "completed" }];
+    await expect(f.bridge.attachConversation({ ...request(), session: { ...ref, sessionId: S2 } })).rejects.toThrow(/child|parent/);
+    f.facade.observeLifecycle = async () => null;
+    await expect(f.bridge.attachConversation(request())).rejects.toThrow(/lifecycle|verified|unavailable/i);
+    expect(f.fake.facade.sendExisting).not.toHaveBeenCalled();
+  });
+  it("reserves across plugins before persistence completes and never acknowledges a failed write", async () => {
+    const f = fixture(), gate = Promise.withResolvers<void>();
+    await f.bridge.ready();
+    f.storage.set.mockImplementationOnce(async () => gate.promise);
+    const first = f.bridge.attachConversation(request());
+    try {
+      await vi.waitFor(() => expect(f.storage.set).toHaveBeenCalled());
+      const other = bridgeFor(f.fake, { pluginId: "other" }).bridge;
+      await expect(other.attachConversation(request("other"))).rejects.toThrow(/exclusive|reserved/i);
+    } finally {
+      gate.reject(new Error("disk failure"));
+      await first.catch(() => {});
+    }
+    await expect(first).rejects.toThrow(/persist/);
+    expect(await f.bridge.receipt("attached")).toBeNull();
+    expect(f.fake.facade.sendNew).not.toHaveBeenCalled();
+  });
+  it("admits exactly one simultaneous cross-plugin attachment", async () => {
+    const f = fixture(), other = bridgeFor(f.fake, { pluginId: "other" }).bridge;
+    const results = await Promise.allSettled([f.bridge.attachConversation(request()), other.attachConversation(request("other"))]);
+    expect(results.filter(r => r.status === "fulfilled")).toHaveLength(1);
+    expect(results.filter(r => r.status === "rejected")).toHaveLength(1);
+    expect(f.fake.facade.sendNew).not.toHaveBeenCalled();
+  });
+  it("keeps a disabled owner's idle session reservation without blocking another session's writes", async () => {
+    const f = fixture();
+    const foreign = { pluginId: "disabled", requestId: "retained", runId: "", status: "unknown", session: ref, sessionProven: true,
+      workspacePath: GAME, writePaths: null, exclusiveSession: true, reservationOnly: true };
+    const bridge = bridgeFor(f.fake, { pluginId: "cold", loadClaims: async () => [foreign] }).bridge;
+    await expect(bridge.attachConversation(request())).rejects.toThrow(/exclusive|reserved/);
+    await bridge.submit(submission("different-session", { sessionMode: "new" })); await settle(bridge);
+    expect(f.fake.facade.sendNew).toHaveBeenCalledOnce();
+  });
+  it("restores the exact attachment and permanently rejects a second owner after going idle", async () => {
+    const f = fixture(); await f.bridge.attachConversation(request()); await settle(f.bridge); f.bridge.dispose();
+    const restored = bridgeFor(f.fake, { storage: f.storage }).bridge;
+    await restored.ready();
+    expect(await restored.attachConversation(request())).toMatchObject({ status: "attached", session: ref, runId: null });
+    expect((await restored.conversation("attached")).messages[0]).toMatchObject({ text: "original prompt" });
+    await expect(restored.attachConversation(request("second"))).rejects.toThrow(/exclusive|reserved/);
+    expect(f.fake.facade.sendNew).not.toHaveBeenCalled(); expect(f.fake.facade.sendExisting).not.toHaveBeenCalled();
+  });
+  it.each(["attachment", "status", "runId", "session", "launch", "fingerprint", "prompt"])("rejects a corrupted restored attachment %s", async field => {
+    const f = fixture(); await f.bridge.attachConversation(request()); await settle(f.bridge); f.bridge.dispose();
+    const index = structuredClone(f.storage.data.get(`wb:${HOST_TASKS_INDEX_KEY}`)) as { entries: Array<Record<string, any>> };
+    const entry = index.entries[0];
+    if (field === "attachment") delete entry.attachment;
+    if (field === "status") entry.receipt.status = "queued";
+    if (field === "runId") entry.receipt.runId = "forged-run";
+    if (field === "session") entry.receipt.session.sessionId = S3;
+    if (field === "launch") entry.launch.model = "frozen-default";
+    if (field === "fingerprint") entry.fingerprint = "{}";
+    if (field === "prompt") entry.prompt = "replay original prompt";
+    f.storage.data.set(`wb:${HOST_TASKS_INDEX_KEY}`, index);
+    await expect(bridgeFor(f.fake, { storage: f.storage }).bridge.ready()).rejects.toThrow(/attachment/);
+    expect(f.fake.facade.sendNew).not.toHaveBeenCalled();
+  });
+  it("refuses closed active chats and failed reads without opening a new chat", async () => {
+    const f = fixture("busy"); f.facade.conversationState = () => null;
+    await expect(f.bridge.attachConversation(request())).rejects.toThrow(/Open the original/);
+    expect(f.fake.facade.openBackground).not.toHaveBeenCalled();
+    f.facade.observeLifecycle = async () => { throw new Error("native read failed"); };
+    await expect(f.bridge.attachConversation(request())).rejects.toThrow("native read failed");
+    expect(f.fake.facade.sendNew).not.toHaveBeenCalled();
+  });
+  it("loads only the original closed idle timeline in the background", async () => {
+    const f = fixture();
+    let open = false;
+    const state = f.facade.conversationState!;
+    f.facade.conversationState = target => open ? state(target) : null;
+    f.fake.facade.openBackground.mockImplementation(async target => { expect(target).toEqual(ref); open = true; });
+    expect(await f.bridge.attachConversation(request())).toMatchObject({ status: "attached", session: ref });
+    expect(f.fake.facade.openBackground).toHaveBeenCalledOnce();
+    expect(f.fake.facade.sendNew).not.toHaveBeenCalled(); expect(f.fake.facade.sendExisting).not.toHaveBeenCalled();
+    expect(f.fake.facade.focus).not.toHaveBeenCalled(); expect(f.fake.facade.openDraft).not.toHaveBeenCalled();
+  });
+  it("continues only explicit new input into the original session and verifies current native choices", async () => {
+    const f = fixture();
+    const send = vi.fn<NonNullable<HostTaskFacade["continueMessage"]>>(async (target, _prompt, _images, runId, before, _launch, _row, beforeSpawn) => {
+      await before("turn", runId); await beforeSpawn?.();
+      expect(target).toEqual(ref); return { delivery: "turn", runId };
+    });
+    f.facade.continueMessage = send;
+    await f.bridge.attachConversation(request());
+    f.facade.conversationLaunch = () => ({ model: "changed-native-model", effort: "medium", providerId: "changed-channel" });
+    const view = await f.bridge.conversation("attached");
+    expect(view.selection).toMatchObject({ model: "changed-native-model", providerId: "changed-channel" });
+    await f.bridge.sendMessage({ conversationRequestId: "attached", requestId: "new-input", expectedInputRevision: view.inputRevision, prompt: "only the new question" });
+    await vi.waitFor(() => expect(send).toHaveBeenCalledOnce());
+    expect(send.mock.calls[0].slice(0, 3)).toEqual([ref, "only the new question", []]);
+    expect(f.fake.facade.sendNew).not.toHaveBeenCalled();
+    expect((await f.bridge.receipt("attached"))?.runId).toBeNull();
+  });
+  it("projects original child edges and stops only the exact original run and native subtree", async () => {
+    const f = fixture("busy"); f.fake.routes.set("original-run", `claude/${S1}`);
+    const child: Awaited<ReturnType<HostTaskFacade["leaderBranches"]>>[number] = { id: "child", parentEngine: "claude", parentSessionId: S1, parentWorkspacePath: GAME, engine: "claude", sessionId: S2, workspacePath: GAME, state: "running", runId: "child-run" };
+    f.facade.leaderBranches = async () => [child, { ...child, id: "unrelated", parentSessionId: S3, sessionId: "44444444-4444-4444-4444-444444444444" }];
+    const stop = vi.fn(async (_parent: TaskSessionRef, _id: string) => { child.state = "stopped"; }); f.facade.stopChild = stop;
+    await f.bridge.attachConversation(request());
+    expect((await f.bridge.conversation("attached")).children.map(c => c.id)).toEqual(["child"]);
+    await f.bridge.stopConversation("attached");
+    expect(f.fake.facade.interrupt).toHaveBeenCalledWith("original-run");
+    expect(stop).toHaveBeenCalledWith(ref, "child"); expect(stop.mock.calls.every(c => c[1] === "child")).toBe(true);
+    expect(child.parentSessionId).toBe(S1);
+    expect(f.fake.facade.sendNew).not.toHaveBeenCalled();
+  });
+});
+
+describe("isolated initial task delivery", () => {
+  function isolated() {
+    const fake = fakeFacade(), facade = fake.facade as HostTaskFacade;
+    const response = Promise.withResolvers<{ runId: string; sessionId: string | null }>();
+    const send = vi.fn<HostTaskFacade["sendNew"]>(async (engine, _workspace, _prompt, runId, _launch, beforeSend) => {
+      await beforeSend?.(); fake.routes.set(runId, `new:${engine}:@host-task/${runId}`); return response.promise;
+    });
+    facade.sendNewIsolated = send;
+    fake.drafts.set(`claude:${GAME}`, { held: true });
+    return { fake, facade, response, send, ...bridgeFor(fake) };
+  }
+  it("starts once without opening or consuming the user's pending slot", async () => {
+    const f = isolated(), held = f.fake.drafts.get(`claude:${GAME}`);
+    await f.bridge.submit(submission("private-start", { sessionMode: "new" })); await settle(f.bridge);
+    const receipt = await f.bridge.receipt("private-start"), runId = receipt!.runId!;
+    expect(receipt?.status).toBe("starting"); expect(f.send).toHaveBeenCalledOnce();
+    expect(f.fake.facade.openDraft).not.toHaveBeenCalled(); expect(f.fake.facade.sendNew).not.toHaveBeenCalled();
+    f.response.resolve({ runId, sessionId: S1 }); await settle(f.bridge);
+    expect(await f.bridge.receipt("private-start")).toMatchObject({ status: "executing", session: { sessionId: S1 } });
+    expect(f.fake.drafts.get(`claude:${GAME}`)).toBe(held);
+    await f.bridge.submit(submission("private-start", { sessionMode: "new" })); await settle(f.bridge); expect(f.send).toHaveBeenCalledOnce();
+  });
+  it("interrupts an isolated starting run before ACK and never reports cancellation as completed", async () => {
+    const f = isolated(); await f.bridge.submit(submission("private-cancel")); await settle(f.bridge);
+    const runId = (await f.bridge.receipt("private-cancel"))!.runId!;
+    await f.bridge.cancel("private-cancel");
+    expect(f.fake.facade.interrupt).toHaveBeenCalledWith(runId);
+    f.fake.emit([ev(runId, 1, "done", { interrupted: true }, S1)]); await settle(f.bridge);
+    expect(await f.bridge.receipt("private-cancel")).toMatchObject({ status: "cancelled", session: { sessionId: S1 } });
+    f.response.resolve({ runId, sessionId: S1 }); await settle(f.bridge);
+    expect(await f.bridge.receipt("private-cancel")).toMatchObject({ status: "cancelled" }); expect(f.send).toHaveBeenCalledOnce();
+  });
+  it("proves an isolated pre-spawn refusal never acquired a native identity", async () => {
+    const f = isolated(); f.send.mockRejectedValueOnce(new TaskPreSpawnError("cancelled during preparation"));
+    await f.bridge.submit(submission("private-unsent")); await settle(f.bridge);
+    expect(await f.bridge.receipt("private-unsent")).toMatchObject({ status: "failed", session: null, runId: null, sessionDecision: null });
+    expect(f.fake.facade.sendNew).not.toHaveBeenCalled(); expect(f.send).toHaveBeenCalledOnce();
+  });
+  it("retains done until a late session identity proves the same original run", async () => {
+    const f = isolated(); await f.bridge.submit(submission("late-identity")); await settle(f.bridge);
+    const runId = (await f.bridge.receipt("late-identity"))!.runId!;
+    f.fake.emit([ev(runId, 1, "done", null)]); await settle(f.bridge);
+    expect(await f.bridge.receipt("late-identity")).toMatchObject({ status: "unknown", session: null });
+    f.response.resolve({ runId, sessionId: null }); await settle(f.bridge);
+    f.fake.emit([ev(runId, 2, "session", S1)]); await settle(f.bridge);
+    expect(await f.bridge.receipt("late-identity")).toMatchObject({ status: "completed", session: { sessionId: S1 } });
+    expect(f.send).toHaveBeenCalledOnce();
+  });
+  it.each(["event", "native-proof"])("does not retroactively cancel completed private work known through %s before late identity", async evidence => {
+    const f = isolated(); await f.bridge.submit(submission("done-before-cancel")); await settle(f.bridge);
+    const runId = (await f.bridge.receipt("done-before-cancel"))!.runId!;
+    f.fake.routes.delete(runId);
+    if (evidence === "event") f.fake.emit([ev(runId, 1, "done", null)]);
+    else f.fake.settled.set(runId, { status: "completed" });
+    await settle(f.bridge);
+    const cancelled = await f.bridge.cancel("done-before-cancel");
+    expect(cancelled?.status).not.toBe("cancelled");
+    expect(f.fake.facade.interrupt).not.toHaveBeenCalled();
+    f.response.resolve({ runId, sessionId: null }); await settle(f.bridge);
+    expect(await f.bridge.receipt("done-before-cancel")).toMatchObject({ status: "unknown", session: null });
+    f.fake.emit([ev(runId, 2, "session", S1)]); await settle(f.bridge);
+    expect(await f.bridge.receipt("done-before-cancel")).toMatchObject({ status: "completed", session: { sessionId: S1 } });
+    expect(f.send).toHaveBeenCalledOnce();
+  });
+  it("does not ignore a contradictory late ACK after a terminal event", async () => {
+    const f = isolated(); await f.bridge.submit(submission("late-conflict")); await settle(f.bridge);
+    const runId = (await f.bridge.receipt("late-conflict"))!.runId!;
+    f.fake.emit([ev(runId, 1, "done", null, S1)]); await settle(f.bridge);
+    expect((await f.bridge.receipt("late-conflict"))?.status).toBe("completed");
+    f.response.resolve({ runId, sessionId: S2 }); await settle(f.bridge);
+    expect(await f.bridge.receipt("late-conflict")).toMatchObject({ status: "unknown", error: expect.stringContaining("identity mismatch"), session: { sessionId: S1 } });
+    await f.bridge.submit(submission("late-conflict")); await settle(f.bridge); expect(f.send).toHaveBeenCalledOnce();
+  });
+  it("retains an identity conflict raised by the real sender after terminal native evidence", async () => {
+    const f = isolated(); await f.bridge.submit(submission("sender-conflict")); await settle(f.bridge);
+    const runId = (await f.bridge.receipt("sender-conflict"))!.runId!;
+    f.fake.emit([ev(runId, 1, "done", null, S1)]); await settle(f.bridge);
+    f.response.reject(Object.assign(new Error("sender refused native rebinding"), { outcomeUnknown: true, nativeIdentityMismatch: true }));
+    await settle(f.bridge);
+    expect(await f.bridge.receipt("sender-conflict")).toMatchObject({ status: "unknown", session: { sessionId: S1 } });
+    await f.bridge.submit(submission("sender-conflict")); await settle(f.bridge); expect(f.send).toHaveBeenCalledOnce();
+  });
+  it("does not promote a restored private route without native acknowledgement to executing", async () => {
+    const f = isolated(); await f.bridge.submit(submission("private-unknown")); await settle(f.bridge);
+    const runId = (await f.bridge.receipt("private-unknown"))!.runId!;
+    f.response.reject(new Error("native reply lost")); await settle(f.bridge);
+    expect((await f.bridge.receipt("private-unknown"))?.status).toBe("unknown");
+    f.bridge.dispose();
+    const next = fakeFacade(); next.routes.set(runId, `new:claude:@host-task/${runId}`);
+    const restored = bridgeFor(next, { storage: f.storage });
+    await settle(restored.bridge);
+    expect(await restored.bridge.receipt("private-unknown")).toMatchObject({ status: "unknown", runId, session: null });
+    expect(next.facade.sendNew).not.toHaveBeenCalled(); expect(next.facade.sendExisting).not.toHaveBeenCalled();
+  });
+});
+
+describe("archived continuous coordinator claims", () => {
+  it.each([false, true])("releases two verified archived sources and sends only the original queued request (release race=%s)", async race => {
+    const first = fakeFacade(), storage = storageFor(), facade = first.facade as HostTaskFacade;
+    const engines = facade.engines;
+    facade.engines = () => [...engines(), { id: "agy", available: true, enabled: true, defaultModel: "gemini", defaultEffort: null }];
+    facade.conversationState = () => ({ messages: [], runId: null, status: "idle", canDeliver: true });
+    facade.leaderBranches = async () => [];
+    const original = bridgeFor(first, { storage }).bridge;
+    const refs = [{ engine: "claude", sessionId: S1, workspacePath: GAME }, { engine: "agy", sessionId: "agy-old", workspacePath: GAME }];
+    for (const [i, id] of ["old-stopped", "old-resumed"].entries()) {
+      await original.submit(submission(id, { engine: refs[i].engine, sessionMode: "new", coordination: true, slotKey: id })); await settle(original);
+      const run = (await original.receipt(id))!.runId!;
+      first.adopt(run, refs[i]); first.emit([ev(run, 1, "session", refs[i].sessionId, refs[i].sessionId, refs[i].engine)]);
+      first.finish(run, refs[i]); first.emit([ev(run, 2, "done", null, refs[i].sessionId, refs[i].engine)]); await settle(original);
+      expect((await original.conversation(id)).status).toBe("idle");
+    }
+    original.dispose();
+    const index = storage.data.get(`wb:${HOST_TASKS_INDEX_KEY}`) as any;
+    // Exercise both a retained hold and an idle claim released by a previous
+    // renderer: neither can bypass fresh lifecycle verification on cold boot.
+    for (const entry of index.entries) entry.conversationHolding = race;
+    index.entries[1].receipt.status = "failed"; index.entries[1].receipt.error = "Original GUI turn was interrupted";
+    const saved = storage.data.get("wb:__host_tasks_v1:conversations") as any;
+    for (const record of saved.records) {
+      if (record.requestId === "old-stopped") {
+        Object.assign(record, { stopping: true, stopEpoch: 1, stopRunId: "stop-fixture", stopInputRevision: 0,
+          stopTerminalProof: { runId: "stop-fixture", sessionRef: refs[0], status: "completed" }, children: [] });
+      } else {
+        Object.assign(record, { stopping: false, stopped: false, stopEpoch: 2, inputRevision: 2, children: [] });
+        record.inputs = [["resolved", 1, "unknown", "older-run", true], ["last", 2, "completed", "last-run", false]].map(([id, rev, status, run, resolved]) => ({
+          receipt: { requestId: id, conversationRequestId: record.requestId, inputRevision: rev, status, delivery: "turn", runId: run,
+            sessionRef: refs[1], acceptedAt: 1, updatedAt: 2, ...(resolved ? { stopResolved: true } : {}) },
+          fingerprint: JSON.stringify([record.requestId, id, Number(rev) - 1, "fixture", []]), prompt: "fixture", images: [],
+        }));
+      }
+    }
+    const next = fakeFacade(), nextFacade = next.facade as HostTaskFacade;
+    const pending = Promise.withResolvers<void>(); let valid = true, activated = false;
+    nextFacade.conversationState = () => null;
+    nextFacade.canProjectTerminalRun = () => false;
+    nextFacade.leaderBranches = async () => [];
+    nextFacade.observeLifecycle = async () => { await pending.promise; return { archived: true, idle: true, isCurrent: () => valid }; };
+    refs.forEach(ref => next.addSession(ref));
+    const cold = bridgeFor(next, { storage }).bridge;
+    const request = submission("original-current", { sessionMode: "new", slotKey: "current" });
+    await cold.submit(request); await settle(cold);
+    expect(await cold.receipt(request.requestId)).toMatchObject({ status: "queued", session: null, runId: null, blockedBy: ["old-stopped", "old-resumed"] });
+    expect(next.facade.sendNew).not.toHaveBeenCalled();
+    const write = storage.set.getMockImplementation()!;
+    if (race) storage.set.mockImplementation(async (plugin, key, value) => {
+      await write(plugin, key, value);
+      if (!activated && key === HOST_TASKS_INDEX_KEY && (value as any).entries.some((e: any) => e.receipt.requestId === "old-stopped" && e.conversationHolding === false)) {
+        activated = true; valid = false; next.poke();
+      }
+    });
+    pending.resolve(); await settle(cold);
+    if (race) {
+      expect(activated).toBe(true);
+      expect(next.facade.sendNew).not.toHaveBeenCalled();
+      expect((storage.data.get(`wb:${HOST_TASKS_INDEX_KEY}`) as any).entries.find((e: any) => e.receipt.requestId === "old-stopped").conversationHolding).toBe(true);
+      // A later fresh native observation may release; the invalidated one cannot.
+      nextFacade.observeLifecycle = async () => ({ archived: true, idle: true, isCurrent: () => true });
+      await cold.conversation("old-stopped"); await cold.conversation("old-resumed"); await settle(cold);
+    }
+    expect(next.facade.sendNew).toHaveBeenCalledTimes(1);
+    expect((await cold.receipt(request.requestId))!.blockedBy).toBeUndefined();
+    expect(next.facade.sendExisting).not.toHaveBeenCalled();
+    expect(next.facade.openBackground).not.toHaveBeenCalled();
+    const settledIndex = storage.data.get(`wb:${HOST_TASKS_INDEX_KEY}`) as any;
+    expect(settledIndex.entries.slice(0, 2).every((e: any) => e.conversationOwner && !e.conversationHolding)).toBe(true);
+    await cold.submit(request); next.poke(); await settle(cold);
+    expect(next.facade.sendNew).toHaveBeenCalledTimes(1);
+    expect(await cold.list()).toHaveLength(3);
+  });
+});
+
 describe("host task bridge delivery", () => {
-  it("persists separate fixed instructions before launch and refuses changed idempotent retries", async () => {
-    const fake = fakeFacade(); const { bridge, storage } = bridgeFor(fake);
+  it("advertises coordinator full-history handoff only with the native full-history facade", async () => {
+    const fake = fakeFacade(), facade = fake.facade as HostTaskFacade;
+    const { bridge } = bridgeFor(fake);
+    expect((await bridge.catalog()).capabilities?.coordinatorFullHistoryHandoff).toBe(false);
+    facade.summarizeHandoff = vi.fn();
+    const support = vi.fn(async () => false); facade.fullHistoryHandoffSupported = support;
+    expect((await bridge.catalog()).capabilities?.coordinatorFullHistoryHandoff).toBe(false);
+    support.mockResolvedValue(true);
+    expect((await bridge.catalog()).capabilities).toMatchObject({ fullHistoryHandoff: true, coordinatorFullHistoryHandoff: true });
+    delete facade.summarizeHandoff;
+    expect((await bridge.catalog()).capabilities?.coordinatorFullHistoryHandoff).toBe(false);
+  });
+  it("binds coordinator summary to this plugin's exact owned request and native session", async () => {
+    const fake = fakeFacade(), facade = fake.facade as HostTaskFacade;
+    const ref = { engine: "claude", sessionId: S1, workspacePath: GAME };
+    facade.conversationState = () => ({ messages: [], runId: null, status: "idle", canDeliver: true });
+    facade.leaderBranches = async () => [];
+    facade.fullHistoryHandoffSupported = async () => true;
+    const summarize = vi.fn(async () => "Native complete history"); facade.summarizeHandoff = summarize;
+    const { bridge, storage } = bridgeFor(fake);
+    await bridge.submit(submission("coordinator-owner", { coordination: true, sessionMode: "new" })); await settle(bridge);
+    const run = fake.facade.sendNew.mock.calls[0][3];
+    fake.adopt(run, ref); fake.emit([ev(run, 1, "session", S1)]); await settle(bridge);
+    fake.finish(run, ref); fake.emit([ev(run, 2, "done", null, S1)]); await settle(bridge);
+    const view = await bridge.conversation("coordinator-owner");
+    const source = { kind: "coordinator" as const, conversationRequestId: "coordinator-owner", expectedRevision: view.revision };
+    const selection = { engine: "codex" as const, model: "selected-compressor" };
+    const other = bridgeFor(fake, { pluginId: "other-summary-plugin", storage }).bridge;
+    await expect(other.summarizeCoordinatorHandoff(source, selection)).rejects.toThrow(/Unknown owned/);
+    expect(summarize).not.toHaveBeenCalled();
+    expect(await bridge.summarizeCoordinatorHandoff(source, selection)).toBe("Native complete history");
+    expect(summarize).toHaveBeenCalledExactlyOnceWith(ref, selection);
+    expect(fake.facade.loadPage).not.toHaveBeenCalled();
+    expect(fake.facade.sendNew).toHaveBeenCalledTimes(1); expect(fake.facade.sendExisting).not.toHaveBeenCalled();
+  });
+  it("gates managed handoff on native support, cost capture and host human confirmation", async () => {
+    const fake = fakeFacade(), facade = fake.facade as HostTaskFacade;
+    const { bridge } = bridgeFor(fake, { confirmCostReview: async () => true, confirmManagedHandoff: async () => true });
+    expect((await bridge.catalog()).capabilities?.managedChildCostHandoff).toBe(false);
+    facade.costApprovals = () => ({ items: [], truncated: false }); facade.captureCostApproval = vi.fn(); facade.handoffCostApproval = vi.fn();
+    const supported = vi.fn(async () => false); facade.managedChildHandoffSupported = supported;
+    expect((await bridge.catalog()).capabilities?.managedChildCostHandoff).toBe(false);
+    supported.mockResolvedValue(true);
+    expect((await bridge.catalog()).capabilities?.managedChildCostHandoff).toBe(true);
+    expect((await bridge.catalog()).capabilities?.managedChildHandoffSelection).toBe(false);
+    facade.resolveHandoffSelection = async selection => selection;
+    const selectionSupported = vi.fn(async () => false); facade.managedChildHandoffSelectionSupported = selectionSupported;
+    expect((await bridge.catalog()).capabilities?.managedChildHandoffSelection).toBe(false);
+    selectionSupported.mockResolvedValue(true);
+    expect((await bridge.catalog()).capabilities?.managedChildHandoffSelection).toBe(true);
+    const withoutDialog = bridgeFor(fake).bridge;
+    expect((await withoutDialog.catalog()).capabilities?.managedChildCostHandoff).toBe(false);
+    expect((await withoutDialog.catalog()).capabilities?.managedChildHandoffSelection).toBe(false);
+  });
+  it("advertises cost handoff previews only with both native cost capture and coordinator evaluation", async () => {
+    const fake = fakeFacade(), facade = fake.facade as HostTaskFacade;
+    const { bridge } = bridgeFor(fake);
+    expect((await bridge.catalog()).capabilities?.costHandoffPreview).toBe(false);
+    facade.captureCostApproval = vi.fn();
+    expect((await bridge.catalog()).capabilities?.costHandoffPreview).toBe(false);
+    facade.sessionCostReview = () => null;
+    expect((await bridge.catalog()).capabilities?.costHandoffPreview).toBe(true);
+    delete facade.captureCostApproval;
+    expect((await bridge.catalog()).capabilities?.costHandoffPreview).toBe(false);
+  });
+
+  it("routes owned cost previews through bounded history without resolving or delivering the held request", async () => {
+    const fake = fakeFacade(), facade = fake.facade as HostTaskFacade;
+    const ref = { engine: "claude", sessionId: S1, workspacePath: GAME };
+    const target = { engine: "claude", sessionId: S2, workspacePath: GAME };
+    const fullMessage = "完整请求🙂".repeat(400);
+    const approval: HostTaskCostApproval = { id: "approval-1", requestId: "held-1", sender: ref, target,
+      message: fullMessage.slice(0, 1200), truncated: true, model: "opus", cacheHeat: "cold",
+      usageKind: "unknown", capturedAt: 1, canHandoff: true };
+    facade.conversationState = () => ({ messages: [], runId: null, status: "idle", canDeliver: true });
+    facade.leaderBranches = async () => [{ id: "preview-child", parentEngine: ref.engine, parentSessionId: ref.sessionId,
+      ...target, state: "completed" }];
+    facade.sessionCostReview = () => null;
+    facade.costApprovals = vi.fn(() => ({ items: [approval], truncated: false }));
+    facade.captureCostApproval = vi.fn(() => ({ approval, message: fullMessage, kind: "cross-session" as const }));
+    facade.resolveCostApproval = vi.fn(async () => {});
+    const confirmCostReview = vi.fn(async () => true);
+    const { bridge, storage } = bridgeFor(fake, { confirmCostReview });
+    await bridge.submit(submission("preview-owner", { coordination: true, sessionMode: "new" })); await settle(bridge);
+    const run = fake.facade.sendNew.mock.calls[0][3];
+    fake.adopt(run, ref); fake.emit([ev(run, 1, "session", S1)]); await settle(bridge);
+    fake.finish(run, ref); fake.emit([ev(run, 2, "done", null, S1)]); await settle(bridge);
+    fake.addSession(target);
+    const view = await bridge.conversation("preview-owner");
+    expect(view.costApprovals).toEqual([approval]);
+    const request = { conversationRequestId: "preview-owner", expectedRevision: view.revision,
+      approvalId: approval.id, approvalRequestId: approval.requestId };
+    const result = await bridge.previewCostHandoff!(request);
+    expect(result).toMatchObject({ conversationRequestId: request.conversationRequestId, approvalId: approval.id,
+      approvalRequestId: approval.requestId, source: target, kind: "crossSession", message: fullMessage,
+      images: [], model: "opus", sourceStamp: expect.stringMatching(/^[a-f0-9]{64}$/) });
+    expect(result.excerpt.messages.map(row => row.role)).toEqual(["user", "assistant"]);
+    expect(fake.facade.loadPage).toHaveBeenCalledWith(target, 20, null);
+    expect(result.excerpt).toMatchObject({ truncated: true, messages: [
+      { text: "old question", truncated: false }, { text: expect.any(String), truncated: true },
+    ] });
+    expect(facade.captureCostApproval).toHaveBeenCalledWith([ref, target], approval);
+    await expect(bridge.previewCostHandoff!({ ...request, expectedRevision: 0 })).rejects.toThrow(/Invalid/);
+    await expect(bridge.previewCostHandoff!({ ...request, expectedRevision: view.revision + 1 })).rejects.toThrow(/stale/);
+    await expect(bridge.previewCostHandoff!({ ...request, approvalId: "other-approval" })).rejects.toThrow(/no longer available/);
+    await expect(bridge.previewCostHandoff!({ ...request, approvalRequestId: "other-held" })).rejects.toThrow(/no longer available/);
+    const other = bridgeFor(fake, { pluginId: "other", storage, confirmCostReview }).bridge;
+    await expect(other.previewCostHandoff!(request)).rejects.toThrow(/Unknown owned/);
+    expect(confirmCostReview).not.toHaveBeenCalled();
+    expect(facade.resolveCostApproval).not.toHaveBeenCalled();
+    expect(fake.facade.sendNew).toHaveBeenCalledTimes(1);
+    expect(fake.facade.sendExisting).not.toHaveBeenCalled();
+    expect(fake.facade.interrupt).not.toHaveBeenCalled();
+  });
+
+  it("freezes a coordinator's explicit tier, verifies native support and fences altered retries and checkpoints", async () => {
+    const fake = fakeFacade(), { bridge, storage } = bridgeFor(fake);
+    const request = submission("fast-owner", { engine: "codex", coordination: true, sessionMode: "new", codexServiceTier: "priority" });
+    expect((await bridge.catalog()).capabilities?.coordinatorServiceTier).toBe(true);
+    await bridge.submit(request); await settle(bridge);
+    expect(fake.facade.sendNew.mock.calls[0][4]).toMatchObject({ codexServiceTierOverride: "priority" });
+    await expect(bridge.submit({ ...request, codexServiceTier: "default" })).rejects.toThrow("different submission");
+    bridge.dispose();
+    const restored = bridgeFor(fake, { storage }).bridge;
+    await expect(restored.receipt("fast-owner")).resolves.toMatchObject({ requestId: "fast-owner" });
+    restored.dispose();
+    const saved = storage.data.get(`wb:${HOST_TASKS_INDEX_KEY}`) as any;
+    saved.entries[0].launch.codexServiceTierOverride = "default";
+    await expect(bridgeFor(fake, { storage }).bridge.ready()).rejects.toThrow("coordinator record");
+  });
+  it("rejects an unavailable or non-coordinator service tier without starting a native task", async () => {
+    const fake = fakeFacade(); fake.facade.codexServiceTierOverrideSupported.mockResolvedValue(false);
+    const { bridge } = bridgeFor(fake);
+    expect((await bridge.catalog()).capabilities?.coordinatorServiceTier).toBe(false);
+    await expect(bridge.submit(submission("old", { engine: "codex", coordination: true, sessionMode: "new", codexServiceTier: "priority" }))).rejects.toThrow("unavailable");
+    await expect(bridge.submit(submission("ordinary", { engine: "codex", sessionMode: "new", codexServiceTier: "priority" }))).rejects.toThrow("coordinator");
+    await expect(bridge.submit(submission("other-engine", { engine: "claude", coordination: true, sessionMode: "new", codexServiceTier: "default" }))).rejects.toThrow("coordinator");
+    expect(fake.facade.sendNew).not.toHaveBeenCalled();
+  });
+  it("identifies a notice source only after the exact coordinator session is proven", async () => {
+    const fake = fakeFacade(), { bridge, storage } = bridgeFor(fake);
+    const ref = { engine: "claude", sessionId: S1, workspacePath: GAME };
+    await bridge.submit(submission("notice-owner", { coordination: true, sessionMode: "new" })); await settle(bridge);
+    expect(await bridge.noticeCoordinator(ref)).toBeNull();
+    const run = fake.facade.sendNew.mock.calls[0][3];
+    fake.adopt(run, ref); fake.emit([ev(run, 1, "session", S1)]); await settle(bridge);
+    expect(await bridge.noticeCoordinator(ref)).toBe("notice-owner");
+    expect(await bridge.noticeCoordinator({ ...ref, workspacePath: TOOL })).toBeNull();
+    expect(await bridge.noticeCoordinator({ ...ref, sessionId: S2 })).toBeNull();
+    const other = bridgeFor(fake, { pluginId: "other", storage }).bridge;
+    expect(await other.noticeCoordinator(ref)).toBeNull();
+  });
+  it("advertises immediate messages only when the native facade provides preparation", async () => {
+    const fake = fakeFacade(); const { bridge } = bridgeFor(fake);
+    expect((await bridge.catalog()).capabilities?.coordinatorMessageQueue).toBe(true);
+    expect((await bridge.catalog()).capabilities?.immediateMessages).toBe(false);
+    (fake.facade as HostTaskFacade).prepareImmediateMessage = vi.fn(async () => {});
+    expect((await bridge.catalog()).capabilities?.immediateMessages).toBe(true);
+    expect(typeof bridge.sendMessageNow).toBe("function");
+  });
+  it.each(["claude", "codex", "agy"])("%s persists separate fixed instructions before launch and refuses changed idempotent retries", async engine => {
+    const fake = fakeFacade();
+    const engines = fake.facade.engines();
+    if (engine === "agy") fake.facade.engines = () => [...engines, { id: "agy", available: true, enabled: true, defaultModel: "gemini", defaultEffort: null }]; const { bridge, storage } = bridgeFor(fake);
     const profile = { version: "coordinate-v1", text: "Stable policy 中文😀" };
-    const request = submission("fixed", { engine: "claude", coordination: true, sessionMode: "new", fixedInstructions: profile });
+    const request = submission("fixed", { engine, model: engine === "agy" ? "gemini" : "opus", coordination: true, sessionMode: "new", fixedInstructions: profile });
     const original = fake.facade.sendNew.getMockImplementation()!;
     fake.facade.sendNew.mockImplementationOnce(async (...args) => {
       const entry = (storage.data.get(`wb:${HOST_TASKS_INDEX_KEY}`) as any).entries[0];
@@ -190,6 +741,31 @@ describe("host task bridge delivery", () => {
     expect((await bridge.catalog()).engines.every(e => !e.supportsFixedInstructions)).toBe(true);
     await expect(bridge.submit(submission("old-native", { engine: "claude", fixedInstructions: { version: "v1", text: "policy" } }))).rejects.toThrow("unavailable");
     expect(fake.facade.sendNew).not.toHaveBeenCalled();
+  });
+  it("publishes exact AGY capability and rejects a legacy host despite global support", async () => {
+    const fake = fakeFacade(); const engines = fake.facade.engines();
+    fake.facade.engines = () => [...engines, { id: "agy", available: true, enabled: true, defaultModel: "gemini", defaultEffort: null }];
+    fake.facade.fixedInstructionsSupported.mockImplementation(async engine => engine !== "agy");
+    const { bridge } = bridgeFor(fake);
+    const catalog = await bridge.catalog();
+    expect(catalog.capabilities?.fixedInstructions).toBe(true);
+    expect(catalog.engines.find(e => e.id === "agy")?.supportsFixedInstructions).toBe(false);
+    expect(catalog.engines.find(e => e.id === "claude")?.supportsFixedInstructions).toBe(true);
+    await expect(bridge.submit(submission("agy-old", { engine: "agy", model: "gemini", fixedInstructions: { version: "v1", text: "policy" } }))).rejects.toThrow("unavailable");
+    expect(fake.facade.sendNew).not.toHaveBeenCalled();
+    fake.facade.fixedInstructionsSupported.mockResolvedValue(true);
+    expect((await bridge.catalog()).engines.find(e => e.id === "agy")?.supportsFixedInstructions).toBe(true);
+  });
+  it("rechecks the exact engine before launching accepted guidance", async () => {
+    const fake = fakeFacade();
+    fake.facade.fixedInstructionsSupported.mockResolvedValueOnce(true).mockResolvedValue(false);
+    const { bridge } = bridgeFor(fake);
+    await bridge.submit(submission("lost-guidance", { engine: "claude", sessionMode: "new", fixedInstructions: { version: "v1", text: "policy" } }));
+    await settle(bridge);
+    expect((await bridge.receipt("lost-guidance"))?.status).toBe("failed");
+    expect((await bridge.receipt("lost-guidance"))?.error).toContain("fixed instructions are unavailable");
+    expect(fake.facade.sendNew).not.toHaveBeenCalled();
+    expect(fake.facade.fixedInstructionsSupported.mock.calls.every(([engine]) => engine === "claude")).toBe(true);
   });
   it("fingerprints and persists initial displayText and projects only its exact committed row", async () => {
     const fake = fakeFacade(), facade = fake.facade as HostTaskFacade;
@@ -255,6 +831,9 @@ describe("host task bridge delivery", () => {
   });
   it("P1 refuses legacy attachment and stop after a newer task took the exact native session", async () => {
     const fake = fakeFacade(), { bridge } = bridgeFor(fake);
+    const facade = fake.facade as HostTaskFacade;
+    const summarize = vi.fn(async () => "Must not summarize the successor's history");
+    facade.summarizeHandoff = summarize; facade.fullHistoryHandoffSupported = async () => true;
     await bridge.submit(submission("A")); await settle(bridge);
     const run = fake.facade.sendNew.mock.calls[0][3], ref = { engine: "claude", sessionId: S1, workspacePath: GAME };
     fake.adopt(run, ref); fake.emit([ev(run, 1, "session", S1)]); await settle(bridge);
@@ -263,6 +842,9 @@ describe("host task bridge delivery", () => {
     expect(fake.facade.sendExisting).toHaveBeenCalledOnce();
     await expect(bridge.conversation("A")).rejects.toThrow(/owner|newer|exclusive/i);
     await expect(bridge.stopConversation("A")).rejects.toThrow(/owner|newer|exclusive/i);
+    await expect(bridge.summarizeCoordinatorHandoff({ kind: "coordinator", conversationRequestId: "A", expectedRevision: 1 },
+      { engine: "codex", model: "selected-compressor" })).rejects.toThrow(/owner|newer|exclusive/i);
+    expect(summarize).not.toHaveBeenCalled();
     expect(fake.facade.interrupt).not.toHaveBeenCalled();
   });
   it("binds continuation to the owned initial request without consuming business ledger entries", async () => {
@@ -330,7 +912,7 @@ describe("host task bridge delivery", () => {
     fake.addSession(ref); fake.rollover.add(`claude/${S1}`);
     fake.facade.loadPage.mockRejectedValueOnce(new Error("history unavailable"));
     const storage = storageFor();
-    storage.data.set(`wb:${HOST_TASKS_INDEX_KEY}`, { version: 1, entries: [], slots: [{ projectId: "example-project", slotKey: "impl", session: ref, lastRequestId: "previous", updatedAt: 1 }] });
+    storage.data.set(`wb:${HOST_TASKS_INDEX_KEY}`, { version: 1, entries: [], slots: [{ projectId: "sample-project", slotKey: "impl", session: ref, lastRequestId: "previous", updatedAt: 1 }] });
     const { bridge } = bridgeFor(fake, { storage });
     await bridge.submit(submission("fallback")); await settle(bridge);
     expect(fake.facade.sendNew).toHaveBeenCalledTimes(1);
@@ -363,7 +945,7 @@ describe("host task bridge delivery", () => {
     fake.finish(runId, { engine: "claude", sessionId: S1, workspacePath: GAME });
     await settle(bridge);
     expect((await bridge.receipt("r1"))!.status).toBe("completed");
-    expect(await bridge.slots("example-project")).toMatchObject([{ slotKey: "impl", session: { sessionId: S1 }, lastRequestId: "r1" }]);
+    expect(await bridge.slots("sample-project")).toMatchObject([{ slotKey: "impl", session: { sessionId: S1 }, lastRequestId: "r1" }]);
     expect(seen.map((r) => r.status)).toContain("starting");
   });
 
@@ -372,7 +954,7 @@ describe("host task bridge delivery", () => {
     const ref = { engine: "claude", sessionId: S1, workspacePath: GAME };
     fake.addSession(ref, "busy");
     const storage = storageFor();
-    storage.data.set(`wb:${HOST_TASKS_INDEX_KEY}`, { version: 1, entries: [], slots: [{ projectId: "example-project", slotKey: "impl", session: ref, lastRequestId: "old", updatedAt: 1 }] });
+    storage.data.set(`wb:${HOST_TASKS_INDEX_KEY}`, { version: 1, entries: [], slots: [{ projectId: "sample-project", slotKey: "impl", session: ref, lastRequestId: "old", updatedAt: 1 }] });
     const { bridge } = bridgeFor(fake, { storage });
     await bridge.submit(submission("r2"));
     await settle(bridge);
@@ -400,8 +982,8 @@ describe("host task bridge delivery", () => {
     fake.addSession(ref, null);
     const storage = storageFor();
     storage.data.set(`wb:${HOST_TASKS_INDEX_KEY}`, { version: 1, entries: [], slots: [
-      { projectId: "example-project", slotKey: "impl", session: ref, lastRequestId: "old", updatedAt: 1 },
-      { projectId: "example-project", slotKey: "gone", session: { ...ref, sessionId: S3 }, lastRequestId: "old", updatedAt: 1 },
+      { projectId: "sample-project", slotKey: "impl", session: ref, lastRequestId: "old", updatedAt: 1 },
+      { projectId: "sample-project", slotKey: "gone", session: { ...ref, sessionId: S3 }, lastRequestId: "old", updatedAt: 1 },
     ] });
     const { bridge } = bridgeFor(fake, { storage });
     await bridge.submit(submission("r1"));
@@ -445,6 +1027,105 @@ describe("host task bridge delivery", () => {
     expect(fake.facade.sendNew).toHaveBeenCalledTimes(1);
   });
 
+  it("persists changed fixed draft reasons and clears them before sending the same request", async () => {
+    const fake = fakeFacade(), facade = fake.facade as HostTaskFacade;
+    const reason = vi.fn<NonNullable<HostTaskFacade["draftBlockReason"]>>().mockReturnValue("user-draft:focused");
+    facade.draftBlockReason = reason;
+    fake.drafts.set(`claude:${GAME}`, { held: true });
+    const { bridge, storage } = bridgeFor(fake), events = vi.fn();
+    const off = bridge.onEvent(events);
+    try {
+      await bridge.submit(submission("diagnosed")); await settle(bridge);
+      expect(await bridge.receipt("diagnosed")).toMatchObject({ status: "queued", blockedBy: ["user-draft", "user-draft:focused"] });
+      expect(reason).toHaveBeenLastCalledWith("claude", GAME, expect.any(Object), { requireOpenTab: false });
+      expect(fake.facade.openDraft).toHaveBeenCalledTimes(1);
+      reason.mockReturnValue("user-draft:text");
+      events.mockClear(); fake.poke(); await settle(bridge);
+      expect(await bridge.receipt("diagnosed")).toMatchObject({ status: "queued", blockedBy: ["user-draft", "user-draft:text"] });
+      expect(events).toHaveBeenCalledWith(expect.objectContaining({ requestId: "diagnosed", blockedBy: ["user-draft", "user-draft:text"] }));
+      const nativeSend = fake.facade.sendNew.getMockImplementation()!;
+      fake.facade.sendNew.mockImplementation(async (...args) => {
+        const index = storage.data.get(`wb:${HOST_TASKS_INDEX_KEY}`) as { entries: Array<{ receipt: HostTaskReceipt }> };
+        expect(index.entries[0].receipt).toMatchObject({ status: "starting", requestId: "diagnosed" });
+        expect(index.entries[0].receipt.blockedBy).toBeUndefined();
+        return nativeSend(...args);
+      });
+      fake.drafts.delete(`claude:${GAME}`); reason.mockReturnValue(null); fake.poke(); await settle(bridge);
+      expect(fake.facade.sendNew).toHaveBeenCalledTimes(1);
+      expect((await bridge.receipt("diagnosed"))?.blockedBy).toBeUndefined();
+      fake.poke(); await settle(bridge);
+      expect(fake.facade.sendNew).toHaveBeenCalledTimes(1);
+    } finally { off(); }
+  });
+
+  it.each(["text", "images"])("reveals only the exact queued %s draft and does not send it", async kind => {
+    const fake = fakeFacade(), facade = fake.facade as HostTaskFacade;
+    facade.draftBlockReason = vi.fn(() => `user-draft:${kind}` as "user-draft:text" | "user-draft:images");
+    fake.drafts.set(`claude:${GAME}`, { held: true });
+    const { bridge } = bridgeFor(fake);
+    await bridge.submit(submission("reveal")); await settle(bridge);
+    await bridge.open("reveal");
+    expect(fake.facade.focusDraft).toHaveBeenCalledExactlyOnceWith("claude", GAME, { requireBlockedDraft: true });
+    expect(fake.facade.sendNew).not.toHaveBeenCalled(); expect(fake.facade.focus).not.toHaveBeenCalled();
+    expect(await bridge.receipt("reveal")).toMatchObject({ status: "queued", session: null, runId: null });
+    await bridge.cancel("reveal");
+    await expect(bridge.open("reveal")).rejects.toThrow(/no conversation/);
+    expect(fake.facade.focusDraft).toHaveBeenCalledTimes(1);
+  });
+  it("reports a changed draft reveal instead of treating it as a successful open", async () => {
+    const fake = fakeFacade(), facade = fake.facade as HostTaskFacade;
+    facade.draftBlockReason = () => "user-draft:text";
+    fake.drafts.set(`claude:${GAME}`, { held: true });
+    fake.facade.focusDraft.mockImplementation(() => { throw new Error("draft changed"); });
+    const { bridge } = bridgeFor(fake);
+    await bridge.submit(submission("changed")); await settle(bridge);
+    await expect(bridge.open("changed")).rejects.toThrow("draft changed");
+    expect(await bridge.receipt("changed")).toMatchObject({ status: "queued" });
+    expect(fake.facade.sendNew).not.toHaveBeenCalled();
+  });
+  it("queries the open-tab guard after openDraft succeeds but draftReady refuses", async () => {
+    const fake = fakeFacade(), facade = fake.facade as HostTaskFacade;
+    facade.draftBlockReason = vi.fn<NonNullable<HostTaskFacade["draftBlockReason"]>>(() => "user-draft:streaming");
+    fake.drafts.set(`claude:${GAME}`, { busy: true });
+    const { bridge } = bridgeFor(fake);
+    await bridge.submit(submission("busy-draft")); await settle(bridge);
+    expect(facade.draftBlockReason).toHaveBeenCalledWith("claude", GAME, expect.any(Object), { requireOpenTab: true });
+    expect(await bridge.receipt("busy-draft")).toMatchObject({ status: "queued", blockedBy: ["user-draft", "user-draft:streaming"] });
+    expect(fake.facade.sendNew).not.toHaveBeenCalled();
+  });
+
+  it("records the fresh reason when the draft disappears while starting is being persisted", async () => {
+    const fake = fakeFacade(), facade = fake.facade as HostTaskFacade;
+    facade.draftBlockReason = vi.fn<NonNullable<HostTaskFacade["draftBlockReason"]>>(() => "user-draft:missing-tab");
+    const { bridge, storage } = bridgeFor(fake), original = storage.set.getMockImplementation()!;
+    storage.set.mockImplementation(async (id, key, value) => {
+      await original(id, key, value);
+      const index = value as { entries?: Array<{ receipt: HostTaskReceipt }> };
+      if (key === HOST_TASKS_INDEX_KEY && index.entries?.some(e => e.receipt.status === "starting")) fake.drafts.delete(`claude:${GAME}`);
+    });
+    await bridge.submit(submission("lost-draft")); await settle(bridge);
+    expect(await bridge.receipt("lost-draft")).toMatchObject({ status: "queued", runId: null, session: null, sessionDecision: null,
+      blockedBy: ["user-draft", "user-draft:missing-tab"] });
+    expect(facade.draftBlockReason).toHaveBeenCalledWith("claude", GAME, expect.any(Object), { requireOpenTab: true });
+    expect(fake.facade.sendNew).not.toHaveBeenCalled();
+  });
+
+  it("never replays an unknown send when independent draft notifications recur", async () => {
+    const fake = fakeFacade(), facade = fake.facade as HostTaskFacade;
+    facade.draftBlockReason = vi.fn(() => null);
+    fake.facade.sendNew.mockRejectedValueOnce(new Error("ambiguous transport outcome"));
+    const { bridge, storage } = bridgeFor(fake);
+    await bridge.submit(submission("uncertain-draft")); await settle(bridge);
+    expect(await bridge.receipt("uncertain-draft")).toMatchObject({ status: "unknown" });
+    fake.poke(); fake.poke(); await settle(bridge);
+    expect(fake.facade.sendNew).toHaveBeenCalledTimes(1);
+    bridge.dispose();
+    const restored = bridgeFor(fake, { storage }).bridge;
+    await restored.ready(); fake.poke(); await settle(restored);
+    expect(await restored.receipt("uncertain-draft")).toMatchObject({ status: "unknown" });
+    expect(fake.facade.sendNew).toHaveBeenCalledTimes(1);
+  });
+
   it("freezes defaultEngine, defaultModel and defaultEffort at submit time even if global defaults change while queued", async () => {
     const fake = fakeFacade();
     fake.drafts.set(`claude:${GAME}`, { held: true });
@@ -469,7 +1150,7 @@ describe("host task bridge delivery", () => {
     storage.data.set(`wb:${HOST_TASKS_INDEX_KEY}`, {
       version: 1,
       entries: [],
-      slots: [{ projectId: "example-project", slotKey: "impl", session: ref, lastRequestId: "old", updatedAt: 1 }],
+      slots: [{ projectId: "sample-project", slotKey: "impl", session: ref, lastRequestId: "old", updatedAt: 1 }],
     });
     const { bridge } = bridgeFor(fake, { storage });
     await bridge.submit(submission("roll-1", { writePaths: ["game/src"] }));
@@ -505,8 +1186,8 @@ describe("host task bridge delivery", () => {
     const { bridge, storage } = bridgeFor(fake);
     await expect(bridge.submit(submission("a", { workspacePath: "G:/nowhere" }))).rejects.toThrow(/registered/);
     await expect(bridge.submit(submission("b", { workspacePath: "G:/old" }))).rejects.toThrow(/registered/);
-    await expect(bridge.submit(submission("c", { writePaths: ["../EXAMPLE/x"] }))).rejects.toThrow(/escapes/);
-    await expect(bridge.submit(submission("d", { writePaths: ["G:/proj/EXAMPLE/x"] }))).rejects.toThrow(/outside/);
+    await expect(bridge.submit(submission("c", { writePaths: ["../SAMPLE-PROJECT/x"] }))).rejects.toThrow(/escapes/);
+    await expect(bridge.submit(submission("d", { writePaths: ["G:/proj/SAMPLE-PROJECT/x"] }))).rejects.toThrow(/outside/);
     await expect(bridge.submit(submission("e", { engine: "nope" }))).rejects.toThrow(/not available/);
     expect(storage.set).not.toHaveBeenCalled();
   });
@@ -663,7 +1344,7 @@ describe("host task cancellation and failures", () => {
     const ref = { engine: "claude", sessionId: S1, workspacePath: GAME };
     fake.addSession(ref);
     const storage = storageFor();
-    storage.data.set(`wb:${HOST_TASKS_INDEX_KEY}`, { version: 1, entries: [], slots: [{ projectId: "example-project", slotKey: "impl", session: ref, lastRequestId: "o", updatedAt: 1 }] });
+    storage.data.set(`wb:${HOST_TASKS_INDEX_KEY}`, { version: 1, entries: [], slots: [{ projectId: "sample-project", slotKey: "impl", session: ref, lastRequestId: "o", updatedAt: 1 }] });
     const { bridge } = bridgeFor(fake, { storage });
     await bridge.submit(submission("m"));
     await settle(bridge);
@@ -1045,6 +1726,27 @@ describe("host task planning and history", () => {
 
 
 describe("frozen native task selections", () => {
+  it("pins and restores an AGY channel without an independent effort", async () => {
+    const fake = fakeFacade();
+    const agy = { engine: "agy", model: "gemini-4-argon-high", providerId: "agy-channel" };
+    const engines = fake.facade.engines;
+    fake.facade.engines = () => [...engines(), { id: "agy", available: true, enabled: true, defaultModel: agy.model, defaultEffort: "high" }];
+    fake.drafts.set(`agy:${GAME}`, { held: true });
+    const invoke = vi.fn(async () => agy);
+    const { bridge, storage } = bridgeFor(fake, { invoke });
+    const request = submission("agy-pinned", agy);
+    expect(await bridge.submit(request)).toMatchObject({ requestedSelection: agy, effectiveSelection: agy });
+    await settle(bridge); bridge.dispose();
+    fake.drafts.clear();
+    const restored = bridgeFor(fake, { invoke, storage }).bridge;
+    await restored.ready(); await settle(restored);
+    expect(fake.facade.sendNew).toHaveBeenCalledTimes(1);
+    expect(fake.facade.sendNew.mock.calls[0][0]).toBe("agy");
+    expect(fake.facade.sendNew.mock.calls[0][4]).toMatchObject({ model: agy.model, providerId: agy.providerId, defaultEffort: null });
+    expect(fake.facade.sendNew.mock.calls[0][4]?.effort).toBeUndefined();
+    await expect(restored.submit(submission("agy-invalid", { ...agy, effort: "high" }))).rejects.toThrow(/effort/);
+    await expect(restored.submit(submission("claude-incomplete", { engine: "claude", model: "opus", providerId: "channel" }))).rejects.toThrow(/explicit/);
+  });
   const selection = { engine: "claude", model: "opus", effort: "ultra", providerId: "channel-a" };
   const effective = { ...selection, model: "claude-opus-full", effort: "max" };
   it.each([{ stage: 2, action: "dispose" }, { stage: 3, action: "dispose" }, { stage: 3, action: "cancel" }])(
@@ -1081,7 +1783,7 @@ describe("frozen native task selections", () => {
     expect(invoke).toHaveBeenCalledWith("plugin_task_resolve", { pluginId: "wb", selection });
     await expect(bridge.submit(submission("pinned", { ...selection, providerId: "channel-b" }))).rejects.toThrow(/different submission/);
     await expect(bridge.submit(submission("partial", { providerId: "channel-a" }))).rejects.toThrow(/explicit/);
-    expect((await bridge.catalog()).capabilities).toEqual({ nativeCoordination: true, images: true, continuousCoordination: true, fixedInstructions: true });
+    expect((await bridge.catalog()).capabilities).toEqual({ existingConversationAttachment: true, nativeCoordination: true, images: true, continuousCoordination: true, coordinatorMessageQueue: true, fixedInstructions: true, immediateMessages: false, costReviewDialog: false, composerPrediction: false, coordinatorServiceTier: true, coordinatorInputCostReview: false, costHandoffPreview: false, managedChildCostHandoff: false, managedChildHandoffSelection: false, fullHistoryHandoff: false, coordinatorFullHistoryHandoff: false });
   });
   it("rejects a changed alias before native send and never replays it", async () => {
     const fake = fakeFacade();
@@ -1096,7 +1798,7 @@ describe("frozen native task selections", () => {
     const fake = fakeFacade(), ref = { engine: "claude", sessionId: S1, workspacePath: GAME };
     fake.addSession(ref); fake.facade.selectionMatches.mockReturnValue(false);
     const storage = storageFor();
-    storage.data.set(`wb:${HOST_TASKS_INDEX_KEY}`, { version: 1, entries: [], slots: [{ projectId: "example-project", slotKey: "impl", session: ref, lastRequestId: "old", updatedAt: 1 }] });
+    storage.data.set(`wb:${HOST_TASKS_INDEX_KEY}`, { version: 1, entries: [], slots: [{ projectId: "sample-project", slotKey: "impl", session: ref, lastRequestId: "old", updatedAt: 1 }] });
     const { bridge } = bridgeFor(fake, { storage, invoke: async () => effective });
     await bridge.submit(submission("roll", selection)); await settle(bridge);
     expect(fake.facade.sendExisting).not.toHaveBeenCalled();
@@ -1139,7 +1841,7 @@ it("does not ignore explicit legacy model/effort when considering slot reuse", a
   const fake = fakeFacade(), ref = { engine: "claude", sessionId: S1, workspacePath: GAME };
   fake.addSession(ref); fake.facade.selectionMatches.mockReturnValue(false);
   const storage = storageFor();
-  storage.data.set(`wb:${HOST_TASKS_INDEX_KEY}`, { version: 1, entries: [], slots: [{ projectId: "example-project", slotKey: "impl", session: ref, lastRequestId: "old", updatedAt: 1 }] });
+  storage.data.set(`wb:${HOST_TASKS_INDEX_KEY}`, { version: 1, entries: [], slots: [{ projectId: "sample-project", slotKey: "impl", session: ref, lastRequestId: "old", updatedAt: 1 }] });
   const { bridge } = bridgeFor(fake, { storage });
   await bridge.submit(submission("legacy-selection", { model: "sonnet", effort: "low" })); await settle(bridge);
   expect(fake.facade.selectionMatches).toHaveBeenCalledWith(ref, expect.objectContaining({ model: "sonnet", effort: "low" }));
@@ -1148,6 +1850,14 @@ it("does not ignore explicit legacy model/effort when considering slot reuse", a
 });
 
 describe("host task image attachments", () => {
+  it("never resolves a managed-child history image reference as a plugin attachment", async () => {
+    const fake = fakeFacade(), invoke = vi.fn();
+    const { bridge, storage } = bridgeFor(fake, { invoke });
+    await expect(bridge.submit(submission("managed-ref", { images: [`task-image:${"a".repeat(64)}`] }))).rejects.toThrow(/valid attachment IDs/);
+    expect(invoke).not.toHaveBeenCalled();
+    expect(fake.facade.sendNew).not.toHaveBeenCalled();
+    expect(storage.data.get(`wb:${HOST_TASKS_INDEX_KEY}`)).toBeUndefined();
+  });
   it("validates, resolves, fingerprints, and forwards opaque image IDs for text+image and image-only submissions", async () => {
     const fake = fakeFacade();
     const invoke = vi.fn(async (cmd: string, args: Record<string, unknown>) => {
@@ -1222,7 +1932,7 @@ describe("host task image attachments", () => {
     reuseStorage.data.set(`wb:${HOST_TASKS_INDEX_KEY}`, {
       version: 1,
       entries: [],
-      slots: [{ projectId: "example-project", slotKey: "impl", session: codexRef, lastRequestId: "prev", updatedAt: 1 }],
+      slots: [{ projectId: "sample-project", slotKey: "impl", session: codexRef, lastRequestId: "prev", updatedAt: 1 }],
     });
     const reuseBridge = bridgeFor(fakeReuse, { storage: reuseStorage, invoke }).bridge;
     await reuseBridge.submit(submission("reuse-unsupported", { images: ["img-1"] }));

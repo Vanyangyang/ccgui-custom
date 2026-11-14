@@ -1222,4 +1222,40 @@ describe("RunStatusStrip", () => {
     expect(container.querySelectorAll("[data-todo-item-key]")).toHaveLength(1);
     expect(document.activeElement?.getAttribute("data-todo-item-key")).toBe("定位页面查询零条数原因");
   });
+
+  it("renders AGY ACP native background tasks and live log progress without exposing Claude-only single-task stop", async () => {
+    seedStopTasks([
+      {
+        id: "task-206",
+        kind: "command",
+        description: "Production build",
+        status: "running",
+        summary: "pnpm build",
+        progress: "vite v6.4.3 building for production...",
+        background: true,
+      },
+      {
+        id: "task-daemon",
+        kind: "command",
+        description: "Dev server",
+        status: "running",
+        ambient: true,
+        background: true,
+      },
+    ], "agy-run-1");
+
+    await renderNativeStrip(KEY, "agy");
+    const taskPill = pill("任务");
+    // Only non-ambient running tasks count toward the active running badge (1 running, 0/2 completed).
+    expect(taskPill.textContent).toContain("1");
+    expect(taskPill.textContent).toContain("0/2");
+
+    await click(taskPill);
+    await openTask(0);
+    const detail = container.querySelector("[data-testid='subagent-detail-overlay']");
+    expect(detail?.textContent).toContain("Production build");
+    expect(detail?.textContent).toContain("后台命令");
+    expect(detail?.textContent).toContain("vite v6.4.3 building for production...");
+    expect(stopButton()).toBeUndefined();
+  });
 });

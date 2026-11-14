@@ -1,6 +1,7 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
 import type { RuntimeCheckpoint } from "@/lib/runtime-checkpoint";
 import type { EngineEventPayload } from "@/lib/events";
+import type { SessionPage } from "@/lib/ipc";
 
 const fake = vi.hoisted(() => ({
   deliver: undefined as ((events: EngineEventPayload[]) => void) | undefined,
@@ -8,6 +9,7 @@ const fake = vi.hoisted(() => ({
   send: vi.fn(async (args: { runId: string; sessionId?: string }) => ({ runId: args.runId, sessionId: args.sessionId ?? null })),
   answer: vi.fn(async () => {}),
   importImages: vi.fn(async (paths: string[]) => paths),
+  loadPage: vi.fn(async (): Promise<SessionPage> => ({ messages: [], subagentHistory: [], nextBefore: null })),
 }));
 vi.mock("@/lib/transport", () => ({ isWeb: false, invoke: vi.fn(async () => false), listen: vi.fn(async () => () => {}) }));
 vi.mock("@/lib/events", () => ({
@@ -17,7 +19,7 @@ vi.mock("@/lib/events", () => ({
 vi.mock("@/lib/ipc", () => ({ ipc: {
   listWorkspaces: vi.fn(async () => []), listSessions: vi.fn(async () => []), listArchivedSessions: vi.fn(async () => []), listEngines: vi.fn(async () => []),
   sendMessage: fake.send, answerQuestion: fake.answer, getAppSettings: vi.fn(async () => ({})), getCliConfig: vi.fn(async () => ({})),
-  loadSessionPage: vi.fn(async () => ({ messages: [], subagentHistory: [], nextBefore: null })), listPlanReviews: vi.fn(async () => []),
+  loadSessionPage: fake.loadPage, listPlanReviews: vi.fn(async () => []),
   activeRunIds: vi.fn(async () => []), rememberSessionModel: vi.fn(async () => {}), rememberSessionEffort: vi.fn(async () => {}),
   rescanSessions: vi.fn(async () => {}),
   importAttachments: fake.importImages, readFile: vi.fn(async () => ({ kind: "other" })),
@@ -40,10 +42,101 @@ function event(kind: EngineEventPayload["kind"], data: unknown, seq = 1): Engine
   return { engine: tab.engine, sessionId: tab.sessionId, runId, seq, kind, data };
 }
 
-beforeEach(() => { vi.useFakeTimers(); localStorage.clear(); fake.listenerReady = undefined; fake.deliver = undefined; fake.send.mockClear(); fake.answer.mockClear(); fake.importImages.mockClear(); });
+beforeEach(() => { vi.useFakeTimers(); localStorage.clear(); fake.listenerReady = undefined; fake.deliver = undefined; fake.send.mockClear(); fake.answer.mockClear(); fake.importImages.mockClear(); fake.loadPage.mockReset(); fake.loadPage.mockResolvedValue({ messages: [], subagentHistory: [], nextBefore: null }); });
 afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); });
 
 describe("chat runtime checkpoint with the real store", () => {
+  it.each([false, true])("restores an acknowledged private start without replay and binds late identity (done=%s)", async done => {
+    const first = await boot(); await first.store.getState().init();
+    const { hostPendingKey } = await import("./host-pending-chat");
+    const { settledRuns, settledRunOutcomes } = await import("./engine-events");
+    const own = { engine: "agy", sessionId: null, workspacePath: "G:/fixture" }, ownKey = "new:agy:G:/fixture";
+    const privateKey = hostPendingKey("agy", runId), nativeKey = "agy/native-restored";
+    const messages = [{ seq: 1, role: "user", text: "host first", ts: null }, { seq: 2, role: "assistant", text: "保留正文🙂", ts: null }];
+    first.store.setState({ active: own, openTabs: [own], drafts: { [ownKey]: "用户旧稿" }, bySession: {
+      [ownKey]: { ...first.stream.EMPTY_SESSION },
+      [privateKey]: { ...first.stream.EMPTY_SESSION, messages, streaming: !done,
+        hostTaskOrigin: { engine: "agy", runId, workspacePath: own.workspacePath }, ...(done ? { settledRunIds: [runId] } : {}) },
+    } });
+    if (done) { settledRuns.set(runId, "done"); settledRunOutcomes.set(runId, { key: privateKey, status: "completed" }); }
+    else first.stream.routeRun(runId, privateKey);
+    const checkpoint = await first.coordinator.prepareRuntimeCheckpoint();
+    const next = await boot(checkpoint); await next.coordinator.resumeRuntimeCheckpoint();
+    fake.deliver?.([{ engine: "agy", runId, sessionId: "native-restored", kind: "session", seq: 10, data: "native-restored" }]);
+    expect(next.store.getState().bySession[privateKey]).toBeUndefined();
+    expect(next.store.getState().bySession[nativeKey].messages).toEqual(messages);
+    expect(next.store.getState().active).toEqual(own); expect(next.store.getState().drafts[ownKey]).toBe("用户旧稿");
+    expect(next.store.getState().openTabs.filter(t => t.sessionId === "native-restored")).toHaveLength(1);
+    expect(fake.send).not.toHaveBeenCalled();
+    if (done) {
+      expect(next.stream.runRouting.has(runId)).toBe(false);
+      const events = await import("./engine-events"); expect(events.settledRunOutcomes.get(runId)).toEqual({ key: nativeKey, status: "completed" });
+    }
+  });
+  it("rejects a restored private identity attached to another key", async () => {
+    const first = await boot(); await first.store.getState().init();
+    first.store.setState({ bySession: { [key]: { ...first.stream.EMPTY_SESSION,
+      hostTaskOrigin: { engine: "agy", runId, workspacePath: tab.workspacePath } } } });
+    const checkpoint = await first.coordinator.prepareRuntimeCheckpoint();
+    await expect(boot(checkpoint)).rejects.toThrow("Invalid host task checkpoint identity");
+  });
+  it.each(["legacy", "current"])("repairs legacy AGY history only after resume, preserving %s checkpoint data", async (format) => {
+    const agyTab = { ...tab, engine: "agy" }, agyKey = "agy/session-1";
+    const first = await boot(); await first.store.getState().init();
+    const messages = [
+      { seq: 23, role: "assistant", text: "native final", ts: "2026-10-30T09:44:01Z" },
+      { seq: 24, role: "tool", text: "read_file", ts: "2026-10-30T10:18:00Z" },
+    ];
+    first.store.setState({ active: tab, openTabs: [tab, agyTab], drafts: { [agyKey]: "unsent draft" },
+      bySession: { [agyKey]: { ...first.stream.EMPTY_SESSION, messages, usage: { input_tokens: 100, output_tokens: 20 } } } });
+    const checkpoint = await first.coordinator.prepareRuntimeCheckpoint();
+    if (format === "legacy") delete (checkpoint.participants.chat as { archiveSourcesVersion?: number }).archiveSourcesVersion;
+    const next = await boot(checkpoint);
+    expect(next.store.getState().bySession[agyKey].messages).toEqual(messages);
+    expect(fake.loadPage).not.toHaveBeenCalled();
+    fake.loadPage.mockResolvedValueOnce({ messages: [messages[0]], subagentHistory: [], nextBefore: null });
+    await next.coordinator.resumeRuntimeCheckpoint();
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    if (format === "legacy") {
+      expect(fake.loadPage).toHaveBeenCalledTimes(1);
+      expect(next.store.getState().bySession[agyKey].messages).toEqual([messages[0]]);
+    } else {
+      expect(fake.loadPage).not.toHaveBeenCalled();
+      expect(next.store.getState().bySession[agyKey].messages).toEqual(messages);
+    }
+    expect(next.store.getState().active).toEqual(tab);
+    expect(next.store.getState().drafts[agyKey]).toBe("unsent draft");
+    expect(fake.send).not.toHaveBeenCalled();
+  });
+
+  it("retries a failed legacy history repair after another checkpoint instead of treating its error as a failed send", async () => {
+    const agyTab = { ...tab, engine: "agy" }, agyKey = "agy/session-1";
+    const first = await boot(); await first.store.getState().init();
+    const messages = [{ role: "assistant", text: "native final", seq: 1, ts: null }, { role: "tool", text: "old replay", seq: 2, ts: null }];
+    first.store.setState({ active: agyTab, openTabs: [agyTab], bySession: { [agyKey]: {
+      ...first.stream.EMPTY_SESSION, messages, usage: { input_tokens: 100, output_tokens: 20 },
+    } } });
+    const oldCheckpoint = await first.coordinator.prepareRuntimeCheckpoint();
+    delete (oldCheckpoint.participants.chat as { archiveSourcesVersion?: number }).archiveSourcesVersion;
+    const next = await boot(oldCheckpoint);
+    fake.loadPage.mockRejectedValueOnce(new Error("native SQLite read failed"));
+    await next.coordinator.resumeRuntimeCheckpoint();
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    expect(next.store.getState().bySession[agyKey]).toMatchObject({ messages, historyReloadRequired: true,
+      error: "Error: native SQLite read failed", historyReloadError: "Error: native SQLite read failed" });
+    const retryCheckpoint = await next.coordinator.prepareRuntimeCheckpoint();
+    const third = await boot(retryCheckpoint);
+    fake.loadPage.mockResolvedValueOnce({ messages: [messages[0]], subagentHistory: [], nextBefore: null });
+    await third.coordinator.resumeRuntimeCheckpoint();
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    expect(fake.loadPage).toHaveBeenCalledTimes(2);
+    expect(third.store.getState().bySession[agyKey].messages).toEqual([messages[0]]);
+    expect(third.store.getState().bySession[agyKey].historyReloadRequired).toBeUndefined();
+    expect(third.store.getState().bySession[agyKey].historyReloadError).toBeUndefined();
+    expect(third.store.getState().bySession[agyKey].error).toBeNull();
+    expect(fake.send).not.toHaveBeenCalled();
+  });
+
   it("accepts older checkpoints without placeholder origins while retaining run ownership", async () => {
     const first = await boot(); await first.store.getState().init();
     first.store.setState({ active: tab, openTabs: [tab], drafts: { [key]: "older draft" },
@@ -85,6 +178,7 @@ describe("chat runtime checkpoint with the real store", () => {
     await first.store.getState().init();
     first.store.setState({ active: tab, openTabs: [tab], drafts: { [key]: "草稿🙂" }, streamingByKey: { [key]: true },
       bySession: { [key]: { ...first.stream.EMPTY_SESSION, streaming: true, nativeTaskRunId: runId,
+        managedAssignmentRuns: [runId], managedInputStart: { runId, firstSeq: 1 },
         messages: [
           { seq: 1, role: "question", text: "Continue?", ts: null, question: { runId, requestId: "approval-1", status: "pending", questions: [] } },
           { seq: 2, role: "assistant", text: "前文", ts: null, live: true },
@@ -109,6 +203,8 @@ describe("chat runtime checkpoint with the real store", () => {
     expect(next.store.getState().drafts[key]).toBe("草稿🙂");
     expect(next.store.getState().bySession[key].queue[0].images).toEqual(["G:/fixture/image.png"]);
     expect(next.stream.runRouting.get(runId)).toBe(key);
+    expect(next.store.getState().bySession[key].managedAssignmentRuns).toEqual([runId]);
+    expect(next.store.getState().bySession[key].managedInputStart).toEqual({ runId, firstSeq: 1 });
     expect(next.store.getState().bySession[key].messages[0].question?.requestId).toBe("approval-1");
     await next.store.getState().init(); // Empty native catalog must not erase the checkpoint tab/run.
     expect(next.store.getState().openTabs).toEqual([tab]);

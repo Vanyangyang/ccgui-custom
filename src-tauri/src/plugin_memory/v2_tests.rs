@@ -7,6 +7,29 @@ fn request() -> ExtractRequest {
         "expectedSourceDigest":"0".repeat(64)}))
     .unwrap()
 }
+#[test]
+fn cached_extract_snapshot_is_bound_to_original_expected_digest_and_from_cursor() {
+    let mut req = request();
+    let selected = selected(&req);
+    req.expected_source_digest = Some(selected.source_digest.clone());
+    let snapshot = serde_json::to_value(ExtractReplay {
+        source_digest: selected.source_digest,
+        range: source::replay_range(
+            &selected.loaded,
+            req.cursor.as_ref(),
+            &selected.selection.next,
+        )
+        .unwrap(),
+    })
+    .unwrap();
+    assert!(decode_extract_replay(&req, snapshot.clone()).is_ok());
+    let mut changed = req.clone();
+    changed.expected_source_digest = Some("f".repeat(64));
+    assert!(decode_extract_replay(&changed, snapshot.clone()).is_err());
+    changed = req;
+    changed.cursor = Some(selected.loaded.rows[1].cursor("synthetic", 0));
+    assert!(decode_extract_replay(&changed, snapshot).is_err());
+}
 fn rows() -> Vec<Row> {
     vec![
         Row {
@@ -45,6 +68,7 @@ fn loaded(rows: Vec<Row>) -> source::Loaded {
         rows,
         later_pages: false,
         fence: "synthetic-native-binding".into(),
+        owner_fence: "synthetic-owner-binding".into(),
         floor_seq: 1,
     }
 }

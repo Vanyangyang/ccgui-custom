@@ -17,10 +17,10 @@ A desktop client for multi-engine AI coding, customized for cross-engine subtask
 
 ## Current Source, Installers & Upgrade Guide
 
-- **Current `main` Source**: Governed by the **V3 persistence contract** and **general plugin SDK 0.3.28** (see the [source synchronization record](./docs/releases/main-2026-10-26.md)). The application display version string remains `1.1.1+protected.35`.
+- **Current `main` Source**: Governed by the **V4 persistence contract** and **general plugin SDK 0.3.56** (see the [current contract and upgrade guide](./docs/custom-maintenance.zh-CN.md#安装与恢复)). The application display version string remains `1.1.1+protected.35`.
 - **Original Tag & Installer Availability**: The build record for the original tag `v1.1.1+protected.35` corresponds to the earlier **V2** architecture (documented in [release record and checksums](./docs/releases/1.1.1+protected.35.md)) and does not reflect current `main`. The `main` source synchronization did not publish a new installer. Check published installers in [GitHub Releases](https://github.com/Vanyangyang/ccgui-custom/releases) against their asset build records; tag Source code ZIP/TAR downloads are raw source files, not packaged installers.
-- **Architectural Upgrade (V1/V2 → V3)**:
-  - Upgrading to current V3 requires a **full-exit upgrade using the complete installer** built and verified from the intended source.
+- **Architectural Upgrade (V1/V2/V3 → V4)**:
+  - Upgrading to current V4 requires a **full-exit upgrade using the complete installer** built and verified from the intended source.
   - Before upgrading: save pending work, finish active tasks, and completely exit all CC GUI instances along with any running worker or supervisor processes.
   - Run the full installer; user data directories are safely retained.
   - *Note*: Live in-app hot-updates cannot bridge incompatible schema contracts. Bypassing schema compatibility checks, mixing incompatible worker versions, or direct downgrades is not supported. See [Installation and Recovery](./docs/custom-maintenance.zh-CN.md#安装与恢复).
@@ -98,9 +98,9 @@ This distribution maintains a customized build based on upstream `v1.1.0` / `v1.
 - **Disabled Upstream Online Auto-Updater**: Configured `IS_CUSTOM_DISTRIBUTION = true` and disabled `createUpdaterArtifacts` along with upstream GitHub Release update checks, preventing generic upstream installers from overwriting the custom build. Use a verified complete installer for cold upgrades, or the local update pipeline for compatible changes.
 - **Removed Third-Party Telemetry**: Removed Baidu Tongji tracking modules (`analytics.ts`, `baidu_tongji.rs`) and associated IPC commands. The packaged Content Security Policy (CSP) is locked to local and bundled assets (tested in `tests/privacy-boundary.test.ts`), and automatic HTTP redirect following for plugin requests is disabled.
 
-### 8. Project Views & General Plugin SDK 0.3.28
+### 8. Project Views & General Plugin SDK 0.3.56
 - **Project Workspaces**: Aggregate registered workspace roots into unified projects while strictly preserving each session's actual working directory. Removing an organizational relationship does not delete files or transfer execution permissions.
-- **General Plugin SDK 0.3.28**: Capabilities include permission-scoped project publishing, detached windows, native task coordination, persistent discussions, and **owned image attachments**.
+- **General Plugin SDK 0.3.56**: Capabilities include permission-scoped project publishing, detached windows, native task coordination, persistent discussions, and **owned image attachments**.
 - **Fixed Instructions & Bounded Memory**: Fixed instructions use supported native instruction channels; memory extraction operates under `host:memory` strictly from owned source evidence.
 - **Update-Close Hooks & Boundary Enforcement**: Update-close hooks drain accepted operations and confirm plugin services have exited prior to switching. All interfaces enforce ownership boundaries, cancellation checks, evidence verification, and non-replay of unknown results. See the [SDK changelog](./packages/plugin-sdk/CHANGELOG.md) and [plugin development guide](./docs/plugin-development-guide.zh-CN.md).
 

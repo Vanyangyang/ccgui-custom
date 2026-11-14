@@ -10,7 +10,7 @@ import type { LeaderBranch, LeaderIdentity } from "./types";
 /** Close the complete batch before choosing a survivor, so no descendant is
  * activated midway through group removal. Archive markers are reversible;
  * only actual deletion may create permanent event tombstones. */
-export function removeLeaderSessions(members: LeaderIdentity[], branches: LeaderBranch[], permanent: boolean) {
+export function removeLeaderSessions(members: LeaderIdentity[], branches: LeaderBranch[], permanent: boolean, preserveDrafts = false) {
   if (branches.length) {
     useCrossSessionActivityStore.getState().removeRecords(branches.map((branch) => `leader:${branch.id}`));
   }
@@ -28,7 +28,7 @@ export function removeLeaderSessions(members: LeaderIdentity[], branches: Leader
     const bySession = { ...s.bySession }, drafts = { ...s.drafts }, streamingByKey = { ...s.streamingByKey }, retryingByKey = { ...s.retryingByKey }, unseen = { ...s.unseen };
     const archivedSessionKeys = { ...s.archivedSessionKeys };
     for (const key of keys) {
-      delete bySession[key]; delete drafts[key]; delete streamingByKey[key]; delete retryingByKey[key]; delete unseen[key];
+      delete bySession[key]; if (!preserveDrafts) delete drafts[key]; delete streamingByKey[key]; delete retryingByKey[key]; delete unseen[key];
       archivedSessionKeys[key] = true;
     }
     const openTabs = s.openTabs.filter((t) => !keys.has(sessionKey(t.engine, t.sessionId, t.workspacePath)));

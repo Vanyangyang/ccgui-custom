@@ -120,6 +120,144 @@ fn terminal(recorder: &Recorder, root: &str, text: &str) {
     emit(recorder, root, 1, "delta", json!(text));
     emit(recorder, root, 2, "turn_complete", json!({}));
 }
+
+#[test]
+fn metadata_only_turn_and_later_done_never_publish_a_completion() {
+    let (_scratch, outbox, recorder, _clock) = fixture();
+    register(&recorder, "run");
+    let admission = outbox.pending(1).unwrap().pop().unwrap();
+    outbox.finish(&admission.id).unwrap();
+
+    // A native background notification can complete a response without the
+    // main conversation emitting text, thinking, or a tool call.
+    emit(&recorder, "run", 1, "tasks", json!({"tasks":[]}));
+    emit(&recorder, "run", 2, "activity", json!({"state":"running"}));
+    emit(&recorder, "run", 3, "throughput", json!({}));
+    emit(&recorder, "run", 4, "message", json!({"role":"tool","text":"old tool","patch":true}));
+    emit(&recorder, "run", 5, "turn_complete", json!({}));
+    assert!(outbox.pending(1).unwrap().is_empty());
+
+    // The native run can subsequently end without another response. Neither
+    // that final event nor worker cleanup may resurrect the empty boundary.
+    emit(&recorder, "run", 6, "done", json!({}));
+    assert!(outbox.pending(1).unwrap().is_empty());
+    recorder.finish_run("run").unwrap();
+    assert!(outbox.pending(10).unwrap().iter().all(|item| item.cancel));
+}
+
+#[test]
+fn metadata_only_turn_followed_by_error_never_publishes_a_completion() {
+    let (_scratch, outbox, recorder, _clock) = fixture();
+    register(&recorder, "run");
+    let admission = outbox.pending(1).unwrap().pop().unwrap();
+    outbox.finish(&admission.id).unwrap();
+
+    emit(&recorder, "run", 1, "activity", json!({"state":"running"}));
+    emit(&recorder, "run", 2, "turn_complete", json!({}));
+    assert!(outbox.pending(1).unwrap().is_empty());
+    emit(&recorder, "run", 3, "activity", json!({"state":"running"}));
+    emit(&recorder, "run", 4, "error", json!("rate limit"));
+    assert!(outbox.pending(10).unwrap().iter().all(|item| item.cancel));
+    recorder.finish_run("run").unwrap();
+    assert!(outbox.pending(10).unwrap().iter().all(|item| item.cancel));
+}
+
+#[test]
+fn real_parent_response_after_empty_turn_still_produces_one_completion() {
+    let (_scratch, outbox, recorder, clock) = fixture();
+    register(&recorder, "run");
+    let admission = outbox.pending(1).unwrap().pop().unwrap();
+    outbox.finish(&admission.id).unwrap();
+
+    emit(&recorder, "run", 1, "turn_complete", json!({}));
+    assert!(outbox.pending(1).unwrap().is_empty());
+    // A late patch from the empty response cannot invent a new response.
+    emit(&recorder, "run", 2, "message", json!({"role":"assistant","text":"late","patch":true}));
+    assert!(outbox.pending(1).unwrap().is_empty());
+    clock.store(2_000, Ordering::SeqCst);
+    emit(&recorder, "run", 3, "delta", json!("实际结果 😀"));
+    emit(&recorder, "run", 4, "turn_complete", json!({}));
+    let completed = outbox.pending(1).unwrap().pop().unwrap();
+    assert!(!completed.cancel && !completed.started);
+    assert_eq!(completed.summary, "实际结果 😀");
+    assert!(completed.started_at_ms > admission.started_at_ms);
+    emit(&recorder, "run", 5, "done", json!({}));
+    assert_eq!(outbox.pending(1).unwrap(), vec![completed.clone()]);
+    outbox.finish(&completed.id).unwrap();
+    recorder.finish_run("run").unwrap();
+    assert!(outbox.pending(1).unwrap().is_empty());
+}
+
+#[test]
+fn substantive_parent_turns_without_final_text_notify_when_the_run_finishes() {
+    for (kind, data) in [
+        ("thinking", json!("thinking")),
+        ("message", json!({"role":"tool","text":"execute"})),
+    ] {
+        let (_scratch, outbox, recorder, _clock) = fixture();
+        register(&recorder, "run");
+        let admission = outbox.pending(1).unwrap().pop().unwrap();
+        outbox.finish(&admission.id).unwrap();
+        emit(&recorder, "run", 1, kind, data);
+        emit(&recorder, "run", 2, "turn_complete", json!({}));
+        // A tool-only or thinking-only reply can be an intermediate turn;
+        // do not announce completion before the native run actually ends.
+        assert!(outbox.pending(1).unwrap().is_empty(), "{kind}");
+        emit(&recorder, "run", 3, "done", json!({}));
+        let completed = outbox.pending(1).unwrap().pop().unwrap();
+        assert!(!completed.cancel && !completed.started, "{kind}");
+        assert!(completed.summary.is_empty(), "{kind}");
+        outbox.finish(&completed.id).unwrap();
+        recorder.finish_run("run").unwrap();
+        assert!(outbox.pending(1).unwrap().is_empty(), "{kind}");
+    }
+}
+
+#[test]
+fn tool_only_intermediate_reply_followed_by_error_does_not_claim_completion() {
+    let (_scratch, outbox, recorder, _clock) = fixture();
+    register(&recorder, "run");
+    let admission = outbox.pending(1).unwrap().pop().unwrap();
+    outbox.finish(&admission.id).unwrap();
+    emit(&recorder, "run", 1, "message", json!({"role":"tool","text":"execute"}));
+    emit(&recorder, "run", 2, "turn_complete", json!({}));
+    assert!(outbox.pending(1).unwrap().is_empty());
+    emit(&recorder, "run", 3, "error", json!("rate limit"));
+    assert!(outbox.pending(10).unwrap().iter().all(|item| item.cancel));
+}
+
+#[test]
+fn empty_turn_before_session_adoption_does_not_hide_a_later_real_response() {
+    let (_scratch, outbox, recorder, _clock) = fixture();
+    let killed = Arc::new(AtomicBool::new(false));
+    assert!(recorder.register_run("run", "claude", "C:/project", None, "q", &killed));
+    let mut empty = event("run", "run", 1, "turn_complete", json!({}));
+    empty["sessionId"] = Value::Null;
+    recorder.observe_event(&empty).unwrap();
+    assert!(outbox.pending(1).unwrap().is_empty());
+    assert!(recorder.adopt_session("run", "claude", "native-1"));
+    let started = outbox.pending(1).unwrap().pop().unwrap();
+    assert!(started.started && started.cancel);
+    emit(&recorder, "run", 2, "delta", json!("real response"));
+    emit(&recorder, "run", 3, "turn_complete", json!({}));
+    let completed = outbox.pending(1).unwrap().pop().unwrap();
+    assert!(!completed.cancel && !completed.started);
+    assert_eq!(completed.summary, "real response");
+}
+
+#[test]
+fn metadata_only_background_events_do_not_reissue_a_read_parent_completion() {
+    let (_scratch, outbox, recorder, _clock) = fixture();
+    register(&recorder, "run");
+    terminal(&recorder, "run", "real response");
+    let completed = outbox.pending(1).unwrap().pop().unwrap();
+    outbox.finish(&completed.id).unwrap();
+    emit(&recorder, "run", 3, "tasks", json!({"tasks":[]}));
+    emit(&recorder, "run", 4, "turn_complete", json!({}));
+    emit(&recorder, "run", 5, "done", json!({}));
+    recorder.finish_run("run").unwrap();
+    assert!(outbox.pending(1).unwrap().is_empty());
+}
 fn row(id: &str, generation: u64) -> Pending {
     Pending {
         id: id.into(),

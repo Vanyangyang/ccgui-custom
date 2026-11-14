@@ -12,7 +12,7 @@ const COLLAPSE_THRESHOLD_PX = 480;
 const COLLAPSED_HEIGHT_PX = 320;
 
 const toggleBtn =
-  "flex size-6 cursor-pointer items-center justify-center rounded-full bg-white/25 text-text-white transition-colors hover:bg-white/40";
+  "flex size-6 cursor-pointer items-center justify-center rounded-full transition-colors";
 
 /** Long user messages collapse behind a bottom fade with a centered
  *  chevron — a pasted document no longer floods the timeline. The fade
@@ -27,8 +27,10 @@ const toggleBtn =
  *  a transitionable length, so only user toggles animate). */
 export const CollapsibleMessage = memo(function CollapsibleMessage({
   children,
+  tone = "user",
 }: {
   children: ReactNode;
+  tone?: "user" | "neutral";
 }) {
   const { t } = useTranslation();
   const reduceMotion = useReducedMotion();
@@ -52,6 +54,9 @@ export const CollapsibleMessage = memo(function CollapsibleMessage({
   }, []);
 
   const collapsed = collapsible && !expanded;
+  const toggleClass = cx(toggleBtn, tone === "neutral"
+    ? "bg-background-tertiary-default text-text-secondary hover:bg-background-tertiary-hover"
+    : "bg-white/25 text-text-white hover:bg-white/40");
   return (
     <div className="relative min-w-0 max-w-full">
       <div
@@ -78,7 +83,8 @@ export const CollapsibleMessage = memo(function CollapsibleMessage({
         <div
           aria-hidden
           className={cx(
-            "pointer-events-none absolute inset-x-0 bottom-0 h-16 bg-linear-to-t from-bubble-user to-transparent",
+            "pointer-events-none absolute inset-x-0 bottom-0 h-16 bg-linear-to-t to-transparent",
+            tone === "neutral" ? "from-background-secondary-default" : "from-bubble-user",
             "transition-opacity duration-200",
             collapsed ? "opacity-100" : "opacity-0",
           )}
@@ -91,7 +97,7 @@ export const CollapsibleMessage = memo(function CollapsibleMessage({
           aria-label={t("chat.messageExpand")}
           title={t("chat.messageExpand")}
           onClick={() => setExpanded(true)}
-          className={`${toggleBtn} absolute bottom-1 left-1/2 -translate-x-1/2`}
+          className={`${toggleClass} absolute bottom-1 left-1/2 -translate-x-1/2`}
         >
           <ChevronDown className="size-3.5" aria-hidden />
         </button>
@@ -103,7 +109,7 @@ export const CollapsibleMessage = memo(function CollapsibleMessage({
           aria-label={t("chat.messageCollapse")}
           title={t("chat.messageCollapse")}
           onClick={() => setExpanded(false)}
-          className={`${toggleBtn} mx-auto mt-1`}
+          className={`${toggleClass} mx-auto mt-1`}
         >
           <ChevronUp className="size-3.5" aria-hidden />
         </button>

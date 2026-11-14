@@ -7,6 +7,7 @@ import Check from "lucide-react/dist/esm/icons/check";
 import List from "lucide-react/dist/esm/icons/list";
 import {
   canRequestSelfUpdate,
+  requiresPluginUpdateRetry,
   useLiveUpdateStore,
   type LiveUpdateBlocker,
   type LiveUpdateState,
@@ -31,6 +32,7 @@ export const LIVE_UPDATE_BLOCKER_KEYS: Record<string, string> = {
   "file-read-in-progress": "fileRead",
   "plugin-view-without-checkpoint": "pluginView",
   "plugin-window-without-checkpoint": "pluginWindow",
+  "plugin-window-unconfirmed-edits": "pluginWindowUnconfirmedEdits",
   "plugin-update-close-failed": "pluginUpdateClose",
   "plugin-update-close-timeout": "pluginUpdateCloseTimeout",
   "layout-resize-in-progress": "layout",
@@ -94,6 +96,11 @@ type SelfUpdateStateSlice = Pick<
   "support" | "stage" | "active" | "transaction" | "channel" | "blockers" | "errorCode" | "error" | "recoveryError"
 >;
 
+export function formatSelfUpdateError(t: TFunction, reason: string): string {
+  return reason === "database schema hash mismatch"
+    ? t("settings.liveUpdateSchemaMismatchHint") : reason;
+}
+
 /** A terminal batch stays inspectable after reconnect. A build or an old
  * committed transaction cannot prove that the latest batch is running. */
 export function deriveSelfUpdateResult(state: SelfUpdateStateSlice, t: TFunction): SelfUpdateProgressSummary | null {
@@ -106,15 +113,16 @@ export function deriveSelfUpdateResult(state: SelfUpdateStateSlice, t: TFunction
   const committed = phase === "Committed" && transaction?.phase === "Committed" && matchesBatch
     && /^[a-f0-9]{64}$/.test(transaction.candidate.manifestSha256)
     && state.active?.manifestSha256 === transaction.candidate.manifestSha256;
+  const reason = batch?.error || (matchesBatch ? transaction?.failureReason : undefined);
   const kind = phase === "Committed" ? committed ? "committed" : "unverified"
-    : phase === "RolledBack" ? "rolled-back" : phase === "Aborted" ? "aborted" : "error";
+    : phase === "RolledBack" ? "rolled-back"
+      : phase === "Aborted" && reason !== "database schema hash mismatch" ? "aborted" : "error";
   const label = t(`statusbar.${kind === "committed" ? "selfUpdateCommitted" : kind === "unverified" ? "selfUpdateUnverified"
     : kind === "rolled-back" ? "selfUpdateRolledBack" : kind === "aborted" ? "selfUpdateAborted" : "selfUpdateFailed"}`);
   const lines = [label];
   if (state.active) lines.push(t("settings.liveUpdateActiveVersion", { version: state.active.version, release: state.active.releaseId }));
   if (transaction && matchesBatch) lines.push(t("settings.liveUpdateTargetVersion", { version: transaction.candidate.version, release: transaction.candidate.releaseId }));
-  const reason = batch?.error || (matchesBatch ? transaction?.failureReason : undefined);
-  if (reason) lines.push(reason);
+  if (reason) lines.push(formatSelfUpdateError(t, reason));
   for (const change of batch?.changes.slice(0, 6) ?? []) lines.push(`• ${change.changeId}: ${change.summary}`);
   lines.push(t("statusbar.selfUpdateOpenSettings"));
   return { kind, label, tooltip: lines.join("\n"), activeTask: false, spinning: false, phaseTimerKey: null };
@@ -223,7 +231,7 @@ export function deriveSelfUpdateProgress(
       );
     }
     if (blockerCount > 0) {
-      detailLines.push(t("settings.liveUpdateWaitingReasons"));
+      detailLines.push(t(requiresPluginUpdateRetry(state.blockers) ? "settings.liveUpdateRetryReasons" : "settings.liveUpdateWaitingReasons"));
       for (const blocker of state.blockers) {
         detailLines.push(`• ${formatLiveUpdateBlocker(t, blocker)}`);
       }
@@ -292,7 +300,7 @@ export function deriveSelfUpdateProgress(
     }
     const errText = state.error || batch?.error || state.recoveryError;
     if (errText) {
-      detailLines.push(errText);
+      detailLines.push(formatSelfUpdateError(t, errText));
     }
     detailLines.push(t("statusbar.selfUpdateOpenSettings"));
     return {

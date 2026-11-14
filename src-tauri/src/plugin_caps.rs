@@ -49,6 +49,14 @@ use tauri::Manager;
 #[tauri::command]
 pub(crate) fn plugin_fixed_instructions_supported() -> bool { true }
 
+/// Shared by the capability handshake and the ledger resolver's engine gate.
+pub(crate) const FIXED_INSTRUCTIONS_ENGINES: [&str; 3] = ["claude", "codex", "agy"];
+
+#[tauri::command]
+pub(crate) fn plugin_fixed_instructions_engines() -> Vec<&'static str> {
+    FIXED_INSTRUCTIONS_ENGINES.to_vec()
+}
+
 use parking_lot::Mutex;
 
 use crate::engine::resolve::{command_for_binary, find_cli_binary, merge_cli_search_path};
@@ -855,6 +863,13 @@ pub(crate) async fn plugin_exec_kill(plugin_id: String, only_exited: Option<bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixed_instruction_handshake_preserves_legacy_and_reports_exact_engines() {
+        assert!(plugin_fixed_instructions_supported());
+        assert_eq!(plugin_fixed_instructions_engines(), ["claude", "codex", "agy"]);
+        assert_eq!(plugin_fixed_instructions_engines(), FIXED_INSTRUCTIONS_ENGINES);
+    }
 
     fn grants(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()

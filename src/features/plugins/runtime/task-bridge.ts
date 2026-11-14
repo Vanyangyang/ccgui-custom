@@ -1,10 +1,11 @@
 import type {
   Disposer, HostTaskCatalog, HostTaskExcerpt, HostTaskExcerptQuery, HostTaskHistoryPage, HostTaskHistoryQuery,
   HostTaskPlan, HostTaskPlanErrorCode, HostTaskPlanRecord, HostTaskPlanRequest, HostTaskReceipt, HostTaskSlot,
-  HostTaskStatus, HostTaskSubmission, HostTasksApi, HostTaskSelection,
+  HostTaskStatus, HostTaskSubmission, HostTasksApi, HostTaskSelection, HostTaskAttachmentRequest,
 } from "@ccgui/plugin-sdk";
 import type { EngineEventPayload } from "@/lib/events";
 import { newId } from "@/lib/id";
+import i18n from "@/lib/i18n";
 import {
   cloneCheckpointValue, isRuntimeSubmissionPaused, registerRuntimeCheckpointBlocker,
   runtimeCheckpoint, whenRuntimeSubmissionResumed, type RuntimeCheckpoint, type RuntimeCheckpointParticipant,
@@ -16,7 +17,7 @@ import {
 } from "./task-facade";
 import { normalizeTaskWritePaths, sameTaskPath, taskScopesConflict, type TaskWriteScope } from "./task-paths";
 import { decodePersistedTaskClaims } from "./task-claims";
-import { createTaskConversationBridge } from "./task-conversation-bridge";
+import { createTaskConversationBridge, type TaskConversationDependencies } from "./task-conversation-bridge";
 import { validateFixedInstructions, sameFixedInstructions, fixedInstructionsIdentity, supportsFixedInstructions } from "./fixed-instructions";
 
 /**
@@ -43,12 +44,13 @@ const PLANNER_ENGINES = new Set(["claude", "codex", "pi"]);
 const SETTLED = new Set<HostTaskStatus>(["completed", "failed", "cancelled"]);
 const ACTIVE = new Set<HostTaskStatus>(["starting", "executing", "awaiting_permission"]);
 const HOLDING_LOCKS = new Set<HostTaskStatus>([...ACTIVE, "unknown"]);
-const STATUSES = new Set<HostTaskStatus>(["queued", ...HOLDING_LOCKS, ...SETTLED]);
+const STATUSES = new Set<HostTaskStatus>(["attached", "queued", ...HOLDING_LOCKS, ...SETTLED]);
 
 type Receipt = Omit<HostTaskReceipt, "text" | "truncated">;
 type Mutable<T> = { -readonly [K in keyof T]: T[K] };
 
 interface Entry {
+  attachment?: true;
   receipt: Mutable<Receipt>;
   fingerprint: string;
   prompt: string;
@@ -132,6 +134,8 @@ export function pendingHostTaskPluginIds(checkpoint: RuntimeCheckpoint): string[
 // --- cross-bridge coordination (scoped per host document facade) ------------
 
 interface Claim extends TaskWriteScope {
+  exclusiveSession?: boolean;
+  reservationOnly?: boolean;
   pluginId: string;
   runId: string;
   requestId: string;
@@ -184,6 +188,7 @@ function planError(error: unknown): HostTaskPlanError {
 
 const ID = /^[A-Za-z0-9._:-]{1,128}$/;
 const validId = (value: unknown): value is string => typeof value === "string" && ID.test(value);
+const validPluginImageId = (value: unknown): value is string => validId(value) && !value.trim().startsWith("task-image:");
 const label = (value: unknown, max = 256): value is string =>
   typeof value === "string" && !!value.trim() && value.length <= max && !/[\u0000-\u001f]/.test(value);
 const selector = (value: unknown): value is string =>
@@ -194,11 +199,18 @@ function clip(text: string, limit: number): string {
 }
 const refKey = (ref: TaskSessionRef) => `${ref.engine}/${ref.sessionId}`;
 const slotId = (projectId: string, slotKey: string) => JSON.stringify([projectId, slotKey]);
+const attachmentFingerprint = (request: HostTaskAttachmentRequest) => JSON.stringify({
+  attachment: true, taskId: request.taskId, projectId: request.projectId, slotKey: request.slotKey,
+  session: { engine: request.session.engine, sessionId: request.session.sessionId, workspacePath: request.session.workspacePath }, writePaths: request.writePaths ?? null,
+});
 
 export interface HostTaskBridgeDependencies {
   facade?: () => Promise<HostTaskFacade>;
   invoke: (command: string, args: Record<string, unknown>) => Promise<unknown>;
+  confirmCostReview?: TaskConversationDependencies["confirmCostReview"];
+  confirmManagedHandoff?: TaskConversationDependencies["confirmManagedHandoff"];
   loadClaims?: () => Promise<unknown>;
+  attachmentCapabilities?: () => Promise<unknown>;
   now?: () => number;
   runId?: () => string;
   paused?: () => boolean;
@@ -210,13 +222,20 @@ export interface HostTaskBridgeDependencies {
 }
 
 export function createHostTaskBridge(pluginId: string, storage: PluginStorageBackend, deps: HostTaskBridgeDependencies):
-  HostTasksApi & { dispose: Disposer; ready(): Promise<void> } {
+  HostTasksApi & { dispose: Disposer; ready(): Promise<void>; noticeCoordinator(ref: TaskSessionRef): Promise<string | null>;
+    summarizeManagedHandoff: ReturnType<typeof createTaskConversationBridge>["summarizeManagedHandoff"];
+    summarizeCoordinatorHandoff: ReturnType<typeof createTaskConversationBridge>["summarizeCoordinatorHandoff"] } {
   const now = deps.now ?? Date.now;
   const checkpoint = deps.checkpoint ?? runtimeCheckpoint;
   const paused = deps.paused ?? (() => checkpoint.isPaused() || isRuntimeSubmissionPaused());
   const whenResumed = deps.whenResumed ?? (() => whenRuntimeSubmissionResumed());
   const participantId = hostTaskCheckpointId(pluginId);
   const checkpointOwner = Symbol(participantId);
+  let attachmentCapability: Promise<boolean> | undefined;
+  const supportsAttachments = () => attachmentCapability ??= Promise.resolve().then(() => deps.attachmentCapabilities?.()).then(value => {
+    const native = value as { version?: unknown; exclusiveSessionReservations?: unknown } | null;
+    return native?.version === 1 && native.exclusiveSessionReservations === true;
+  }).catch(() => false);
   let predecessorDrain: Promise<void> = Promise.resolve();
   const entries = new Map<string, Entry>();
   const conversationHolds = new Set<string>();
@@ -306,6 +325,15 @@ export function createHostTaskBridge(pluginId: string, storage: PluginStorageBac
     if (!facade) return;
     facadeClaims(facade).delete(`${pluginId}\u0000${entry.receipt.requestId}`);
   };
+  const reserveConversation = (entry: Entry) => {
+    const session = entry.conversationSession ?? entry.receipt.session;
+    if (!facade || !session || !entry.sessionProven || !(entry.coordination || entry.conversationOwner)) return;
+    facadeClaims(facade).set(`${pluginId}\u0000reservation:${entry.receipt.requestId}`, {
+      pluginId, requestId: entry.receipt.requestId, runId: "", session: { ...session },
+      status: "unknown", sessionProven: true, workspacePath: entry.receipt.workspacePath,
+      writePaths: entry.writePaths, exclusiveSession: true, reservationOnly: true,
+    });
+  };
   const claim = (entry: Entry) => {
     if (!facade) return;
     facadeClaims(facade).set(`${pluginId}\u0000${entry.receipt.requestId}`, {
@@ -357,6 +385,7 @@ export function createHostTaskBridge(pluginId: string, storage: PluginStorageBac
         return;
       }
       entry.conversationSession ??= { ...session };
+      reserveConversation(entry);
     }
     slots.set(slotId(entry.receipt.projectId, entry.receipt.slotKey), {
       projectId: entry.receipt.projectId, slotKey: entry.receipt.slotKey,
@@ -368,8 +397,8 @@ export function createHostTaskBridge(pluginId: string, storage: PluginStorageBac
 
   const validSelection = (value: unknown): value is HostTaskSelection => {
     const v = value as HostTaskSelection | null;
-    return !!v && [v.engine, v.model, v.effort, v.providerId].every(selector) &&
-      ["claude", "codex"].includes(v.engine);
+    return !!v && [v.engine, v.model, v.providerId].every(selector) &&
+      (v.engine === "agy" ? v.effort === undefined : ["claude", "codex"].includes(v.engine) && selector(v.effort));
   };
   const sameSelection = (a: HostTaskSelection, b: HostTaskSelection) =>
     a.engine === b.engine && a.model === b.model && a.effort === b.effort && a.providerId === b.providerId;
@@ -404,19 +433,42 @@ export function createHostTaskBridge(pluginId: string, storage: PluginStorageBac
     }
   };
   const validateEntrySelection = (raw: Entry) => {
+    if (raw.attachment !== undefined || raw.receipt.status === "attached" || raw.receipt.sessionDecision === "attached") {
+      const r = raw.receipt, ref = r.session;
+      let fingerprint: { writePaths?: string[] | null };
+      try { fingerprint = JSON.parse(raw.fingerprint); } catch { throw new Error("Invalid existing conversation attachment fingerprint"); }
+      if (!fingerprint || typeof fingerprint !== "object" || Array.isArray(fingerprint)) throw new Error("Invalid existing conversation attachment fingerprint");
+      if (raw.attachment !== true || r.status !== "attached" || r.sessionDecision !== "attached" || r.runId !== null ||
+        !ref || !selector(ref.engine) || !plausibleSessionId(ref.engine, ref.sessionId) || !sameTaskPath(ref.workspacePath, r.workspacePath) ||
+        !raw.conversationSession || !sameSession(raw.conversationSession, ref) || raw.sessionProven !== true ||
+        raw.coordination !== true || raw.conversationOwner !== true || typeof raw.conversationHolding !== "boolean" ||
+        raw.prompt !== "" || raw.sessionMode !== "new" || raw.requestedEngine !== ref.engine || raw.newEngine !== ref.engine ||
+        raw.lastSeq !== -1 || !raw.launch || typeof raw.launch !== "object" || Array.isArray(raw.launch) || Object.keys(raw.launch).length || raw.execEngine || raw.ack || raw.identityMismatch ||
+        raw.cancelRequested || raw.pendingTerminal || raw.forgotten || raw.images || raw.fixedInstructions || raw.displayText !== undefined || raw.userRow ||
+        raw.hasExplicitHandoff || raw.rolloverHandoffApplied || raw.hasText || !label(r.executionId) || !Number.isFinite(r.acceptedAt) || !Number.isFinite(r.updatedAt) ||
+        r.requestedSelection || r.effectiveSelection || !label(r.taskId) || !label(r.projectId) || !label(r.slotKey) ||
+        raw.fingerprint !== attachmentFingerprint({ requestId: r.requestId, taskId: r.taskId, projectId: r.projectId, slotKey: r.slotKey, session: ref, writePaths: fingerprint.writePaths ?? undefined }) ||
+        JSON.stringify(normalizeTaskWritePaths(fingerprint.writePaths ?? undefined, r.workspacePath)) !== JSON.stringify(raw.writePaths)) {
+        throw new Error("Invalid existing conversation attachment record");
+      }
+      return;
+    }
+    if (!raw.prompt.trim() && !raw.images?.length && !raw.forgotten) throw new Error("Invalid empty host task prompt");
     const requested = raw.receipt.requestedSelection;
     const effective = raw.receipt.effectiveSelection;
     const launch = raw.launch;
     let fingerprint: unknown;
     try { fingerprint = JSON.parse(raw.fingerprint); } catch { throw new Error("Invalid host task fingerprint"); }
     const extension = Array.isArray(fingerprint) && fingerprint.length > 12 && fingerprint.at(-1) && typeof fingerprint.at(-1) === "object" && !Array.isArray(fingerprint.at(-1))
-      ? fingerprint.pop() as { coordination?: unknown; displayText?: unknown; fixedInstructions?: unknown } : undefined;
+      ? fingerprint.pop() as { coordination?: unknown; displayText?: unknown; fixedInstructions?: unknown; codexServiceTier?: unknown } : undefined;
     validateFixedInstructions(raw.fixedInstructions);
     validateFixedInstructions(extension?.fixedInstructions);
     if ((raw.coordination !== undefined && raw.coordination !== true) || (raw.conversationOwner !== undefined && raw.conversationOwner !== true) ||
       (raw.conversationHolding !== undefined && typeof raw.conversationHolding !== "boolean") ||
       extension?.coordination !== raw.coordination || (raw.coordination && raw.sessionMode !== "new") ||
-      (extension && Object.keys(extension).some(k => !["coordination", "displayText", "fixedInstructions"].includes(k))) ||
+      (extension && Object.keys(extension).some(k => !["coordination", "displayText", "fixedInstructions", "codexServiceTier"].includes(k))) ||
+      extension?.codexServiceTier !== launch?.codexServiceTierOverride ||
+      (launch?.codexServiceTierOverride !== undefined && (!raw.coordination || raw.newEngine !== "codex" || !["default", "priority"].includes(launch.codexServiceTierOverride))) ||
       !sameFixedInstructions(extension?.fixedInstructions, raw.fixedInstructions) ||
       extension?.displayText !== raw.displayText || (raw.displayText !== undefined && (typeof raw.displayText !== "string" || raw.displayText.length > MAX_PROMPT)) ||
       (raw.userRow && (!Number.isSafeInteger(raw.userRow.seq) || typeof raw.userRow.text !== "string" || raw.userRow.runId !== raw.receipt.runId || (raw.userRow.ts !== null && typeof raw.userRow.ts !== "string"))) ||
@@ -435,7 +487,7 @@ export function createHostTaskBridge(pluginId: string, storage: PluginStorageBac
       (!Array.isArray(raw.images) ||
         raw.images.length < 1 ||
         raw.images.length > 8 ||
-        raw.images.some((id) => !validId(id)))
+        raw.images.some((id) => !validPluginImageId(id)))
     ) {
       throw new Error("Invalid host task images record");
     }
@@ -449,7 +501,7 @@ export function createHostTaskBridge(pluginId: string, storage: PluginStorageBac
     if (
       fingerprint.length !== expectedLen ||
       hasImages !== (fpImages !== undefined) ||
-      (hasImages && (!fpImages!.every(validId) || !sameList(raw.images, fpImages!)))
+      (hasImages && (!fpImages!.every(validPluginImageId) || !sameList(raw.images, fpImages!)))
     ) {
       throw new Error("Invalid host task launch record");
     }
@@ -461,7 +513,7 @@ export function createHostTaskBridge(pluginId: string, storage: PluginStorageBac
         (raw.receipt.session != null && raw.receipt.session.engine !== effective.engine) ||
         launch.model !== effective.model || launch.effort !== effective.effort || launch.providerId !== effective.providerId ||
         !fpHasPinned || fingerprint[9] !== requested.engine || fingerprint[10] !== requested.model ||
-        fingerprint[11] !== requested.effort || fingerprint[12] !== requested.providerId) {
+        (fingerprint[11] ?? undefined) !== requested.effort || fingerprint[12] !== requested.providerId) {
         throw new Error("Invalid pinned host task selection record");
       }
     } else if ((fingerprint[9] ?? null) !== raw.requestedEngine ||
@@ -532,6 +584,14 @@ export function createHostTaskBridge(pluginId: string, storage: PluginStorageBac
     }
     const changed: Entry[] = [];
     for (const entry of entries.values()) {
+      reserveConversation(entry);
+      // An idle observation belongs to its renderer lifetime. Revalidate every
+      // retained continuous owner before admitting work after cold recovery.
+      if (!entry.attachment && (entry.coordination || entry.conversationOwner) && !entry.conversationHolding) {
+        entry.conversationHolding = true;
+        conversationHolds.add(entry.receipt.requestId);
+        changed.push(entry);
+      }
       if (entry.conversationHolding) {
         facadeClaims(facade).set(`${pluginId}\u0000conversation:${entry.receipt.requestId}`, {
           pluginId, requestId: entry.receipt.requestId, runId: "", session: entry.receipt.session ?? null,
@@ -550,7 +610,7 @@ export function createHostTaskBridge(pluginId: string, storage: PluginStorageBac
       const live = entry.receipt.runId ? facade.liveRun(entry.receipt.runId) : null;
       const engine = entry.execEngine ?? entry.receipt.session?.engine ?? entry.newEngine;
       if (live) {
-        entry.ack = true;
+        const hadNativeAcceptance = entry.ack === true || entry.sessionProven === true;
         if (!live.startsWith("new:")) {
           const sessionId = live.slice(engine.length + 1);
           if (!live.startsWith(`${engine}/`) || !plausibleSessionId(engine, sessionId) ||
@@ -566,7 +626,12 @@ export function createHostTaskBridge(pluginId: string, storage: PluginStorageBac
           moveSlot(entry);
         }
         if (entry.receipt.status === "unknown" || entry.receipt.status === "starting") {
-          entry.receipt = { ...entry.receipt, status: "executing", error: undefined, updatedAt: now() };
+          // A restored local route keeps Stop reachable; only an ACK or native
+          // identity proves delivery. An uncertain private launch is not replayed
+          // or promoted to executing merely because its renderer state survived.
+          entry.receipt = hadNativeAcceptance
+            ? { ...entry.receipt, status: "executing", error: undefined, updatedAt: now() }
+            : { ...entry.receipt, status: "unknown", error: "Native acceptance is still unconfirmed; original run retained without replay", updatedAt: now() };
           changed.push(entry);
         }
         if (entry.cancelRequested && entry.receipt.runId) {
@@ -705,17 +770,19 @@ export function createHostTaskBridge(pluginId: string, storage: PluginStorageBac
       // Earlier requests keep acceptance order when writes conflict; later ones
       // block once holding locks (active or unknown). Same-slot disjoint tasks
       // do not block here so they can run in parallel sessions.
-      if (!conversationHolds.has(other.receipt.requestId) && (SETTLED.has(other.receipt.status) || (!earlier && !HOLDING_LOCKS.has(other.receipt.status)))) continue;
+      if (!conversationHolds.has(other.receipt.requestId) && (other.attachment || SETTLED.has(other.receipt.status) || (!earlier && !HOLDING_LOCKS.has(other.receipt.status)))) continue;
       if (taskScopesConflict(scope, { workspacePath: other.receipt.workspacePath, writePaths: other.writePaths })) {
         blockers.push(other.receipt.requestId);
       }
     }
     for (const [key, other] of facadeClaims(facade)) {
       if (other.pluginId === pluginId) continue; // own requests are covered above
+      if (other.reservationOnly) continue;
       if (!other.identityMismatch && other.runId && !facade.liveRun(other.runId)) {
         const settled = facade.settledRun?.(other.runId, other.session);
         if (settled && (other.sessionProven || settled.status !== "completed" || other.cancelRequested)) {
-          facadeClaims(facade).delete(key);
+          if (other.exclusiveSession) other.reservationOnly = true;
+          else facadeClaims(facade).delete(key);
           continue;
         }
       }
@@ -727,11 +794,19 @@ export function createHostTaskBridge(pluginId: string, storage: PluginStorageBac
   const sameList = (a: readonly string[] | undefined, b: readonly string[]) =>
     (a?.length ?? 0) === b.length && b.every((value, i) => a?.[i] === value);
 
+  const draftBlockedBy = (entry: Entry, engine: string, requireOpenTab: boolean): string[] => {
+    const reason = facade.draftBlockReason?.(engine, entry.receipt.workspacePath, entry.launch, { requireOpenTab });
+    return reason ? ["user-draft", reason] : ["user-draft"];
+  };
+
   function sameSession(a: TaskSessionRef, b: TaskSessionRef) {
     return a.engine === b.engine && a.sessionId === b.sessionId && sameTaskPath(a.workspacePath, b.workspacePath);
   }
-  const exclusiveOwner = (ref: TaskSessionRef, except?: Entry) => [...entries.values()].find(other => other !== except &&
-    (other.coordination || other.conversationOwner) && (other.conversationSession ?? other.receipt.session) && sameSession((other.conversationSession ?? other.receipt.session)!, ref));
+  const sameNativeSession = (a: TaskSessionRef, b: TaskSessionRef) => a.engine === b.engine && a.sessionId === b.sessionId;
+  const exclusiveOwner = (ref: TaskSessionRef, except?: Entry) => [...entries.values()].some(other => other !== except &&
+    (other.coordination || other.conversationOwner) && (other.conversationSession ?? other.receipt.session) && sameNativeSession((other.conversationSession ?? other.receipt.session)!, ref)) ||
+    [...facadeClaims(facade).values()].some(other => other.exclusiveSession && other.session &&
+      !(other.pluginId === pluginId && other.requestId === except?.receipt.requestId) && sameNativeSession(other.session, ref));
 
   async function reconcileUnknownEntries() {
     for (const entry of [...entries.values()]) {
@@ -765,7 +840,7 @@ export function createHostTaskBridge(pluginId: string, storage: PluginStorageBac
       await reconcileUnknownEntries();
       for (const entry of [...entries.values()]) {
         if (disposed || fenced || paused()) break;
-        if (entry.receipt.status !== "queued") continue;
+        if (entry.attachment || entry.receipt.status !== "queued") continue;
         const blockers = blockersFor(entry);
         if (blockers.length) {
           if (!sameList(entry.receipt.blockedBy, blockers)) await change(entry, { blockedBy: blockers });
@@ -882,14 +957,15 @@ export function createHostTaskBridge(pluginId: string, storage: PluginStorageBac
         if (entry.receipt.blockedBy?.length) await change(entry, { blockedBy: undefined });
         return;
       }
-      if (
-        !facade.openDraft(route.engine, entry.receipt.workspacePath, entry.launch) ||
-        !facade.draftReady(route.engine, entry.receipt.workspacePath, entry.launch)
-      ) {
-        if (!sameList(entry.receipt.blockedBy, ["user-draft"])) {
-          await change(entry, { blockedBy: ["user-draft"] });
+      if (!facade.sendNewIsolated) {
+        const opened = facade.openDraft(route.engine, entry.receipt.workspacePath, entry.launch);
+        if (!opened || !facade.draftReady(route.engine, entry.receipt.workspacePath, entry.launch)) {
+          const blockedBy = draftBlockedBy(entry, route.engine, opened);
+          if (!sameList(entry.receipt.blockedBy, blockedBy)) {
+            await change(entry, { blockedBy });
+          }
+          return;
         }
-        return;
       }
       if (route.rolloverFrom) {
         if (!await applyRolloverHandoff(entry, route.rolloverFrom)) return;
@@ -917,10 +993,10 @@ export function createHostTaskBridge(pluginId: string, storage: PluginStorageBac
       if (paused()) { await revert(); return; }
       const ready = target
         ? facade.inspect(target) === "idle"
-        : facade.draftReady(engine, entry.receipt.workspacePath, entry.launch);
+        : !!facade.sendNewIsolated || facade.draftReady(engine, entry.receipt.workspacePath, entry.launch);
       if (!ready) {
         if (target) await change(entry, { status: "failed", error: "Exact host task chat is no longer idle; nothing was sent" });
-        else await revert(["user-draft"]);
+        else await revert(draftBlockedBy(entry, engine, true));
         return;
       }
       const assertPendingSend = () => {
@@ -949,6 +1025,8 @@ export function createHostTaskBridge(pluginId: string, storage: PluginStorageBac
       const beforeSend = async () => {
         assertPendingSend();
         verifyEngineImageSupport();
+        if (entry.fixedInstructions && !await facade.fixedInstructionsSupported?.(engine)) throw new TaskPreSpawnError("Native fixed instructions are unavailable for this engine; nothing was sent");
+        if (entry.launch.codexServiceTierOverride !== undefined && await facade.codexServiceTierOverrideSupported?.() !== true) throw new TaskPreSpawnError("Codex service tier override is unavailable; nothing was sent");
         await verifySelection(entry);
         assertPendingSend();
         await resolveImagesForSend();
@@ -959,7 +1037,8 @@ export function createHostTaskBridge(pluginId: string, storage: PluginStorageBac
         assertPendingSend();
       };
       try { await beforeSend(); } catch (error) {
-        await change(entry, { status: entry.cancelRequested ? "cancelled" : "failed", error: (error as Error).message });
+        await change(entry, { status: entry.cancelRequested ? "cancelled" : "failed", error: (error as Error).message,
+          ...(!target ? { runId: null, sessionDecision: null } : {}) });
         return;
       }
       sent = true;
@@ -968,13 +1047,14 @@ export function createHostTaskBridge(pluginId: string, storage: PluginStorageBac
         if (row.runId !== runId) throw new TaskPreSpawnError("Native user row belongs to another run");
         entry.userRow = structuredClone(row); await persistIndex(); assertPendingSend();
       };
+      const sendNew = (facade.sendNewIsolated ?? facade.sendNew).bind(facade);
       const send = target
         ? (onUserRow ? facade.sendExisting(target, entry.prompt, runId, entry.launch, beforeSend, resolvedImagePaths, onUserRow) : resolvedImagePaths?.length
             ? facade.sendExisting(target, entry.prompt, runId, entry.launch, beforeSend, resolvedImagePaths)
             : facade.sendExisting(target, entry.prompt, runId, entry.launch, beforeSend))
-        : (onUserRow ? facade.sendNew(engine, entry.receipt.workspacePath, entry.prompt, runId, entry.launch, beforeSend, resolvedImagePaths, onUserRow) : resolvedImagePaths?.length
-            ? facade.sendNew(engine, entry.receipt.workspacePath, entry.prompt, runId, entry.launch, beforeSend, resolvedImagePaths)
-            : facade.sendNew(engine, entry.receipt.workspacePath, entry.prompt, runId, entry.launch, beforeSend));
+        : (onUserRow ? sendNew(engine, entry.receipt.workspacePath, entry.prompt, runId, entry.launch, beforeSend, resolvedImagePaths, onUserRow) : resolvedImagePaths?.length
+            ? sendNew(engine, entry.receipt.workspacePath, entry.prompt, runId, entry.launch, beforeSend, resolvedImagePaths)
+            : sendNew(engine, entry.receipt.workspacePath, entry.prompt, runId, entry.launch, beforeSend));
       void send.then((ack) => serial(() => onAck(entry, runId, ack)), (error: unknown) => serial(() => onSendError(entry, runId, error)))
         .finally(() => { inFlightStarts.delete(runId); reservations.delete(reservation); kick(); });
     } finally {
@@ -983,7 +1063,7 @@ export function createHostTaskBridge(pluginId: string, storage: PluginStorageBac
   }
 
   async function onAck(entry: Entry, runId: string, ack: TaskAck) {
-    if (disposed || entry.receipt.runId !== runId || SETTLED.has(entry.receipt.status)) return;
+    if (disposed || entry.receipt.runId !== runId) return;
     const engine = entry.execEngine!;
     const target = entry.receipt.session;
     if (ack.runId !== runId || (ack.sessionId !== null && (!plausibleSessionId(engine, ack.sessionId) ||
@@ -1002,9 +1082,14 @@ export function createHostTaskBridge(pluginId: string, storage: PluginStorageBac
       entry.sessionProven = true;
       if (!target) patch = { session: { engine, sessionId: ack.sessionId, workspacePath: entry.receipt.workspacePath } };
     }
+    if (SETTLED.has(entry.receipt.status)) {
+      if (patch.session) await change(entry, patch, moveSlot);
+      return;
+    }
     const terminal = entry.pendingTerminal;
     if (terminal) {
-      await change(entry, entry.sessionProven ? { ...patch, ...terminal } :
+      await change(entry, entry.sessionProven ? { ...patch, ...(entry.cancelRequested && terminal.status === "completed"
+        ? { status: "cancelled" as const, error: "Cancelled by the requester" } : terminal) } :
         { ...patch, status: "unknown", error: "Turn finished without native session evidence" }, moveSlot);
       return;
     }
@@ -1013,12 +1098,19 @@ export function createHostTaskBridge(pluginId: string, storage: PluginStorageBac
   }
 
   async function onSendError(entry: Entry, runId: string, error: unknown) {
-    if (disposed || entry.receipt.runId !== runId || SETTLED.has(entry.receipt.status)) return;
+    if (disposed || entry.receipt.runId !== runId) return;
+    if (error && typeof error === "object" && "nativeIdentityMismatch" in error && error.nativeIdentityMismatch === true) {
+      await change(entry, { status: "unknown", error: "Native send identity mismatch; not rebound or replayed" }, e => { e.identityMismatch = true; });
+      return;
+    }
+    if (SETTLED.has(entry.receipt.status)) return;
     if (error instanceof TaskPreSpawnError && !entry.ack) {
+      const unbound = entry.receipt.sessionDecision === "new" && !entry.receipt.session && !entry.sessionProven
+        ? { runId: null, sessionDecision: null } : {};
       if (entry.cancelRequested) {
-        await change(entry, { status: "cancelled", error: "Cancelled before delivery" });
+        await change(entry, { ...unbound, status: "cancelled", error: "Cancelled before delivery" });
       } else {
-        await change(entry, { status: "failed", error: `Task was not sent: ${error.message}` });
+        await change(entry, { ...unbound, status: "failed", error: `Task was not sent: ${error.message}` });
       }
       return;
     }
@@ -1033,6 +1125,7 @@ export function createHostTaskBridge(pluginId: string, storage: PluginStorageBac
       if (entry.ack && (entry.sessionProven || result.status !== "completed" || entry.cancelRequested)) {
         update(entry, result);
       } else if (entry.ack) {
+        entry.pendingTerminal = result;
         update(entry, { status: "unknown", error: "Turn finished without native session evidence" });
       } else {
         entry.pendingTerminal = result;
@@ -1046,9 +1139,9 @@ export function createHostTaskBridge(pluginId: string, storage: PluginStorageBac
       const entry = [...entries.values()].find((e) => e.receipt.runId === event.runId);
       if (
         !entry ||
-        !HOLDING_LOCKS.has(entry.receipt.status) ||
+        (!HOLDING_LOCKS.has(entry.receipt.status) && !(SETTLED.has(entry.receipt.status) && !entry.receipt.session && event.kind === "session")) ||
         entry.identityMismatch ||
-        entry.pendingTerminal ||
+        (entry.pendingTerminal && event.kind !== "session") ||
         event.engine !== entry.execEngine ||
         !Number.isInteger(event.seq) ||
         event.seq <= entry.lastSeq
@@ -1068,6 +1161,11 @@ export function createHostTaskBridge(pluginId: string, storage: PluginStorageBac
       }
       entry.ack = true;
       entry.lastSeq = event.seq;
+      if (entry.pendingTerminal && entry.sessionProven) {
+        const terminal = entry.pendingTerminal;
+        update(entry, entry.cancelRequested && terminal.status === "completed" ? interrupted(entry) : terminal);
+        continue;
+      }
       if ((entry.receipt.status === "starting" || entry.receipt.status === "unknown") && entry.ack) {
         update(entry, { status: "executing", error: undefined });
       }
@@ -1098,7 +1196,8 @@ export function createHostTaskBridge(pluginId: string, storage: PluginStorageBac
           break;
         case "done": {
           const ref = entry.receipt.session;
-          settle(entry, ref && facade.wasInterrupted(ref) ? interrupted(entry) : { status: "completed", error: undefined });
+          settle(entry, entry.cancelRequested || (data as { interrupted?: unknown } | null)?.interrupted === true || ref && facade.wasInterrupted(ref)
+            ? interrupted(entry) : { status: "completed", error: undefined });
           changed.add(entry);
           break;
         }
@@ -1184,7 +1283,7 @@ export function createHostTaskBridge(pluginId: string, storage: PluginStorageBac
       request.images !== undefined &&
       (!Array.isArray(request.images) ||
         request.images.length > 8 ||
-        request.images.some((id) => !validId(id)))
+        request.images.some((id) => !validPluginImageId(id)))
     ) {
       throw new Error("Task images must be at most 8 valid attachment IDs");
     }
@@ -1194,13 +1293,15 @@ export function createHostTaskBridge(pluginId: string, storage: PluginStorageBac
     if (request.sessionMode !== "auto" && request.sessionMode !== "new") throw new Error("sessionMode must be \"auto\" or \"new\"");
     if (request.coordination !== undefined && request.coordination !== true) throw new Error("coordination must be true when specified");
     if (request.coordination && request.sessionMode !== "new") throw new Error("A coordinator requires sessionMode new");
+    if (request.codexServiceTier !== undefined && (!request.coordination || request.engine !== "codex" || !["default", "priority"].includes(request.codexServiceTier))) throw new Error("Codex service tier requires an explicitly selected Codex coordinator");
     if (typeof request.workspacePath !== "string" || !request.workspacePath.trim()) throw new Error("workspacePath is required");
     for (const [field, value] of [["engine", request.engine], ["model", request.model], ["effort", request.effort], ["providerId", request.providerId]] as const) {
       if (value !== undefined && !selector(value)) throw new Error(`Invalid task ${field}`);
     }
-    if (request.providerId !== undefined && (!request.engine || !request.model || !request.effort)) {
+    if (request.providerId !== undefined && (!request.engine || !request.model || (request.engine !== "agy" && !request.effort))) {
       throw new Error("providerId requires explicit engine, model and effort");
     }
+    if (request.engine === "agy" && request.effort !== undefined) throw new Error("AGY effort is selected through its model");
     if (request.effort !== undefined && !["low", "medium", "high", "xhigh", "max", "ultra"].includes(request.effort)) {
       throw new Error("Task effort must be one of low, medium, high, xhigh, max, ultra");
     }
@@ -1213,6 +1314,105 @@ export function createHostTaskBridge(pluginId: string, storage: PluginStorageBac
     }
   }
 
+  async function verifyAttachmentTarget(ref: TaskSessionRef, projectId: string) {
+    const workspace = registeredWorkspace(facade, ref.workspacePath);
+    if (!workspace || workspace.remote || workspace.archived || !facade.known(ref)) throw new Error(i18n.t("taskAttachment.workspace"));
+    const engine = facade.engines().find(e => e.id === ref.engine);
+    if (!engine?.available || !engine.enabled) throw new Error(i18n.t("taskAttachment.engine"));
+    const projectMatches = (projects: Awaited<ReturnType<HostTaskFacade["projects"]>>) => projects.filter(p => p.id === projectId &&
+      p.members.some(m => sameTaskPath(m.path, ref.workspacePath) && m.role === "development" && m.status === "available")).length === 1;
+    if (!projectMatches(await facade.projects())) throw new Error(i18n.t("taskAttachment.project"));
+    const rejectManagedChild = (branches: Awaited<ReturnType<HostTaskFacade["leaderBranches"]>>) => {
+      if (branches.some(b => b.engine === ref.engine && b.sessionId === ref.sessionId && b.state !== "reclaimed")) throw new Error(i18n.t("taskAttachment.child"));
+    };
+    rejectManagedChild(await facade.leaderBranches(true));
+    let lifecycle = await facade.observeLifecycle?.(ref, { forAttachment: true });
+    if (!lifecycle || lifecycle.archived || !lifecycle.isCurrent()) throw new Error(i18n.t("taskAttachment.lifecycle"));
+    rejectManagedChild(await facade.leaderBranches(true));
+    if (!lifecycle.isCurrent()) throw new Error(i18n.t("taskAttachment.changed"));
+    let state = facade.conversationState?.(ref);
+    if (!state) {
+      if (!lifecycle.idle) throw new Error(i18n.t("taskAttachment.open"));
+      await facade.openBackground(ref);
+      state = facade.conversationState?.(ref);
+      lifecycle = await facade.observeLifecycle?.(ref, { forAttachment: true });
+      if (!lifecycle || lifecycle.archived || !lifecycle.isCurrent()) throw new Error(i18n.t("taskAttachment.changed"));
+    }
+    if (!projectMatches(await facade.projects())) throw new Error(i18n.t("taskAttachment.changed"));
+    rejectManagedChild(await facade.leaderBranches(true));
+    if (!lifecycle.isCurrent()) throw new Error(i18n.t("taskAttachment.changed"));
+    const currentWorkspace = registeredWorkspace(facade, ref.workspacePath);
+    if (!currentWorkspace || currentWorkspace.remote || currentWorkspace.archived || !facade.engines().some(e => e.id === ref.engine && e.available && e.enabled) ||
+      !state || !facade.known(ref) || !facade.conversationLaunch?.(ref)) throw new Error(i18n.t("taskAttachment.configuration"));
+    if (state.status !== "idle" && !state.runId) throw new Error(i18n.t("taskAttachment.run"));
+    return { state, holding: state.status !== "idle" || !lifecycle.idle };
+  }
+
+  async function attachConversation(request: HostTaskAttachmentRequest): Promise<HostTaskReceipt> {
+    if (!request || !validId(request.requestId) || !label(request.taskId) || !label(request.projectId) || !label(request.slotKey) ||
+      !request.session || !selector(request.session.engine) || !plausibleSessionId(request.session.engine, request.session.sessionId) ||
+      !label(request.session.workspacePath, 4096) || Object.keys(request).some(k => !["requestId", "taskId", "projectId", "slotKey", "session", "writePaths"].includes(k)) ||
+      Object.keys(request.session).some(k => !["engine", "sessionId", "workspacePath"].includes(k))) throw new Error("Invalid existing conversation attachment request");
+    request = structuredClone(request);
+    await ensure();
+    if (!await supportsAttachments()) throw new Error(i18n.t("taskAttachment.unsupported"));
+    return serial(async () => {
+      assertLive(); checkpoint.assertAllowed();
+      if (fenced) throw new Error("Task ledger is fenced after an ambiguous storage failure");
+      const previous = entries.get(request.requestId);
+      // Comparison keys are not native execution paths. Recover the saved
+      // spelling before IPC, and keep the original binding for idempotent retries.
+      const retained = previous?.attachment ? previous.receipt.session : undefined;
+      if (retained && retained.engine === request.session.engine && retained.sessionId === request.session.sessionId &&
+        sameTaskPath(retained.workspacePath, request.session.workspacePath)) {
+        request = { ...request, session: { ...request.session, workspacePath: retained.workspacePath } };
+      } else if (!previous) {
+        const sources = facade.sessions().filter(s => s.engine === request.session.engine && s.sessionId === request.session.sessionId);
+        if (sources.length > 1 || sources.some(s => s.remote || !sameTaskPath(s.workspacePath, request.session.workspacePath))) {
+          throw new Error(i18n.t("taskAttachment.workspace"));
+        }
+        if (sources.length === 1) request = { ...request, session: { ...request.session, workspacePath: sources[0].workspacePath } };
+      }
+      const writePaths = normalizeTaskWritePaths(request.writePaths, request.session.workspacePath);
+      const fingerprint = attachmentFingerprint(request);
+      if (previous) {
+        if (previous.fingerprint !== fingerprint) throw new Error("Task requestId already belongs to a different submission");
+        return view(previous);
+      }
+      if (entries.size >= MAX_ENTRIES) throw new Error("Task ledger capacity reached");
+      if (exclusiveOwner(request.session)) throw new Error(i18n.t("taskAttachment.reserved"));
+      const verified = await verifyAttachmentTarget(request.session, request.projectId);
+      assertLive(); checkpoint.assertAllowed();
+      // The shared facade reservation is taken synchronously before the first
+      // persistence await; independent plugin chains cannot both accept it.
+      if (exclusiveOwner(request.session)) throw new Error(i18n.t("taskAttachment.reserved"));
+      const at = now();
+      const entry: Entry = {
+        attachment: true, receipt: { requestId: request.requestId, taskId: request.taskId, projectId: request.projectId, slotKey: request.slotKey,
+          executionId: `attachment-${newId()}`, workspacePath: request.session.workspacePath, status: "attached", sessionDecision: "attached",
+          session: { ...request.session }, runId: null, acceptedAt: at, updatedAt: at },
+        fingerprint, prompt: "", writePaths, requestedEngine: request.session.engine, newEngine: request.session.engine,
+        launch: {}, sessionMode: "new", lastSeq: -1, sessionProven: true, coordination: true, conversationOwner: true,
+        conversationSession: { ...request.session }, conversationHolding: verified.holding,
+      };
+      entries.set(request.requestId, entry); reserveConversation(entry);
+      if (entry.conversationHolding) {
+        conversationHolds.add(request.requestId);
+        facadeClaims(facade).set(`${pluginId}\u0000conversation:${request.requestId}`, { pluginId, requestId: request.requestId, runId: "",
+          session: { ...request.session }, status: "unknown", sessionProven: true, workspacePath: request.session.workspacePath, writePaths });
+      }
+      try { await persistIndex(); }
+      catch {
+        entries.delete(request.requestId); conversationHolds.delete(request.requestId); fenced = true;
+        // The write may have committed before reporting failure. Retain the
+        // exact-session reservation until authoritative cold recovery.
+        throw new Error(i18n.t("taskAttachment.save"));
+      }
+      emit(entry); conversations.wake();
+      return view(entry);
+    });
+  }
+
   async function submit(request: HostTaskSubmission): Promise<HostTaskReceipt> {
     validateSubmission(request);
     request = structuredClone(request);
@@ -1223,13 +1423,14 @@ export function createHostTaskBridge(pluginId: string, storage: PluginStorageBac
       request.writePaths ?? null, request.contextRefs ?? null, request.sessionMode, request.handoffFrom ?? null,
       request.engine ?? null, request.model ?? null, request.effort ?? null,
       ...(request.providerId !== undefined ? [request.providerId] : []),
-      ...(imageIds ? [imageIds] : []), ...(request.coordination || request.displayText !== undefined || request.fixedInstructions ? [{ ...(request.coordination ? { coordination: true } : {}), ...(request.displayText !== undefined ? { displayText: request.displayText } : {}), ...(request.fixedInstructions ? { fixedInstructions: fixedInstructionsIdentity(request.fixedInstructions) } : {}) }] : [])]);
+      ...(imageIds ? [imageIds] : []), ...(request.coordination || request.displayText !== undefined || request.fixedInstructions || request.codexServiceTier !== undefined ? [{ ...(request.coordination ? { coordination: true } : {}), ...(request.displayText !== undefined ? { displayText: request.displayText } : {}), ...(request.fixedInstructions ? { fixedInstructions: fixedInstructionsIdentity(request.fixedInstructions) } : {}), ...(request.codexServiceTier !== undefined ? { codexServiceTier: request.codexServiceTier } : {}) }] : [])]);
     const previous = entries.get(request.requestId);
     if (previous) {
       if (previous.fingerprint !== fingerprint) throw new Error("Task requestId already belongs to a different submission");
       return view(previous);
     }
-    if (request.fixedInstructions && !await facade.fixedInstructionsSupported?.()) throw new Error("Native fixed instructions are unavailable");
+    if (request.fixedInstructions && !await facade.fixedInstructionsSupported?.(request.engine)) throw new Error("Native fixed instructions are unavailable");
+    if (request.codexServiceTier !== undefined && await facade.codexServiceTierOverrideSupported?.() !== true) throw new Error("Codex service tier override is unavailable");
     const workspace = registeredWorkspace(facade, request.workspacePath);
     if (!workspace || workspace.remote || workspace.archived) throw new Error("workspacePath must be a registered, local, non-archived workspace");
     const writePaths = normalizeTaskWritePaths(request.writePaths, workspace.path);
@@ -1239,7 +1440,7 @@ export function createHostTaskBridge(pluginId: string, storage: PluginStorageBac
     if (!info?.available || !info.enabled) throw new Error(`Engine ${newEngine} is not available for tasks`);
     if (imageIds && info.supportsImages !== true) throw new Error(`Engine ${newEngine} does not support image attachments`);
     const requestedSelection: HostTaskSelection | undefined = request.providerId !== undefined
-      ? { engine: request.engine!, model: request.model!, effort: request.effort!, providerId: request.providerId } : undefined;
+      ? { engine: request.engine!, model: request.model!, ...(request.effort !== undefined ? { effort: request.effort } : {}), providerId: request.providerId } : undefined;
     const effectiveSelection = requestedSelection ? await resolveSelection(requestedSelection) : undefined;
     if (imageIds) {
       await resolveTaskImages(imageIds);
@@ -1248,8 +1449,9 @@ export function createHostTaskBridge(pluginId: string, storage: PluginStorageBac
     const frozenLaunch: TaskLaunchChoices = {
       ...(request.model ? { model: request.model } : {}),
       ...(request.effort ? { effort: request.effort } : {}),
+      ...(request.codexServiceTier !== undefined ? { codexServiceTierOverride: request.codexServiceTier } : {}),
       defaultModel: info.defaultModel ?? null,
-      defaultEffort: info.defaultEffort ?? null,
+      defaultEffort: newEngine === "agy" ? null : info.defaultEffort ?? null,
       defaultProvider: info.defaultProvider ?? null,
       ...(effectiveSelection ? { model: effectiveSelection.model, effort: effectiveSelection.effort, providerId: effectiveSelection.providerId } : {}),
     };
@@ -1312,10 +1514,20 @@ export function createHostTaskBridge(pluginId: string, storage: PluginStorageBac
         await change(entry, { status: "cancelled", error: "Cancelled before delivery", blockedBy: undefined });
       } else if ((ACTIVE.has(status) || status === "unknown") && !entry.identityMismatch) {
         if (!entry.cancelRequested) {
+          const terminal = entry.pendingTerminal ?? (entry.receipt.runId && !facade.liveRun(entry.receipt.runId)
+            ? facade.settledRun?.(entry.receipt.runId, entry.receipt.session) : null);
+          if (terminal) {
+            // Cancellation cannot rewrite a terminal event that already won.
+            // A completed first turn still waits for its native identity.
+            entry.pendingTerminal = terminal;
+            await change(entry, entry.sessionProven || terminal.status !== "completed" ? terminal :
+              { status: "unknown", error: "Turn finished without native session evidence" }, moveSlot);
+            return view(entry);
+          }
           entry.cancelRequested = true;
           await change(entry, {});
         }
-        if ((entry.ack || status === "unknown") && entry.receipt.runId) {
+        if ((entry.ack || status === "unknown" || facade.sendNewIsolated && entry.receipt.sessionDecision === "new") && entry.receipt.runId) {
           const stopped = await facade.interrupt(entry.receipt.runId).catch(() => false);
           if (!stopped && !facade.liveRun(entry.receipt.runId)) {
             const settledPatch = settleFromNativeProof(entry);
@@ -1588,9 +1800,12 @@ export function createHostTaskBridge(pluginId: string, storage: PluginStorageBac
   async function catalog(options?: { includeModels?: boolean }): Promise<HostTaskCatalog> {
     await ensure();
     const fixedInstructions = await facade.fixedInstructionsSupported?.() === true;
+    const coordinatorServiceTier = await facade.codexServiceTierOverrideSupported?.() === true;
+    const fullHistoryHandoff = !!facade.summarizeHandoff && await facade.fullHistoryHandoffSupported?.() === true;
+    const managedChildCostHandoff = !!deps.confirmManagedHandoff && !!deps.confirmCostReview && !!facade.costApprovals && !!facade.captureCostApproval && !!facade.handoffCostApproval && await facade.managedChildHandoffSupported?.() === true;
     const workspaces = facade.workspaces().map((w) => ({ ...w, executable: !w.remote && !w.archived }));
     const engines = await Promise.all(facade.engines().map(async (e) => ({
-      ...e, supportsImages: e.supportsImages === true, supportsFixedInstructions: fixedInstructions && supportsFixedInstructions(e.id), planner: PLANNER_ENGINES.has(e.id) && e.available && e.enabled,
+      ...e, supportsImages: e.supportsImages === true, supportsFixedInstructions: supportsFixedInstructions(e.id) && await facade.fixedInstructionsSupported?.(e.id) === true, planner: PLANNER_ENGINES.has(e.id) && e.available && e.enabled,
       ...(options?.includeModels ? { models: e.available && e.enabled ? await facade.models(e.id).catch(() => null) : null } : {}),
     })));
     const projects = (await facade.projects().catch(() => [])).map((p) => ({
@@ -1598,13 +1813,13 @@ export function createHostTaskBridge(pluginId: string, storage: PluginStorageBac
       members: p.members.map((m) => ({ id: m.id, path: m.path, label: m.label, role: m.role, status: m.status,
         registered: workspaces.some((w) => sameTaskPath(w.path, m.path)) })),
     }));
-    return { defaultEngine: facade.activeEngine(), engines, workspaces, projects, capabilities: { nativeCoordination: true, images: true, continuousCoordination: true, fixedInstructions } };
+    return { defaultEngine: facade.activeEngine(), engines, workspaces, projects, capabilities: { existingConversationAttachment: await supportsAttachments(), nativeCoordination: true, images: true, continuousCoordination: true, coordinatorMessageQueue: true, fixedInstructions, immediateMessages: typeof facade.prepareImmediateMessage === "function", costReviewDialog: !!deps.confirmCostReview && !!facade.costApprovals && !!facade.resolveCostApproval, composerPrediction: !!facade.composerPrediction && !!facade.dismissComposerPrediction, coordinatorServiceTier, fullHistoryHandoff, coordinatorFullHistoryHandoff: fullHistoryHandoff && typeof conversations.summarizeCoordinatorHandoff === "function", coordinatorInputCostReview: !!deps.confirmCostReview && !!facade.sessionCostReview, costHandoffPreview: !!facade.captureCostApproval && !!facade.sessionCostReview, managedChildCostHandoff, managedChildHandoffSelection: managedChildCostHandoff && !!facade.resolveHandoffSelection && await facade.managedChildHandoffSelectionSupported?.() === true } };
   }
 
   // --- registration ----------------------------------------------------------
 
   const conversations = createTaskConversationBridge({
-    pluginId, storage, now, runId: deps.runId, paused,
+    pluginId, storage, now, runId: deps.runId, paused, confirmCostReview: deps.confirmCostReview, confirmManagedHandoff: deps.confirmManagedHandoff,
     coordinators: () => [...entries.values()].filter(e => e.coordination || e.conversationOwner).map(e => e.receipt.requestId),
     facade: async () => { await ensure(); return facade; },
     owned: async (id) => {
@@ -1624,18 +1839,46 @@ export function createHostTaskBridge(pluginId: string, storage: PluginStorageBac
         }
         if (!entry.conversationOwner || !entry.conversationSession) {
           entry.conversationOwner = true; entry.conversationSession = { ...ref };
+          reserveConversation(entry);
           await persistIndex();
         }
       }
       return { receipt: view(entry), proven: entry.sessionProven === true, launch: entry.launch, displayText: entry.displayText, userRow: entry.userRow, fixedInstructions: entry.fixedInstructions };
     },
     resolveImages: resolveTaskImages,
-    verify: async (id) => { const entry = entries.get(id); if (!entry) throw new TaskPreSpawnError("Unknown owned coordinator"); await verifySelection(entry); },
+    handoffExcerpt: (ref) => excerpt({ ...ref, limit: 20, maxChars: 12000 }),
+    verify: async (id) => {
+      const entry = entries.get(id); if (!entry) throw new TaskPreSpawnError("Unknown owned coordinator");
+      if (entry.receipt.session && exclusiveOwner(entry.receipt.session, entry)) throw new TaskPreSpawnError("Exact session has a different exclusive owner");
+      if (entry.attachment) {
+        try {
+          if (!await supportsAttachments()) throw new Error(i18n.t("taskAttachment.unsupported"));
+          await verifyAttachmentTarget(entry.conversationSession!, entry.receipt.projectId);
+        }
+        catch (error) { throw new TaskPreSpawnError(error instanceof Error ? error.message : String(error)); }
+      } else await verifySelection(entry);
+    },
     blocked: (id) => { const entry = entries.get(id); return !entry || blockersFor(entry).length > 0; },
     cancelInitial: cancel,
-    async hold(id, holding) {
+    async hold(id, holding, stillCurrent) {
       const entry = entries.get(id); if (!entry || !facade) return;
       const key = `${pluginId}\u0000conversation:${id}`;
+      if (!holding && stillCurrent) {
+        // Keep the live write fence while its release is persisted. A source
+        // change during that await must not let a different request dispatch.
+        if (stillCurrent()) {
+          if (entry.conversationHolding === false && !conversationHolds.has(id) && !facadeClaims(facade).has(key)) return true;
+          const wasHolding = entry.conversationHolding;
+          entry.conversationHolding = false;
+          await persistIndex();
+          if (stillCurrent()) {
+            conversationHolds.delete(id); facadeClaims(facade).delete(key);
+            if (wasHolding) kickAll();
+            return true;
+          }
+        }
+        holding = true;
+      }
       if (holding) {
         conversationHolds.add(id);
         facadeClaims(facade).set(key, { pluginId, requestId: id, runId: "", session: entry.receipt.session ?? null,
@@ -1646,12 +1889,13 @@ export function createHostTaskBridge(pluginId: string, storage: PluginStorageBac
         await persistIndex();
         if (!holding) kickAll();
       }
+      return !holding;
     },
   });
 
   const unregisterBlocker = (deps.registerBlocker ?? registerRuntimeCheckpointBlocker)(
     participantId,
-    () => inFlightStarts.size ? ["task-start-unpublished"] : [],
+    () => [...(inFlightStarts.size ? ["task-start-unpublished"] : []), ...(conversations.pendingImmediate() ? ["task-immediate-input-pending"] : []), ...(conversations.pendingManagedHandoff() ? ["task-managed-handoff-pending"] : [])],
   );
 
   const participant: RuntimeCheckpointParticipant = {
@@ -1663,6 +1907,8 @@ export function createHostTaskBridge(pluginId: string, storage: PluginStorageBac
       if (initializationFailure) reasons.push("ledger-initialization-failed");
       if (fenced) reasons.push("ledger-ambiguous");
       if (inFlightStarts.size) reasons.push("task-start-unpublished");
+      if (conversations.pendingImmediate()) reasons.push("task-immediate-input-pending");
+      if (conversations.pendingManagedHandoff()) reasons.push("task-managed-handoff-pending");
       return reasons;
     },
     async ready() {
@@ -1695,12 +1941,27 @@ export function createHostTaskBridge(pluginId: string, storage: PluginStorageBac
   if (!restored && checkpoint.isPaused() && inherited) restoreCheckpoint(inherited.snapshot);
 
   return {
+    async noticeCoordinator(ref) {
+      await ensure();
+      return serial(async () => {
+        assertLive();
+        const matches = [...entries.values()].filter(entry => !entry.forgotten && !entry.identityMismatch && entry.sessionProven &&
+          (entry.coordination || entry.conversationOwner) && entry.receipt.session && sameSession(entry.receipt.session, ref));
+        if (matches.length > 1) throw new Error("Ambiguous coordinator notice source");
+        return matches[0]?.receipt.requestId ?? null;
+      });
+    },
     conversation: conversations.conversation,
     sendMessage: conversations.sendMessage,
     messageReceipt: conversations.messageReceipt,
     cancelMessage: conversations.cancelMessage,
+    sendMessageNow: conversations.sendMessageNow,
     stopConversation: conversations.stopConversation,
     conversationAction: conversations.conversationAction,
+    previewCostHandoff: conversations.previewCostHandoff,
+    summarizeManagedHandoff: conversations.summarizeManagedHandoff,
+    summarizeCoordinatorHandoff: conversations.summarizeCoordinatorHandoff,
+    handoffManagedChild: conversations.handoffManagedChild,
     onConversationEvent: conversations.onConversationEvent,
     ready,
     catalog,
@@ -1751,6 +2012,7 @@ export function createHostTaskBridge(pluginId: string, storage: PluginStorageBac
       return cancelled;
     },
     submit,
+    attachConversation,
     async receipt(requestId) { await ensure(); return serial(async () => { const entry = entries.get(requestId); return entry ? view(entry) : null; }); },
     async list(query) {
       await ensure();
@@ -1762,14 +2024,25 @@ export function createHostTaskBridge(pluginId: string, storage: PluginStorageBac
     cancel,
     async open(requestId) {
       await ensure();
-      const entry = entries.get(requestId);
-      if (!entry) throw new Error("Unknown task request");
-      if (entry.receipt.session) { await facade.focus(entry.receipt.session); return; }
-      if (entry.receipt.sessionDecision === "new" && entry.execEngine && ACTIVE.has(entry.receipt.status)) {
-        await facade.focusDraft(entry.execEngine, entry.receipt.workspacePath);
-        return;
-      }
-      throw new Error("This task has no conversation yet");
+      return serial(async () => {
+        assertLive();
+        const entry = entries.get(requestId);
+        if (!entry) throw new Error("Unknown task request");
+        if (entry.receipt.session) { await facade.focus(entry.receipt.session); return; }
+        const blocked = entry.receipt.blockedBy;
+        if (entry.receipt.status === "queued" && entry.receipt.runId === null && entry.receipt.sessionDecision === null &&
+          blocked?.length === 2 && blocked[0] === "user-draft" && ["user-draft:text", "user-draft:images"].includes(blocked[1])) {
+          const engine = entry.execEngine ?? entry.newEngine;
+          if (!engine) throw new Error("This task has no conversation yet");
+          await facade.focusDraft(engine, entry.receipt.workspacePath, { requireBlockedDraft: true });
+          return;
+        }
+        if (entry.receipt.sessionDecision === "new" && entry.execEngine && ACTIVE.has(entry.receipt.status)) {
+          await facade.focusDraft(entry.execEngine, entry.receipt.workspacePath);
+          return;
+        }
+        throw new Error("This task has no conversation yet");
+      });
     },
     async forget(requestId) {
       await ensure();

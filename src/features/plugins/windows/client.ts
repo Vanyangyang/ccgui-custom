@@ -1,8 +1,10 @@
 import {
-  copyAction, copyJson, copySnapshot, defaultDetachedTransport, EVENTS, mergeSnapshot, sameWindow,
+  copyAction, copyJson, defaultDetachedTransport, EVENTS, MAX_RESULT_BYTES, mergeSnapshot, sameWindow,
   type ActionInspection, type ActionReceipt, type CloseRequestedEvent, type DetachedAction, type DetachedInit,
-  type DetachedSnapshot, type DetachedStatus, type DetachedTransport, type JsonValue, type SnapshotEvent,
+  type DetachedSnapshot, type DetachedStatus, type DetachedTransport, type JsonValue, type SnapshotEvent, type SnapshotUpdate,
 } from "./protocol";
+import { applySnapshotUpdate, SnapshotBaselineError } from "./json-snapshot";
+import type { IncrementalActionInspection, IncrementalActionReceipt, IncrementalSnapshotEvent, NativeDetachedInit, SnapshotRead, SnapshotWireEvent } from "./incremental-protocol";
 
 export interface DetachedActionResult { value: JsonValue; snapshot: DetachedSnapshot; sequence: number }
 class ActionRejectedError extends Error {}
@@ -27,7 +29,7 @@ export interface DetachedSurfaceClient {
 export function createDetachedSurfaceClient(options: { transport?: DetachedTransport; messages?: { pending: string; notSent: string } } = {}): DetachedSurfaceClient {
   const transport = options.transport ?? defaultDetachedTransport;
   let disposed = false;
-  let initialized: DetachedInit | undefined;
+  let initialized: NativeDetachedInit | undefined;
   let initPromise: Promise<DetachedInit> | undefined;
   let snapshot: DetachedSnapshot | undefined;
   let dark = false;
@@ -37,6 +39,8 @@ export function createDetachedSurfaceClient(options: { transport?: DetachedTrans
   let queueError: Error | undefined;
   let recoveryEpoch = 0;
   let recoveryPromise: Promise<boolean> | undefined;
+  let snapshotRead: Promise<void> | undefined;
+  let requiredSnapshotRevision = 0;
   const unresolved = new Map<number, { resolve?: (value: DetachedActionResult) => void; reject?: (error: Error) => void }>();
   const pendingMessage = () => options.messages?.pending ?? "Original action result is pending; it will not be resubmitted";
   let returning = false;
@@ -49,6 +53,7 @@ export function createDetachedSurfaceClient(options: { transport?: DetachedTrans
   const unlisteners: (() => void)[] = [];
   // Native events may arrive after listen is installed but before init resolves.
   const earlySnapshots: SnapshotEvent[] = [];
+  const earlyUpdates: IncrementalSnapshotEvent[] = [];
   const earlyCloses: CloseRequestedEvent[] = [];
   function notify() { for (const listener of listeners) listener(); }
   function setStatus(status: DetachedStatus) { currentStatus = status; notify(); }
@@ -59,12 +64,75 @@ export function createDetachedSurfaceClient(options: { transport?: DetachedTrans
   }
   function acceptSnapshot(incoming: DetachedSnapshot, incomingDark?: boolean) {
     const previous = snapshot;
-    snapshot = mergeSnapshot(snapshot, incoming);
+    const previousDark = dark;
+    snapshot = initialized?.incremental ? applySnapshotUpdate(snapshot, { kind: "full", snapshot: incoming }) : mergeSnapshot(snapshot, incoming);
     if (incomingDark !== undefined && (!previous || incoming.revision >= previous.revision)) dark = incomingDark;
-    if (snapshot !== previous || incomingDark !== undefined) notify();
+    if (snapshot !== previous || dark !== previousDark) notify();
   }
-  function receiveSnapshot(event: SnapshotEvent) {
+  function updateRevision(update: SnapshotUpdate): number { return update.kind === "full" ? update.snapshot.revision : update.revision; }
+  function applyUpdate(update: SnapshotUpdate, incomingDark?: boolean) {
+    const previous = snapshot, previousDark = dark;
+    snapshot = applySnapshotUpdate(snapshot, update);
+    if (incomingDark !== undefined && (!previous || updateRevision(update) >= previous.revision)) dark = incomingDark;
+    if (snapshot !== previous || dark !== previousDark) notify();
+  }
+  async function restoreSnapshot(minimum: number) {
+    const target = initialized;
+    if (!target?.incremental || disposed) throw new SnapshotBaselineError("Detached snapshot is unavailable");
+    // One shared read repairs both a missing display delta and an action's
+    // receipt. It never reinitializes sequence watermarks or resends actions.
+    for (let attempt = 0; attempt < 2 && (snapshot?.revision ?? -1) < minimum; attempt++) {
+      snapshotRead ??= (async () => {
+        let result: SnapshotRead;
+        try { result = await transport.invoke<SnapshotRead>("plugin_window_snapshot", { request: { windowId: target.windowId, registrationId: target.registrationId } }); }
+        catch { throw new SnapshotBaselineError("Unable to restore detached snapshot"); }
+        if (disposed || initialized !== target) throw new SnapshotBaselineError("Detached snapshot owner changed");
+        if (!result || !sameWindow(target, result) || typeof result.dark !== "boolean") throw new Error("Invalid detached snapshot recovery");
+        acceptSnapshot(result.snapshot, result.dark);
+      })().finally(() => { snapshotRead = undefined; });
+      await snapshotRead;
+    }
+    if ((snapshot?.revision ?? -1) < minimum) throw new SnapshotBaselineError("Detached snapshot has not caught up");
+  }
+  async function acceptUpdate(update: SnapshotUpdate, incomingDark?: boolean) {
+    try { applyUpdate(update, incomingDark); }
+    catch (error) {
+      if (!(error instanceof SnapshotBaselineError)) throw error;
+      requiredSnapshotRevision = Math.max(requiredSnapshotRevision, updateRevision(update));
+      await restoreSnapshot(requiredSnapshotRevision);
+      // Validate even duplicate-revision effects; a full resync does not make
+      // a conflicting or malformed patch acceptable.
+      applyUpdate(update, incomingDark);
+    }
+    if (snapshot && snapshot.revision >= requiredSnapshotRevision) {
+      requiredSnapshotRevision = 0;
+      if (currentStatus.phase === "recovering" && !unresolved.size && !queueError && !returning) {
+        setStatus({ phase: "detached", windowId: initialized?.windowId });
+      }
+    }
+  }
+  function receiveSnapshot(event: SnapshotWireEvent) {
     if (disposed) return;
+    if ("update" in event) {
+      if (!initialized) {
+        try {
+          // Missing baseline is expected before init; malformed deltas are not.
+          try { applySnapshotUpdate(undefined, event.update); } catch (error) { if (!(error instanceof SnapshotBaselineError)) throw error; }
+          const index = earlyUpdates.findIndex(previous => sameWindow(previous, event));
+          if (index >= 0) { if (updateRevision(event.update) >= updateRevision(earlyUpdates[index].update)) earlyUpdates[index] = event; }
+          else { if (earlyUpdates.length >= 4) throw new Error("Too many startup window identities"); earlyUpdates.push(event); }
+        } catch { queueError = new Error("Invalid detached startup snapshot"); fail(queueError.message); }
+        return;
+      }
+      if (!sameWindow(initialized, event)) return;
+      if (!initialized.incremental) { queueError = new Error("Unexpected detached snapshot transport"); fail(queueError.message); return; }
+      void acceptUpdate(event.update, event.dark).catch(error => {
+        if (disposed) return;
+        if (error instanceof SnapshotBaselineError) setStatus({ phase: "recovering", error: "Unable to restore detached snapshot", windowId: initialized?.windowId });
+        else { queueError = new Error("Invalid detached snapshot"); fail(queueError.message); }
+      });
+      return;
+    }
     if (!initialized) {
       try {
         const index = earlySnapshots.findIndex(previous => sameWindow(previous, event));
@@ -110,13 +178,14 @@ export function createDetachedSurfaceClient(options: { transport?: DetachedTrans
     if (initPromise) return initPromise;
     initPromise = (async () => {
       await Promise.all([
-        transport.listen<SnapshotEvent>(EVENTS.snapshot, ({ payload }) => receiveSnapshot(payload)),
+        transport.listen<SnapshotWireEvent>(EVENTS.snapshot, ({ payload }) => receiveSnapshot(payload)),
         transport.listen<CloseRequestedEvent>(EVENTS.closeRequested, ({ payload }) => receiveClose(payload)),
       ].map(promise => promise.then(unlisten => { if (disposed || initFailed) unlisten(); else unlisteners.push(unlisten); })));
       if (disposed) throw new Error("Detached client disposed");
-      const data = await transport.invoke<DetachedInit>("plugin_window_init");
+      const data = await transport.invoke<NativeDetachedInit>("plugin_window_init");
       if (disposed) throw new Error("Detached client disposed");
       initialized = data;
+      if (data.incremental !== undefined && typeof data.incremental !== "boolean") throw new Error("Invalid detached snapshot transport");
       if (!Number.isSafeInteger(data.nextSequence) || data.nextSequence < 1) throw new Error("Invalid detached sequence watermark");
       nextSequence = data.nextSequence;
       if (!Array.isArray(data.unresolvedSequences) || data.unresolvedSequences.length > 192 || new Set(data.unresolvedSequences).size !== data.unresolvedSequences.length ||
@@ -124,12 +193,17 @@ export function createDetachedSurfaceClient(options: { transport?: DetachedTrans
       for (const sequence of data.unresolvedSequences) unresolved.set(sequence, {});
       acceptSnapshot(data.snapshot, data.dark);
       for (const event of earlySnapshots.splice(0)) receiveSnapshot(event);
+      for (const event of earlyUpdates.splice(0)) {
+        if (!sameWindow(data, event)) continue;
+        if (!data.incremental) throw new Error("Unexpected detached startup transport");
+        await acceptUpdate(event.update, event.dark);
+      }
       if (queueError) throw queueError;
       setStatus({ phase: unresolved.size ? "recovering" : "detached", windowId: data.windowId, ...(unresolved.size ? { error: pendingMessage() } : {}) });
       pollTimer = setInterval(() => {
         if (polling || disposed) return;
         polling = true;
-        void (unresolved.size || currentStatus.phase === "unavailable" ? reconcile() : status()).catch(() => {}).finally(() => { polling = false; });
+        void (unresolved.size || requiredSnapshotRevision || currentStatus.phase === "unavailable" ? reconcile() : status()).catch(() => {}).finally(() => { polling = false; });
       }, 5000);
       for (const event of earlyCloses.splice(0)) receiveClose(event);
       return { ...data, snapshot: snapshot!, dark };
@@ -141,13 +215,20 @@ export function createDetachedSurfaceClient(options: { transport?: DetachedTrans
     });
     return initPromise;
   }
-  function acceptReceipt(receipt: ActionReceipt, sequence: number): DetachedActionResult {
+  async function acceptReceipt(receipt: ActionReceipt | IncrementalActionReceipt, sequence: number): Promise<DetachedActionResult> {
     if (!receipt || receipt.sequence !== sequence || typeof receipt.ok !== "boolean" ||
       (receipt.unknown !== undefined && typeof receipt.unknown !== "boolean") ||
       (receipt.error != null && typeof receipt.error !== "string")) throw new Error("Invalid detached action receipt");
-    const receiptSnapshot = copySnapshot(receipt.snapshot);
-    const value = copyJson(receipt.value === undefined ? null : receipt.value);
-    acceptSnapshot(receiptSnapshot);
+    const value = copyJson(receipt.value === undefined ? null : receipt.value, MAX_RESULT_BYTES);
+    // Receipt completion includes baseline restoration, so flush/return guards
+    // cannot pass an acknowledged action with uninstalled editor state.
+    if (initialized?.incremental) {
+      if (!("update" in receipt)) throw new Error("Invalid incremental detached receipt");
+      await acceptUpdate(receipt.update);
+    } else {
+      if (!("snapshot" in receipt)) throw new Error("Invalid detached action receipt");
+      acceptSnapshot(receipt.snapshot);
+    }
     if (receipt.unknown) throw new Error(pendingMessage());
     if (!receipt.ok) throw new ActionRejectedError(receipt.error || "Detached action failed");
     return { value, snapshot: snapshot!, sequence };
@@ -163,13 +244,19 @@ export function createDetachedSurfaceClient(options: { transport?: DetachedTrans
     if (recoveryPromise) return recoveryPromise;
     const target = initialized;
     recoveryPromise = (async () => {
+      if (requiredSnapshotRevision) {
+        try { await restoreSnapshot(requiredSnapshotRevision); requiredSnapshotRevision = 0; }
+        catch { return false; }
+      }
       for (const [sequence, pending] of [...unresolved]) {
         try {
-          const result = await transport.invoke<ActionInspection>("plugin_window_inspect_action", { request: { windowId: target.windowId, registrationId: target.registrationId, sequence } });
+          const result = await transport.invoke<ActionInspection | IncrementalActionInspection>(target.incremental ? "plugin_window_inspect_action_update" : "plugin_window_inspect_action", {
+            request: { windowId: target.windowId, registrationId: target.registrationId, sequence, ...(target.incremental ? { knownRevision: snapshot!.revision } : {}) },
+          });
           if (disposed || initialized !== target) return false;
           if (!result || !sameWindow(target, result) || result.sequence !== sequence || result.state !== "resolved") continue;
           let value: DetachedActionResult;
-          try { value = acceptReceipt(result.receipt!, sequence); }
+          try { value = await acceptReceipt(result.receipt!, sequence); }
           catch (error) {
             if (!(error instanceof ActionRejectedError)) continue;
             unresolved.delete(sequence); pending.reject?.(error); continue;
@@ -207,11 +294,11 @@ export function createDetachedSurfaceClient(options: { transport?: DetachedTrans
       if (!Number.isSafeInteger(nextSequence) || nextSequence >= Number.MAX_SAFE_INTEGER) throw new Error("Detached action sequence exhausted");
       const sequence = nextSequence++;
       try {
-        const receipt = await transport.invoke<ActionReceipt>("plugin_window_action", {
-          request: { windowId: target.windowId, registrationId: target.registrationId, sequence, action },
+        const receipt = await transport.invoke<ActionReceipt | IncrementalActionReceipt>(target.incremental ? "plugin_window_action_update" : "plugin_window_action", {
+          request: { windowId: target.windowId, registrationId: target.registrationId, sequence, action, ...(target.incremental ? { knownRevision: snapshot!.revision } : {}) },
         });
         if (disposed) throw new Error("Detached client disposed");
-        const result = acceptReceipt(receipt, sequence);
+        const result = await acceptReceipt(receipt, sequence);
         if (!disposed && !returning && currentStatus.phase === "detached" && currentStatus.returnBlocked) {
           const canReturn = [...returnGuards].every(guard => { try { return guard(); } catch { return false; } });
           if (canReturn) setStatus({ phase: "detached", windowId: target.windowId });
@@ -233,6 +320,12 @@ export function createDetachedSurfaceClient(options: { transport?: DetachedTrans
           queueError = new Error("Detached action sequence mismatch; this action was not sent");
           throw queueError;
         }
+        if (target.incremental && error === "plugin_window_snapshot_base_mismatch") {
+          // action_update checks knownRevision before admission. This exact
+          // refusal proves there is no original receipt to poll indefinitely.
+          queueError = new Error(options.messages?.notSent ?? "Detached snapshot baseline mismatch; this action was not sent");
+          throw queueError;
+        }
         return awaitOriginalReceipt(sequence);
       }
     });
@@ -251,6 +344,11 @@ export function createDetachedSurfaceClient(options: { transport?: DetachedTrans
     // Keep draining if producers appended while we were waiting. requestReturn locks producers first.
     let observed: Promise<void>;
     do { observed = queue; await observed; } while (observed !== queue);
+    if (requiredSnapshotRevision) {
+      await restoreSnapshot(requiredSnapshotRevision);
+      if (snapshot && snapshot.revision >= requiredSnapshotRevision) requiredSnapshotRevision = 0;
+      else throw new SnapshotBaselineError("Detached snapshot has not caught up");
+    }
     if (disposed || queueError) throw queueError ?? new Error("Detached client disposed");
   }
   function requestReturn(reason: "return" | "closed" | "maintenance" = "return"): Promise<void> {
@@ -323,7 +421,7 @@ export function createDetachedSurfaceClient(options: { transport?: DetachedTrans
     for (const pending of unresolved.values()) pending.reject?.(new Error("Detached client disposed; original action was not replayed"));
     unresolved.clear();
     for (const unlisten of unlisteners.splice(0)) unlisten();
-    listeners.clear(); returnGuards.clear(); earlyCloses.length = 0; earlySnapshots.length = 0;
+    listeners.clear(); returnGuards.clear(); earlyCloses.length = 0; earlySnapshots.length = 0; earlyUpdates.length = 0;
   }
   return { init, dispatch, requestReturn, discardAndReturn, flush, status, reconcile, focusOwner, dispose,
     registerReturnGuard(guard) { returnGuards.add(guard); return () => { returnGuards.delete(guard); }; },

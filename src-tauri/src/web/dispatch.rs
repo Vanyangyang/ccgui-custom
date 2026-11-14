@@ -94,6 +94,7 @@ struct PiModelsArgs { engine: String, text: String }
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct QuotaArgs {
     provider_id: Option<String>, force: Option<bool>, cache_only: Option<bool>, workspace_path: Option<String>,
+    silent: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -182,6 +183,25 @@ struct LeaderGroupArgs {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LeaderGroupCleanupArgs {
+    engine: String,
+    session_id: String,
+    workspace_path: String,
+    expected: crate::leader::GroupCleanupExpectation,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LeaderSubtreeCleanupArgs {
+    parent_engine: String,
+    parent_session_id: String,
+    workspace_path: String,
+    branch_id: String,
+    expected: crate::leader::GroupCleanupExpectation,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RespondPlanReviewArgs {
     plan_id: String,
     expected_revision: i64,
@@ -211,6 +231,18 @@ fn ser_native_error<T: serde::Serialize, E: serde::Serialize>(r: Result<T, E>) -
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct McpInventoryArgs { workspace: Option<String> }
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CliPluginsInventoryArgs { engine: String, workspace: Option<String> }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CliPluginsActionArgs { request: crate::cli_plugins::CliPluginActionRequest }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CliHooksActionArgs { request: crate::cli_hooks::HookToggleRequest }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -372,6 +404,7 @@ struct UpdateCursorModelSelectionArgs {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SendMessageArgs {
+    codex_service_tier_override: Option<String>,
     claude_ultracode: Option<bool>,
     claude_haiku_assist: Option<bool>,
     run_id: Option<String>,
@@ -954,9 +987,10 @@ pub(super) async fn dispatch(
         }
         "agy_vertex_credits_read" => {
             let a: QuotaArgs = parse_args(&raw)?;
-            // Cached reads are passive; force opens a login window and replaces local data.
-            authorize_vertex_credits_context(&app.state::<crate::AppState>().db, a.force, context)?;
-            ser(crate::agy_vertex_credits::agy_vertex_credits_read(app.clone(), a.force).await)
+            // Cached reads are passive; force and silent refreshes open a billing WebView on the host.
+            let writes = Some(a.force.unwrap_or(false) || a.silent.unwrap_or(false));
+            authorize_vertex_credits_context(&app.state::<crate::AppState>().db, writes, context)?;
+            ser(crate::agy_vertex_credits::agy_vertex_credits_read(app.clone(), a.force, a.silent).await)
         }
         "agy_vertex_config_read" => {
             ser(Ok::<_, String>(crate::agy_vertex_credits::agy_vertex_config_read()))
@@ -983,6 +1017,18 @@ pub(super) async fn dispatch(
             ser(crate::leader::group_action(&app.state::<crate::AppState>().db,
                 a.engine, a.session_id, a.workspace_path, a.action).await)
         }
+        "task_group_archive_checked" => {
+            let _update_guard = crate::worker_host::task_action_guard().await?;
+            let a: LeaderGroupCleanupArgs = parse_args(&raw)?;
+            ser(crate::leader::group_archive_checked(&app.state::<crate::AppState>().db,
+                a.engine, a.session_id, a.workspace_path, a.expected).await)
+        }
+        "task_subtree_archive_checked" => {
+            let _update_guard = crate::worker_host::task_action_guard().await?;
+            let a: LeaderSubtreeCleanupArgs = parse_args(&raw)?;
+            ser(crate::leader::subtree_archive_checked(&app.state::<crate::AppState>().db,
+                a.parent_engine, a.parent_session_id, a.workspace_path, a.branch_id, a.expected).await)
+        }
         "send_message" => {
             let a: SendMessageArgs = parse_args(&raw)?;
             ser(crate::engine::send_message(
@@ -1000,9 +1046,11 @@ pub(super) async fn dispatch(
                 a.computer_use,
                 a.claude_ultracode,
                 a.claude_haiku_assist,
+                a.codex_service_tier_override,
             )
             .await)
         }
+        "codex_service_tier_override_supported" => ser(Ok::<_, String>(crate::engine::codex_service_tier_override_supported())),
         "send_side_message" => {
             let a: SendSideMessageArgs = parse_args(&raw)?;
             ser(crate::engine::send_side_message(
@@ -1402,6 +1450,22 @@ pub(super) async fn dispatch(
             let a: McpInventoryArgs = parse_args(&raw)?;
             ser_native_error(crate::mcp::mcp_inventory(app.state(), a.workspace).await)
         }
+        "cli_plugins_inventory" => {
+            let a: CliPluginsInventoryArgs = parse_args(&raw)?;
+            ser(crate::cli_plugins::cli_plugins_inventory(app.state(), a.engine, a.workspace).await)
+        }
+        "cli_hooks_inventory" => {
+            let a: CliPluginsInventoryArgs = parse_args(&raw)?;
+            ser(crate::cli_hooks::cli_hooks_inventory(app.state(), a.engine, a.workspace).await)
+        }
+        "cli_hooks_set_enabled" => {
+            let a: CliHooksActionArgs = parse_args(&raw)?;
+            ser(crate::cli_hooks::cli_hooks_set_enabled(app.state(), a.request).await)
+        }
+        "cli_plugins_action" => {
+            let a: CliPluginsActionArgs = parse_args(&raw)?;
+            ser(crate::cli_plugins::cli_plugins_action(app.state(), a.request).await)
+        }
         "mcp_set_enabled" => {
             let a: McpSetEnabledArgs = parse_args(&raw)?;
             ser_native_error(crate::mcp::mcp_set_enabled(app.state(), a.request).await)
@@ -1735,6 +1799,7 @@ pub(super) async fn dispatch(
         // All egress goes through enabled/manifest grant checks in plugin_caps;
         // interrupt and cleanup also retain native plugin ownership checks.
         "plugin_fixed_instructions_supported" => Ok(serde_json::json!(crate::plugin_caps::plugin_fixed_instructions_supported())),
+        "plugin_fixed_instructions_engines" => Ok(serde_json::json!(crate::plugin_caps::plugin_fixed_instructions_engines())),
         "plugin_agent_start" => {
             let a: PluginAgentStartArgs = parse_args(&raw)?;
             ser(crate::plugin_caps::plugin_agent_start(app.clone(), a.plugin_id,
@@ -1778,7 +1843,7 @@ pub(super) async fn dispatch(
 // browser writes. An authenticated LAN-token connection has no device row.
 fn collaboration_write_required(command: &str) -> Option<bool> {
     match command {
-        "active_run_ids" | "task_snapshot" | "list_plan_reviews" | "mcp_inventory" | "skills_hub_query"
+        "active_run_ids" | "task_snapshot" | "list_plan_reviews" | "mcp_inventory" | "cli_plugins_inventory" | "cli_hooks_inventory" | "skills_hub_query"
         | "list_workspace_projects" | "get_session_sidebar_workspaces" | "list_image_preview_grants" | "image_preview_scope" | "read_preview_image"
         | "grant_scope" | "list_granted_roots" | "plugin_list" | "plugin_read_artwork"
         | "plugin_read_file" | "plugin_storage_get"
@@ -1788,8 +1853,8 @@ fn collaboration_write_required(command: &str) -> Option<bool> {
         | "git_branch_merged" | "git_resolve_pr" | "remote_control_active" => Some(false),
         "runtime_worker_start" | "runtime_worker_control" | "runtime_worker_plan_review"
         | "save_workspace_project" | "assign_session_sidebar_workspaces" | "remove_workspace_project" | "plugin_publish_workspace_project" | "revoke_image_preview_grant"
-        | "task_branch_action" | "task_group_action"
-        | "respond_plan_review" | "add_workspace" | "plugin_add_workspace" | "mcp_set_enabled"
+        | "task_branch_action" | "task_group_action" | "task_group_archive_checked" | "task_subtree_archive_checked"
+        | "respond_plan_review" | "add_workspace" | "plugin_add_workspace" | "mcp_set_enabled" | "cli_plugins_action" | "cli_hooks_set_enabled"
         | "mcp_probe" | "skills_hub_mutate" | "grant_root" | "revoke_granted_root"
         | "plugin_agent_start" | "plugin_agent_interrupt" | "plugin_http_request"
         | "plugin_exec_run" | "plugin_exec_spawn" | "plugin_exec_kill"
@@ -1869,6 +1934,21 @@ mod follow_up_args_tests {
     use serde_json::json;
 
     #[test]
+    fn checked_group_archive_requires_complete_expected_identity_on_web() {
+        let raw = json!({ "engine": "claude", "sessionId": "root", "workspacePath": "/project",
+            "expected": { "branchIds": ["branch"], "members": [{ "engine": "claude", "sessionId": "root", "workspacePath": "/project" }], "lastActivityAt": 123 } });
+        let parsed: LeaderGroupCleanupArgs = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(parsed.expected.branch_ids, vec!["branch"]);
+        assert_eq!(parsed.expected.last_activity_at, 123);
+        let mut missing = raw.clone();
+        missing.as_object_mut().unwrap().remove("expected");
+        assert!(serde_json::from_value::<LeaderGroupCleanupArgs>(missing).is_err());
+        let mut extra = raw;
+        extra["expected"]["unknown"] = json!(true);
+        assert!(serde_json::from_value::<LeaderGroupCleanupArgs>(extra).is_err());
+    }
+
+    #[test]
     fn legacy_commands_also_recheck_device_revocation_and_closed_connections() {
         let db = crate::db::Db::open_at(std::path::Path::new(":memory:")).unwrap();
         db.web_device_touch("legacy", "test", 1).unwrap();
@@ -1894,8 +1974,9 @@ mod follow_up_args_tests {
             ("list_image_preview_grants", false), ("image_preview_scope", false),
             ("read_preview_image", false), ("revoke_image_preview_grant", true),
             ("task_snapshot", false), ("task_branch_action", true),
-            ("task_group_action", true), ("list_plan_reviews", false),
+            ("task_group_action", true), ("task_group_archive_checked", true), ("task_subtree_archive_checked", true), ("list_plan_reviews", false),
             ("respond_plan_review", true), ("runtime_worker_plan_review", true), ("mcp_inventory", false), ("mcp_set_enabled", true),
+            ("cli_plugins_inventory", false), ("cli_hooks_inventory", false), ("cli_plugins_action", true), ("cli_hooks_set_enabled", true),
             ("mcp_probe", true), ("skills_hub_query", false), ("skills_hub_mutate", true),
             ("grant_scope", false), ("grant_root", true), ("list_granted_roots", false),
             ("revoke_granted_root", true), ("add_workspace", true), ("plugin_add_workspace", true),

@@ -38,6 +38,124 @@ function fixture(options: WorkerEventOptions = {}) {
 }
 
 describe("WorkerEventTransport", () => {
+  it("quarantines a failed restored source while replaying healthy sources and reports it once", async () => {
+    vi.useFakeTimers();
+    const f = fixture();
+    f.adapter.restoreCursors({ "worker-a": 19, "worker-b": 0 });
+    f.archives.set("worker-b", [event(1, "worker-b")]);
+    const normal = f.rawInvoke.getMockImplementation()!;
+    f.rawInvoke.mockImplementation((command, args) => command === "runtime_worker_sources"
+      ? Promise.resolve([
+        { streamId: "worker-a", runId: "run-a", head: 0, recoveryError: "worker-recovery-failed" },
+        { streamId: "worker-b", runId: "run-b", head: f.archives.get("worker-b")!.length },
+      ]) : normal(command, args));
+    await f.adapter.start();
+    f.live(event(20));
+    f.archives.get("worker-b")!.push(event(2, "worker-b"));
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(f.adapter.captureCursors()).toEqual({ "worker-a": 19, "worker-b": 2 });
+    expect(f.deliver.mock.calls.map(call => call[2])).toEqual([
+      { streamId: "worker-b", seq: 1 }, { streamId: "worker-b", seq: 2 },
+    ]);
+    expect(f.onError).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      code: "worker-recovery-failed", message: "Worker recovery requires attention", streamId: "worker-a",
+    }));
+    expect(f.rawInvoke.mock.calls.some(([command, args]) => command === "runtime_worker_events" && args?.streamId === "worker-a")).toBe(false);
+    await expect(f.adapter.pause()).rejects.toMatchObject({ code: "worker-recovery-failed", streamId: "worker-a" });
+    // A rejected checkpoint leaves healthy reconciliation running.
+    f.archives.get("worker-b")!.push(event(3, "worker-b"));
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(f.adapter.captureCursors()["worker-b"]).toBe(3);
+    expect(f.onError).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports an unattached recovery failure without adopting its history or blocking a checkpoint", async () => {
+    const f = fixture();
+    f.rawInvoke.mockResolvedValueOnce([{ streamId: "worker-a", runId: "run-a", head: 0, recoveryError: "worker-recovery-failed" }]);
+    await f.adapter.start();
+    await f.adapter.pause();
+    expect(f.adapter.captureCursors()).toEqual({});
+    expect(f.onError).toHaveBeenCalledTimes(1);
+    f.adapter.attachSource("worker-a", 7);
+    await expect(f.adapter.pause()).rejects.toMatchObject({ code: "worker-recovery-failed", streamId: "worker-a" });
+  });
+
+  it("resumes a recovered source at its preserved cursor once discovery clears the failure", async () => {
+    const f = fixture();
+    f.adapter.restoreCursors({ "worker-a": 1 });
+    f.rawInvoke.mockResolvedValueOnce([{ streamId: "worker-a", runId: "run-a", head: 0, recoveryError: "worker-recovery-failed" }]);
+    await f.adapter.start();
+    await expect(f.adapter.pause()).rejects.toMatchObject({ code: "worker-recovery-failed" });
+    f.archives.set("worker-a", [event(1), event(2)]);
+    await f.adapter.reconnect();
+    await f.adapter.pause();
+    expect(f.adapter.captureCursors()).toEqual({ "worker-a": 2 });
+    expect(f.deliver).toHaveBeenCalledExactlyOnceWith("chat://delta", "片段2😀", { streamId: "worker-a", seq: 2 });
+  });
+
+  it("keeps the latest native summary last when an older archive appears on repeated discovery", async () => {
+    const f = fixture(); await f.adapter.start();
+    const summary = { runId: "run-b", sessionId: "same-session", engine: "agy", seq: 20, kind: "message",
+      ts: 1793353441047, data: { role: "assistant", text: "17:44 final summary" } };
+    const final = { stream_id: "worker-b", seq: 1, name: "engine://event", payload: [summary] };
+    f.archives.set("worker-b", [final]); f.live(final);
+    await f.adapter.reconnect();
+    f.archives.set("old-archive", [{ stream_id: "old-archive", seq: 1, name: "engine://event", payload: [{
+      ...summary, runId: "run-a", seq: 6, ts: 1793348812000, data: { role: "tool", text: "16:26 read_file" },
+    }] }]);
+    const originalInvoke = f.rawInvoke.getMockImplementation()!;
+    f.rawInvoke.mockImplementation((command, args) => command === "runtime_worker_sources"
+      ? Promise.resolve([...f.archives].map(([streamId, events]) => ({ streamId, runId: `run-${streamId}`,
+        head: events.at(-1)?.seq ?? 0, replayOnly: streamId === "old-archive" })))
+      : originalInvoke(command, args));
+    await f.adapter.reconnect(); await f.adapter.reconnect(); await f.adapter.pause(); await f.adapter.resume();
+    expect(f.deliver.mock.calls).toEqual([["engine://event", [summary], { streamId: "worker-b", seq: 1 }]]);
+    expect(f.adapter.captureCursors()).toEqual({ "worker-b": 1 });
+    expect(f.rawInvoke.mock.calls.some(([command, args]) => command === "runtime_worker_events" && args?.streamId === "old-archive")).toBe(false);
+  });
+
+  it.each(["restored", "running"])("does not adopt an unknown hydrated archive while %s", async mode => {
+    const f = fixture();
+    if (mode === "restored") f.adapter.restoreCursors({});
+    else await f.adapter.start();
+    f.archives.set("old-archive", [event(1, "old-archive", "old tool/delta")]);
+    f.rawInvoke.mockResolvedValueOnce([{ streamId: "old-archive", runId: "old-run", head: 1, active: false, replayOnly: true }]);
+    if (mode === "restored") await f.adapter.start();
+    else await f.adapter.reconnect();
+    expect(f.deliver).not.toHaveBeenCalled();
+    expect(f.adapter.captureCursors()).toEqual({});
+    expect(f.rawInvoke.mock.calls.some(([command]) => command === "runtime_worker_events")).toBe(false);
+  });
+
+  it.each(["checkpoint", "explicit"])("replays a hydrated archive authorized by %s", async mode => {
+    const f = fixture();
+    f.archives.set("worker-a", [event(1), event(2)]);
+    if (mode === "checkpoint") f.adapter.restoreCursors({ "worker-a": 1 });
+    else f.adapter.attachSource("worker-a", 1);
+    f.rawInvoke.mockResolvedValueOnce([{ streamId: "worker-a", runId: "run-a", head: 2, active: false, replayOnly: true }]);
+    await f.adapter.start();
+    expect(f.deliver).toHaveBeenCalledExactlyOnceWith("chat://delta", "片段2😀", { streamId: "worker-a", seq: 2 });
+    expect(f.adapter.captureCursors()).toEqual({ "worker-a": 2 });
+  });
+
+  it.each([false, undefined])("catches up a completed new worker with replayOnly=%s", async replayOnly => {
+    const f = fixture();
+    await f.adapter.start();
+    f.archives.set("new-worker", [event(1, "new-worker")]);
+    f.rawInvoke.mockResolvedValueOnce([{ streamId: "new-worker", runId: "new-run", head: 1, active: false, ...(replayOnly === undefined ? {} : { replayOnly }) }]);
+    await f.adapter.reconnect();
+    expect(f.deliver).toHaveBeenCalledTimes(1);
+    expect(f.adapter.captureCursors()).toEqual({ "new-worker": 1 });
+  });
+
+  it.each([null, "true", 0, undefined])("rejects a present nonboolean replayOnly=%s", async replayOnly => {
+    const f = fixture();
+    f.adapter.restoreCursors({});
+    f.rawInvoke.mockResolvedValueOnce([{ streamId: "worker-a", runId: "run-a", head: 0, replayOnly }]);
+    await expect(f.adapter.start()).rejects.toMatchObject({ code: "invalid-sources" });
+    expect(f.adapter.captureCursors()).toEqual({});
+  });
+
   it("listens before discovery and resumes a restored cursor across reconnect duplicates", async () => {
     const f = fixture();
     f.archives.set("worker-a", [event(1), event(2)]);

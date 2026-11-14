@@ -345,6 +345,16 @@ fn credential_context_allowed() -> bool {
         .iter()
         .all(|key| std::env::var_os(key).is_none_or(|value| value.is_empty()))
 }
+
+/// Read-only identity for resident native processes. Never expose the credential
+/// itself, refresh it, or treat an unavailable/isolated login as a reusable one.
+pub(crate) fn native_auth_fingerprint() -> Option<String> {
+    if !credential_context_allowed() {
+        return None;
+    }
+    access::read().ok().map(|credential| credential.fingerprint)
+}
+
 fn binding(provider: Option<&str>, workspace: Option<&Path>) -> Result<Binding, &'static str> {
     // A shared native keyring is not evidence of identity in custom/isolated homes.
     if !credential_context_allowed() {
@@ -558,6 +568,26 @@ impl AgyQuotaState {
         F: Fn(access::Credential) -> Fut,
         Fut: std::future::Future<Output = Result<Value, &'static str>>,
     {
+        self.read_access_as(false, base_stamp, cache_only, read, fetch, current)
+            .await
+    }
+
+    /// `manual` marks a user click: a cooldown hit is then reported instead of
+    /// silently answering with the unchanged cache.
+    async fn read_access_as<R, F, Fut>(
+        &self,
+        manual: bool,
+        base_stamp: &str,
+        cache_only: bool,
+        read: R,
+        fetch: F,
+        current: impl Fn() -> bool,
+    ) -> AgyQuotaSnapshot
+    where
+        R: Fn() -> Result<access::Credential, &'static str>,
+        F: Fn(access::Credential) -> Fut,
+        Fut: std::future::Future<Output = Result<Value, &'static str>>,
+    {
         if !current() {
             self.forget_identity(base_stamp);
             return AgyQuotaSnapshot::unavailable("auth_changed");
@@ -617,7 +647,7 @@ impl AgyQuotaState {
             };
             parse_api(&value, now_seconds())
         };
-        self.read_bound(&stamp, cache_only, query, still_current)
+        self.read_bound_as(manual, &stamp, cache_only, query, still_current)
             .await
     }
     fn cached(&self, stamp: &str, current: impl Fn() -> bool) -> AgyQuotaSnapshot {
@@ -644,6 +674,18 @@ impl AgyQuotaState {
         query: impl std::future::Future<Output = Result<Vec<AgyQuotaGroup>, &'static str>>,
         current: impl Fn() -> bool,
     ) -> AgyQuotaSnapshot {
+        self.read_bound_as(false, stamp, cache_only, query, current)
+            .await
+    }
+
+    async fn read_bound_as(
+        &self,
+        manual: bool,
+        stamp: &str,
+        cache_only: bool,
+        query: impl std::future::Future<Output = Result<Vec<AgyQuotaGroup>, &'static str>>,
+        current: impl Fn() -> bool,
+    ) -> AgyQuotaSnapshot {
         if cache_only {
             return self.cached(stamp, current);
         }
@@ -665,7 +707,12 @@ impl AgyQuotaState {
             let entry = cache.entry(stamp.to_owned()).or_default();
             if entry.last_attempt.is_some_and(|at| at.elapsed() < COOLDOWN) {
                 drop(cache);
-                return self.cached(stamp, current);
+                let mut cached = self.cached(stamp, current);
+                // Only a usable sample gets the notice; an unavailable one keeps its own reason.
+                if manual && cached.status != "unavailable" && cached.error_code.is_none() {
+                    cached.error_code = Some("refresh_cooldown");
+                }
+                return cached;
             }
             entry.last_attempt = Some(Instant::now());
         }
@@ -724,7 +771,8 @@ pub async fn agy_quota_read(
     cache_only: Option<bool>,
     workspace_path: Option<String>,
 ) -> Result<AgyQuotaSnapshot, String> {
-    let _ = force; // Manual and automatic API reads share the same cooldown.
+    // Manual and automatic API reads share the same cooldown; a manual click that hits it says so.
+    let manual = force.unwrap_or(false);
     let binding = match binding(
         provider_id.as_deref(),
         workspace_path.as_deref().map(Path::new),
@@ -734,7 +782,8 @@ pub async fn agy_quota_read(
     };
     Ok(tokio::time::timeout(
         Duration::from_secs(15),
-        state.read_access(
+        state.read_access_as(
+            manual,
             &binding.stamp,
             cache_only.unwrap_or(false),
             access::read,
@@ -1232,6 +1281,34 @@ mod tests {
             .groups
             .is_empty());
         assert_eq!(state.cached("a", || false).error_code, Some("auth_changed"));
+    }
+    #[tokio::test]
+    async fn manual_click_inside_cooldown_is_told_the_cache_was_reused() {
+        let state = AgyQuotaState::default();
+        let fresh = state
+            .read_bound_as(true, "a", false, async { Ok(groups()) }, || true)
+            .await;
+        assert_eq!(fresh.error_code, None);
+        let clicked = state
+            .read_bound_as(true, "a", false, async { panic!("cooldown") }, || true)
+            .await;
+        assert_eq!(clicked.error_code, Some("refresh_cooldown"));
+        assert_eq!(clicked.groups, fresh.groups);
+        assert_eq!(clicked.collected_at, fresh.collected_at);
+        // Automatic reads and the stored sample stay free of the click-only notice.
+        let automatic = state
+            .read_bound_as(false, "a", false, async { panic!("cooldown") }, || true)
+            .await;
+        assert_eq!(automatic.error_code, None);
+        // A failed first attempt keeps its own reason instead of a cooldown notice.
+        let failed = state
+            .read_bound_as(true, "b", false, async { Err("query_failed") }, || true)
+            .await;
+        let again = state
+            .read_bound_as(true, "b", false, async { panic!("cooldown") }, || true)
+            .await;
+        assert_eq!(failed.error_code, Some("query_failed"));
+        assert_eq!(again.error_code, Some("query_failed"));
     }
     #[tokio::test]
     async fn changed_during_query_and_failed_refresh() {

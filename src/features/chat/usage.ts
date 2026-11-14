@@ -189,6 +189,25 @@ export function hasReadableUsage(usage: unknown): boolean {
   return Boolean(raw && (parseUsage(raw) !== null || raw.context_usage != null));
 }
 
+/** AGY's ACP snapshot is authoritative, including an empty context after compaction. */
+export function hasAcpContextUsage(usage: unknown): boolean {
+  const raw = asRecord(usage);
+  const context = asRecord(raw?.context_usage);
+  return raw?.context_usage_source === "acp_usage_update" &&
+    raw.context_usage_kind === "current_context" &&
+    typeof raw.model_context_window === "number" && Number.isSafeInteger(raw.model_context_window) &&
+    raw.model_context_window > 0 &&
+    typeof context?.input_tokens === "number" && Number.isSafeInteger(context.input_tokens) &&
+    context.input_tokens >= 0 && context.output_tokens === 0;
+}
+
+/** Keep the last reading visible while retiring its priority at a new turn boundary. */
+export function staleAcpContextUsage(usage: unknown): unknown {
+  const raw = asRecord(usage);
+  return hasAcpContextUsage(raw) && raw?.context_usage_stale !== true
+    ? { ...raw, context_usage_stale: true } : usage;
+}
+
 /** Latest message usage snapshot on a page that actually reports occupancy.
  *  Falls back to the last non-null usage (e.g. window-only metadata) when no
  *  row has token counts yet. */
@@ -209,6 +228,36 @@ export function mergeUsage(next: unknown, prev: unknown): unknown {
   const nextObj = asRecord(next);
   const prevObj = asRecord(prev);
   if (!nextObj || !prevObj) return next;
+  if (hasAcpContextUsage(nextObj) && nextObj.context_usage_stale !== true) {
+    // A usage_update carries occupancy only; it must not erase the last bill.
+    const merged: Record<string, unknown> = parseUsage(nextObj) === null ? {
+      ...prevObj,
+      context_usage_kind: nextObj.context_usage_kind,
+      context_usage_source: nextObj.context_usage_source,
+      context_usage: nextObj.context_usage,
+      model_context_window: nextObj.model_context_window,
+    } : { ...nextObj };
+    delete merged.context_usage_stale;
+    return merged;
+  }
+  if (hasAcpContextUsage(prevObj) && prevObj.context_usage_stale !== true) {
+    // A late DB read can itself contain current_context, but is less authoritative.
+    const merged: Record<string, unknown> = {
+      ...(parseUsage(nextObj) !== null ? nextObj : prevObj),
+      context_usage_kind: prevObj.context_usage_kind,
+      context_usage: prevObj.context_usage,
+      context_usage_source: prevObj.context_usage_source,
+      model_context_window: reportedContextWindow(prevObj),
+    };
+    delete merged.context_usage_stale;
+    return merged;
+  }
+  const nextContext = asRecord(nextObj.context_usage);
+  if (hasAcpContextUsage(prevObj) && prevObj.context_usage_stale === true &&
+    (nextObj.context_usage_kind === "current_context" || nextObj.context_usage_kind === "last_prompt") &&
+    (parseUsage(nextContext) !== null || (nextContext?.input_tokens === 0 && nextContext.output_tokens === 0))) {
+    return nextObj;
+  }
   // An all-zero placeholder (e.g. a locally generated error row or aborted turn)
   // carries no occupancy of its own and must not wipe a known token snapshot;
   // only a context window attached to it is worth forwarding.
@@ -233,5 +282,7 @@ export function mergeUsage(next: unknown, prev: unknown): unknown {
     ...withWindow,
     context_usage_kind: prevObj.context_usage_kind,
     context_usage: prevObj.context_usage,
+    ...(prevObj.context_usage_source !== undefined ? { context_usage_source: prevObj.context_usage_source } : {}),
+    ...(prevObj.context_usage_stale === true ? { context_usage_stale: true } : {}),
   };
 }

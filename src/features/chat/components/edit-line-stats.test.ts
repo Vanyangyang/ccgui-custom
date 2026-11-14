@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it, vi } from "vitest";
 import type { Message } from "@/lib/ipc";
 import { computeDiffLines, countEditLines, createEditLineStatsBuilder, deriveEditLineStats } from "./edit-line-stats";

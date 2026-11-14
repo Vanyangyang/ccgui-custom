@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it } from "vitest";
 import { filterModels, groupModelsByProvider } from "./model-list";
 import type { ModelOption } from "./cli-menu";

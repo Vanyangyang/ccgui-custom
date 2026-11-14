@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it } from "vitest";
 import { mergeExternalSessions } from "./session-utils";
 import type { SessionMeta } from "@/lib/ipc";

@@ -2,7 +2,7 @@ import { act, createRef, type RefObject } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
 import { ChatConversation } from "./ChatConversation";
-import { sessionKey, useChatStore } from "../store";
+import { sessionKey, useChatStore, type ActiveSession } from "../store";
 import { EMPTY_SESSION, runRouting } from "../store/stream";
 import { getSelectedAgent } from "@/features/agents/selected-agent";
 import { ipc, type ResolvedBuiltInAgent, type Workspace } from "@/lib/ipc";
@@ -22,19 +22,22 @@ vi.mock("./MessageTimeline", () => ({ MessageTimeline: () => null }));
 // Keep ChatConversation, both composer hooks and messaging real. This minimal
 // footer exposes their controlled input, busy/Stop and attachment interfaces.
 vi.mock("./ConversationFooter", () => ({ ConversationFooter: (props: {
-  draft: string; streaming: boolean; images: string[]; onDraftChange: (v: string) => void; onSubmit: (v: string) => void;
+  active: ActiveSession | null; streaming: boolean; images: string[]; onDraftChange: (v: string) => void; onSubmit: (v: string) => void;
   onStop: () => void; onDropPaths: (paths: string[]) => void; onRemoveImage: (path: string) => void;
   onQueue?: (v: string) => void;
   composerInputRef: RefObject<ComposerInputHandle | null>;
-}) => <div>
-  <textarea aria-label="draft" value={props.draft} onChange={(e) => props.onDraftChange(e.target.value)} />
-  <button onClick={() => props.onSubmit(props.draft)}>submit</button>
-  {props.onQueue && <button onClick={() => props.onQueue!(props.draft)}>queue</button>}
+}) => {
+  const draftKey = props.active ? sessionKey(props.active.engine, props.active.sessionId, props.active.workspacePath) : "";
+  const draft = useChatStore(s => s.drafts[draftKey] ?? "");
+  return <div>
+  <textarea aria-label="draft" value={draft} onChange={(e) => props.onDraftChange(e.target.value)} />
+  <button onClick={() => props.onSubmit(draft)}>submit</button>
+  {props.onQueue && <button onClick={() => props.onQueue!(draft)}>queue</button>}
   {props.streaming && <button onClick={props.onStop}>stop</button>}
   <button onClick={() => props.onDropPaths(["first.png"])}>attach-first</button>
   <button onClick={() => props.onDropPaths(["next.png"])}>attach-next</button>
   {props.images.map((path) => <button key={path} data-image={path} onClick={() => props.onRemoveImage(path)}>{path}</button>)}
-</div> }));
+</div>; } }));
 
 const workspace: Workspace = { id: "draft", path: "G:/composer-draft", name: "draft", lastOpenedAt: null, sortOrder: null, groupId: null };
 const tab = { engine: "claude", sessionId: null, workspacePath: workspace.path };

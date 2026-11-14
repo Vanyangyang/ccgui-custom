@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it } from "vitest";
 import type { AgyQuotaSnapshot } from "@/lib/ipc";
 import { agyQuotaModelGroup, validAgyQuotaSnapshot } from "./agy-quota";

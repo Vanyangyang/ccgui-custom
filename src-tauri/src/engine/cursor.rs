@@ -178,6 +178,7 @@ struct StreamState {
 #[derive(Default)]
 pub struct CursorEngine {
     state: Mutex<StreamState>,
+    throughput: Mutex<super::cursor_throughput::CursorThroughput>,
 }
 
 impl CursorEngine {
@@ -251,13 +252,16 @@ fn tool_parts(tool_call: &Value) -> Option<(String, &Value)> {
 fn normalize_usage(usage: &Value) -> Option<Value> {
     let num = |key: &str| usage.get(key).and_then(Value::as_u64);
     let input = num("inputTokens")?;
-    let output = num("outputTokens").unwrap_or(0);
-    Some(json!({
+    let mut out = json!({
         "input_tokens": input,
-        "output_tokens": output,
         "cache_read_input_tokens": num("cacheReadTokens").unwrap_or(0),
         "cache_creation_input_tokens": num("cacheWriteTokens").unwrap_or(0),
-    }))
+        "usage_scope": "turn",
+    });
+    if let Some(output) = num("outputTokens") {
+        out["output_tokens"] = json!(output);
+    }
+    Some(out)
 }
 
 impl Engine for CursorEngine {
@@ -277,6 +281,10 @@ impl Engine for CursorEngine {
     }
 
     fn build_command(&self, req: &SendRequest, bin: &str) -> Result<BuiltCommand, String> {
+        self.throughput
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .arm(std::time::Instant::now());
         let mut cmd = command_for_binary(bin);
         crate::proxy::configure_cursor_command_proxy(&mut cmd);
         for arg in [
@@ -382,11 +390,14 @@ impl Engine for CursorEngine {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             return;
         };
+        let now = std::time::Instant::now();
         let kind = str_field(&value, "type").unwrap_or("");
         let subtype = str_field(&value, "subtype").unwrap_or("");
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let mut telemetry = self.throughput.lock().unwrap_or_else(|p| p.into_inner());
         match kind {
             "system" if subtype == "init" => {
+                telemetry.on_init(now);
                 if let Some(id) = str_field(&value, "session_id") {
                     out.push(EngineEvent::SessionId(id.to_string()));
                 }
@@ -399,6 +410,9 @@ impl Engine for CursorEngine {
             "thinking" if subtype == "delta" => {
                 if let Some(text) = value.get("text").and_then(Value::as_str).filter(|t| !t.is_empty()) {
                     out.push(EngineEvent::Thinking(text.to_string()));
+                    if let Some(sample) = telemetry.on_stream_delta(text, now) {
+                        out.push(EngineEvent::Throughput(sample));
+                    }
                 }
             }
             "assistant" => {
@@ -417,6 +431,9 @@ impl Engine for CursorEngine {
                     || (state.deltas > 1 && text == state.pending);
                 if summary {
                     if state.deltas == 0 {
+                        if let Some(sample) = telemetry.on_stream_delta(&text, now) {
+                            out.push(EngineEvent::Throughput(sample));
+                        }
                         out.push(EngineEvent::Delta(text));
                     }
                     state.pending.clear();
@@ -424,16 +441,24 @@ impl Engine for CursorEngine {
                 } else {
                     state.pending.push_str(&text);
                     state.deltas += 1;
+                    if let Some(sample) = telemetry.on_stream_delta(&text, now) {
+                        out.push(EngineEvent::Throughput(sample));
+                    }
                     out.push(EngineEvent::Delta(text));
                 }
             }
             "tool_call" => {
+                let call_id = str_field(&value, "call_id");
                 let Some((name, payload)) = value.get("tool_call").and_then(tool_parts) else {
                     return;
                 };
                 match subtype {
-                    "started" => out.push(tool_call_message(name, payload.get("args"))),
+                    "started" => {
+                        telemetry.on_tool_started(call_id, now);
+                        out.push(tool_call_message(name, payload.get("args")));
+                    }
                     "completed" => {
+                        telemetry.on_tool_completed(call_id, now);
                         let result = payload.get("result");
                         let unwrapped = result.and_then(|r| r.get("success")).or(result);
                         out.push(tool_result_patch(name, unwrapped));
@@ -455,6 +480,9 @@ impl Engine for CursorEngine {
                 }
                 let failed = value.get("is_error").and_then(Value::as_bool) == Some(true)
                     || (!subtype.is_empty() && subtype != "success");
+                if let Some(sample) = telemetry.finish_result(&value, failed, now) {
+                    out.push(EngineEvent::Throughput(sample));
+                }
                 if failed {
                     let message = str_field(&value, "result")
                         .or_else(|| str_field(&value, "error"))
@@ -465,6 +493,17 @@ impl Engine for CursorEngine {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn finish_telemetry(&self, _interrupted: bool, out: &mut Vec<EngineEvent>) {
+        if let Some(sample) = self
+            .throughput
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .finish_eof(std::time::Instant::now())
+        {
+            out.push(EngineEvent::Throughput(sample));
         }
     }
 }

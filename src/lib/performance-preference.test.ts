@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { initializePerformancePreference, setPerformanceEnabled, getPerformancePreference, synchronizePerformancePreference } from "./performance-preference";
 import { performanceRecorder } from "./performance-diagnostics";

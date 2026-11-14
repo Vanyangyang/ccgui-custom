@@ -5,7 +5,7 @@ import { Button } from "@/components/base/buttons/button";
 import { useChatStore, sessionKey } from "@/features/chat/store";
 import { errorText } from "@/lib/errors";
 import { branchDeletionState, useLeaderStore } from "./store";
-import { isDirectChild, leaderGroupRoot, leaderGroupBranches, sameIdentity, type LeaderBranch, type LeaderIdentity } from "./types";
+import { archivedBranchIds, isDirectChild, leaderGroupRoot, leaderGroupBranches, sameIdentity, type LeaderBranch, type LeaderIdentity } from "./types";
 import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw";
 import { ActionFeedbackIcon, useActionFeedback } from "@/components/base/action-feedback";
 import { useClaudeContextWindow } from "@/features/chat/components/use-claude-context-window";
@@ -63,6 +63,7 @@ function LeaderManagement({ parent }: { parent: LeaderIdentity }) {
   const isRoot = sameIdentity(groupRoot, parent);
   const descendants = leaderGroupBranches(snapshot, groupRoot);
   const archivedGroup = snapshot.archivedGroups?.find((group) => sameIdentity(group.root, groupRoot));
+  const archivedChildren = archivedBranchIds(snapshot);
   const groupTitle = sessions.find((s) => sameIdentity(s, groupRoot));
   const title = groupTitle?.customTitle || groupTitle?.title || archivedGroup?.title || groupRoot.sessionId.slice(0, 8);
   const displayedError = localError ?? error;
@@ -121,14 +122,18 @@ function LeaderManagement({ parent }: { parent: LeaderIdentity }) {
         {!children.length && <p className="text-body-2-medium text-text-tertiary">{t("leader.noChildren")}</p>}
         {children.map((branch) => {
           const deadline = leaderDeadlineInfo(branch);
+          // A separately archived child is retained history until restored.
+          const archived = archivedChildren.has(branch.id);
           const session = branch.sessionId ? bySession[sessionKey(branch.engine, branch.sessionId, branch.workspacePath)] : undefined;
           const context = leaderContextInfo({ branch, sample: usage.sampleFor(branch), cachedUsage: session?.usage,
             model: session?.activeModel, claudeWindow: claudeContext.window, claudeConfigKnown: claudeContext.block !== "unavailable" });
           return <div key={branch.id} data-leader-branch={branch.id} className="rounded-lg border border-border-button-default p-3">
           <div className="flex items-center justify-between gap-2">
             <span className="min-w-0 truncate text-body-2-medium text-text-primary" title={branch.title}>{branch.title}</span>
-            <span className="shrink-0 text-caption-1-medium text-text-secondary">{branch.engine} · {t(`leader.state.${branch.state}`)}</span>
+            <span className="shrink-0 text-caption-1-medium text-text-secondary">{branch.engine} · {t(`leader.state.${branch.state}`)}{archived ? ` · ${t("leader.archivedChild")}` : ""}</span>
           </div>
+          {branch.handoffFrom && <p className="mt-1 text-caption-1-medium text-text-tertiary">{t("leader.handoffFrom", { id: branch.handoffFrom.branchId.slice(0, 8) })}</p>}
+          {branch.handoffTo && <p className="mt-1 text-caption-1-medium text-text-tertiary">{t("leader.handoffTo", { id: branch.handoffTo.branchId.slice(0, 8) })}</p>}
           <p className="mt-1 text-caption-1-medium text-text-tertiary">
             {deadline.known ? t(deadline.expired ? "leader.expiredDeadline" : "leader.deadline", { time: new Date(branch.deadlineAt).toLocaleString() }) : t("leader.deadlineUnknown")}
           </p>
@@ -142,9 +147,9 @@ function LeaderManagement({ parent }: { parent: LeaderIdentity }) {
           {branch.error && <p role="alert" className="mt-2 whitespace-pre-wrap text-body-2-medium text-text-error">{branch.error}</p>}
           {branch.result && <details className="mt-2 text-body-2-medium text-text-secondary"><summary>{t("leader.result")}{branch.resultTruncated ? ` · ${t("leader.truncated")}` : ""}</summary><pre className="mt-2 whitespace-pre-wrap break-words font-sans">{branch.result}</pre></details>}
           <div className="mt-3 flex flex-wrap gap-2">
-            <Button variant="secondary" size="small" disabled={!branch.sessionId || busy} onClick={() => open(branch)}>{t("leader.openChild")}</Button>
-            <Button variant="secondary" size="small" disabled={busy || branch.state === "reclaiming" || ttlSeconds === null} onClick={() => act(branch, "renew")}>{t("leader.renew")}</Button>
-            <Button variant="secondary" size="small" disabled={busy || ["completed", "failed", "stopped", "reclaiming"].includes(branch.state)} onClick={() => act(branch, "stop")}>{t("leader.stop")}</Button>
+            <Button variant="secondary" size="small" disabled={!branch.sessionId || busy || archived} onClick={() => open(branch)}>{t("leader.openChild")}</Button>
+            <Button variant="secondary" size="small" disabled={busy || archived || ["reclaiming", "handed_off"].includes(branch.state) || ttlSeconds === null} onClick={() => act(branch, "renew")}>{t("leader.renew")}</Button>
+            <Button variant="secondary" size="small" disabled={busy || archived || ["completed", "failed", "stopped", "handed_off", "reclaiming"].includes(branch.state)} onClick={() => act(branch, "stop")}>{t("leader.stop")}</Button>
           </div>
         </div>; })}
         <div className="flex justify-end gap-2">

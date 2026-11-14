@@ -24,13 +24,17 @@ const IDLE_ADVISORY_MS: i64 = 300_000;
 const RETIRE_TIMEOUT: Duration = Duration::from_secs(20);
 static MANAGER: OnceLock<Arc<LeaderManager>> = OnceLock::new();
 mod archive;
+pub(crate) mod task_lifecycle;
 mod branch_delete;
 mod cost_approval;
+mod attachments;
 mod delegation;
 mod delegation_storage;
+pub(crate) mod parent_wakeup;
 mod model_policy;
 mod worker_handoff;
 pub use cost_approval::TaskCostApproval;
+pub use attachments::TaskImage;
 pub use delegation::TaskDelegation;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -56,8 +60,14 @@ pub struct LeaderBranch {
     pub session_id: Option<String>,
     pub title: String,
     pub task: String,
+    /// Immutable host-owned copies of the latest assignment's image files.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<TaskImage>,
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// Explicit handoff route; absent on legacy branches which use the current channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
     pub run_id: Option<String>,
     pub state: String,
     pub created_at: i64,
@@ -72,6 +82,20 @@ pub struct LeaderBranch {
     pub cost_approval: Option<TaskCostApproval>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegation: Option<TaskDelegation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_to: Option<TaskHandoffLink>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_from: Option<TaskHandoffLink>,
+}
+
+/// Host-authored durable relationship; never supplied by an agent or worker.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TaskHandoffLink {
+    pub branch_id: String,
+    pub request_id: String,
+    pub operation_id: String,
+    pub payload_fingerprint: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -80,6 +104,15 @@ pub struct LeaderSnapshot {
     pub leaders: Vec<LeaderIdentity>,
     pub branches: Vec<LeaderBranch>,
     pub archived_groups: Vec<LeaderArchivedGroup>,
+}
+
+/// The group the cleanup dialog displayed before requesting whole-group archive.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GroupCleanupExpectation {
+    pub branch_ids: Vec<String>,
+    pub members: Vec<LeaderIdentity>,
+    pub last_activity_at: i64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -106,8 +139,9 @@ pub struct Caller {
 #[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SpawnArgs {
-    /// Optional registered local execution workspace. Cross-workspace targets must be
-    /// available development members of the parent's registered project. Omit to inherit cwd.
+    /// Optional registered local execution workspace that is available and unarchived.
+    /// All supported engines may dispatch across projects and member roles without
+    /// a separate workspace grant. Omit to inherit cwd.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_path: Option<String>,
     /// Idempotency key you choose (1-128 characters). Reuse it only to retry this exact call.
@@ -119,6 +153,10 @@ pub struct SpawnArgs {
     /// Everything the child receives: it cannot see this conversation, so include the goal,
     /// relevant paths and facts, constraints, and what its final reply should report.
     pub task: String,
+    /// Optional image file references, relative to the parent's workspace or
+    /// inside the host's pasted-images sandbox. Up to eight; copied durably.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<String>,
     /// Optional exact model ID. Omit to use the host's default for this engine.
     pub model: Option<String>,
     /// Reasoning effort such as low, medium, high, xhigh or max. Omit to use the user's default.
@@ -135,6 +173,10 @@ pub struct SendArgs {
     pub branch_id: String,
     pub request_id: String,
     pub message: String,
+    /// Optional image files; captured with this exact assignment and retained
+    /// through human cost review, restart and Handoff. Omit for text only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -150,18 +192,35 @@ pub struct RenewArgs {
     pub ttl_seconds: u64,
 }
 
+const TASK_PREVIEW_CHARS: usize = 160;
+const RUNNING_RESULT_PREVIEW_CHARS: usize = 500;
+const TASK_WAIT_MAX_TIMEOUT_SECS: u64 = 120;
+const TASK_WAIT_DEFAULT_TIMEOUT_SECS: u64 = 20;
+const TASK_WAIT_ACTIVE_HINT: &str = "Selected child task is still running. If you have no other local parallel work, stop calling tools and end this turn now: CC GUI will automatically schedule a parent continuation when the child completes, fails, or needs approval. Do not poll task_wait in a loop.";
+
 #[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WaitArgs {
     /// Direct children to watch. Omit to watch all unreclaimed direct children.
     pub branch_ids: Option<Vec<String>>,
-    /// At most 20 (the default).
+    /// Seconds to wait (0-120, default 20). Long tasks may pass 60-120, then end the turn if still running so the host's completion continuation wakes the parent.
+    #[schemars(range(min = 0, max = 120))]
     pub timeout_seconds: Option<u64>,
+    /// Set true only when the full delegated task prompt text is needed; default false returns compact `taskPreview` (up to 160 chars).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_task: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct ListArgs {}
+pub struct ListArgs {
+    /// Set true only when the full delegated task prompt text is needed; default false returns compact `taskPreview` (up to 160 chars).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_task: Option<bool>,
+    /// Include bounded terminal results. Default false returns at most 500 characters per result; use task_wait for selected children.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_result: Option<bool>,
+}
 
 pub fn is_method(method: &str) -> bool {
     matches!(
@@ -182,6 +241,23 @@ fn text_limit(value: &str, name: &str, max: usize) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn validate_image_arguments(images: &[String]) -> Result<(), String> {
+    if images.len() > 8 {
+        return Err("Task assignments support at most eight images".into());
+    }
+    for image in images { text_limit(image, "image path", 8192)?; }
+    Ok(())
+}
+
+/// A stop or replacement during an unlocked read must invalidate that read,
+/// including multiple state transitions in the same millisecond.
+fn same_assignment_source(current: &LeaderBranch, sampled: &LeaderBranch) -> bool {
+    current.engine == sampled.engine && current.session_id == sampled.session_id
+        && current.workspace_path == sampled.workspace_path && current.model == sampled.model
+        && current.run_id == sampled.run_id && current.updated_at == sampled.updated_at
+        && current.state == sampled.state && current.task == sampled.task && current.images == sampled.images
 }
 
 fn ttl(value: u64) -> Result<u64, String> {
@@ -223,18 +299,56 @@ fn trim_tool_field(value: &mut Value, field: &str, chars: usize) -> bool {
     true
 }
 
-// Unreclaimed durable/UI records retain their content. These previews stay below the
-// relay's 1 MiB envelope, even with 128 children or a large native error.
-fn tool_branch(branch: &LeaderBranch, budget: usize) -> Result<Value, String> {
-    let mut value = encoded(branch)?;
-    trim_tool_field(&mut value, "task", 512);
-    if let Some(delegation) = value.get_mut("delegation") {
-        trim_tool_field(delegation, "task", 512);
+fn trim_tool_field_tail(value: &mut Value, field: &str, chars: usize) -> bool {
+    let Some(text) = value.get(field).and_then(Value::as_str) else {
+        return false;
+    };
+    let total = text.chars().count();
+    if total <= chars {
+        return false;
     }
-    while serde_json::to_vec(&value).map_err(|e| e.to_string())?.len() > budget {
+    let tail: String = text.chars().skip(total - chars).collect();
+    value[field] = Value::String(tail);
+    value[format!("{field}Truncated")] = Value::Bool(true);
+    true
+}
+
+fn compact_task_field(value: &mut Value, include_task: bool) {
+    let Some(text) = value.get("task").and_then(Value::as_str).map(str::to_owned) else {
+        return;
+    };
+    let total = text.chars().count();
+    let preview: String = text.chars().take(TASK_PREVIEW_CHARS).collect();
+    value["taskPreview"] = Value::String(preview);
+    if total > TASK_PREVIEW_CHARS {
+        value["taskTruncated"] = Value::Bool(true);
+    }
+    if include_task {
+        trim_tool_field(value, "task", 512);
+    } else if let Some(obj) = value.as_object_mut() {
+        obj.shift_remove("task");
+    }
+}
+
+fn compact_result_field(value: &mut Value, include_terminal_result: bool) {
+    let nonterminal = value
+        .get("state")
+        .and_then(Value::as_str)
+        .is_some_and(|state| matches!(state, "starting" | "queued" | "running"));
+    if include_terminal_result && !nonterminal {
+        return;
+    }
+    if trim_tool_field_tail(value, "result", RUNNING_RESULT_PREVIEW_CHARS) {
+        value["resultPreview"] = Value::Bool(true);
+    }
+}
+
+fn fit_tool_branch_budget(value: &mut Value, budget: usize) -> Result<(), String> {
+    while serde_json::to_vec(value).map_err(|e| e.to_string())?.len() > budget {
         let largest = [
             "result",
             "task",
+            "taskPreview",
             "error",
             "workspacePath",
             "title",
@@ -250,7 +364,7 @@ fn tool_branch(branch: &LeaderBranch, budget: usize) -> Result<Value, String> {
         })
         .filter(|(_, _, chars)| *chars > 0)
         .map(|(field, bytes, chars)| (false, field, bytes, chars))
-        .chain(["result", "task", "error"].into_iter().filter_map(|field| {
+        .chain(["result", "task", "taskPreview", "error"].into_iter().filter_map(|field| {
             value.get("delegation")?.get(field)?.as_str()
                 .filter(|text| !text.is_empty()).map(|text| (true, field, text.len(), text.chars().count()))
         }))
@@ -258,9 +372,41 @@ fn tool_branch(branch: &LeaderBranch, budget: usize) -> Result<Value, String> {
         let Some((nested, field, _, chars)) = largest else {
             return Err("Leader identity metadata exceeds the tool response budget".into());
         };
-        if nested { trim_tool_field(&mut value["delegation"], field, chars / 2); }
-        else { trim_tool_field(&mut value, field, chars / 2); }
+        let target = if nested { &mut value["delegation"] } else { &mut *value };
+        trim_tool_field(target, field, chars / 2);
+        if field == "result" { target["resultPreview"] = Value::Bool(true); }
     }
+    Ok(())
+}
+
+// Unreclaimed durable/UI records retain their content. These previews stay below the
+// relay's 1 MiB envelope, even with 128 children or a large native error.
+fn tool_branch(branch: &LeaderBranch, budget: usize) -> Result<Value, String> {
+    let mut value = encoded(branch)?;
+    trim_tool_field(&mut value, "task", 512);
+    if let Some(delegation) = value.get_mut("delegation") {
+        trim_tool_field(delegation, "task", 512);
+    }
+    fit_tool_branch_budget(&mut value, budget)?;
+    Ok(value)
+}
+
+fn compact_tool_branch(branch: &LeaderBranch, budget: usize, include_task: bool, include_result: bool) -> Result<Value, String> {
+    let mut value = encoded(branch)?;
+    // Keep current activity visible without repeating the same long assignment
+    // body. The durable branch and delegation records remain untouched.
+    let shared_result = branch.delegation.as_ref().is_some_and(|delegation| {
+        delegation.run_id == branch.run_id && delegation.result == branch.result
+            && branch.result.chars().count() > RUNNING_RESULT_PREVIEW_CHARS
+    });
+    compact_task_field(&mut value, include_task);
+    compact_result_field(&mut value, include_result && !shared_result);
+    if shared_result { value["resultSource"] = json!("delegation.result"); }
+    if let Some(delegation) = value.get_mut("delegation") {
+        compact_task_field(delegation, include_task);
+        compact_result_field(delegation, include_result);
+    }
+    fit_tool_branch_budget(&mut value, budget)?;
     Ok(value)
 }
 
@@ -272,6 +418,7 @@ pub fn validate_arguments(method: &str, arguments: Value) -> Result<Value, Strin
             text_limit(&a.request_id, "request_id", 128)?;
             text_limit(&a.title, "title", 256)?;
             text_limit(&a.task, "task", MAX_INPUT_CHARS)?;
+            validate_image_arguments(&a.images)?;
             if let Some(path) = &a.workspace_path {
                 text_limit(path, "workspace_path", 4096)?;
             }
@@ -288,6 +435,7 @@ pub fn validate_arguments(method: &str, arguments: Value) -> Result<Value, Strin
             text_limit(&a.branch_id, "branch_id", 128)?;
             text_limit(&a.request_id, "request_id", 128)?;
             text_limit(&a.message, "message", MAX_INPUT_CHARS)?;
+            validate_image_arguments(&a.images)?;
             encoded(&a)
         }
         "task_stop" => {
@@ -304,8 +452,8 @@ pub fn validate_arguments(method: &str, arguments: Value) -> Result<Value, Strin
         "task_list" => encoded(&decode::<ListArgs>(arguments)?),
         "task_wait" => {
             let a: WaitArgs = decode(arguments)?;
-            if a.timeout_seconds.unwrap_or(20) > 20 {
-                return Err("timeout_seconds must be at most 20".into());
+            if a.timeout_seconds.unwrap_or(TASK_WAIT_DEFAULT_TIMEOUT_SECS) > TASK_WAIT_MAX_TIMEOUT_SECS {
+                return Err("timeout_seconds must be at most 120".into());
             }
             if let Some(ids) = &a.branch_ids {
                 if ids.len() > MAX_DIRECT_BRANCHES {
@@ -334,6 +482,9 @@ struct Request {
     #[serde(default)]
     arguments_fingerprint: Option<String>,
     branch_id: String,
+    /// Original public selector when a parent addressed a predecessor alias.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    requested_branch_id: Option<String>,
     state: String,
     response: Option<Value>,
     error: Option<String>,
@@ -410,6 +561,7 @@ struct BranchRecord {
 fn erase_branch_content(record: &mut BranchRecord) {
     record.branch.title.clear();
     record.branch.task.clear();
+    record.branch.images.clear();
     record.branch.model = None;
     record.branch.effort = None;
     record.branch.result.clear();
@@ -553,9 +705,9 @@ fn identity(engine: &str, session: &str, workspace: &str) -> LeaderIdentity {
     }
 }
 
-/// Only Windows drive-absolute paths have interchangeable separators. Keep
-/// case, dot components and directory boundaries intact; never resolve aliases.
-fn workspace_key(path: &str) -> String {
+/// The historical spelling is part of persisted receipt/handoff fingerprints.
+/// Keep it stable even when comparison rules gain another equivalent spelling.
+fn legacy_workspace_key(path: &str) -> String {
     let bytes = path.as_bytes();
     if cfg!(windows) && bytes.len() >= 3 && bytes[0].is_ascii_alphabetic()
         && bytes[1] == b':' && matches!(bytes[2], b'/' | b'\\')
@@ -579,7 +731,19 @@ fn workspace_key(path: &str) -> String {
     }
 }
 
-fn same_workspace(a: &str, b: &str) -> bool {
+/// Normalize separators and the drive letter only. Directory casing, trailing
+/// separators, dot segments and non-Windows paths retain their identity.
+fn workspace_key(path: &str) -> String {
+    let mut normalized = legacy_workspace_key(path);
+    let bytes = path.as_bytes();
+    if cfg!(windows) && bytes.len() >= 3 && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':' && matches!(bytes[2], b'/' | b'\\') {
+        normalized.get_mut(..1).expect("ASCII drive letter").make_ascii_uppercase();
+    }
+    normalized
+}
+
+pub(crate) fn same_workspace(a: &str, b: &str) -> bool {
     workspace_key(a) == workspace_key(b)
 }
 
@@ -591,6 +755,10 @@ fn key(parent: &LeaderIdentity) -> IdentityKey {
     )
 }
 
+fn legacy_key(parent: &LeaderIdentity) -> IdentityKey {
+    (parent.engine.clone(), parent.session_id.clone(), legacy_workspace_key(&parent.workspace_path))
+}
+
 fn belongs(branch: &LeaderBranch, parent: &LeaderIdentity) -> bool {
     branch.parent_engine == parent.engine
         && branch.parent_session_id == parent.session_id
@@ -598,7 +766,7 @@ fn belongs(branch: &LeaderBranch, parent: &LeaderIdentity) -> bool {
 }
 
 impl LeaderBranch {
-    fn parent_workspace(&self) -> &str {
+    pub(crate) fn parent_workspace(&self) -> &str {
         self.parent_workspace_path.as_deref().unwrap_or(&self.workspace_path)
     }
 }
@@ -698,7 +866,7 @@ fn fenced(state: &str) -> bool {
 fn terminal(state: &str) -> bool {
     matches!(
         state,
-        "completed" | "failed" | "stopped" | "unknown" | "reclaimed"
+        "completed" | "failed" | "stopped" | "unknown" | "reclaimed" | "handed_off"
     )
 }
 
@@ -757,8 +925,10 @@ pub(crate) fn schema_contract_descriptor() -> Value {
         session_id: Some(String::new()),
         title: String::new(),
         task: String::new(),
+        images: Vec::new(),
         model: Some(String::new()),
         effort: Some(String::new()),
+        provider_id: None,
         run_id: Some(String::new()),
         state: String::new(),
         created_at: 0,
@@ -784,8 +954,21 @@ pub(crate) fn schema_contract_descriptor() -> Value {
                 }),
             }),
             model: Some(String::new()),
+            image_refs: Vec::new(),
         }),
         delegation: None,
+        handoff_to: Some(TaskHandoffLink {
+            branch_id: String::new(),
+            request_id: String::new(),
+            operation_id: String::new(),
+            payload_fingerprint: String::new(),
+        }),
+        handoff_from: Some(TaskHandoffLink {
+            branch_id: String::new(),
+            request_id: String::new(),
+            operation_id: String::new(),
+            payload_fingerprint: String::new(),
+        }),
     };
     branch.delegation = Some(TaskDelegation::new("", &branch, 0));
     let request = Request {
@@ -795,6 +978,7 @@ pub(crate) fn schema_contract_descriptor() -> Value {
         arguments: Value::Null,
         arguments_fingerprint: Some(String::new()),
         branch_id: String::new(),
+        requested_branch_id: Some(String::new()),
         state: String::new(),
         response: Some(Value::Null),
         error: Some(String::new()),
@@ -818,6 +1002,7 @@ pub(crate) fn schema_contract_descriptor() -> Value {
             "acknowledged",
             "failed",
             "cancelled",
+            "handed_off",
             "unknown",
             "reclaimed",
         ],
@@ -828,6 +1013,7 @@ pub(crate) fn schema_contract_descriptor() -> Value {
             "waiting",
             "awaiting_cost_approval",
             "completed",
+            "handed_off",
             "failed",
             "stopped",
             "unknown",
@@ -858,6 +1044,7 @@ fn write_branch_in_transaction(conn: &rusqlite::Connection, record: &BranchRecor
          session_id=excluded.session_id,state=excluded.state,record_json=excluded.record_json,permission=excluded.permission",
         params![b.id,b.parent_engine,b.parent_session_id,b.workspace_path,b.engine,b.session_id,b.state,serialized,record.permission]
     ).map_err(|e| e.to_string())?;
+    parent_wakeup::persist(conn, b)?;
     delegation_storage::persist(conn, b)
 }
 
@@ -880,9 +1067,7 @@ impl LeaderManager {
         };
         let archived = crate::settings::read_settings()?.archived_workspaces;
         let conn = self.db.0.lock();
-        validate_workspace_registration(&conn, &parent.workspace_path, &archived, true)?;
-        validate_workspace_registration(&conn, target, &archived, true)?;
-        crate::workspace_projects::authorize_task_target(&conn, &parent.workspace_path, target, same_workspace)?;
+        authorize_task_workspace(&conn, &archived, &parent.workspace_path, target)?;
         Ok(target.to_owned())
     }
 
@@ -1040,6 +1225,7 @@ impl LeaderManager {
             // whole migration back and is returned to the caller.
             let tx = conn.transaction().map_err(|e| e.to_string())?;
             archive::load_groups(&tx, &mut inner)?;
+            parent_wakeup::recover(&tx)?;
             for request in &migrated_requests {
                 write_request(&tx, request)?;
             }
@@ -1189,6 +1375,7 @@ impl LeaderManager {
                     "failed" | "unknown" | "stopped"
                 )
                 || record.stopping
+                || record.branch.handoff_to.is_some()
                 || record.branch.engine != caller.engine
                 || record.branch.session_id.as_deref() != Some(&caller.session_id)
                 || !same_workspace(&record.branch.workspace_path, &caller.workspace_path)
@@ -1246,6 +1433,9 @@ impl LeaderManager {
             )
             .map(Some);
         }
+        if request.state == "handed_off" {
+            return self.handoff_response(inner, request).map(Some);
+        }
         if let Some(response) = &request.response {
             let mut response = response.clone();
             if let Some(record) = inner.branches.get(&request.branch_id) {
@@ -1300,6 +1490,7 @@ impl LeaderManager {
         let run_id = uuid::Uuid::new_v4().to_string();
         let now = (self.clock)();
         let workspace = self.spawn_workspace(parent, args.workspace_path.as_deref())?;
+        let images = attachments::capture(&args.images, &parent.workspace_path)?;
         let mut branch = LeaderBranch {
             id: id.clone(),
             parent_engine: parent.engine.clone(),
@@ -1310,8 +1501,10 @@ impl LeaderManager {
             session_id: None,
             title: args.title.clone(),
             task: args.task.clone(),
+            images,
             model,
             effort,
+            provider_id: None,
             run_id: Some(run_id.clone()),
             state: "starting".into(),
             created_at: now,
@@ -1324,6 +1517,8 @@ impl LeaderManager {
             error: None,
             cost_approval: None,
             delegation: None,
+            handoff_to: None,
+            handoff_from: None,
         };
         delegation::begin(&mut branch, &args.request_id);
         let record = BranchRecord {
@@ -1342,6 +1537,7 @@ impl LeaderManager {
             arguments_fingerprint: Some(arguments_fingerprint(&arguments)?),
             arguments: Value::Null,
             branch_id: id.clone(),
+            requested_branch_id: None,
             state: "starting".into(),
             response: None,
             error: None,
@@ -1389,6 +1585,7 @@ impl LeaderManager {
         let previous = self.child(inner, parent, branch_id)?;
         if fenced(&previous.branch.state)
             || previous.stopping
+            || previous.branch.handoff_to.is_some()
             || self.active(inner, &previous.branch)
             || previous.branch.cost_approval.is_some()
             || previous.branch.state == "awaiting_cost_approval"
@@ -1420,6 +1617,25 @@ impl LeaderManager {
         {
             return Ok(Reservation::Replay(response));
         }
+        let resolved_id = self.resolve_child_id(&inner, parent, &args.branch_id)?;
+        let args = &SendArgs { branch_id: resolved_id, ..args.clone() };
+        let sampled = self.sendable_child(&inner, parent, &args.branch_id)?.branch.clone();
+        // File validation/copying can be slow; keep stop and unrelated task
+        // actions responsive, then revalidate authority and physical identity.
+        let images = if args.images.is_empty() { Vec::new() } else {
+            drop(inner);
+            let images = attachments::capture(&args.images, &parent.workspace_path)?;
+            inner = self.inner.lock();
+            self.authorize(&inner, caller)?;
+            if let Some(response) = self.replay(&inner, parent, &args.request_id, "task_send", &arguments)? {
+                return Ok(Reservation::Replay(response));
+            }
+            let current = &self.sendable_child(&inner, parent, &args.branch_id)?.branch;
+            if !same_assignment_source(current, &sampled) {
+                return Err("Child changed while its assignment images were being prepared; nothing was sent".into());
+            }
+            images
+        };
         let previous = self.sendable_child(&inner, parent, &args.branch_id)?;
         let cache = self.send_cache(&previous.branch)?;
         if !crate::history::prompt_cache::cache_time_limit_disabled(
@@ -1440,12 +1656,10 @@ impl LeaderManager {
                 return Ok(Reservation::Replay(response));
             }
             let current = &self.sendable_child(&inner, parent, &args.branch_id)?.branch;
-            let unchanged = current.engine == sampled.engine
-                && current.session_id == sampled.session_id
-                && current.workspace_path == sampled.workspace_path
-                && current.model == sampled.model
-                && current.run_id == sampled.run_id
-                && current.updated_at == sampled.updated_at;
+            let unchanged = same_assignment_source(current, &sampled);
+            if !unchanged {
+                return Err("Child changed while its cost review was being prepared; nothing was sent".into());
+            }
             let small = match small_context.as_ref().filter(|_| unchanged) {
                 Some(evidence) => self.small_context_still_matches(current, evidence)?,
                 None => false,
@@ -1455,13 +1669,13 @@ impl LeaderManager {
                 &current.engine, current.model.as_deref(),
             ) && cost_approval::requires_approval(cache.as_ref(), (self.clock)()) {
                 let response =
-                    self.hold_send(&mut inner, parent, permission, args, &arguments, cache)?;
+                    self.hold_send(&mut inner, parent, permission, args, &arguments, images, cache)?;
                 drop(inner);
                 self.emit();
                 return Ok(Reservation::Replay(response));
             }
         }
-        self.start_send(&mut inner, parent, permission, args, arguments)
+        self.start_send(&mut inner, parent, permission, args, arguments, images)
     }
 
     fn start_send(
@@ -1471,6 +1685,7 @@ impl LeaderManager {
         permission: &str,
         args: &SendArgs,
         arguments: Value,
+        images: Vec<TaskImage>,
     ) -> Result<Reservation<(LeaderBranch, String)>, String> {
         let previous = self.child(inner, parent, &args.branch_id)?;
         self.spawn_workspace(parent, Some(&previous.branch.workspace_path))?;
@@ -1488,6 +1703,7 @@ impl LeaderManager {
         record.branch.run_id = Some(run_id.clone());
         record.branch.cost_approval = None;
         record.branch.task = args.message.clone();
+        record.branch.images = images;
         record.branch.state = "starting".into();
         record.branch.updated_at = (self.clock)();
         record.branch.last_activity_at = record.branch.updated_at;
@@ -1502,6 +1718,8 @@ impl LeaderManager {
             arguments_fingerprint: Some(arguments_fingerprint(&arguments)?),
             arguments: Value::Null,
             branch_id: args.branch_id.clone(),
+            requested_branch_id: arguments.get("branch_id").and_then(Value::as_str)
+                .filter(|id| *id != args.branch_id).map(str::to_owned),
             state: "starting".into(),
             response: None,
             error: None,
@@ -1797,6 +2015,7 @@ fn validate_workspace_registration(
         if let Some(raw) = meta {
             let meta: Value =
                 serde_json::from_str(&raw).map_err(|_| "Workspace metadata is invalid")?;
+            if strict_local && !meta.is_object() { return Err("Workspace metadata is invalid".into()); }
             if meta.get("wsl").is_some() || (strict_local && meta.get("remote").is_some()) {
                 return Err("Child tasks do not support WSL or remote workspaces".into());
             }
@@ -1805,6 +2024,19 @@ fn validate_workspace_registration(
     if !std::path::Path::new(workspace).is_dir() {
         return Err("Local workspace directory is unavailable".into());
     }
+    if strict_local {
+        crate::workspace_projects::local_path(workspace)
+            .and_then(crate::workspace_projects::identity)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn authorize_task_workspace(
+    conn: &rusqlite::Connection, archived: &[String], parent: &str, target: &str,
+) -> Result<(), String> {
+    if same_workspace(parent, target) { return Ok(()); }
+    validate_workspace_registration(conn, parent, archived, true)?;
+    validate_workspace_registration(conn, target, archived, true)?;
     Ok(())
 }
 
@@ -1933,6 +2165,47 @@ pub(crate) fn detached_worker_presentation(
 #[cfg(test)]
 mod worker_schema_tests {
     use super::*;
+
+    #[test]
+    fn v4_reads_and_rewrites_v3_records_without_handoff_fields_or_data_loss() {
+        let descriptor = schema_contract_descriptor();
+        let mut old_branch = descriptor["branchRecord"].clone();
+        old_branch.as_object_mut().unwrap().shift_remove("handoffTo");
+        old_branch.as_object_mut().unwrap().shift_remove("handoffFrom");
+        old_branch["id"] = json!("legacy-branch");
+        old_branch["state"] = json!("completed");
+        old_branch["task"] = json!("保留原任务 🧭\n```rust\nlet n = 1;\n```");
+        old_branch["result"] = json!("旧结果及引用 [source](https://example.test/source)");
+        let branch: LeaderBranch = serde_json::from_value(old_branch.clone()).unwrap();
+        assert!(branch.handoff_to.is_none());
+        assert!(branch.handoff_from.is_none());
+        let mut old_request = descriptor["requestRecord"].clone();
+        old_request.as_object_mut().unwrap().shift_remove("requested_branch_id");
+        old_request["request_id"] = json!("legacy-request");
+        old_request["branch_id"] = json!("legacy-branch");
+        old_request["state"] = json!("acknowledged");
+        old_request["arguments"] = json!({"branch_id":"legacy-branch", "message":"继续 🧭"});
+        old_request["response"] = json!({"saved":"原始响应", "nested":[1,true,null]});
+        let request: Request = serde_json::from_value(old_request.clone()).unwrap();
+        assert!(request.requested_branch_id.is_none());
+
+        let db = Db::open_in_memory().unwrap();
+        ensure_schema(&db).unwrap();
+        let conn = db.0.lock();
+        write_branch(&conn, &BranchRecord {
+            branch, permission: "manual".into(), output: Output::default(),
+            questions: HashSet::new(), plans: HashSet::new(), stopping: false, dirty: false,
+        }).unwrap();
+        write_request(&conn, &request).unwrap();
+        let saved_branch: String = conn.query_row(
+            "SELECT record_json FROM leader_branches WHERE id='legacy-branch'", [], |row| row.get(0),
+        ).unwrap();
+        let saved_request: String = conn.query_row(
+            "SELECT record_json FROM leader_requests WHERE request_id='legacy-request'", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&saved_branch).unwrap(), old_branch);
+        assert_eq!(serde_json::from_str::<Value>(&saved_request).unwrap(), old_request);
+    }
 
     #[test]
     fn worker_rejects_legacy_schema_without_migrating_it() {
@@ -2386,6 +2659,9 @@ impl LeaderManager {
             if record.branch.cost_approval.is_some() || record.branch.state == "awaiting_cost_approval" {
                 return Err("This branch is awaiting human cost approval; approve or cancel the pending request first".into());
             }
+            if record.branch.handoff_to.is_some() {
+                return Err("This child was handed off; continue its successor through the parent task".into());
+            }
             if record.branch.run_id.as_deref() != Some(run_id)
                 && self.active(&inner, &record.branch)
             {
@@ -2763,6 +3039,7 @@ impl LeaderManager {
         if run.engine != engine
             || record.branch.engine != engine
             || run.retired
+            || record.branch.handoff_to.is_some()
             || (fenced(&record.branch.state) && !cleanup)
         {
             return Err(INACTIVE_MANAGED_BINDING.into());
@@ -2869,6 +3146,21 @@ fn append_bounded(target: &mut String, text: &str, truncated: &mut bool) {
     }
 }
 
+fn annotate_assignment(metadata: &mut Value, branch: &LeaderBranch, run_id: &str) {
+    let assigned = branch.delegation.as_ref().map_or(
+        branch.run_id.as_deref() == Some(run_id),
+        |delegation| delegation.run_id.as_deref() == Some(run_id) && !terminal(&delegation.state),
+    );
+    if assigned {
+        metadata["assignment"] = Value::String(branch.task.clone());
+        metadata["assignmentSource"] = json!({
+            "engine": branch.parent_engine,
+            "sessionId": branch.parent_session_id,
+            "workspacePath": branch.parent_workspace(),
+        });
+    }
+}
+
 impl LeaderManager {
     fn observe(&self, event: &mut Value) {
         let Some(run_id) = event
@@ -2949,11 +3241,11 @@ impl LeaderManager {
                 event["leader"]["reclaimed"] = Value::Bool(true);
                 return;
             }
-            if kind == "session" {
-                event["leader"]["assignment"] = Value::String(record.branch.task.clone());
-            }
             if record.branch.run_id.as_deref() != Some(base.as_str()) || retired {
                 return;
+            }
+            if kind == "session" {
+                annotate_assignment(&mut event["leader"], &record.branch, &base);
             }
         } else if retired {
             return;
@@ -3252,6 +3544,46 @@ pub async fn task_group_action(
     group_action(&state.db, engine, session_id, workspace_path, action).await
 }
 
+#[tauri::command]
+pub async fn task_group_archive_checked(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, crate::AppState>,
+    engine: String,
+    session_id: String,
+    workspace_path: String,
+    expected: GroupCleanupExpectation,
+) -> Result<LeaderSnapshot, String> {
+    require_main(&window)?;
+    let _task_action = crate::worker_host::task_action_guard().await?;
+    group_archive_checked(&state.db, engine, session_id, workspace_path, expected).await
+}
+
+pub(crate) async fn group_archive_checked(db: &Db, engine: String, session_id: String, workspace_path: String,
+    expected: GroupCleanupExpectation) -> Result<LeaderSnapshot, String> {
+    archive::group_archive_checked(db, engine, session_id, workspace_path, expected).await
+}
+
+/// Cleanup archive of one expired child subtree; the direct parent stays live.
+#[tauri::command]
+pub async fn task_subtree_archive_checked(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, crate::AppState>,
+    parent_engine: String,
+    parent_session_id: String,
+    workspace_path: String,
+    branch_id: String,
+    expected: GroupCleanupExpectation,
+) -> Result<LeaderSnapshot, String> {
+    require_main(&window)?;
+    let _task_action = crate::worker_host::task_action_guard().await?;
+    subtree_archive_checked(&state.db, parent_engine, parent_session_id, workspace_path, branch_id, expected).await
+}
+
+pub(crate) async fn subtree_archive_checked(db: &Db, parent_engine: String, parent_session_id: String,
+    workspace_path: String, branch_id: String, expected: GroupCleanupExpectation) -> Result<LeaderSnapshot, String> {
+    archive::subtree_archive_checked(db, parent_engine, parent_session_id, workspace_path, branch_id, expected).await
+}
+
 /// Shared by the native window and the authenticated web dispatcher.
 pub(crate) async fn group_action(db: &Db, engine: String, session_id: String, workspace_path: String, action: String) -> Result<LeaderSnapshot, String> {
     archive::group_action(db, engine, session_id, workspace_path, action).await
@@ -3282,17 +3614,136 @@ pub async fn task_resolve_cost_approval(
     let _task_action = crate::worker_host::task_action_guard().await?;
     let manager = manager()?;
     let parent = identity(&parent_engine, &parent_session_id, &workspace_path);
+    submit_cost_decision(&state, &manager, &parent, &branch_id, &request_id, approve, reviewed_model.as_deref()).await
+}
+
+fn assignment_prompt(branch: &LeaderBranch) -> String {
+    // Reuse the host correspondence wrapper so native history retains the
+    // parent identity without matching task text to an unrelated human input.
+    format!("[Message from CC GUI {}]\n\n{}", json!({
+        "engine": branch.parent_engine, "session_id": branch.parent_session_id,
+    }), branch.task)
+}
+
+async fn launch_assignment(state: &crate::AppState, branch: LeaderBranch, permission: String, run_id: &str) -> Result<crate::engine::SendResult, String> {
+    let images = attachments::paths(&branch.images)?;
+    let prompt = assignment_prompt(&branch);
+    crate::engine::send_message_inner(state, branch.engine, branch.workspace_path, branch.session_id,
+        prompt, images, branch.model, branch.effort, Some(permission), branch.provider_id, Some(run_id.into()), None, None).await
+}
+
+async fn submit_cost_decision(state: &crate::AppState, manager: &LeaderManager, parent: &LeaderIdentity,
+    branch_id: &str, request_id: &str, approve: bool, reviewed_model: Option<&str>) -> Result<LeaderSnapshot, String> {
     if let Some((branch, run_id, permission)) = manager.resolve_cost_approval(
-        &parent, &branch_id, &request_id, approve, reviewed_model.as_deref(),
+        parent, branch_id, request_id, approve, reviewed_model,
     )? {
-        let result = crate::engine::send_message_inner(
-            &state, branch.engine, branch.workspace_path, branch.session_id,
-            branch.task, None, branch.model, branch.effort, Some(permission),
-            None, Some(run_id.clone()), None, None,
-        ).await;
-        manager.acknowledge(&parent, &request_id, &run_id, result)?;
+        let result = launch_assignment(state, branch, permission, &run_id).await;
+        manager.acknowledge(parent, request_id, &run_id, result)?;
     }
     manager.snapshot()
+}
+
+#[tauri::command]
+pub fn task_managed_child_handoff_supported(window: tauri::WebviewWindow) -> Result<bool, String> {
+    require_main(&window)?;
+    Ok(true)
+}
+
+#[tauri::command]
+pub fn task_managed_child_handoff_selection_supported(window: tauri::WebviewWindow) -> Result<bool, String> {
+    require_main(&window)?;
+    Ok(true)
+}
+
+async fn resolve_handoff_selection(selection: crate::plugin_conversations::Selection) -> Result<crate::plugin_conversations::Selection, String> {
+    crate::plugin_conversations::validate_selection(&selection).map_err(|_| "HANDOFF_TARGET_INVALID".to_owned())?;
+    if !crate::engine::list_engines().await.map_err(|_| "HANDOFF_TARGET_UNAVAILABLE".to_owned())?.iter().any(|engine|
+        engine.id == selection.engine && engine.available && engine.enabled) {
+        return Err("HANDOFF_TARGET_UNAVAILABLE".into());
+    }
+    let resolved = crate::plugin_conversations::resolve_selection(selection)
+        .map_err(|_| "HANDOFF_TARGET_RESOLUTION_FAILED".to_owned())?;
+    let settings = crate::settings::read_settings().map_err(|_| "HANDOFF_TARGET_RESOLUTION_FAILED".to_owned())?;
+    model_policy::validate_handoff(&settings, &resolved.engine, &resolved.model, &resolved.provider_id)?;
+    Ok(resolved)
+}
+
+#[tauri::command]
+pub(crate) async fn task_resolve_handoff_selection(window: tauri::WebviewWindow,
+    selection: crate::plugin_conversations::Selection) -> Result<crate::plugin_conversations::Selection, String> {
+    require_main(&window)?;
+    resolve_handoff_selection(selection).await
+}
+
+#[tauri::command]
+pub(crate) async fn task_handoff_child(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, crate::AppState>,
+    parent_engine: String,
+    parent_session_id: String,
+    workspace_path: String,
+    branch_id: String,
+    request_id: String,
+    source_session_id: String,
+    reviewed_model: Option<String>,
+    operation_id: String,
+    summary: String,
+    target_selection: Option<crate::plugin_conversations::Selection>,
+) -> Result<LeaderSnapshot, String> {
+    require_main(&window)?;
+    let _task_action = crate::worker_host::task_action_guard().await?;
+    let manager = manager()?;
+    let parent = identity(&parent_engine, &parent_session_id, &workspace_path);
+    submit_managed_handoff(&state, &manager, &parent, &branch_id, &request_id, &source_session_id,
+        reviewed_model.as_deref(), &operation_id, &summary, target_selection).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn submit_managed_handoff(state: &crate::AppState, manager: &LeaderManager, parent: &LeaderIdentity,
+    branch_id: &str, request_id: &str, source_session_id: &str, reviewed_model: Option<&str>,
+    operation_id: &str, summary: &str, target_selection: Option<crate::plugin_conversations::Selection>) -> Result<LeaderSnapshot, String> {
+    if let Some(selection) = &target_selection {
+        let resolved = resolve_handoff_selection(selection.clone()).await?;
+        if resolved != *selection {
+            return Err("HANDOFF_TARGET_CHANGED".into());
+        }
+    }
+    if let Some((branch, run_id, spawn_request_id, permission)) = manager.reserve_handoff_with_selection(
+        parent, branch_id, request_id, source_session_id, reviewed_model, operation_id, summary, target_selection.as_ref(),
+    )? {
+        let result = launch_assignment(state, branch, permission, &run_id).await;
+        manager.acknowledge(parent, &spawn_request_id, &run_id, result)?;
+    }
+    manager.snapshot()
+}
+
+/// Isolated send-path fixtures exercise the same post-confirmation code. The
+/// feature cannot be enabled in release builds and grants no shipping IPC.
+#[cfg(feature = "test-harness")]
+pub async fn test_human_handoff(state: &crate::AppState, parent: &LeaderIdentity, branch_id: &str,
+    request_id: &str, source_session_id: &str, model: Option<&str>, operation_id: &str, summary: &str) -> Result<LeaderSnapshot, String> {
+    submit_managed_handoff(state, manager()?.as_ref(), parent, branch_id, request_id, source_session_id, model, operation_id, summary, None).await
+}
+
+#[cfg(feature = "test-harness")]
+pub async fn test_resolve_handoff_selection(selection: Value) -> Result<Value, String> {
+    let selection = serde_json::from_value(selection).map_err(|_| "HANDOFF_TARGET_INVALID".to_owned())?;
+    serde_json::to_value(resolve_handoff_selection(selection).await?).map_err(|_| "HANDOFF_TARGET_RESOLUTION_FAILED".to_owned())
+}
+
+#[cfg(feature = "test-harness")]
+pub async fn test_human_handoff_with_selection(state: &crate::AppState, parent: &LeaderIdentity, branch_id: &str,
+    request_id: &str, source_session_id: &str, model: Option<&str>, operation_id: &str, summary: &str,
+    selection: Value) -> Result<LeaderSnapshot, String> {
+    let selection = serde_json::from_value(selection).map_err(|error| error.to_string())?;
+    submit_managed_handoff(state, manager()?.as_ref(), parent, branch_id, request_id, source_session_id,
+        model, operation_id, summary, Some(selection)).await
+}
+
+#[cfg(feature = "test-harness")]
+pub async fn test_human_cost_decision(state: &crate::AppState, parent: &LeaderIdentity, branch_id: &str,
+    request_id: &str, approve: bool, model: Option<&str>) -> Result<LeaderSnapshot, String> {
+    submit_cost_decision(state, manager()?.as_ref(), parent, branch_id, request_id, approve, model).await
 }
 
 pub(crate) fn snapshot() -> Result<LeaderSnapshot, String> {
@@ -3484,51 +3935,152 @@ pub fn forget_session(db: &Db, engine: &str, session_id: &str) -> Result<(), Str
 }
 
 impl LeaderManager {
+    #[cfg(test)]
     fn views(
         &self,
         inner: &Inner,
         parent: &LeaderIdentity,
         ids: Option<&[String]>,
     ) -> Result<Vec<Value>, String> {
-        self.views_with_budget(inner, parent, ids, MAX_TOOL_RESPONSE_BYTES - 8192)
+        self.views_with_options(inner, parent, ids, MAX_TOOL_RESPONSE_BYTES - 8192, false, true)
     }
 
+    #[cfg(test)]
     fn list_response(
         &self,
         inner: &Inner,
         parent: &LeaderIdentity,
     ) -> Result<Value, String> {
-        Ok(json!({"branches":self.views(inner,parent,None)?}))
+        self.list_response_with_options(inner, parent, false, false)
     }
 
-    fn views_with_budget(
+    fn list_response_with_options(
+        &self,
+        inner: &Inner,
+        parent: &LeaderIdentity,
+        include_task: bool,
+        include_result: bool,
+    ) -> Result<Value, String> {
+        Ok(json!({
+            "branches": self.views_with_options(
+                inner,
+                parent,
+                None,
+                MAX_TOOL_RESPONSE_BYTES - 8192,
+                include_task,
+                include_result,
+            )?
+        }))
+    }
+
+    async fn wait_for_children(
+        &self,
+        caller: &Caller,
+        parent: &LeaderIdentity,
+        args: &WaitArgs,
+    ) -> Result<Value, String> {
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_secs(args.timeout_seconds.unwrap_or(TASK_WAIT_DEFAULT_TIMEOUT_SECS));
+        let include_task = args.include_task.unwrap_or(false);
+        let mut start: Option<HashMap<String, Value>> = None;
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            self.checkpoint()?;
+            let (views, news, pending) = {
+                let inner = self.inner.lock();
+                self.authorize(&inner, caller)?;
+                let views = self.views_with_options(
+                    &inner,
+                    parent,
+                    args.branch_ids.as_deref(),
+                    MAX_TOOL_RESPONSE_BYTES - 8192,
+                    include_task,
+                    true,
+                )?;
+                let start = start.get_or_insert_with(|| {
+                    views
+                        .iter()
+                        .map(|v| {
+                            let id = v.get("id").and_then(Value::as_str).unwrap_or_default();
+                            (id.to_string(), wait_mark(v).1)
+                        })
+                        .collect()
+                });
+                let (news, pending) = wait_news(start, &views);
+                (views, news, pending)
+            };
+            if !news.is_empty() || !pending || tokio::time::Instant::now() >= deadline {
+                let timed_out = news.is_empty() && pending;
+                self.consume_parent_wakeups(parent, &views)?;
+                let mut response = json!({
+                    "branches": views,
+                    "changedBranchIds": news,
+                    "timedOut": timed_out,
+                });
+                if timed_out
+                    && response["branches"].as_array().is_some_and(|branches| {
+                        branches.iter().any(|view| {
+                            let task = view
+                                .get("delegation")
+                                .filter(|value| value.is_object())
+                                .unwrap_or(view);
+                            task.get("state")
+                                .and_then(Value::as_str)
+                                .is_some_and(|state| matches!(state, "starting" | "queued" | "running"))
+                        })
+                    })
+                {
+                    response["waitHint"] = Value::String(TASK_WAIT_ACTIVE_HINT.into());
+                }
+                return Ok(response);
+            }
+            tokio::select! {_=notified=>{},_=tokio::time::sleep_until(deadline)=>{}}
+        }
+    }
+
+    fn views_with_options(
         &self,
         inner: &Inner,
         parent: &LeaderIdentity,
         ids: Option<&[String]>,
         response_budget: usize,
+        include_task: bool,
+        include_result: bool,
     ) -> Result<Vec<Value>, String> {
-        let mut records: Vec<&BranchRecord> = match ids {
+        let mut records: Vec<(String, &BranchRecord)> = match ids {
             Some(ids) => ids
                 .iter()
-                .map(|id| self.child(inner, parent, id))
+                .map(|id| {
+                    let actual = self.resolve_child_id(inner, parent, id)?;
+                    Ok::<_, String>((id.clone(), self.child(inner, parent, &actual)?))
+                })
                 .collect::<Result<_, _>>()?,
+            // Children the user archived are retained history, not working state.
             None => inner
                 .branches
                 .values()
-                .filter(|r| belongs(&r.branch, parent) && r.branch.state != "reclaimed")
+                .filter(|r| belongs(&r.branch, parent) && r.branch.state != "reclaimed"
+                    && archive::ensure_available(inner, &r.branch.engine,
+                        r.branch.session_id.as_deref().unwrap_or_default(), Some(&r.branch.id)).is_ok())
+                .map(|r| (r.branch.id.clone(), r))
                 .collect(),
         };
         records.sort_by(|a, b| {
-            (a.branch.created_at, &a.branch.id).cmp(&(b.branch.created_at, &b.branch.id))
+            (a.1.branch.created_at, &a.0).cmp(&(b.1.branch.created_at, &b.0))
         });
         let budget = response_budget / records.len().max(1);
         let now = (self.clock)();
         let cache_windows = crate::history::prompt_cache::load_all(&self.db.0.lock()).map_err(|e| e.to_string())?;
         records
             .into_iter()
-            .map(|r| {
-                let mut view = tool_branch(&r.branch, budget.saturating_sub(256))?;
+            .map(|(requested_id, r)| {
+                let mut view = compact_tool_branch(&r.branch, budget.saturating_sub(256), include_task, include_result)?;
+                if requested_id != r.branch.id {
+                    view["id"] = Value::String(requested_id);
+                    view["actualBranchId"] = Value::String(r.branch.id.clone());
+                }
                 let alive = self.active(inner, &r.branch);
                 let idle_ms = (now - r.branch.last_activity_at).max(0);
                 let idle_secs = (idle_ms / 1000) as u64;
@@ -3580,6 +4132,8 @@ impl LeaderManager {
             ttl(seconds)?;
         }
         let mut inner = self.inner.lock();
+        let id = self.resolve_child_id(&inner, parent, id)?;
+        let id = id.as_str();
         let record = self.child(&inner, parent, id)?;
         if fenced(&record.branch.state) || record.stopping {
             return Err("Child is being stopped or reclaimed".into());
@@ -3650,8 +4204,11 @@ impl LeaderManager {
     }
 
     async fn stop(&self, parent: &LeaderIdentity, id: &str) -> Result<LeaderBranch, String> {
+        let resolved;
         {
             let mut inner = self.inner.lock();
+            resolved = self.resolve_child_id(&inner, parent, id)?;
+            let id = resolved.as_str();
             let record = self.child(&inner, parent, id)?;
             if fenced(&record.branch.state) || record.stopping {
                 return Err("Child is already being stopped or reclaimed".into());
@@ -3664,6 +4221,7 @@ impl LeaderManager {
             }
             inner.branches.get_mut(id).ok_or("Unknown branch")?.stopping = true;
         }
+        let id = resolved.as_str();
         let retirement = match self.stop_runs(&[id.into()]).await {
             Ok(()) => self.wait_retired(&[id.into()]).await,
             Err(error) => Err(error),
@@ -3683,7 +4241,7 @@ impl LeaderManager {
         let mut inner = self.inner.lock();
         let record = inner.branches.get_mut(id).ok_or("Unknown branch")?;
         record.branch.state = "stopped".into();
-        record.branch.updated_at = (self.clock)();
+        record.branch.updated_at = (self.clock)().max(record.branch.updated_at.saturating_add(1));
         record.stopping = false;
         self.save(record)?;
         let result = record.branch.clone();
@@ -3837,7 +4395,7 @@ impl LeaderManager {
                     .get(&key(root))
                     .ok_or("Archived Leader group is missing")?;
                 if !inner.deleting_groups.contains(&key(root))
-                    || !group.branch_ids.iter().any(|candidate| candidate == id)
+                    || !archive::owned_branch_ids(&inner, group).iter().any(|candidate| candidate == id)
                 {
                     return Err("Branch deletion is not owned by this whole-group action".into());
                 }
@@ -3859,8 +4417,15 @@ impl LeaderManager {
                     .archived_groups
                     .get(&key(root))
                     .ok_or("Archived Leader group is missing")?;
-                if ids.iter().any(|id| !group.branch_ids.contains(id)) {
+                if ids.iter().any(|id| !archive::owned_branch_ids(&inner, group).contains(id)) {
                     return Err("Descendant deletion escapes this archived Leader group".into());
+                }
+            } else {
+                // A separately archived descendant is user-retained history;
+                // only its own restore or deletion may change it.
+                for id in &ids {
+                    let branch = &inner.branches.get(id).ok_or("Subtree branch is missing")?.branch;
+                    archive::ensure_available(&inner, &branch.engine, branch.session_id.as_deref().unwrap_or_default(), Some(id))?;
                 }
             }
             if ids.iter().any(|id| {
@@ -4095,24 +4660,9 @@ pub async fn dispatch(
                 }
             };
             manager.emit();
-            let workspace = manager.inner.lock().branches.get(&id)
-                .ok_or("Reserved child is missing")?.branch.workspace_path.clone();
-            let result = crate::engine::send_message_inner(
-                state,
-                args.engine,
-                workspace,
-                None,
-                args.task,
-                None,
-                model,
-                effort,
-                Some(permission),
-                None,
-                Some(run_id.clone()),
-                None,
-                None,
-            )
-            .await;
+            let branch = manager.inner.lock().branches.get(&id)
+                .ok_or("Reserved child is missing")?.branch.clone();
+            let result = launch_assignment(state, branch, permission, &run_id).await;
             // `id` stays in the durable ledger even when launch fails.
             let _ = id;
             manager.acknowledge(&parent, &args.request_id, &run_id, result)
@@ -4132,64 +4682,22 @@ pub async fn dispatch(
                 Reservation::Start(start) => start,
             };
             manager.emit();
-            let result = crate::engine::send_message_inner(
-                state,
-                branch.engine,
-                branch.workspace_path,
-                branch.session_id,
-                args.message,
-                None,
-                branch.model,
-                branch.effort,
-                Some(permission),
-                None,
-                Some(run_id.clone()),
-                None,
-                None,
-            )
-            .await;
+            let result = launch_assignment(state, branch, permission, &run_id).await;
             manager.acknowledge(&parent, &args.request_id, &run_id, result)
         }
         "task_list" => {
+            let args: ListArgs = decode(arguments)?;
             manager.checkpoint()?;
             let inner = manager.inner.lock();
             manager.authorize(&inner, &caller)?;
-            manager.list_response(&inner, &parent)
+            let result = manager.list_response_with_options(&inner, &parent, args.include_task.unwrap_or(false), args.include_result.unwrap_or(false))?;
+            drop(inner);
+            if let Some(views) = result["branches"].as_array() { manager.consume_parent_wakeups(&parent, views)?; }
+            Ok(result)
         }
         "task_wait" => {
             let args: WaitArgs = decode(arguments)?;
-            let deadline = tokio::time::Instant::now()
-                + Duration::from_secs(args.timeout_seconds.unwrap_or(20));
-            let mut start: Option<HashMap<String, Value>> = None;
-            loop {
-                let notified = manager.changed.notified();
-                tokio::pin!(notified);
-                notified.as_mut().enable();
-                manager.checkpoint()?;
-                let (views, news, pending) = {
-                    let inner = manager.inner.lock();
-                    manager.authorize(&inner, &caller)?;
-                    let views = manager.views(&inner, &parent, args.branch_ids.as_deref())?;
-                    let start = start.get_or_insert_with(|| {
-                        views
-                            .iter()
-                            .map(|v| {
-                                let id = v.get("id").and_then(Value::as_str).unwrap_or_default();
-                                (id.to_string(), wait_mark(v).1)
-                            })
-                            .collect()
-                    });
-                    let (news, pending) = wait_news(start, &views);
-                    (views, news, pending)
-                };
-                if !news.is_empty() || !pending || tokio::time::Instant::now() >= deadline {
-                    let timed_out = news.is_empty() && pending;
-                    return Ok(
-                        json!({"branches":views,"changedBranchIds":news,"timedOut":timed_out}),
-                    );
-                }
-                tokio::select! {_=notified=>{},_=tokio::time::sleep_until(deadline)=>{}}
-            }
+            manager.wait_for_children(&caller, &parent, &args).await
         }
         "task_renew" => {
             let args: RenewArgs = decode(arguments)?;

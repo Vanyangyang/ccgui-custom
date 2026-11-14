@@ -32,7 +32,13 @@ export const CHANGELOG_DATA: ChangelogEntry[] = [
     version: "1.1.1+protected.35",
     date: "2026-10-21",
     content: {
-      zh: `源码同步（2026-10-26）
+      zh: `源码同步（2026-11-14）
+- 通用插件 SDK 更新至 0.3.56，包含受管任务交接、独立窗口增量传输、记忆审阅及对应开发文档。
+- 同步运行恢复、任务协作、CLI 扩展管理、AGY ACP、额度与会话交互的累计源码改动。
+- 移除 AGY 手动上下文窗口与固定自动压缩阈值覆盖；继续读取引擎实际提供的上下文信息。
+- 当前源码采用 V4 持久化契约。从 V1/V2/V3 升级须结束任务、退出全部实例并使用由目标源码重新构建和验证的完整安装包，不能绕过兼容检查。此次源码同步未发布新安装包或 tag；原始 protected.35/V2 安装包不代表当前 main。详见 docs/custom-maintenance.zh-CN.md。
+
+源码同步（2026-10-26）
 - 通用插件 SDK 更新至 0.3.28：项目视图、独立窗口、原生任务与讨论会话、图片附件、固定指令、受限记忆提炼及更新前服务关闭协议。
 - 改善跨工作区任务与会话归属、通信队列、上下文/额度展示、终端进程回收和更新检查点恢复。
 - 本次仅同步宿主与通用 SDK 源码，不包含游戏工作台插件、素材或专属验收脚本，也不创建新的安装包或 tag。已有安装包以各自构建记录和校验值为准，不能作为本次全部源码的二进制证明。详见 docs/releases/main-2026-10-26.md。
@@ -47,7 +53,13 @@ V3 构建与升级提示
 - **图片工具与通信面板**：会话图库支持切换、缩放、旋转、复制和保存；通信面板增加状态/类型筛选与紧凑/详细视图，保留图片批注与失败反馈。
 - **会话可靠性与模型范围**：完善草稿交接、队列控制、Claude/AGY 用量恢复和缓存证据；Cursor 请求遵守已保存的允许模型名单。子任务按实际启动时的模型策略校验。
 - **发行对应关系**：原始安装包对应 GitHub 提交 28dfbbda1，SHA-256 为 ae912a6b180c82627b691d56f2307712a97587b16e082f43417a7105c46d4fc8。本条版本记录为构建后的补记，原始安装包内未包含本条；详见仓库 docs/releases/1.1.1+protected.35.md。`,
-      en: `Source synchronization (2026-10-26)
+      en: `Source synchronization (2026-11-14)
+- Update the general plugin SDK to 0.3.56, including managed task handoff, incremental detached-window transport, memory review and developer documentation.
+- Synchronize accumulated source changes for runtime recovery, task coordination, CLI extension management, AGY ACP, quotas and conversation interactions.
+- Remove manual AGY context-window settings and the fixed auto-compaction threshold override; keep context information actually reported by the engine.
+- Current source uses the V4 persistence contract. Upgrading from V1/V2/V3 requires finishing tasks, exiting every instance and using a complete installer freshly built and verified from the intended source, without bypassing compatibility checks. This source synchronization publishes no new installer or tag; the original protected.35/V2 installer does not represent current main. See docs/custom-maintenance.zh-CN.md.
+
+Source synchronization (2026-10-26)
 - Update the general plugin SDK to 0.3.28: project views, detached windows, native tasks and discussion conversations, image attachments, fixed instructions, bounded memory extraction and service shutdown before updates.
 - Improve cross-workspace task and session ownership, communication queues, context/quota presentation, terminal process cleanup and update checkpoint recovery.
 - This synchronization contains host and general SDK source only. It excludes the game workbench plugin, assets and dedicated acceptance scripts, and creates no new installer or tag. Existing installers retain their own build records and checksums and do not prove that they contain every change in this source update. See docs/releases/main-2026-10-26.md.

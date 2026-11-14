@@ -68,6 +68,7 @@ let container: HTMLDivElement;
 let root: Root;
 let captured: AiChatRepo[];
 let sidebar: ReturnType<typeof useChatSidebar>;
+const setDialog = vi.fn();
 
 function Harness() {
   const streaming = useChatStore((s) => s.streamingByKey["codex/s-1"] === true);
@@ -78,7 +79,7 @@ function Harness() {
     threadRetrying: [retrying],
     collapseSidebarOnMobile: () => {},
     composerInputRef: { current: null },
-    setDialog: () => {},
+    setDialog,
   });
   captured = sidebar.repos;
   return null;
@@ -92,6 +93,7 @@ describe("useChatSidebar repo mapping", () => {
     expect(captured[0].threads[0].auxiliaryKind).toBeUndefined();
   });
   beforeEach(async () => {
+    setDialog.mockClear();
     useProjectsStore.setState({ projects: [], loaded: true, error: null });
     useChatStore.setState({
       workspaces: [WS],
@@ -144,7 +146,7 @@ describe("useChatSidebar repo mapping", () => {
     } finally { await act(async () => useChatStore.setState({ selectSession: originalSelect })); }
   });
 
-  it("project organization retains other workspaces and new chat follows the active workspace", async () => {
+  it("new chat offers workspace selection with the active workspace preferred without creating a draft", async () => {
     const originalStart = useChatStore.getState().startNewChat;
     const start = vi.fn();
     const other = { ...WS, id: "w2", path: "/ws/b", name: "b" };
@@ -159,8 +161,11 @@ describe("useChatSidebar repo mapping", () => {
       expect(sidebar.sections?.[0]).toMatchObject({ name: "My project", repos: [{ label: "Custom name" }] });
       expect(sidebar.sections?.[1].repos[0].id).toBe("w2");
       await act(async () => sidebar.handleNewSession());
-      expect(start).toHaveBeenCalledExactlyOnceWith(other.path);
+      expect(setDialog).toHaveBeenCalledExactlyOnceWith({ kind: "newSession", workspaceId: other.id });
+      expect(start).not.toHaveBeenCalled();
       expect(useChatStore.getState().active?.sessionId).toBe("other-chat");
+      await act(async () => sidebar.handleNewSessionInWorkspace(WS.id));
+      expect(start).toHaveBeenCalledExactlyOnceWith(WS.path);
     } finally { await act(async () => useChatStore.setState({ startNewChat: originalStart })); }
   });
 
@@ -180,6 +185,21 @@ describe("useChatSidebar repo mapping", () => {
       "codex/s-1",
     ]);
     expect(captured[0]?.path).toBe(workspacePath);
+  });
+
+  it("marks unavailable project worktrees in the nested workspace picker data", async () => {
+    const worktree = { ...WS, id: "unavailable-wt", path: "/ws/a-feature", parentId: WS.id };
+    await act(async () => {
+      useChatStore.setState({ workspaces: [WS, worktree] });
+      useProjectsStore.setState({ projects: [{ id: "p", name: "Project", defaultPath: WS.path, members: [
+        { id: "root", path: WS.path, label: "Root", role: "development", status: "available" },
+        { id: "wt", path: worktree.path, label: "Feature", role: "development", status: "missing" },
+      ] }] });
+    });
+    expect(sidebar.repos[0].worktrees?.[0].unavailable).toBe("missing");
+    expect(sidebar.sections?.[0].repos[0].worktrees?.[0].unavailable).toBe("missing");
+    await act(async () => useProjectsStore.setState({ projects: [] }));
+    expect(sidebar.repos[0].worktrees?.[0].unavailable).toBeUndefined();
   });
 
   it("shows sessions and drafts without an override across drive-case and trailing-slash aliases", async () => {
@@ -422,6 +442,28 @@ describe("会话入口切回对话中心面", () => {
     });
     expectOnlyChatLeft();
     expect(useChatStore.getState().active).toMatchObject({ sessionId: null, workspacePath: "/ws/a" });
+  });
+
+  it("多个工作区先选择，选中 worktree 后才切换中心面，归档后的旧选项不再启动", async () => {
+    const worktree = { ...WS, id: "wt", path: "/ws/a-feature", parentId: WS.id };
+    setDialog.mockClear();
+    await act(async () => useChatStore.setState({ workspaces: [WS, worktree] }));
+    await act(async () => sidebar.handleNewSession());
+    expect(setDialog).toHaveBeenCalledExactlyOnceWith({ kind: "newSession", workspaceId: WS.id });
+    expect(useChatStore.getState().active).toBeNull();
+    expect(usePluginHubStore.getState().active).toBe(true);
+    expect(usePluginTabsStore.getState().activeId).toBe("plugin:demo:main");
+    await act(async () => sidebar.handleNewSessionInWorkspace(worktree.id));
+    expectOnlyChatLeft();
+    expect(useChatStore.getState().active).toMatchObject({ sessionId: null, workspacePath: worktree.path });
+
+    await act(async () => useChatStore.setState({ archivedWorkspaces: [worktree.id], active: null }));
+    await act(async () => sidebar.handleNewSessionInWorkspace(worktree.id));
+    expect(useChatStore.getState().active).toBeNull();
+    setDialog.mockClear();
+    await act(async () => sidebar.handleNewSession());
+    expect(setDialog).not.toHaveBeenCalled();
+    expect(useChatStore.getState().active).toMatchObject({ workspacePath: WS.path });
   });
 
   it("点击会话线程切回对话（草稿态走 focusTab）", async () => {

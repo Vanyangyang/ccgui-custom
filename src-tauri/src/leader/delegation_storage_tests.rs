@@ -2,6 +2,30 @@ use super::*;
 
 const META: &str = "$ccguiDelegation";
 
+#[test]
+#[cfg(windows)]
+fn delegation_storage_drive_case_matching_preserves_legacy_receipt_fingerprints() {
+    let f = fixture_with_workspace(Arc::new(|_, _, _| Ok(())), "claude", "g:\\repo");
+    let (id, run) = spawn(&f, "legacy-drive-case");
+    settle(&f, &id, &run, "legacy-drive-child");
+    let raw = raw_request(&f, "legacy-drive-case");
+    let request: Request = serde_json::from_value(raw.clone()).unwrap();
+    // This is the pre-drive-folding on-disk identity: lower-case drive retained.
+    let historical_identity = arguments_fingerprint(&json!([
+        ["claude", "parent-session", "g:/repo"], "legacy-drive-case", "task_spawn", id,
+        request.arguments_fingerprint,
+    ])).unwrap();
+    assert_eq!(raw["response"]["branch"][META]["requestIdentity"], historical_identity);
+    assert_eq!(key(&f.parent).2, "G:/repo");
+    let recovered = reload(&f);
+    assert_eq!(recovered.inner.lock().branches[&id].branch.delegation.as_ref().unwrap().state, "completed");
+    let upper_parent = identity("claude", "parent-session", "G:/repo");
+    let response = recovered.replay(&recovered.inner.lock(), &upper_parent, "legacy-drive-case", "task_spawn",
+        &encoded(&args("legacy-drive-case")).unwrap()).unwrap();
+    assert!(response.is_some());
+    assert_eq!(recovered.parent_wakeups().unwrap().len(), 1);
+}
+
 fn raw_branch(f: &Fixture, id: &str) -> Value {
     let raw: String = f
         .manager
@@ -255,6 +279,7 @@ fn delegation_storage_v2_manual_chat_preserves_result_but_new_request_invalidate
         if new_dispatch {
             native["task"] = json!("A new parent assignment");
             let args = SendArgs {
+                images: Vec::new(),
                 branch_id: id.clone(),
                 request_id: "v2-next".into(),
                 message: "A new parent assignment".into(),
@@ -330,6 +355,7 @@ fn delegation_storage_invalid_metadata_cannot_promote_cached_manual_completion_e
         );
         hot_send_cache(&f, &id);
         let send = SendArgs {
+            images: Vec::new(),
             branch_id: id.clone(),
             request_id: "next".into(),
             message: "Next assignment".into(),
@@ -413,6 +439,7 @@ fn delegation_storage_branch_and_receipt_commit_atomically_with_or_without_outer
         CREATE TRIGGER reject_branch BEFORE UPDATE ON leader_branches BEGIN SELECT RAISE(ABORT,'branch persistence failure'); END;").unwrap();
     hot_send_cache(&f, &id);
     let send = SendArgs {
+        images: Vec::new(),
         branch_id: id.clone(),
         request_id: "not-committed".into(),
         message: "Never started".into(),

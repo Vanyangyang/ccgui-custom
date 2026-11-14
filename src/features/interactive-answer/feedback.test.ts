@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it } from "vitest";
 import { answerOriginMatches, parameterFeedback } from "./feedback";
 const identity = (key: string) => JSON.stringify([JSON.stringify([key, 42]), 100]);

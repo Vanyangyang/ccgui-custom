@@ -28,7 +28,8 @@ export function getDefaultEffort(engineId: string): EffortLevel {
   return engineId === "claude" ? "xhigh" : "medium";
 }
 
-/** Older Claude selections used ultra for the highest effort stop; AGY models only support low/medium/high. */
+/** Older Claude selections used ultra for the highest effort stop; independent
+ * AGY effort keeps three stops. Catalog-encoded tiers are read from model IDs. */
 export function normalizeEffortLevel<T extends string | null | undefined>(
   engineId: string,
   effort: T,

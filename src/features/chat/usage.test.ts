@@ -1,5 +1,6 @@
+// @vitest-environment node
 import { describe, expect, it } from "vitest";
-import { cursorContextOccupancyKnown, latestMessageUsage, mergeUsage, parseUsage, reportedContextWindow, selectCursorContext } from "./usage";
+import { cursorContextOccupancyKnown, hasAcpContextUsage, latestMessageUsage, mergeUsage, parseUsage, reportedContextWindow, selectCursorContext, staleAcpContextUsage } from "./usage";
 import { usageBreakdown } from "./components/usage-breakdown";
 
 describe("cursor context occupancy", () => {
@@ -115,6 +116,80 @@ describe("parseUsage", () => {
 });
 
 describe("mergeUsage", () => {
+  it("preserves billing and fresh priority when a context-only DB or stale ACP snapshot arrives", () => {
+    const fresh = {
+      input_tokens: 100, output_tokens: 20,
+      context_usage_kind: "current_context", context_usage_source: "acp_usage_update",
+      context_usage: { input_tokens: 40_000, output_tokens: 0 }, model_context_window: 1_000_000,
+    };
+    const db = { context_usage_kind: "current_context", context_usage: { input_tokens: 90_000, output_tokens: 0 }, model_context_window: 200_000 };
+    const merged = mergeUsage(db, fresh);
+    expect(parseUsage(merged)?.total).toBe(120);
+    expect(merged).toMatchObject(fresh);
+    const stale = staleAcpContextUsage({ ...fresh, context_usage: { input_tokens: 10_000, output_tokens: 0 } });
+    const retained = mergeUsage(stale, fresh);
+    expect(retained).not.toHaveProperty("context_usage_stale");
+    expect(mergeUsage(db, retained)).toMatchObject(fresh);
+    expect(parseUsage(mergeUsage(db, retained))?.total).toBe(120);
+    const placeholder = { input_tokens: 0, output_tokens: 0, total_tokens: 0 };
+    expect(parseUsage(mergeUsage(placeholder, fresh))?.total).toBe(120);
+    const emptyOfficial = { ...fresh, ...placeholder, context_usage: { input_tokens: 0, output_tokens: 0 } };
+    const emptied = mergeUsage(emptyOfficial, retained);
+    expect(parseUsage(emptied)?.total).toBe(120);
+    expect(emptied).toMatchObject({ context_usage: { input_tokens: 0, output_tokens: 0 } });
+  });
+
+  it("retires ACP priority at a turn boundary until a new official snapshot arrives", () => {
+    const official = {
+      context_usage_kind: "current_context", context_usage_source: "acp_usage_update",
+      context_usage: { input_tokens: 40_000, output_tokens: 0 }, model_context_window: 1_000_000,
+    };
+    const stale = staleAcpContextUsage(official);
+    expect(stale).toMatchObject({ ...official, context_usage_stale: true });
+    const billed = mergeUsage({ input_tokens: 100, output_tokens: 20 }, stale);
+    expect(billed).toMatchObject({ ...official, context_usage_stale: true, input_tokens: 100 });
+    for (const kind of ["current_context", "last_prompt"]) {
+      const fallback = { context_usage_kind: kind, context_usage: { input_tokens: 500, output_tokens: 10 } };
+      expect(mergeUsage(fallback, billed)).toEqual(fallback);
+      const empty = { context_usage_kind: kind, context_usage: { input_tokens: 0, output_tokens: 0 } };
+      expect(mergeUsage(empty, billed)).toEqual(empty);
+    }
+    const fresh = mergeUsage(official, billed);
+    expect(fresh).not.toHaveProperty("context_usage_stale");
+    expect(mergeUsage({ context_usage_kind: "last_prompt", context_usage: { input_tokens: 900 } }, fresh))
+      .toMatchObject(official);
+  });
+
+  it("requires a positive safe integer window before granting ACP snapshot priority", () => {
+    const snapshot = {
+      context_usage_kind: "current_context", context_usage_source: "acp_usage_update",
+      context_usage: { input_tokens: 0, output_tokens: 0 }, model_context_window: 1_000_000,
+    };
+    expect(hasAcpContextUsage(snapshot)).toBe(true);
+    for (const window of [undefined, null, "1000000", 0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(hasAcpContextUsage({ ...snapshot, model_context_window: window })).toBe(false);
+    }
+  });
+
+  it("keeps official AGY snapshots separate from billing and accepts compaction to zero", () => {
+    const official = (used: number) => ({
+      context_usage_kind: "current_context", context_usage_source: "acp_usage_update",
+      context_usage: { input_tokens: used, output_tokens: 0 }, model_context_window: 1_000_000,
+    });
+    const first = mergeUsage(official(100_000), { input_tokens: 500, output_tokens: 20 });
+    expect(parseUsage(first)).toMatchObject({ input: 500, output: 20 });
+    const compacted = mergeUsage(official(0), first);
+    expect(compacted).toMatchObject({ ...official(0), input_tokens: 500, output_tokens: 20 });
+    for (const fallback of [
+      { input_tokens: 800, output_tokens: 50 },
+      { input_tokens: 800, context_usage_kind: "current_context", context_usage: { input_tokens: 90_000 }, model_context_window: 200_000 },
+      { input_tokens: 0, model_context_window: 200_000 },
+    ]) {
+      expect(mergeUsage(fallback, compacted)).toMatchObject(official(0));
+    }
+    expect(parseUsage(official(100_000))).toBeNull();
+  });
+
   it("keeps a previously reported context window", () => {
     const merged = mergeUsage(
       { input_tokens: 10, output_tokens: 2, total_tokens: 12 },

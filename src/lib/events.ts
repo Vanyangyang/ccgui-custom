@@ -63,7 +63,15 @@ export interface EngineEventPayload {
    *  timing. Since SDK 0.3.15. */
   genMs?: number;
   /** Native-owned branch identity; never inferred from foreground UI state. */
-  leader?: { branchId: string; workspacePath: string; title: string; assignment?: string; reclaimed?: boolean; identityRejected?: boolean };
+  leader?: {
+    branchId: string;
+    workspacePath: string;
+    title: string;
+    assignment?: string;
+    assignmentSource?: { engine: string; sessionId: string; workspacePath: string };
+    reclaimed?: boolean;
+    identityRejected?: boolean;
+  };
 }
 
 /** Batched engine events arrive as an array under a single event name. */

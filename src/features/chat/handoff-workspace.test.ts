@@ -23,6 +23,7 @@ function deferred<T>() {
 }
 beforeEach(() => {
   vi.spyOn(ipc, "taskSnapshot").mockResolvedValue({ leaders: [], branches: [] });
+  vi.spyOn(ipc, "handoffFullHistorySupported").mockResolvedValue(true);
   localStorage.removeItem(HANDOFF_PREFERENCES_KEY);
   useHandoffStore.setState({ byWorkspace: {} });
   useSidechatStore.setState({ btwBySession: {}, sidechatBySession: {} });
@@ -121,12 +122,13 @@ describe("handoff workspace migration", () => {
     const summary = deferred<string>();
     const summarize = vi.spyOn(ipc, "summarizeSessionHandoff").mockReturnValue(summary.promise);
     useHandoffStore.getState().startHandoff({ ...args, initialMode: "grok" });
-    await Promise.resolve(); // Move an already-started model request.
+    await vi.waitFor(() => expect(summarize).toHaveBeenCalledOnce()); // Move an already-started model request.
     expect(move()).toBe(true);
     useHandoffStore.getState().startHandoff({ ...args, sourceSessionId: "successor" });
     const successorDraft = draft(source);
     summary.resolve("compressed result");
     await summary.promise;
+    await vi.waitFor(() => expect(useHandoffStore.getState().byWorkspace[target].compressionRunning).toBe(false));
     expect(summarize).toHaveBeenCalledTimes(1);
     expect(draft()).toContain("compressed result");
     expect(draft()).toContain("【交接目录说明】");

@@ -605,16 +605,14 @@ fn upgrade_executable_variant(path: PathBuf) -> PathBuf {
     }
 }
 
-/// The (program, leading args) a batch wrapper needs, or None for binaries
-/// CreateProcess can launch directly. Test-gated so the mapping is exercised
-/// on every platform.
+/// The (program, leading args) PowerShell scripts need. Batch files must be
+/// passed directly to Command so Rust applies its cmd.exe-specific escaping.
+/// Test-gated so the mapping is exercised on every platform.
 #[cfg(any(windows, test))]
 fn windows_wrapper(bin: &str) -> Option<(&'static str, Vec<String>)> {
     let trimmed = bin.trim();
     let lower = trimmed.to_ascii_lowercase();
-    if lower.ends_with(".cmd") || lower.ends_with(".bat") {
-        Some(("cmd", vec!["/c".to_string(), trimmed.to_string()]))
-    } else if lower.ends_with(".ps1") {
+    if lower.ends_with(".ps1") {
         Some((
             "powershell",
             vec![
@@ -630,9 +628,10 @@ fn windows_wrapper(bin: &str) -> Option<(&'static str, Vec<String>)> {
     }
 }
 
-/// A spawnable command for `bin`. On Windows, `.cmd`/`.bat` wrappers run via
-/// `cmd /c` and `.ps1` via `powershell -File`; everything else (and all of
-/// Unix) spawns directly. Args are appended by the caller afterwards.
+/// A spawnable command for `bin`. On Windows, Rust handles `.cmd`/`.bat`
+/// escaping (and rejects arguments such as newlines that it cannot escape);
+/// explicitly invoking `cmd /c` would bypass that protection. `.ps1` still
+/// uses `powershell -File`. Args are appended by the caller afterwards.
 pub(crate) fn command_for_binary(bin: &str) -> Command {
     #[cfg(feature = "test-harness")]
     let fixture_binary = crate::test_harness::launchable_binary(bin).map(strip_verbatim);
@@ -658,6 +657,11 @@ pub(crate) fn command_for_binary(bin: &str) -> Command {
         cmd.env_remove(super::NATIVE_COMPLETION_OWNER);
         return cmd;
     }
+    #[cfg(windows)]
+    let bin = match Path::new(bin.trim()).extension().and_then(|ext| ext.to_str()) {
+        Some(ext) if ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat") => bin.trim(),
+        _ => bin,
+    };
     #[allow(unused_mut)]
     let mut command = Command::new(bin);
     #[cfg(feature = "test-harness")]
@@ -1071,14 +1075,9 @@ mod tests {
     }
 
     #[test]
-    fn windows_wrapper_maps_batch_and_ps1() {
-        let (program, leading) = windows_wrapper(r"C:\npm\claude.cmd").unwrap();
-        assert_eq!(program, "cmd");
-        assert_eq!(leading, vec!["/c", r"C:\npm\claude.cmd"]);
-
-        let (program, leading) = windows_wrapper(r"C:\npm\claude.BAT").unwrap();
-        assert_eq!(program, "cmd");
-        assert_eq!(leading[0], "/c");
+    fn windows_wrapper_leaves_batch_escaping_to_rust_and_maps_ps1() {
+        assert!(windows_wrapper(r"C:\npm\claude.cmd").is_none());
+        assert!(windows_wrapper(r"C:\npm\claude.BAT").is_none());
 
         let (program, leading) = windows_wrapper(r"C:\npm\claude.ps1").unwrap();
         assert_eq!(program, "powershell");
@@ -1095,6 +1094,65 @@ mod tests {
 
         assert!(windows_wrapper(r"C:\npm\claude.exe").is_none());
         assert!(windows_wrapper("/usr/local/bin/claude").is_none());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_batch_arguments_round_trip_or_fail_before_execution() {
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let node = which::which("node.exe").expect("Node is required for the argv fixture");
+        let fixture = Fixture(std::env::temp_dir().join(format!(
+            "ccgui batch argv {}", uuid::Uuid::new_v4()
+        )));
+        std::fs::create_dir_all(&fixture.0).unwrap();
+        std::fs::write(
+            fixture.0.join("argv.cjs"),
+            "console.log(JSON.stringify(process.argv.slice(2)));",
+        ).unwrap();
+        let marker = fixture.0.join("executed.txt");
+        let arguments = [
+            "", "plain", "hello world", "say \"hello\"", "trailing\\",
+            "space and trailing\\", "%CCGUI_ARGV_FAKE_VALUE%", "!CCGUI_ARGV_FAKE_VALUE!",
+            "a&b|c<d>e^f(g)", "x\"&echo CCGUI_EXTRA_COMMAND&rem \"", "中文😀",
+        ];
+        for extension in ["cmd", "BAT"] {
+            let batch = fixture.0.join(format!("argv.{extension}"));
+            std::fs::write(&batch, concat!(
+                "@echo off\r\n",
+                ">\"%~dp0executed.txt\" echo executed\r\n",
+                "\"%CCGUI_ARGV_NODE%\" \"%~dp0argv.cjs\" %*\r\n",
+            )).unwrap();
+            let make_command = || {
+                let mut command = command_for_binary(batch.to_str().unwrap());
+                command.env_clear()
+                    .env("SystemRoot", std::env::var_os("SystemRoot").unwrap())
+                    .env("CCGUI_ARGV_NODE", &node)
+                    .env("CCGUI_ARGV_FAKE_VALUE", "EXPANDED_TEST_VALUE")
+                    .creation_flags(0x08000000);
+                command
+            };
+            for argument in arguments {
+                let output = make_command().args(["--print", argument]).output().await.unwrap();
+                assert!(output.status.success(), "{extension}: {argument:?}");
+                assert!(output.stderr.is_empty(), "{extension}: {argument:?}");
+                // Parsing the entire stdout also rejects any extra command output.
+                let actual: Vec<String> = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(actual, ["--print", argument], "{extension}");
+                assert!(marker.exists());
+                std::fs::remove_file(&marker).unwrap();
+            }
+            for argument in ["first\nsecond", "first\r\nsecond", "first\n&echo CCGUI_EXTRA_COMMAND"] {
+                let error = make_command().args(["--print", argument]).output().await.unwrap_err();
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+                assert!(!marker.exists(), "invalid input must not execute the batch file");
+            }
+        }
     }
 
     #[test]

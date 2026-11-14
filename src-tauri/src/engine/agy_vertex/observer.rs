@@ -1,6 +1,6 @@
 //! Fixed Vertex inference for built-in observer tickets. No agent, tools, history or
 //! fallback provider is started. The caller owns ticket cancellation/expiry.
-use super::{http_client, load_target, vertex_url, DEFAULT_MODEL};
+use super::{http_client, load_target, vertex_url};
 use crate::engine::side_call::SideCallError;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
@@ -120,7 +120,7 @@ pub(crate) fn parse_decision(value: &Value) -> Result<Option<Value>, SideCallErr
 pub(crate) fn configuration_fingerprint() -> Option<[u8; 32]> {
     use sha2::{Digest, Sha256};
     let target = load_target().ok()?;
-    if target.model != DEFAULT_MODEL {
+    if !super::is_known_vertex_model(&target.model) {
         return None;
     }
     let bytes = serde_json::to_vec(&(
@@ -182,7 +182,7 @@ async fn request(
 pub(crate) async fn generate(brief: &Value) -> Result<Option<Value>, SideCallError> {
     let body = request_body(brief)?;
     let target = load_target().map_err(|_| SideCallError::Unavailable)?;
-    if target.model != DEFAULT_MODEL {
+    if !super::is_known_vertex_model(&target.model) {
         return Err(SideCallError::Unavailable);
     }
     let client = http_client().map_err(|_| SideCallError::Unavailable)?;

@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it } from "vitest";
 import { initialSideRunProgress, reduceSideRunProgress, type SideRunProgress } from "./progress";
 

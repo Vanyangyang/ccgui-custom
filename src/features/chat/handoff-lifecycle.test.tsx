@@ -26,6 +26,8 @@ function draft() { return useChatStore.getState().drafts[key]; }
 
 beforeEach(() => {
   vi.spyOn(ipc, "taskSnapshot").mockResolvedValue({ leaders: [], branches: [] });
+  vi.spyOn(ipc, "handoffFullHistorySupported").mockResolvedValue(true);
+  vi.spyOn(ipc, "cancelSessionHandoff").mockResolvedValue(true);
   localStorage.removeItem(HANDOFF_PREFERENCES_KEY);
   useHandoffStore.setState({ byWorkspace: {} });
   useChatStore.setState({ ...original, activeEngine: "codex", active: null, openTabs: [], drafts: {}, sessions: [], archivedSessionKeys: {}, streamingByKey: {} });
@@ -58,11 +60,12 @@ describe("handoff lifecycle ownership", () => {
     const summary = deferred<string>();
     vi.spyOn(ipc, "summarizeSessionHandoff").mockReturnValue(summary.promise);
     useHandoffStore.getState().startHandoff(args);
-    await Promise.resolve(); // Let the child snapshot start the model request.
+    await vi.waitFor(() => expect(ipc.summarizeSessionHandoff).toHaveBeenCalledOnce());
     const edited = draft().replace("original conclusion", "用户手工核实的结论，不可覆盖");
     useChatStore.getState().setDraft(key, edited);
     summary.resolve("background generated summary");
     await summary.promise;
+    await vi.waitFor(() => expect(useHandoffStore.getState().byWorkspace[workspacePath].compressionRunning).toBe(false));
     expect(draft()).toBe(edited);
     expect(useHandoffStore.getState().byWorkspace[workspacePath].grokStatus).toBe("done");
   });
@@ -87,21 +90,35 @@ describe("handoff lifecycle ownership", () => {
     history.resolve({ messages: state.messages } as Awaited<ReturnType<typeof ipc.loadSessionPage>>);
     await history.promise;
     expect(draft()).toContain("original conclusion");
+    await vi.waitFor(() => expect(ipc.summarizeSessionHandoff).toHaveBeenCalledOnce());
     if (manualEdit) useChatStore.getState().setDraft(key, draft().replace("original conclusion", "历史读入后的人工修改"));
     summary.resolve("new Grok summary");
     await summary.promise;
+    await vi.waitFor(() => expect(useHandoffStore.getState().byWorkspace[workspacePath].compressionRunning).toBe(false));
     expect(draft()).toContain(manualEdit ? "历史读入后的人工修改" : "new Grok summary");
     expect(useHandoffStore.getState().byWorkspace[workspacePath].grokStatus).toBe("done");
   });
 
-  it("ignores superseded Grok replies and errors, and keeps the selected local mode", async () => {
+  it.each([false, true])("ignores a superseded Grok result (failure=%s), keeps local mode, and permits a later request", async (failure) => {
     const first = deferred<string>(); const second = deferred<string>();
     vi.spyOn(ipc, "summarizeSessionHandoff").mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
     useHandoffStore.getState().startHandoff(args);
-    await Promise.resolve();
+    await vi.waitFor(() => expect(ipc.summarizeSessionHandoff).toHaveBeenCalledOnce());
     useHandoffStore.getState().retryGrok(workspacePath);
+    expect(ipc.summarizeSessionHandoff).toHaveBeenCalledOnce(); // The source remains single-flight.
+    useHandoffStore.getState().setCompressionMode(workspacePath, "local");
+    expect(ipc.cancelSessionHandoff).toHaveBeenCalledOnce();
+    if (failure) first.reject(new Error("stale failure"));
+    else first.resolve("stale summary");
+    await first.promise.catch(() => {});
+    await vi.waitFor(() => expect(useHandoffStore.getState().byWorkspace[workspacePath].compressionRunning).toBe(false));
+    expect(useHandoffStore.getState().byWorkspace[workspacePath]).toMatchObject({ mode: "local", grokStatus: "idle", grokError: null });
+    expect(draft()).toContain("original conclusion");
+    expect(draft()).not.toContain("stale summary");
+    useHandoffStore.getState().setCompressionMode(workspacePath, "grok");
+    await vi.waitFor(() => expect(ipc.summarizeSessionHandoff).toHaveBeenCalledTimes(2));
     second.resolve("latest summary"); await second.promise;
-    first.reject(new Error("stale failure")); await first.promise.catch(() => {});
+    await vi.waitFor(() => expect(useHandoffStore.getState().byWorkspace[workspacePath].compressionRunning).toBe(false));
     expect(useHandoffStore.getState().byWorkspace[workspacePath].grokStatus).toBe("done");
     expect(draft()).toContain("latest summary");
     useHandoffStore.getState().setCompressionMode(workspacePath, "local");
@@ -112,13 +129,13 @@ describe("handoff lifecycle ownership", () => {
     const first = deferred<string>(); const second = deferred<string>();
     vi.spyOn(ipc, "summarizeSessionHandoff").mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
     useHandoffStore.getState().startHandoff(args);
-    await Promise.resolve();
+    await vi.waitFor(() => expect(ipc.summarizeSessionHandoff).toHaveBeenCalledOnce());
     const before = draft();
     useHandoffStore.getState().dismissHandoff(workspacePath);
     first.resolve("dismissed result"); await first.promise;
     expect(draft()).toBe(before);
     useHandoffStore.getState().startHandoff(args);
-    await Promise.resolve();
+    await vi.waitFor(() => expect(ipc.summarizeSessionHandoff).toHaveBeenCalledTimes(2));
     const entry = useHandoffStore.getState().byWorkspace[workspacePath];
     useHandoffStore.getState().setSending(workspacePath, entry.id, true);
     useHandoffStore.getState().setCompressionMode(workspacePath, "detailed");
@@ -129,6 +146,7 @@ describe("handoff lifecycle ownership", () => {
     const otherKey = sessionKey("claude", null, "/other");
     useChatStore.setState({ activeEngine: "claude", active: { engine: "claude", sessionId: null, workspacePath: "/other" }, drafts: { ...useChatStore.getState().drafts, [otherKey]: "other workspace" } });
     second.resolve("submitted result"); await second.promise;
+    await vi.waitFor(() => expect(useHandoffStore.getState().byWorkspace[workspacePath].compressionRunning).toBe(false));
     expect(draft()).toBe(before + " during send");
     expect(useChatStore.getState().drafts[otherKey]).toBe("other workspace");
   });
@@ -305,9 +323,10 @@ describe("handoff lifecycle ownership", () => {
     expect(draft()).toContain("接下来请继续：继续检查\r\n接下来请继续：不要截断用户后续行");
 
     useHandoffStore.getState().setCompressionMode(workspacePath, "grok");
-    await Promise.resolve();
+    await vi.waitFor(() => expect(ipc.summarizeSessionHandoff).toHaveBeenCalledOnce());
     summary.resolve("- **目标与背景**：二次交接提炼完成");
     await summary.promise;
+    await vi.waitFor(() => expect(useHandoffStore.getState().byWorkspace[workspacePath].compressionRunning).toBe(false));
     expect(draft()).toContain("上一会话交接摘要（模型提炼）：\n> - **目标与背景**：二次交接提炼完成");
     expect(draft()).not.toContain("上一会话最后结论摘要：");
     expect(replaceHandoffDraftSummary(draft(), "")).not.toContain("\n\n\n接下来请继续：");
@@ -328,7 +347,7 @@ describe("handoff lifecycle ownership", () => {
     });
 
     useHandoffStore.getState().startHandoff(args);
-    await Promise.resolve();
+    await vi.waitFor(() => expect(ipc.summarizeSessionHandoff).toHaveBeenCalledOnce());
     // Simulate user clicking "View Source" while Grok distillation is still running
     useChatStore.setState({
       active: { engine: "codex", sessionId: "source-session", workspacePath },
@@ -336,6 +355,7 @@ describe("handoff lifecycle ownership", () => {
 
     summary.resolve("Grok summary while viewing source");
     await summary.promise;
+    await vi.waitFor(() => expect(useHandoffStore.getState().byWorkspace[workspacePath].compressionRunning).toBe(false));
 
     expect(draft()).toContain("Grok summary while viewing source");
     expect(useChatStore.getState().drafts[claudeDraftKey]).toBe("unrelated claude draft");

@@ -51,8 +51,26 @@ fn session_db_in(id: &str, homes: &[PathBuf]) -> Result<Option<PathBuf>, String>
     Ok(found)
 }
 
-fn validate_resume(id: &str, bridged: bool) -> Result<(), String> {
+pub(super) fn validate_resume(id: &str, bridged: bool) -> Result<(), String> {
     validate_resume_in(id, bridged, &session_homes())
+}
+
+/// Resident native ACP (`agy acp --stdio`) handles local Antigravity personal
+/// subscription turns. Vertex-bridged models (`--app_data_dir`), remote WSL
+/// workspaces, and tool-constrained runs stay on their dedicated child paths.
+pub(super) fn acp_turn_requested(req: &SendRequest, wsl: bool) -> bool {
+    if wsl || req.allowed_tools.is_some() {
+        return false;
+    }
+    if std::env::var_os("CCGUI_AGY_DISABLE_ACP")
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    {
+        return false;
+    }
+    !req.model
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(super::agy_vertex::is_bridge_model)
 }
 
 fn validate_resume_in(id: &str, bridged: bool, homes: &[PathBuf; 2]) -> Result<(), String> {
@@ -76,14 +94,43 @@ impl AgyEngine {
     pub fn new() -> Self {
         Self::default()
     }
+
+    fn build_command_with_host_chat_in(
+        &self,
+        req: &SendRequest,
+        bin: &str,
+        server: &Value,
+        staging_parent: &std::path::Path,
+    ) -> Result<BuiltCommand, String> {
+        if req.allowed_tools.is_some() {
+            return Err("Tool-constrained AGY runs cannot mount the host chat capability".into());
+        }
+        // Every launch, including native resume, gets newly materialized rules.
+        let root = stage_host_plugin(staging_parent, Some(server), "")?;
+        let mut request = req.clone();
+        request.additional_dirs.push(root.to_string_lossy().to_string());
+        match self.build_command(&request, bin) {
+            Ok(mut built) => {
+                built.command.env(OWNED_RULES_ROOT, &root);
+                built.cleanup_files.push(root);
+                Ok(built)
+            }
+            Err(error) => { super::cleanup_staged_files(&[root]); Err(error) }
+        }
+    }
 }
 
 const HOST_STAGING: &str = "agy-host-staging";
-const HOST_PLUGIN: &str = ".agents/plugins/ccgui-host";
+pub(super) const HOST_PLUGIN: &str = ".agents/plugins/ccgui-host";
+// Command-local bookkeeping, explicitly reset by every AGY build. Reading
+// get_envs() never trusts an inherited environment variable. Together with the
+// cleanup registration and --add-dir this identifies this build's owned rules;
+// unrelated cleanup paths must never be used as a plugin workspace.
+pub(super) const OWNED_RULES_ROOT: &str = "CCGUI_INTERNAL_AGY_RULES_ROOT";
 
 /// AGY discovers local plugin MCP and rules through --add-dir. Each process
 /// receives a private workspace; no native/global MCP file is ever changed.
-fn stage_host_chat(parent: &std::path::Path, server: &Value) -> Result<PathBuf, String> {
+fn stage_host_plugin(parent: &std::path::Path, server: Option<&Value>, instructions: &str) -> Result<PathBuf, String> {
     if !parent.is_absolute() || parent.ancestors().any(|path|
         std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())) {
         return Err("AGY host staging requires an absolute directory without links".into());
@@ -111,12 +158,15 @@ fn stage_host_chat(parent: &std::path::Path, server: &Value) -> Result<PathBuf, 
     let staged = (|| {
         let plugin = root.join(HOST_PLUGIN);
         std::fs::create_dir_all(plugin.join("rules")).map_err(|_| "Cannot create AGY host plugin")?;
-        let config = serde_json::json!({"mcpServers":{"ccgui":server}});
-        for (path, text) in [
+        let mut files = vec![
             (plugin.join("plugin.json"), "{\"name\":\"ccgui-host\"}".to_string()),
-            (plugin.join("mcp_config.json"), serde_json::to_string(&config).map_err(|_| "Cannot encode AGY host plugin")?),
-            (plugin.join("rules/AGENTS.md"), String::new()),
-        ] {
+            (plugin.join("rules/AGENTS.md"), instructions.to_string()),
+        ];
+        if let Some(server) = server {
+            let config = serde_json::json!({"mcpServers":{"ccgui":server}});
+            files.push((plugin.join("mcp_config.json"), serde_json::to_string(&config).map_err(|_| "Cannot encode AGY host plugin")?));
+        }
+        for (path, text) in files {
             use std::io::Write;
             let mut options = std::fs::OpenOptions::new();
             options.write(true).create_new(true);
@@ -135,15 +185,51 @@ fn stage_host_chat(parent: &std::path::Path, server: &Value) -> Result<PathBuf, 
 }
 
 pub(super) fn append_host_instructions(built: &mut BuiltCommand, instructions: &str) -> Result<(), String> {
+    append_host_instructions_in(built, instructions, &crate::paths::app_home().join(HOST_STAGING))
+}
+
+fn append_host_instructions_in(built: &mut BuiltCommand, instructions: &str, staging_parent: &std::path::Path) -> Result<(), String> {
     if instructions.is_empty() { return Ok(()); }
-    let root = built.cleanup_files.first().ok_or("AGY Leader requires its per-run host plugin")?;
-    let path = root.join(HOST_PLUGIN).join("rules/AGENTS.md");
-    // The plugin exists only for this launch and has not yet been spawned.
-    std::fs::write(path, instructions).map_err(|_| "Cannot write AGY Leader instructions".into())
+    let owned = built.command.as_std().get_envs()
+        .find(|(key, _)| *key == std::ffi::OsStr::new(OWNED_RULES_ROOT))
+        .and_then(|(_, value)| value)
+        .ok_or("AGY instructions require an AGY-owned command")?;
+    if !owned.is_empty() {
+        let root = PathBuf::from(owned);
+        let args: Vec<_> = built.command.as_std().get_args().collect();
+        if !built.cleanup_files.contains(&root)
+            || !args.windows(2).any(|args| args[0] == "--add-dir" && args[1] == root.as_os_str()) {
+            return Err("AGY rules directory is not owned by this launch".into());
+        }
+        let path = root.join(HOST_PLUGIN).join("rules/AGENTS.md");
+        if path.ancestors().take_while(|path| path.starts_with(&root)).any(|path|
+            std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())) {
+            return Err("AGY rules directory must not contain links".into());
+        }
+        // Update only the existing file in this launch's private plugin.
+        use std::io::Write;
+        return std::fs::OpenOptions::new().write(true).truncate(true).open(path)
+            .and_then(|mut file| file.write_all(instructions.as_bytes()))
+            .map_err(|_| "Cannot write AGY host instructions".into());
+    }
+    // Readonly Sidechat intentionally has no host MCP server. Rules carry no
+    // tool grants; do not convert its plan-mode launch into an MCP-enabled run.
+    let args: Vec<_> = built.command.as_std().get_args().collect();
+    if !args.windows(2).any(|args| args == ["--mode", "plan"]) {
+        return Err("AGY instructions without host MCP require a readonly launch".into());
+    }
+    // Materialize all files before publishing either the argument or cleanup
+    // registration. stage_host_plugin removes its new root on any write error.
+    let root = stage_host_plugin(staging_parent, None, instructions)?;
+    // AGY's flag parser accepts --add-dir after --print's single string value;
+    // keep the original command, prompt bytes and launch options intact.
+    built.command.arg("--add-dir").arg(&root).env(OWNED_RULES_ROOT, &root);
+    built.cleanup_files.push(root);
+    Ok(())
 }
 
 /// 提取并规范化上下文窗口字段
-fn attach_context_window(mut usage: Value) -> Value {
+pub(super) fn attach_context_window(mut usage: Value) -> Value {
     if usage.get("model_context_window").is_some() {
         return usage;
     }
@@ -168,12 +254,12 @@ fn attach_context_window(mut usage: Value) -> Value {
     usage
 }
 
-/// AGY never puts the model's window on the stream; it records it (and its own
-/// estimate of the live context) in the conversation's `gen_metadata`. When
-/// that is readable it replaces the per-request prompt counts, which are not an
-/// occupancy. Unreadable (not yet flushed, locked, other layout) leaves `usage`
-/// untouched — the post-turn re-read picks the metadata up later.
-fn read_native_context_usage(conversation_id: Option<&str>) -> Option<Value> {
+/// Native history / legacy-stream fallback. ACP 1.5.8+ reports context through
+/// usage_update, which the ACP driver prefers. Other paths read the window and
+/// live-context estimate from gen_metadata rather than mistaking request totals
+/// for occupancy. Unreadable metadata (not flushed, locked, unknown layout)
+/// leaves usage untouched; a later history read may pick it up.
+pub(super) fn read_native_context_usage(conversation_id: Option<&str>) -> Option<Value> {
     let id = conversation_id.filter(|id| !id.is_empty() && !id.contains(['/', '\\', '.']))?;
     let db = session_db(id).ok().flatten()?;
     crate::history::agy::read_native_context(&db)
@@ -181,7 +267,7 @@ fn read_native_context_usage(conversation_id: Option<&str>) -> Option<Value> {
         .and_then(crate::history::agy::native_context_usage)
 }
 
-fn attach_native_context(mut usage: Value, conversation_id: Option<&str>) -> Value {
+pub(super) fn attach_native_context(mut usage: Value, conversation_id: Option<&str>) -> Value {
     if let (Some(native), Some(target)) = (
         read_native_context_usage(conversation_id),
         usage.as_object_mut(),
@@ -201,9 +287,9 @@ impl Engine for AgyEngine {
     }
 
     fn supports_images(&self) -> bool {
-        // build_command injects absolute image paths + a `view_file`
-        // instruction into the prompt and registers the pasted-images sandbox
-        // via `--add-dir`; that IS the agy image transport.
+        // build_command injects absolute image paths + a `read_file` /
+        // `view_file` instruction into the prompt and registers the
+        // pasted-images sandbox via `--add-dir`; that IS the agy image transport.
         true
     }
     fn supports_effort(&self) -> bool {
@@ -233,6 +319,7 @@ impl Engine for AgyEngine {
             .begin(session_id, Instant::now());
         let mut cmd = command_for_binary(bin);
         configure_background_command(&mut cmd);
+        cmd.env(OWNED_RULES_ROOT, "");
         let bridged = req
             .model
             .as_deref()
@@ -336,8 +423,8 @@ impl Engine for AgyEngine {
         } else {
             super::images::agy_prompt_with_images(&req.prompt, &req.images, &req.workspace)
         };
-        // `--print` is a string flag: the next token is the prompt. Keep it last
-        // so a following option can never be swallowed as the prompt value.
+        // `--print` consumes exactly one string argument. Keep the pair together;
+        // a later readonly rules mount can append --add-dir after the prompt.
         cmd.arg("--print");
         cmd.arg(&prompt_text);
 
@@ -353,16 +440,7 @@ impl Engine for AgyEngine {
 
     fn build_command_with_host_chat(&self, req: &SendRequest, bin: &str, server: Option<&Value>) -> Result<BuiltCommand, String> {
         let Some(server) = server else { return self.build_command(req, bin); };
-        if req.allowed_tools.is_some() {
-            return Err("Tool-constrained AGY runs cannot mount the host chat capability".into());
-        }
-        let root = stage_host_chat(&crate::paths::app_home().join(HOST_STAGING), server)?;
-        let mut request = req.clone();
-        request.additional_dirs.push(root.to_string_lossy().to_string());
-        match self.build_command(&request, bin) {
-            Ok(mut built) => { built.cleanup_files.push(root); Ok(built) }
-            Err(error) => { super::cleanup_staged_files(&[root]); Err(error) }
-        }
+        self.build_command_with_host_chat_in(req, bin, server, &crate::paths::app_home().join(HOST_STAGING))
     }
 
     fn parse_line(&self, line: &str, out: &mut Vec<EngineEvent>) {
@@ -409,10 +487,11 @@ impl Engine for AgyEngine {
                 }
             }
             "step_update" => {
+                let now = Instant::now();
                 let step = nested(&value, "step_update");
                 let id = string_field(&value, "conversation_id")
                     .or_else(|| string_field(step, "conversation_id"));
-                telemetry.step(step, id);
+                telemetry.step(step, id, now);
                 let emit_tool_call = step
                     .get("tool_info")
                     .is_some_and(Value::is_object)
@@ -440,17 +519,20 @@ impl Engine for AgyEngine {
                 }
                 // A multi-step turn used to show nothing until its very end.
                 // Each finished root model response refreshes the live rate
-                // and context window occupancy.
-                if string_field(step, "step_type") == Some("agent_response")
-                    && string_field(step, "state") == Some("DONE")
-                {
-                    if let Some(sample) = telemetry.running_sample(Instant::now()) {
+                // and context window occupancy; active streaming steps emit a
+                // 1 Hz live preview once >= 500ms of active model time elapsed.
+                if string_field(step, "step_type") == Some("agent_response") {
+                    if string_field(step, "state") == Some("DONE") {
+                        if let Some(sample) = telemetry.running_sample(Instant::now()) {
+                            out.push(EngineEvent::Throughput(sample));
+                        }
+                        if let Some(native) =
+                            read_native_context_usage(id.or_else(|| telemetry.root()))
+                        {
+                            out.push(EngineEvent::Usage(native));
+                        }
+                    } else if let Some(sample) = telemetry.live_sample(now) {
                         out.push(EngineEvent::Throughput(sample));
-                    }
-                    if let Some(native) =
-                        read_native_context_usage(id.or_else(|| telemetry.root()))
-                    {
-                        out.push(EngineEvent::Usage(native));
                     }
                 }
             }
@@ -508,12 +590,11 @@ impl Engine for AgyEngine {
     }
 }
 
-/// `--effort` only when the request names one and the model slug does not
-/// already encode it (`gemini-3.8-flash-high`). The requested string is passed
-/// through unchanged.
+/// `--effort` only when the request names one and the model supports an
+/// independent effort. The requested string is passed through unchanged.
 pub(crate) fn effort_flag<'a>(requested: Option<&'a str>, model: &str) -> Option<&'a str> {
     let effort = requested.map(str::trim).filter(|e| !e.is_empty())?;
-    if model_encodes_effort(model) {
+    if !model_supports_independent_effort(model) {
         return None;
     }
     Some(effort)
@@ -521,7 +602,20 @@ pub(crate) fn effort_flag<'a>(requested: Option<&'a str>, model: &str) -> Option
 
 pub(crate) fn model_encodes_effort(model: &str) -> bool {
     let lower = model.trim().to_ascii_lowercase();
-    lower.ends_with("-high") || lower.ends_with("-medium") || lower.ends_with("-low")
+    lower.ends_with("-xhigh")
+        || lower.ends_with("-high")
+        || lower.ends_with("-medium")
+        || lower.ends_with("-low")
+}
+
+pub(crate) fn model_has_no_effort(model: &str) -> bool {
+    let trimmed = model.trim();
+    trimmed.eq_ignore_ascii_case("gemini-pro-orchestrator")
+        || trimmed.eq_ignore_ascii_case("gemini-pro-orchestrator-argon")
+}
+
+pub(crate) fn model_supports_independent_effort(model: &str) -> bool {
+    !model_has_no_effort(model) && !model_encodes_effort(model)
 }
 
 fn event_name(value: &Value) -> &str {
@@ -552,6 +646,14 @@ fn push_conversation_id(value: &Value, out: &mut Vec<EngineEvent>) {
 }
 
 fn parse_step_update(step: &Value, emit_tool_call: bool, out: &mut Vec<EngineEvent>) {
+    if let Some(thinking) = step
+        .get("thinking_delta")
+        .or_else(|| step.get("thinkingDelta"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        out.push(EngineEvent::Thinking(thinking.to_string()));
+    }
     if let Some(delta) = step
         .get("text_delta")
         .and_then(Value::as_str)
@@ -719,14 +821,15 @@ mod tests {
     #[test]
     fn host_plugin_is_private_and_preserves_prompt_resume_and_role_text() {
         let engine = AgyEngine::new();
+        let parent = std::env::temp_dir().join(format!("agy-host-test-{}", uuid::Uuid::new_v4()));
         let mut request = req(Some("auto"));
         request.session_id = Some("native-session".into());
         request.prompt = "用户任务 🧭\n原文 $(id) %PATH%".into();
         request.model = Some("gemini-3.8-flash-high".into());
         let server = serde_json::json!({"command":"fake-ccgui","args":["--host-chat-mcp"],"env":{"CCGUI_HOST_CHAT_TOKEN":"first-run"}});
-        let mut first = engine.build_command_with_host_chat(&request, "agy", Some(&server)).unwrap();
+        let mut first = engine.build_command_with_host_chat_in(&request, "agy", &server, &parent).unwrap();
         let second_server = serde_json::json!({"command":"fake-ccgui","env":{"CCGUI_HOST_CHAT_TOKEN":"second-run"}});
-        let second = engine.build_command_with_host_chat(&request, "agy", Some(&second_server)).unwrap();
+        let second = engine.build_command_with_host_chat_in(&request, "agy", &second_server, &parent).unwrap();
         assert_ne!(first.cleanup_files, second.cleanup_files);
         let root = &first.cleanup_files[0];
         let config: Value = serde_json::from_slice(&std::fs::read(root.join(HOST_PLUGIN).join("mcp_config.json")).unwrap()).unwrap();
@@ -750,6 +853,192 @@ mod tests {
         super::super::cleanup_staged_files(&second.cleanup_files);
         assert!(first.cleanup_files.iter().all(|path| !path.exists()));
         assert!(second.cleanup_files.iter().all(|path| !path.exists()));
+        std::fs::remove_dir(parent).unwrap();
+    }
+
+    #[test]
+    fn fixed_rules_are_rebuilt_on_each_resume_without_changing_prompt_or_launch_selection() {
+        let parent = std::env::temp_dir().join(format!("agy-fixed-test-{}", uuid::Uuid::new_v4()));
+        let engine = AgyEngine::new();
+        let server = serde_json::json!({"command":"fake-host"});
+        let mut request = req(Some("plan"));
+        request.prompt = "用户原文 🧭\n%PATH% $(id) `echo`".into();
+        request.model = Some("fixture-model".into());
+        request.effort = Some("high".into());
+        let session = format!("fixture-{}", uuid::Uuid::new_v4());
+        let mut roots = Vec::new();
+        let mut surviving = None;
+        for (turn, policy) in ["policy-v1", "policy-v2", "policy-v3"].into_iter().enumerate() {
+            if turn > 0 { request.session_id = Some(session.clone()); }
+            let mut built = engine.build_command_with_host_chat_in(&request, "fake-agy", &server, &parent).unwrap();
+            let root = built.cleanup_files[0].clone();
+            assert!(!roots.contains(&root));
+            let rules = root.join(HOST_PLUGIN).join("rules/AGENTS.md");
+            assert_eq!(std::fs::read_to_string(&rules).unwrap(), "");
+            let combined = super::super::host_instructions::with_plugin_instructions(
+                super::super::host_instructions::with_chat_presentation("agy", true, Some("managed role".into())),
+                Some(format!("<plugin_fixed_instructions>\n{policy}\n</plugin_fixed_instructions>")),
+            ).unwrap();
+            append_host_instructions(&mut built, &combined).unwrap();
+            let text = std::fs::read_to_string(&rules).unwrap();
+            assert_eq!(text, combined);
+            assert_eq!(text.matches("managed role").count(), 1);
+            assert_eq!(text.matches("<ccgui-presentation-capabilities>").count(), 1);
+            assert_eq!(text.matches(policy).count(), 1);
+            assert!(!text.contains(&request.prompt));
+            let args: Vec<_> = built.command.as_std().get_args().map(|s| s.to_string_lossy().to_string()).collect();
+            assert_eq!(&args[args.len()-2..], &["--print".to_string(), request.prompt.clone()]);
+            assert!(args.windows(2).any(|a| a == ["--add-dir", root.to_str().unwrap()]));
+            assert!(args.windows(2).any(|a| a == ["--model", request.model.as_deref().unwrap()]));
+            assert!(args.windows(2).any(|a| a == ["--mode", "plan"]));
+            assert!(args.windows(2).any(|a| a == ["--effort", "high"]));
+            assert_eq!(args.iter().filter(|a| *a == "--conversation").count(), usize::from(turn > 0));
+            if turn > 0 { assert!(args.windows(2).any(|a| a == ["--conversation", session.as_str()])); }
+            assert!(args.iter().all(|arg| !arg.contains("policy-v")));
+            assert_eq!(request.additional_dirs, Vec::<String>::new());
+            roots.push(root.clone());
+            if turn == 0 {
+                // Leave a second run alive while the other run is replaced.
+                surviving = Some((root, text));
+            } else {
+                super::super::cleanup_staged_files(&built.cleanup_files);
+                assert!(!root.exists());
+            }
+            let (other_root, other_text) = surviving.as_ref().unwrap();
+            assert_eq!(std::fs::read_to_string(other_root.join(HOST_PLUGIN).join("rules/AGENTS.md")).unwrap(), *other_text);
+        }
+        super::super::cleanup_staged_files(&roots);
+        assert!(roots.iter().all(|root| !root.exists()));
+        std::fs::remove_dir(parent).unwrap();
+    }
+
+    #[test]
+    fn fixed_rules_build_and_write_failures_leave_other_runs_intact_and_clean_up() {
+        let parent = std::env::temp_dir().join(format!("agy-fixed-error-{}", uuid::Uuid::new_v4()));
+        let engine = AgyEngine::new();
+        let server = serde_json::json!({"command":"fake-host"});
+        let request = req(Some("auto"));
+        let mut live = engine.build_command_with_host_chat_in(&request, "fake-agy", &server, &parent).unwrap();
+        append_host_instructions(&mut live, "keep live policy").unwrap();
+        let mut invalid = request.clone();
+        invalid.prompt = "/compact".into();
+        assert!(engine.build_command_with_host_chat_in(&invalid, "fake-agy", &server, &parent).is_err());
+        assert_eq!(std::fs::read_dir(&parent).unwrap().count(), 1);
+
+        let mut failed = engine.build_command_with_host_chat_in(&request, "fake-agy", &server, &parent).unwrap();
+        let path = failed.cleanup_files[0].join(HOST_PLUGIN).join("rules/AGENTS.md");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(append_host_instructions(&mut failed, "cannot write").is_err());
+        // The send path uses this same cleanup on an instruction-write failure.
+        super::super::cleanup_staged_files(&failed.cleanup_files);
+        assert!(failed.cleanup_files.iter().all(|path| !path.exists()));
+        assert_eq!(std::fs::read_dir(&parent).unwrap().count(), 1);
+        assert_eq!(std::fs::read_to_string(live.cleanup_files[0].join(HOST_PLUGIN).join("rules/AGENTS.md")).unwrap(), "keep live policy");
+        super::super::cleanup_staged_files(&live.cleanup_files);
+        std::fs::remove_dir(parent).unwrap();
+    }
+
+    #[test]
+    fn readonly_without_host_mcp_stages_fixed_rules_on_initial_and_resumed_launches() {
+        let engine = AgyEngine::new();
+        let parent = std::env::temp_dir().join(format!("agy-readonly-rules-{}", uuid::Uuid::new_v4()));
+        let mut request = req(Some("plan"));
+        request.prompt = "只读原文 🧭\r\n--add-dir $(id) %PATH%".into();
+        request.model = Some("fixture-model".into());
+        request.effort = Some("high".into());
+        let session = format!("fixture-{}", uuid::Uuid::new_v4());
+        let mut roots = Vec::new();
+        for resumed in [false, true] {
+            request.session_id = resumed.then(|| session.clone());
+            // This is the workbench readonly path: no host MCP server.
+            let mut built = engine.build_command_with_host_chat(&request, "fake-agy", None).unwrap();
+            assert!(built.cleanup_files.is_empty());
+            append_host_instructions_in(&mut built, "fixed policy 🧭", &parent).unwrap();
+            assert_eq!(built.cleanup_files.len(), 1);
+            let root = built.cleanup_files[0].clone();
+            assert!(!roots.contains(&root));
+            assert_eq!(std::fs::read_to_string(root.join(HOST_PLUGIN).join("rules/AGENTS.md")).unwrap(), "fixed policy 🧭");
+            assert!(root.join(HOST_PLUGIN).join("plugin.json").is_file());
+            assert!(!root.join(HOST_PLUGIN).join("mcp_config.json").exists());
+            let args: Vec<_> = built.command.as_std().get_args().map(|s| s.to_string_lossy().to_string()).collect();
+            assert!(args.windows(2).any(|a| a == ["--print", request.prompt.as_str()]));
+            assert!(args.windows(2).any(|a| a == ["--add-dir", root.to_str().unwrap()]));
+            assert!(args.windows(2).any(|a| a == ["--mode", "plan"]));
+            assert!(args.windows(2).any(|a| a == ["--model", "fixture-model"]));
+            assert!(args.windows(2).any(|a| a == ["--effort", "high"]));
+            assert_eq!(args.windows(2).any(|a| a == ["--conversation", session.as_str()]), resumed);
+            assert!(!args.iter().any(|a| a == "--dangerously-skip-permissions" || a.contains("fixed policy")));
+            append_host_instructions_in(&mut built, "replacement policy", &parent).unwrap();
+            assert_eq!(built.cleanup_files, vec![root.clone()]);
+            assert_eq!(built.command.as_std().get_args().filter(|arg| *arg == root.as_os_str()).count(), 1);
+            roots.push(root);
+        }
+        super::super::cleanup_staged_files(&roots);
+        assert!(roots.iter().all(|root| !root.exists()));
+        std::fs::remove_dir(parent).unwrap();
+    }
+
+    #[test]
+    fn host_rules_reuse_only_the_owned_directory_and_never_the_first_cleanup_path() {
+        let parent = std::env::temp_dir().join(format!("agy-owned-rules-{}", uuid::Uuid::new_v4()));
+        let unrelated = parent.join("unrelated");
+        std::fs::create_dir_all(unrelated.join(HOST_PLUGIN).join("rules")).unwrap();
+        let untouched = unrelated.join(HOST_PLUGIN).join("rules/AGENTS.md");
+        std::fs::write(&untouched, "existing unrelated rules").unwrap();
+        let engine = AgyEngine::new();
+        let server = serde_json::json!({"command":"fake-host"});
+        let request = req(Some("plan"));
+        let mut built = engine.build_command_with_host_chat_in(&request, "fake-agy", &server, &parent).unwrap();
+        let root = built.cleanup_files[0].clone();
+        built.cleanup_files.insert(0, unrelated.clone());
+        let before: Vec<_> = built.command.as_std().get_args().map(|arg| arg.to_owned()).collect();
+        for policy in ["first policy", "updated policy"] {
+            append_host_instructions_in(&mut built, policy, &parent).unwrap();
+            assert_eq!(built.cleanup_files, vec![unrelated.clone(), root.clone()]);
+            assert_eq!(std::fs::read_to_string(root.join(HOST_PLUGIN).join("rules/AGENTS.md")).unwrap(), policy);
+            assert_eq!(std::fs::read_to_string(&untouched).unwrap(), "existing unrelated rules");
+            assert_eq!(built.command.as_std().get_args().collect::<Vec<_>>(), before.iter().map(|arg| arg.as_os_str()).collect::<Vec<_>>());
+        }
+        let config: Value = serde_json::from_slice(&std::fs::read(root.join(HOST_PLUGIN).join("mcp_config.json")).unwrap()).unwrap();
+        assert_eq!(config["mcpServers"]["ccgui"], server);
+
+        let mut readonly = engine.build_command_with_host_chat(&request, "fake-agy", None).unwrap();
+        readonly.cleanup_files.push(unrelated.clone());
+        append_host_instructions_in(&mut readonly, "readonly policy", &parent).unwrap();
+        assert_eq!(readonly.cleanup_files.len(), 2);
+        assert_ne!(readonly.cleanup_files[1], root);
+        assert_eq!(std::fs::read_to_string(&untouched).unwrap(), "existing unrelated rules");
+        assert!(!readonly.cleanup_files[1].join(HOST_PLUGIN).join("mcp_config.json").exists());
+        // Only the synthetic fixture is removed; it never entered a user tree.
+        super::super::cleanup_staged_files(&readonly.cleanup_files);
+        super::super::cleanup_staged_files(&[root]);
+        std::fs::remove_dir(parent).unwrap();
+    }
+
+    #[test]
+    fn readonly_rules_staging_failure_keeps_command_and_existing_cleanup_unchanged() {
+        let parent = std::env::temp_dir().join(format!("agy-rules-failure-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&parent).unwrap();
+        let blocked = parent.join("not-a-directory");
+        std::fs::write(&blocked, "keep").unwrap();
+        let mut built = AgyEngine::new().build_command_with_host_chat(&req(Some("plan")), "fake-agy", None).unwrap();
+        let before: Vec<_> = built.command.as_std().get_args().map(|arg| arg.to_owned()).collect();
+        assert!(append_host_instructions_in(&mut built, "policy", &blocked).is_err());
+        assert!(built.cleanup_files.is_empty());
+        assert_eq!(built.command.as_std().get_args().collect::<Vec<_>>(), before.iter().map(|arg| arg.as_os_str()).collect::<Vec<_>>());
+        assert_eq!(std::fs::read_to_string(&blocked).unwrap(), "keep");
+        assert_eq!(std::fs::read_dir(&parent).unwrap().count(), 1);
+        append_host_instructions_in(&mut built, "policy", &parent).unwrap();
+        let root = built.cleanup_files[0].clone();
+        let path = root.join(HOST_PLUGIN).join("rules/AGENTS.md");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(append_host_instructions_in(&mut built, "replacement", &parent).is_err());
+        super::super::cleanup_staged_files(&built.cleanup_files);
+        assert!(!root.exists());
+        std::fs::remove_file(blocked).unwrap();
+        std::fs::remove_dir(parent).unwrap();
     }
 
     #[test]
@@ -767,10 +1056,10 @@ mod tests {
 
     #[test]
     fn host_staging_rejects_relative_and_nondirectory_roots_without_mutating_them() {
-        assert!(stage_host_chat(std::path::Path::new("relative"), &Value::Null).is_err());
+        assert!(stage_host_plugin(std::path::Path::new("relative"), Some(&Value::Null), "").is_err());
         let file = std::env::temp_dir().join(format!("ccgui-agy-staging-file-{}", uuid::Uuid::new_v4()));
         std::fs::write(&file, "keep").unwrap();
-        assert!(stage_host_chat(&file, &Value::Null).is_err());
+        assert!(stage_host_plugin(&file, Some(&Value::Null), "").is_err());
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "keep");
         std::fs::remove_file(file).unwrap();
     }
@@ -906,6 +1195,7 @@ mod tests {
         let prompt_arg = args.last().unwrap();
         assert!(prompt_arg.starts_with("hi"));
         assert!(prompt_arg.contains(crate::engine::images::AGY_IMAGE_MARKER));
+        assert!(prompt_arg.contains("read_file"));
         assert!(prompt_arg.contains("view_file"));
         assert!(prompt_arg.contains(&format!("<image path=\"{}\"></image>", pasted_img.display())));
     }
@@ -1109,6 +1399,45 @@ mod tests {
             }
         }
         assert_eq!(actual, chunks.concat());
+    }
+
+    #[test]
+    fn thinking_deltas_preserve_whitespace_unicode_and_precede_text_or_tool() {
+        let chunks = ["  ", "思考中文", "\n", "🧠 ", ""];
+        let mut actual = String::new();
+        for (idx, chunk) in chunks.iter().enumerate() {
+            let key = if idx % 2 == 0 { "thinking_delta" } else { "thinkingDelta" };
+            let line = serde_json::json!({"event":"step_update", "step_update":{key: chunk}}).to_string();
+            let ev = events(&line);
+            if chunk.is_empty() {
+                assert!(ev.is_empty());
+            } else {
+                assert!(matches!(&ev[..], [EngineEvent::Thinking(text)] if text == chunk));
+                if let EngineEvent::Thinking(text) = &ev[0] {
+                    actual.push_str(text);
+                }
+            }
+        }
+        assert_eq!(actual, chunks.concat());
+
+        let combined = serde_json::json!({
+            "event": "step_update",
+            "step_update": {
+                "thinking_delta": "先分析",
+                "text_delta": "再回答",
+                "tool_info": { "name": "Read", "parameters": { "path": "a.rs" } }
+            }
+        })
+        .to_string();
+        let ev = events(&combined);
+        assert!(matches!(
+            &ev[..],
+            [
+                EngineEvent::Thinking(t),
+                EngineEvent::Delta(d),
+                EngineEvent::Message { role, .. }
+            ] if t == "先分析" && d == "再回答" && role == "tool"
+        ));
     }
 
     #[test]
@@ -1317,7 +1646,42 @@ mod tests {
     }
 
     #[test]
+    fn orchestrator_ignores_stale_effort_in_commands_and_history() {
+        for model in ["gemini-pro-orchestrator", "gemini-pro-orchestrator-argon"] {
+            assert!(!model_encodes_effort(model));
+            assert_eq!(effort_flag(Some("high"), model), None);
+            assert_eq!(effort_flag(Some("medium"), &format!(" {} ", model.to_ascii_uppercase())), None);
+            let mut request = req(Some("auto"));
+            request.model = Some(model.into());
+            request.effort = Some("high".into());
+            let args = argv(&request);
+            assert!(!args.iter().any(|arg| arg == "--effort"));
+            assert!(args.windows(2).any(|pair| pair == ["--model", model]));
+        }
+        assert_eq!(effort_flag(Some("medium"), "gemini-pro-orchestrator-preview"), Some("medium"));
+        let model = "gemini-pro-orchestrator";
+        let db = crate::db::Db::open_in_memory().unwrap();
+        db.0.lock().execute(
+            "INSERT INTO sessions(engine,session_id,workspace_path,file_path,file_size,file_mtime_ms) VALUES('agy','orchestrator','/tmp/ws','/tmp/ws/o.jsonl',1,1)", [],
+        ).unwrap();
+        db.remember_session_model("agy", "orchestrator", model, 1).unwrap();
+        db.remember_session_effort("agy", "orchestrator", "high", 1).unwrap();
+        let sessions = crate::history::reader::list_sessions_from(&db).unwrap();
+        assert_eq!(sessions[0].model.as_deref(), Some(model));
+        assert_eq!(sessions[0].effort, None);
+    }
+
+    #[test]
     fn suppresses_independent_effort_when_model_id_encodes_tier() {
+        assert_eq!(effort_flag(Some("medium"), "gemini-4-hydrogen-xhigh"), None);
+        assert!(model_encodes_effort(" GEMINI-4-HYDROGEN-XHIGH "));
+        assert!(!model_encodes_effort("gemini-4-hydrogen-xhigh-preview"));
+        let mut request = req(Some("auto"));
+        request.model = Some("gemini-4-hydrogen-xhigh".into());
+        request.effort = Some("medium".into());
+        let args = argv(&request);
+        assert!(!args.iter().any(|arg| arg == "--effort"));
+        assert!(args.windows(2).any(|pair| pair == ["--model", "gemini-4-hydrogen-xhigh"]));
         assert_eq!(effort_flag(Some("medium"), "gemini-4-argon-high"), None);
         assert_eq!(effort_flag(Some("medium"), "claude-opus-4-6-thinking-low"), None);
         assert_eq!(effort_flag(Some("medium"), "gpt-oss-120b-medium"), None);
@@ -1337,6 +1701,12 @@ mod tests {
         let sessions = crate::history::reader::list_sessions_from(&db).unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].model.as_deref(), Some("gemini-4-argon-high"));
+        assert_eq!(sessions[0].effort, None);
+
+        db.remember_session_model("agy", "s-agy-1", "gemini-4-hydrogen-xhigh", 2)
+            .unwrap();
+        let sessions = crate::history::reader::list_sessions_from(&db).unwrap();
+        assert_eq!(sessions[0].model.as_deref(), Some("gemini-4-hydrogen-xhigh"));
         assert_eq!(sessions[0].effort, None);
     }
 

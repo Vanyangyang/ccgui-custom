@@ -335,7 +335,7 @@ fn validate_official(target: &Target, content: &str) -> Result<(), String> {
                 .map_err(|e| format!("invalid TOML in {}: {e}", target.path.display()))?;
         }
         _ => {
-            let value: Value = serde_json::from_str(content)
+            let value: Value = serde_json::from_str(content.strip_prefix('\u{feff}').unwrap_or(content))
                 .map_err(|e| format!("invalid JSON in {}: {e}", target.path.display()))?;
             if !value.is_object() {
                 return Err(format!("{} must be a JSON object", target.path.display()));
@@ -1161,6 +1161,20 @@ mod tests {
             env.get("OPENAI_API_KEY").map(String::as_str),
             Some("sk-codex")
         );
+    }
+
+    #[test]
+    fn official_json_bom_round_trip_preserves_original_bytes() {
+        let (dir, target) = fixture("official-bom", "settings.json");
+        let content = concat!("\u{feff}", r#"{"unknown":{"command":"\"C:\\Program Files\\AGY\\agy.exe\""}}"#, "\r\n");
+        validate_official(&target, content).unwrap();
+        write_official(&target, content).unwrap();
+        assert_eq!(std::fs::read(&target.path).unwrap(), content.as_bytes());
+        for invalid in ["\u{feff}{broken", "\u{feff}\u{feff}{}", "\u{feff}[]"] {
+            assert!(validate_official(&target, invalid).is_err());
+            assert_eq!(std::fs::read(&target.path).unwrap(), content.as_bytes());
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -69,6 +69,7 @@ describe("probe store", () => {
     expect(probeable(entry())).toBe(true);
     expect(probeable(entry({ command: null, url: "https://x/mcp" }))).toBe(true);
     expect(probeable(entry({ command: null, url: null }))).toBe(false);
+    expect(probeable(entry({ probeAllowed: false }))).toBe(false);
   });
 
   it("drops results whose config version changed", () => {

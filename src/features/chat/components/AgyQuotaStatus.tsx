@@ -8,6 +8,7 @@ import ExternalLink from "lucide-react/dist/esm/icons/external-link";
 import type { AgyQuotaSnapshot } from "@/lib/ipc";
 import { openExternal } from "@/lib/platform";
 import {
+  agyVertexErrorKey,
   getAgyVertexCreditsUrl,
   useAgyVertexCredits,
 } from "@/features/settings/agy-vertex-guardrail";
@@ -147,14 +148,20 @@ export function AgyQuotaStatus({ snapshot, model, loading, refresh, now = Date.n
               <p>{t("settings.agyVertexStepsGuide")}</p>
               <p className="mt-1 text-text-tertiary">
                 {vertexCredits.errorCode && vertexCredits.errorCode !== "not_connected"
-                  ? vertexCredits.errorCode === "sync_cancelled"
-                    ? t("settings.agyVertexErrorCancelled")
-                    : vertexCredits.errorCode === "permission_denied"
-                      ? t("settings.agyVertexErrorPermissionDenied")
-                      : vertexCredits.errorCode
+                  ? t(agyVertexErrorKey(vertexCredits.errorCode))
                   : t("settings.agyVertexNotSynced")}
               </p>
             </div>
+          )}
+          {hasVertexCredits && vertexCredits.collectedAt !== undefined && Number.isFinite(vertexCredits.collectedAt) && (
+            <p className="text-caption-1-regular text-text-tertiary">
+              {t("chat.agyVertexCreditsUpdated", { time: new Date(vertexCredits.collectedAt * 1000).toLocaleString(i18n.language) })}
+            </p>
+          )}
+          {hasVertexCredits && vertexCredits.refreshError && (
+            <p role="status" className="text-caption-1-regular text-text-warning-primary">
+              {t(vertexCredits.refreshError === "login_required" ? "chat.agyVertexRefreshLoginRequired" : "chat.agyVertexRefreshTimeout")}
+            </p>
           )}
           <p className="text-caption-1-regular text-text-tertiary">{t("chat.agyVertexCreditsNote")}</p>
           <div className="flex items-center justify-between gap-2">

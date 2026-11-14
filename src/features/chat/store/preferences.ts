@@ -12,7 +12,7 @@ import { notifyCliConfigChanged } from "@/features/settings/providers";
 import { persistSettings } from "./settings-persist";
 import { persistClaudeUltracode } from "./claude-ultracode";
 import { normalizeEffortLevel } from "@/components/application/ai-chat/effort-levels";
-import { encodedModelEffort } from "@/components/application/ai-chat/model-effort";
+import { supportsIndependentModelEffort } from "@/components/application/ai-chat/model-effort";
 import type { ChatStore } from "./types";
 import type { StoreGet, StoreSet } from "./context";
 
@@ -137,7 +137,7 @@ export function createPreferenceActions(
         stampActiveTab({ model: model || undefined });
         if (active.sessionId && model) {
           const key = sessionKey(engine, active.sessionId, active.workspacePath);
-          if (encodedModelEffort(engine, model) && get().bySession[key]?.activeEffort) {
+          if (!supportsIndependentModelEffort(engine, model) && get().bySession[key]?.activeEffort) {
             patchSession(set, key, { activeEffort: null });
           }
           // Remember the chosen model on the session immediately so switching
@@ -146,7 +146,7 @@ export function createPreferenceActions(
           // in sync with remember_session_effort before the next send.
           patchSession(set, key, { activeModel: model });
           set((s) => ({ sessions: s.sessions.map((session) => session.engine === engine && session.sessionId === active.sessionId
-            ? { ...session, model, ...(encodedModelEffort(engine, model) ? { effort: null } : {}) } : session) }));
+            ? { ...session, model, ...(!supportsIndependentModelEffort(engine, model) ? { effort: null } : {}) } : session) }));
           await ipc.rememberSessionModel(engine, active.sessionId, model);
         }
       }

@@ -12,6 +12,7 @@ use super::{McpConfigSection, McpSourceError, McpSourceInfo};
 use std::path::PathBuf;
 
 mod read;
+pub(crate) use read::parse_jsonc as parse_jsonc_for_plugins;
 mod write;
 
 pub(super) use read::{probe_target_from_json, probe_target_from_toml};
@@ -203,6 +204,24 @@ const SOURCES: &[Source] = &[
         writable: false,
         readonly_reason_code: REASON_GROK_PROJECT,
     },
+    json_source!(
+        "pi_user",
+        "pi",
+        "user",
+        Some(Toggle::Enabled),
+        false,
+        false,
+        REASON_UNVERIFIED_WRITE
+    ),
+    json_source!(
+        "pi_project",
+        "pi",
+        "project",
+        Some(Toggle::Enabled),
+        false,
+        false,
+        REASON_UNVERIFIED_WRITE
+    ),
     json_source!(
         "omp_user",
         "omp",
@@ -461,8 +480,6 @@ pub(super) fn engine_source_infos(engine: &str, workspace: Option<&str>) -> Vec<
 /// 该引擎是否提供 MCP 配置：native（原生）/ plugin（插件提供）/ none。
 pub(super) fn engine_support(id: &str) -> &'static str {
     match id {
-        // PI CLI 明确不内置 MCP（上游文档：No MCP），本项目不伪造来源。
-        "pi" => "none",
         "dsh" => "plugin",
         _ => "native",
     }
@@ -516,6 +533,10 @@ fn candidate_paths(id: &str, workspace: Option<&str>) -> Vec<PathBuf> {
         "grok_user" => vec![grok_home().join("config.toml")],
         "grok_project" => workspace_path
             .map(|path| vec![path.join(".grok").join("config.toml")])
+            .unwrap_or_default(),
+        "pi_user" => vec![crate::engine::engine_home(Some("PI_CODING_AGENT_DIR"), ".pi/agent").join("mcp.json")],
+        "pi_project" => workspace_path
+            .map(|path| vec![path.join(".pi").join("mcp.json")])
             .unwrap_or_default(),
         "omp_user" => vec![omp_agent_dir().join("mcp.json")],
         "omp_project" => workspace_path

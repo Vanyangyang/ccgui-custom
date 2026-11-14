@@ -11,6 +11,7 @@ vi.mock("@/lib/ipc", () => ({ ipc: {
   rescanSessions: vi.fn(async () => {}), usageRecord: vi.fn(async () => {}),
   computerUseSetActive: vi.fn(async () => {}),
   activeRunIds: vi.fn(async () => []),
+  interruptSession: vi.fn(async () => true),
 } }));
 vi.mock("@/lib/events", () => ({
   listenEngineEvents: vi.fn(async () => () => {}),
@@ -736,5 +737,185 @@ describe("a response's metadata belongs to the response's own rows", () => {
     expect(row.usage).toBeUndefined();
     expect(rows()[1]).toEqual(oldReply);
     expect(deps.get().bySession[KEY].usage).toEqual(OLD_USAGE);
+  });
+});
+
+describe("agy acp native task lifecycle", () => {
+  const AGY_KEY = sessionKey("agy", "agy-session", "/ws");
+  const agyEvent = (kind: ChatEngineEvent["kind"], seq: number, data: unknown, runId = "agy-run"): ChatEngineEvent => ({
+    kind, seq, data, runId, engine: "agy", sessionId: "agy-session",
+  });
+
+  beforeEach(() => {
+    dropRunUsage("agy-run");
+    untrackRun("agy-run");
+    useChatStore.setState((s) => ({
+      bySession: {
+        ...s.bySession,
+        [AGY_KEY]: { ...EMPTY_SESSION, messages: [{ seq: 1, role: "user", text: "pnpm build", ts: null }] },
+      },
+    }));
+  });
+
+  afterEach(() => {
+    drainPending(AGY_KEY);
+    dropRunUsage("agy-run");
+    untrackRun("agy-run");
+  });
+
+  it.each(["waiting", "requires_action"] as const)("clears %s on Stop before late native cleanup without releasing queued messages", async (activity) => {
+    handleEngineEvents([
+      agyEvent("tasks", 1, { tasks: [{ ...task(), kind: "command", background: true }] }),
+      agyEvent("question", 2, { requestId: "agy-question", input: { questions: [{ question: "Continue?", options: [] }] } }),
+      agyEvent("activity", 3, { state: activity }),
+    ], deps);
+    const queued = { id: "queued-agy", text: "Next request", images: [], queuedAt: Date.now() };
+    useChatStore.setState((s) => ({
+      bySession: { ...s.bySession, [AGY_KEY]: { ...s.bySession[AGY_KEY], queue: [queued] } },
+    }));
+    const refreshSessionUsage = useChatStore.getState().refreshSessionUsage;
+    useChatStore.setState({ refreshSessionUsage: vi.fn(async () => {}) });
+    try {
+      // The stop IPC resolves before the reader's task/card/done events arrive.
+      await useChatStore.getState().interrupt({ engine: "agy", sessionId: "agy-session", workspacePath: "/ws" });
+    } finally {
+      useChatStore.setState({ refreshSessionUsage });
+    }
+    const stopped = deps.get().bySession[AGY_KEY];
+    expect(ipc.interruptSession).toHaveBeenCalledWith("agy-run");
+    expect(stopped).toMatchObject({ streaming: false, interrupted: true, nativeActivity: null });
+    expect(stopped.settledRunIds).toContain("agy-run");
+    // Only native cleanup may settle task and question status.
+    expect(stopped.nativeTasks?.[0].status).toBe("running");
+    expect(stopped.messages.find((row) => row.question)?.question?.status).toBe("pending");
+
+    handleEngineEvents([
+      agyEvent("activity", 4, { state: "running" }),
+      agyEvent("delta", 5, "Late output must not revive the stopped run"),
+      agyEvent("tasks", 6, { tasks: [{ ...task("stopped"), kind: "command", background: true }] }),
+      agyEvent("question_settled", 7, { requestId: "agy-question" }),
+      agyEvent("done", 8, { usage: null, interrupted: true }),
+    ], deps);
+    const settled = deps.get().bySession[AGY_KEY];
+    expect(settled).toMatchObject({ streaming: false, interrupted: true, nativeActivity: null });
+    expect(settled.nativeTasks?.[0].status).toBe("stopped");
+    expect(settled.messages.find((row) => row.question)?.question?.status).toBe("cancelled");
+    expect(settled.messages.some((row) => row.text.includes("Late output"))).toBe(false);
+    expect(settled.queue).toEqual([queued]);
+    expect(deps.drainQueue).not.toHaveBeenCalled();
+    expect(runRouting.has("agy-run")).toBe(false);
+  });
+
+  it("adopts agy nativeTaskRunId, protects background waiting runs from orphan sweeps, and settles wakeup continuations", async () => {
+    handleEngineEvents([
+      agyEvent("tasks", 1, {
+        tasks: [{
+          id: "task-206",
+          kind: "command",
+          description: "Production build",
+          status: "running",
+          progress: "vite v6.4.3 building for production...",
+          background: true,
+        }],
+      }),
+      agyEvent("delta", 2, "Build moved to background."),
+      agyEvent("turn_complete", 3, { usage: { input_tokens: 120, output_tokens: 30 } }),
+      agyEvent("activity", 4, { state: "waiting" }),
+    ], deps);
+
+    const waiting = deps.get().bySession[AGY_KEY];
+    expect(waiting.nativeTaskRunId).toBe("agy-run");
+    expect(waiting.streaming).toBe(true);
+    expect(waiting.nativeActivity).toBe("waiting");
+    expect(waiting.nativeTasks?.[0]).toMatchObject({
+      id: "task-206",
+      status: "running",
+      progress: "vite v6.4.3 building for production...",
+    });
+    expect(waiting.messages.at(-1)?.usage).toMatchObject({ input_tokens: 120, output_tokens: 30 });
+    expect(ipc.usageRecord).toHaveBeenCalledTimes(1);
+
+    vi.advanceTimersByTime(60 * 60_000);
+    expect(rereads()).toHaveBeenCalledWith(AGY_KEY);
+    routeRun("native-other", OTHER);
+    await reconcileOrphanRuns(ipc.activeRunIds, () => {});
+    expect(runRouting.get("agy-run")).toBe(AGY_KEY);
+
+    handleEngineEvents([
+      agyEvent("tasks", 5, {
+        tasks: [{
+          id: "task-206",
+          kind: "command",
+          description: "Production build",
+          status: "completed",
+          progress: "dist/index.js 42 kB",
+          background: true,
+        }],
+      }),
+      agyEvent("activity", 6, { state: "running" }),
+      agyEvent("delta", 7, "Build completed: dist/index.js 42 kB."),
+      agyEvent("turn_complete", 8, { usage: { input_tokens: 160, output_tokens: 24 } }),
+      agyEvent("done", 9, { usage: null }),
+    ], deps);
+
+    const settled = deps.get().bySession[AGY_KEY];
+    expect(settled.streaming).toBe(false);
+    expect(settled.nativeActivity).toBeNull();
+    expect(settled.nativeTasks?.[0]).toMatchObject({ status: "completed", progress: "dist/index.js 42 kB" });
+    expect(settled.messages.at(-1)).toMatchObject({
+      role: "assistant",
+      text: "Build completed: dist/index.js 42 kB.",
+      usage: { input_tokens: 160, output_tokens: 24 },
+    });
+    expect(ipc.usageRecord).toHaveBeenCalledTimes(2);
+    expect(runRouting.has("agy-run")).toBe(false);
+  });
+
+  it("settles active native tasks to unknown on abrupt run error and accepts later late stopped cleanup", async () => {
+    handleEngineEvents([
+      agyEvent("tasks", 1, {
+        tasks: [{
+          id: "task-50",
+          kind: "command",
+          description: "Inspect agy ACP strings",
+          status: "running",
+          summary: "python -c ...",
+          background: true,
+        }],
+      }),
+      agyEvent("delta", 2, "Running command."),
+      agyEvent("turn_complete", 3, { usage: { input_tokens: 40, output_tokens: 10 } }),
+      agyEvent("activity", 4, { state: "waiting" }),
+    ], deps);
+
+    expect(deps.get().bySession[AGY_KEY].nativeTasks?.[0].status).toBe("running");
+
+    // Simulate abrupt worker death before a final tasks snapshot could flush.
+    handleEngineEvents([agyEvent("error", 5, "AGY ACP daemon exited unexpectedly")], deps);
+
+    const errored = deps.get().bySession[AGY_KEY];
+    expect(errored.streaming).toBe(false);
+    expect(errored.nativeActivity).toBeNull();
+    expect(errored.nativeTasks?.[0].status).toBe("unknown");
+    expect(runRouting.has("agy-run")).toBe(false);
+
+    vi.advanceTimersByTime(60 * 60_000);
+    await reconcileOrphanRuns(ipc.activeRunIds, () => {});
+    expect(runRouting.has("agy-run")).toBe(false);
+
+    // A late cleanup tasks snapshot may still upgrade unknown -> stopped.
+    handleEngineEvents([
+      agyEvent("tasks", 6, {
+        tasks: [{
+          id: "task-50",
+          kind: "command",
+          description: "Inspect agy ACP strings",
+          status: "stopped",
+          summary: "python -c ...",
+          background: true,
+        }],
+      }),
+    ], deps);
+    expect(deps.get().bySession[AGY_KEY].nativeTasks?.[0].status).toBe("stopped");
   });
 });

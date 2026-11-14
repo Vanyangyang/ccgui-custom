@@ -1,9 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
-import { safeRef, inside, proxyEnvironment, nativeEnvironment, fixtureMaintenance, git, main, ROOT } from './custom-maintain.mjs';
+import { createHash } from 'node:crypto';
+import { safeRef, inside, proxyEnvironment, nativeEnvironment, git, main, ROOT } from './custom-maintain.mjs';
+import { defaultCargoJobs } from './self-update-build.mjs';
+import { commit, fixture, nextRelease, preparedBuild, snapshot, write } from './custom-maintain-fixture.mjs';
+
+// Upstream integration, verification and build reports. Installation is covered
+// by custom-maintain-install*.test.mjs so the files run in parallel.
 test('untrusted refs and paths cannot escape the maintenance workspace', () => {
   for (const ref of ['--force', '../main', 'a//b', 'v1; whoami', 'main/', 'v1.', 'refs/.hidden', 'refs/tag.lock', 'v1@{0}']) assert.throws(() => safeRef(ref));
   assert.equal(safeRef('v1.1.0'), 'v1.1.0');
@@ -13,61 +18,9 @@ test('untrusted refs and paths cannot escape the maintenance workspace', () => {
   assert.match(inside('C:/workspace', 'integration'), /integration$/);
 });
 
-function write(root, filename, contents) {
-  const target = path.join(root, filename);
-  fs.mkdirSync(path.dirname(target), { recursive: true });
-  fs.writeFileSync(target, contents);
-  return target;
-}
-function commit(root, message) {
-  git(['add', '--all'], root);
-  git(['commit', '--quiet', '-m', message], root);
-  return git(['rev-parse', 'HEAD'], root);
-}
-function fixture(t, hooks = {}) {
-  const container = fs.mkdtempSync(path.join(os.tmpdir(), 'ccgui-maintenance-'));
-  // This exact directory was created by this test; never clean a computed parent.
-  t.after(() => { inside(os.tmpdir(), container); fs.rmSync(container, { recursive: true, force: true }); });
-  const upstream = path.join(container, 'upstream');
-  const root = path.join(container, 'source');
-  const backup = path.join(container, 'backup.git');
-  fs.mkdirSync(upstream);
-  git(['init', '--quiet', '--initial-branch=main'], upstream);
-  git(['config', 'user.name', 'Maintenance Fixture'], upstream);
-  git(['config', 'user.email', 'fixture@example.invalid'], upstream);
-  git(['config', 'core.autocrlf', 'false'], upstream);
-  write(upstream, '.gitignore', 'artifacts/\nprofile/\nsrc-tauri/target/\n');
-  write(upstream, '.custom/manifest.json', JSON.stringify({ upstreamRemote: upstream, upstreamReleaseCommit: '', upstreamRelease: 'v1', patchRevision: 1 }));
-  write(upstream, 'src/version/distribution.ts', 'export const IS_CUSTOM_DISTRIBUTION = true;\n');
-  write(upstream, 'package.json', JSON.stringify({ version: '1.1.1' }));
-  write(upstream, 'shared.txt', 'base\n');
-  const base = commit(upstream, 'baseline');
-  git(['tag', 'v1'], upstream);
-  git(['clone', '--quiet', upstream, root], container);
-  git(['config', 'user.name', 'Maintenance Fixture'], root);
-  git(['config', 'user.email', 'fixture@example.invalid'], root);
-  git(['config', 'core.autocrlf', 'false'], root);
-  git(['remote', 'rename', 'origin', 'upstream'], root);
-  git(['init', '--quiet', '--bare', backup], container);
-  git(['remote', 'add', 'origin', backup], root);
-  const manifest = { upstreamRemote: upstream, upstreamReleaseCommit: base, upstreamRelease: 'v1', patchRevision: 1 };
-  write(root, '.custom/manifest.json', JSON.stringify(manifest));
-  commit(root, 'custom baseline');
-  const api = fixtureMaintenance(root, hooks);
-  return { container, upstream, root, backup, base, manifest, api };
-}
-function nextRelease(f, contents = 'new upstream\n') {
-  write(f.upstream, 'upstream.txt', contents);
-  const head = commit(f.upstream, 'upstream release');
-  git(['tag', 'v2'], f.upstream);
-  return head;
-}
-function snapshot(root) {
-  const filename = path.join(root, 'shared.txt');
-  return { head: git(['rev-parse', 'HEAD'], root), branch: git(['branch', '--show-current'], root), status: git(['status', '--porcelain=v1'], root), content: fs.readFileSync(filename, 'utf8'), timestamp: fs.statSync(filename).mtimeMs, manifest: fs.readFileSync(path.join(root, '.custom/manifest.json'), 'utf8') };
-}
+const ownRemotes = { ownRemotes: true };
 test('integration creates a merged candidate, records revision and pushes only its local backup', t => {
-  const f = fixture(t);
+  const f = fixture(t, {}, ownRemotes);
   const upstreamHead = nextRelease(f);
   const before = snapshot(f.root);
   const existing = write(f.container, 'ccgui-integrations/existing/keep.txt', 'keep');
@@ -87,7 +40,7 @@ test('integration creates a merged candidate, records revision and pushes only i
   assert.notEqual(second.branch, result.branch);
 });
 test('recorded release is a no-op without worktree or revision changes', t => {
-  const f = fixture(t);
+  const f = fixture(t, {}, ownRemotes);
   const before = snapshot(f.root);
   assert.equal(f.api.integrate('v1').status, 'already_integrated');
   assert.deepEqual(snapshot(f.root), before);
@@ -95,7 +48,7 @@ test('recorded release is a no-op without worktree or revision changes', t => {
   assert.equal(git(['worktree', 'list', '--porcelain'], f.root).match(/^worktree /gm).length, 1);
 });
 test('already reachable upstream is a no-op even when the recorded release differs', t => {
-  const f = fixture(t);
+  const f = fixture(t, {}, ownRemotes);
   nextRelease(f);
   git(['fetch', '--quiet', 'upstream', '--tags'], f.root);
   git(['merge', '--quiet', '--no-edit', 'v2'], f.root);
@@ -105,7 +58,7 @@ test('already reachable upstream is a no-op even when the recorded release diffe
   assert.equal(fs.existsSync(path.join(f.container, 'ccgui-integrations')), false);
 });
 test('integration retains conflict worktree and leaves source and backup unchanged', t => {
-  const f = fixture(t);
+  const f = fixture(t, {}, ownRemotes);
   write(f.root, 'shared.txt', 'custom\n');
   commit(f.root, 'custom edit');
   write(f.upstream, 'shared.txt', 'upstream\n');
@@ -121,7 +74,7 @@ test('integration retains conflict worktree and leaves source and backup unchang
   assert.equal(git(['branch', '--list', result.branch], f.backup), '');
 });
 test('dirty source and changed reviewed upstream are rejected before creating candidates', t => {
-  const f = fixture(t);
+  const f = fixture(t, {}, ownRemotes);
   write(f.root, 'shared.txt', 'uncommitted');
   assert.throws(() => f.api.integrate('v1'), /Commit local work/);
   commit(f.root, 'local change');
@@ -131,7 +84,7 @@ test('dirty source and changed reviewed upstream are rejected before creating ca
   assert.equal(fs.existsSync(path.join(f.container, 'ccgui-integrations')), false);
 });
 test('unsafe and nonexistent integration refs preserve the source checkout', t => {
-  const f = fixture(t);
+  const f = fixture(t, {}, ownRemotes);
   const before = snapshot(f.root);
   assert.throws(() => f.api.integrate('../escape'), /safe upstream/);
   assert.throws(() => f.api.integrate('missing-release'), /rev-parse failed/);
@@ -157,18 +110,6 @@ test('verification cannot certify a commit or uncommitted edit introduced while 
   assert.equal(f.api.recordVerification(nextHead).head, nextHead);
 });
 
-function preparedBuild(f) {
-  const head = git(['rev-parse', 'HEAD'], f.root);
-  write(f.root, 'artifacts/custom-verification.json', JSON.stringify({ head, clean: true }));
-  const exe = write(f.root, 'src-tauri/target/release/ccgui-next.exe', 'new binary fixture');
-  const installer = write(f.root, 'src-tauri/target/release/bundle/nsis/CCGUI-setup.exe', 'installer fixture');
-  const destination = write(f.root, 'profile/AppData/Local/Programs/CCGUI/ccgui-next.exe', 'old binary fixture');
-  const shortcut = write(f.root, 'profile/Desktop/CC GUI（代理保护）.lnk', 'protected shortcut');
-  const script = write(f.root, 'profile/protected-launch.ps1', 'protected script');
-  const normalShortcut = write(f.root, 'profile/Desktop/CC GUI.lnk', 'normal shortcut');
-  const report = f.api.recordBuild('1.1.1+protected.1', Date.now());
-  return { head, exe, installer, destination, shortcut, script, normalShortcut, report };
-}
 test('successful build report binds clean verified HEAD, binary hash and installer', t => {
   const f = fixture(t);
   const b = preparedBuild(f);
@@ -177,6 +118,13 @@ test('successful build report binds clean verified HEAD, binary hash and install
   assert.equal(b.report.installer, b.installer);
   assert.match(b.report.sha256, /^[a-f0-9]{64}$/);
   assert.ok(Number.isFinite(Date.parse(b.report.builtAt)));
+  assert.equal(b.report.reportVersion, 2);
+  assert.deepEqual(b.report.resources.map(item => item.path), ['agent-catalogs/catalog.json', 'skills/creator/SKILL.md', 'skills/creator/references/sdk-api.md']);
+  for (const item of b.report.resources) {
+    const bytes = fs.readFileSync(path.join(f.root, item.source));
+    assert.equal(item.size, bytes.length);
+    assert.equal(item.sha256, createHash('sha256').update(bytes).digest('hex'));
+  }
 });
 test('build report rejects dirty, unverified or stale artifacts', t => {
   const f = fixture(t);
@@ -185,71 +133,9 @@ test('build report rejects dirty, unverified or stale artifacts', t => {
   assert.throws(() => f.api.recordBuild('1.1.1+protected.1', Date.now()), /exact revision/);
   commit(f.root, 'new revision');
   assert.throws(() => f.api.recordBuild('1.1.1+protected.1', Date.now()), /exact revision/);
-  write(f.root, 'artifacts/custom-verification.json', JSON.stringify({ head: git(['rev-parse', 'HEAD'], f.root), clean: true }));
+  f.api.recordVerification(git(['rev-parse', 'HEAD'], f.root));
   fs.utimesSync(b.exe, new Date(0), new Date(0));
   assert.throws(() => f.api.recordBuild('1.1.1+protected.1', Date.now()), /stale/);
-});
-test('install backs up, verifies copy, archives ordinary shortcut and launches exact protected link', t => {
-  const launched = [];
-  const f = fixture(t, { launch: filename => launched.push(filename) });
-  const b = preparedBuild(f);
-  const shortcutTime = fs.statSync(b.shortcut).mtimeMs;
-  const result = f.api.install();
-  assert.equal(result.installedSHA, b.report.sha256);
-  assert.equal(fs.readFileSync(result.backup, 'utf8'), 'old binary fixture');
-  assert.equal(fs.readFileSync(b.destination, 'utf8'), 'new binary fixture');
-  assert.equal(fs.existsSync(b.normalShortcut), false);
-  assert.equal(fs.readFileSync(path.join(path.dirname(result.backup), 'CC GUI.lnk'), 'utf8'), 'normal shortcut');
-  assert.deepEqual(launched, [b.shortcut]);
-  assert.equal(fs.readFileSync(b.shortcut, 'utf8'), 'protected shortcut');
-  assert.equal(fs.statSync(b.shortcut).mtimeMs, shortcutTime);
-  assert.equal(fs.readFileSync(b.script, 'utf8'), 'protected script');
-  const again = f.api.install();
-  assert.notEqual(again.backup, result.backup);
-});
-test('running clients prevent install without copying or launching', t => {
-  let launched = false;
-  const f = fixture(t, { running: () => 1, launch: () => { launched = true; } });
-  const b = preparedBuild(f);
-  assert.throws(() => f.api.install(), /Close every/);
-  assert.equal(fs.readFileSync(b.destination, 'utf8'), 'old binary fixture');
-  assert.equal(fs.existsSync(b.normalShortcut), true);
-  assert.equal(launched, false);
-  assert.equal(fs.readdirSync(path.join(f.root, 'artifacts')).filter(name => name.startsWith('custom-install-')).length, 0);
-});
-test('process query failure or a client starting after backup prevents copying', t => {
-  let calls = 0;
-  const f = fixture(t, { running: () => calls++ === 0 ? 0 : 1 });
-  const b = preparedBuild(f);
-  assert.throws(() => f.api.install(), /Close every/);
-  assert.equal(fs.readFileSync(b.destination, 'utf8'), 'old binary fixture');
-  const invalid = fixtureMaintenance(f.root, { running: () => 'unknown' });
-  assert.throws(() => invalid.install(), /Could not verify/);
-});
-test('checksum mismatch restores existing binary and preserves both shortcuts', t => {
-  let launched = false;
-  const f = fixture(t, { copy: (_source, target) => fs.writeFileSync(target, 'corrupt'), launch: () => { launched = true; } });
-  const b = preparedBuild(f);
-  assert.throws(() => f.api.install(), /checksum mismatch/);
-  assert.equal(fs.readFileSync(b.destination, 'utf8'), 'old binary fixture');
-  assert.equal(fs.existsSync(b.normalShortcut), true);
-  assert.equal(fs.readFileSync(b.shortcut, 'utf8'), 'protected shortcut');
-  assert.equal(launched, false);
-});
-test('binary tampering, build path tampering, and verification HEAD mismatch prevent install', t => {
-  const f = fixture(t);
-  const b = preparedBuild(f);
-  fs.writeFileSync(b.exe, 'tampered');
-  assert.throws(() => f.api.install(), /verified revision/);
-  fs.writeFileSync(b.exe, 'new binary fixture');
-  write(f.root, 'artifacts/custom-build.json', JSON.stringify({ ...b.report, exe: b.destination }));
-  assert.throws(() => f.api.install(), /verified revision/);
-  write(f.root, 'artifacts/custom-build.json', JSON.stringify({ ...b.report, installer: path.join(f.container, 'outside.exe') }));
-  assert.throws(() => f.api.install(), /outside the intended/);
-  write(f.root, 'artifacts/custom-build.json', JSON.stringify(b.report));
-  write(f.root, 'artifacts/custom-verification.json', JSON.stringify({ head: 'different', clean: true }));
-  assert.throws(() => f.api.install(), /exact revision/);
-  assert.equal(fs.readFileSync(b.destination, 'utf8'), 'old binary fixture');
 });
 test('maintenance leaves direct access and user proxy policy unchanged', () => {
   assert.deepEqual(proxyEnvironment({}), {}, 'a fresh user must not need a maintainer proxy');
@@ -273,7 +159,9 @@ test('maintenance leaves direct access and user proxy policy unchanged', () => {
 });
 
 test('native builds default to bounded concurrency and retain an explicit user setting', () => {
-  assert.equal(nativeEnvironment({}).CARGO_BUILD_JOBS, '2');
+  assert.equal(nativeEnvironment({}).CARGO_BUILD_JOBS, defaultCargoJobs());
+  assert.equal(nativeEnvironment({}, '5').CARGO_BUILD_JOBS, '5');
+  assert.equal(nativeEnvironment({}, '5', path.join(ROOT, 'artifacts', 'check-target')).CARGO_TARGET_DIR, path.join(ROOT, 'artifacts', 'check-target'));
   const base = { CARGO_BUILD_JOBS: '4', CARGO_TARGET_DIR: 'outside-fixture', HTTPS_PROXY: 'http://proxy.fixture:8080' };
   const env = nativeEnvironment(base);
   assert.equal(env.CARGO_BUILD_JOBS, '4');
@@ -294,6 +182,7 @@ test('fresh or damaged verification reports give an actionable error without cer
 
 test('build reports reject embedded local checkout or profile paths without echoing them', t => {
   const f = fixture(t);
+  const startedAt = Date.now();
   const b = preparedBuild(f);
   for (const [localPath, encoding, oddOffset] of [
     [f.root, 'utf8', false],
@@ -303,10 +192,58 @@ test('build reports reject embedded local checkout or profile paths without echo
   ]) {
     const encoded = Buffer.from(`fixture ${localPath} fixture`, encoding);
     fs.writeFileSync(b.exe, oddOffset ? Buffer.concat([Buffer.from([0]), encoded]) : encoded);
-    assert.throws(() => f.api.recordBuild('1.1.1+protected.1', Date.now()), error => {
+    assert.throws(() => f.api.recordBuild('1.1.1+protected.1', startedAt), error => {
       assert.match(error.message, /contains a local build path/);
       assert.equal(error.message.includes(localPath), false);
       return true;
     });
   }
+});
+
+test('ignored additions and skip-worktree changes cannot be certified as committed resources', t => {
+  const f = fixture(t);
+  const b = preparedBuild(f);
+  const source = b.report.resources[0].source;
+  git(['update-index', '--skip-worktree', source], f.root);
+  fs.writeFileSync(path.join(f.root, source), 'mutable catalog');
+  assert.equal(git(['status', '--porcelain=v1'], f.root), '');
+  assert.throws(() => f.api.recordVerification(b.head), /committed HEAD/);
+  assert.throws(() => f.api.install(), /committed HEAD/);
+  fs.writeFileSync(path.join(f.root, source), 'new catalog');
+  write(f.root, '.git/info/exclude', 'src-tauri/resources/skills/ignored.md\n');
+  write(f.root, 'src-tauri/resources/skills/ignored.md', 'uncertified bytes');
+  assert.equal(git(['status', '--porcelain=v1'], f.root), '');
+  assert.throws(() => f.api.recordBuild('1.1.1+protected.1', Date.now()), /committed HEAD/);
+  fs.unlinkSync(path.join(f.root, 'src-tauri/resources/skills/ignored.md'));
+  fs.unlinkSync(path.join(f.root, source));
+  assert.throws(() => f.api.install(), /empty|committed HEAD/);
+});
+
+test('resource mappings must match the supported Tauri configuration', t => {
+  const f = fixture(t);
+  preparedBuild(f);
+  write(f.root, '.custom/tauri.json', JSON.stringify({ bundle: { resources: { 'resources/skills': 'other' } } }));
+  const head = commit(f.root, 'unsupported override');
+  assert.throws(() => f.api.recordVerification(head), /mapping overrides/);
+  write(f.root, '.custom/tauri.json', '{}');
+  write(f.root, 'src-tauri/tauri.conf.json', JSON.stringify({ bundle: { resources: ['resources/skills'] } }));
+  assert.throws(() => f.api.recordVerification(commit(f.root, 'unsupported array')), /Unsupported Tauri resource mapping/);
+});
+
+test('a verification report records which stages ran and which were reused, and a failed stage certifies nothing', t => {
+  const f = fixture(t);
+  const head = git(['rev-parse', 'HEAD'], f.root);
+  const results = [{ id: 'types', label: 'types', status: 'ran' }, { id: 'vitest', label: 'vitest', status: 'reused', head: 'a'.repeat(40) }];
+  f.api.finishVerification(head, results);
+  const report = JSON.parse(fs.readFileSync(path.join(f.root, 'artifacts/custom-verification.json'), 'utf8'));
+  assert.deepEqual(report.checks, ['types', 'vitest', 'diff']);
+  assert.deepEqual(report.stages, [{ id: 'types', status: 'ran' }, { id: 'vitest', status: 'reused', head: 'a'.repeat(40) }]);
+  assert.equal(report.head, head);
+  fs.rmSync(path.join(f.root, 'artifacts/custom-verification.json'));
+  const quiet = console.log;
+  console.log = () => {};
+  try {
+    assert.throws(() => f.api.finishVerification(head, [results[0], { id: 'vitest', label: 'vitest', status: 'failed' }, { id: 'n', label: 'n', status: 'skipped', reason: 'n did not compile' }]), /Verification failed: vitest; inspect/);
+  } finally { console.log = quiet; }
+  assert.equal(fs.existsSync(path.join(f.root, 'artifacts/custom-verification.json')), false);
 });

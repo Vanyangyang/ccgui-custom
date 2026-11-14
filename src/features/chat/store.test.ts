@@ -799,6 +799,7 @@ describe("refreshSessions and the not-yet-scanned session", () => {
       openTabs: [tab],
       active: tab,
       bySession: { "omp/s-archived": { ...EMPTY_SESSION } },
+      drafts: { "omp/s-archived": "keep after refresh" },
     });
     vi.mocked(ipc.listArchivedSessions).mockResolvedValue([archived]);
 
@@ -808,6 +809,7 @@ describe("refreshSessions and the not-yet-scanned session", () => {
     expect(useChatStore.getState().openTabs).toEqual([]);
     expect(useChatStore.getState().active).toBeNull();
     expect(useChatStore.getState().bySession["omp/s-archived"]).toBeUndefined();
+    expect(useChatStore.getState().drafts["omp/s-archived"]).toBe("keep after refresh");
   });
 });
 

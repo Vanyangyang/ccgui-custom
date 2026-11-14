@@ -86,6 +86,33 @@ describe("local live update coordinator", () => {
     expect(store.getState().stage).toBe("waiting");
   });
 
+  it("waits for a service that survives preparation instead of repeatedly closing and restoring views", async () => {
+    vi.useFakeTimers();
+    const f = fixture();
+    f.setStatus({ ...status(transaction, ["plugin-processes"]), blockerDetails: [{ reason: "plugin-processes", pluginId: "demo" }] });
+    f.deps.canClosePluginViews = vi.fn((blockers: readonly LiveUpdateBlocker[]) => blockers.every(b => b.reason === "plugin-processes" && b.pluginId === "demo"));
+    f.deps.preparePluginViews = vi.fn(async () => { f.calls.push("stop-service"); });
+    f.deps.resumePluginViews = vi.fn();
+    const original = f.native.getMockImplementation()!;
+    f.native.mockImplementation(async command => {
+      if (command === "live_update_begin" && f.calls.filter(call => call === "live_update_begin").length === 0) {
+        f.calls.push(command); throw new Error("Update is waiting: plugin-processes");
+      }
+      if (command === "live_update_abort") { f.calls.push(command); return undefined; }
+      return original(command);
+    });
+    const store = f.create(); const stop = startLiveUpdateRuntime(store); await settle();
+    await vi.advanceTimersByTimeAsync(15_000); await settle();
+    expect(f.deps.preparePluginViews).toHaveBeenCalledTimes(1);
+    expect(f.calls.filter(call => call === "live_update_begin")).toHaveLength(1);
+    expect(store.getState().stage).toBe("waiting");
+    f.setStatus(status());
+    await vi.advanceTimersByTimeAsync(3_000); await settle();
+    expect(store.getState().stage).toBe("handoff");
+    expect(f.deps.preparePluginViews).toHaveBeenCalledTimes(2);
+    stop();
+  });
+
   it("never hides a generic or malformed process blocker behind a cooperative service", async () => {
     for (const extra of [{ reason: "plugin-processes" }, { reason: "plugin-processes", pluginId: "bad/id" }]) {
       const f = fixture();
@@ -128,8 +155,49 @@ describe("local live update coordinator", () => {
     expect(f.native).toHaveBeenCalledWith("live_update_abort", { transactionId: transaction.id, defer: true });
     expect(f.calls).toEqual(["live_update_status", "live_update_abort", "abort-checkpoint", "resume-views", "resume"]);
     vi.mocked(f.deps.preparePluginViews!).mockImplementation(async () => { f.setOpen(false); });
-    await store.getState().refresh(); await settle();
+    await store.getState().retrySwitch(); await settle();
     expect(store.getState().stage).toBe("handoff");
+  });
+
+  it("keeps a refused detached-window close visible without retrying until explicitly requested", async () => {
+    vi.useFakeTimers();
+    const f = closableFixture();
+    f.setStatus(status(transaction, ["plugin-window-without-checkpoint"]));
+    vi.mocked(f.deps.preparePluginViews!).mockRejectedValue(Object.assign(new Error("Unconfirmed edits remain in detached window"), { code: "DETACHED_RETURN_BLOCKED" }));
+    const store = f.create(); const stop = startLiveUpdateRuntime(store); await settle();
+    expect(store.getState().blockers).toContainEqual({ participant: "plugin-update-close", reason: "plugin-window-unconfirmed-edits" });
+    await vi.advanceTimersByTimeAsync(15_000); await settle();
+    expect(f.deps.preparePluginViews).toHaveBeenCalledTimes(1);
+    expect(store.getState().stage).toBe("waiting");
+    expect(store.getState().blockers).toContainEqual({ participant: "plugin-update-close", reason: "plugin-window-unconfirmed-edits" });
+    expect(f.calls.filter(call => call === "live_update_abort")).toHaveLength(1);
+    expect(f.calls).not.toContain("live_update_activate");
+    // A status-only read cannot silently retry a refused close.
+    await store.getState().refresh(); await settle();
+    expect(f.deps.preparePluginViews).toHaveBeenCalledTimes(1);
+    // The user has resolved the edit and explicitly retried.
+    f.setStatus(status());
+    vi.mocked(f.deps.preparePluginViews!).mockImplementation(async () => { f.setOpen(false); });
+    await store.getState().retrySwitch(); await settle();
+    expect(f.deps.preparePluginViews).toHaveBeenCalledTimes(2);
+    expect(store.getState().stage).toBe("handoff");
+    stop();
+  });
+
+  it("releases a preparation failure when the staged transaction changes", async () => {
+    vi.useFakeTimers();
+    const f = closableFixture();
+    vi.mocked(f.deps.preparePluginViews!).mockRejectedValueOnce(new Error("save failed"))
+      .mockImplementation(async () => { f.setOpen(false); });
+    const store = f.create(); const stop = startLiveUpdateRuntime(store); await settle();
+    expect(store.getState().stage).toBe("waiting");
+    const next = { ...transaction, id: "another-transaction" };
+    f.setStatus(status(next));
+    await vi.advanceTimersByTimeAsync(3_000); await settle();
+    expect(f.deps.preparePluginViews).toHaveBeenCalledTimes(2);
+    expect(store.getState().stage).toBe("handoff");
+    expect(f.native).toHaveBeenCalledWith("live_update_activate", expect.objectContaining({ transactionId: next.id }));
+    stop();
   });
 
   it("cancels a pending save promptly and never activates after its late completion", async () => {
@@ -151,12 +219,34 @@ describe("local live update coordinator", () => {
     vi.useFakeTimers();
     const f = closableFixture(); const pending = Promise.withResolvers<void>();
     vi.mocked(f.deps.preparePluginViews!).mockReturnValue(pending.promise);
-    const store = f.create(); await store.getState().refresh(); await settle();
+    const store = f.create(); const stop = startLiveUpdateRuntime(store); await settle();
     await vi.advanceTimersByTimeAsync(45_000); await settle();
     expect(store.getState()).toMatchObject({ stage: "waiting", transaction,
       blockers: [{ reason: "plugin-update-close-timeout" }] });
     expect(f.deps.resumePluginViews).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(15_000); await settle();
+    expect(f.deps.preparePluginViews).toHaveBeenCalledTimes(1);
+    expect(store.getState().blockers).toContainEqual(expect.objectContaining({ reason: "plugin-update-close-timeout" }));
     pending.resolve(); await settle(); expect(f.calls).not.toContain("live_update_activate");
+    stop();
+  });
+
+  it("keeps the close failure paused after an interrupted status read and allows cancelling it", async () => {
+    vi.useFakeTimers();
+    const f = closableFixture();
+    vi.mocked(f.deps.preparePluginViews!).mockRejectedValue(new Error("save failed"));
+    const store = f.create(); const stop = startLiveUpdateRuntime(store); await settle();
+    f.native.mockRejectedValueOnce(new Error("temporary status failure"));
+    await vi.advanceTimersByTimeAsync(3_000); await settle();
+    expect(store.getState().errorCode).toBe("statusFailed");
+    await vi.advanceTimersByTimeAsync(10_000); await settle();
+    expect(store.getState()).toMatchObject({ stage: "waiting", errorCode: undefined });
+    expect(store.getState().blockers).toContainEqual(expect.objectContaining({ reason: "plugin-update-close-failed", detail: "save failed" }));
+    expect(f.deps.preparePluginViews).toHaveBeenCalledTimes(1);
+    await store.getState().cancel();
+    expect(store.getState()).toMatchObject({ stage: "idle", cancelled: true, transaction: null });
+    expect(f.calls).not.toContain("live_update_activate");
+    stop();
   });
 
   it("rechecks readiness after closing views and releases their freeze if a new blocker appears", async () => {
@@ -168,6 +258,22 @@ describe("local live update coordinator", () => {
     expect(store.getState()).toMatchObject({ stage: "waiting", blockers: [{ participant: "app-ui", reason: "open-dialog" }] });
     expect(f.calls).not.toContain("live_update_begin");
     expect(f.deps.resumePluginViews).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not repeatedly prepare a plugin view that remains blocked after preparation", async () => {
+    vi.useFakeTimers();
+    const f = closableFixture();
+    vi.mocked(f.deps.preparePluginViews!).mockResolvedValue(undefined);
+    const store = f.create(); const stop = startLiveUpdateRuntime(store); await settle();
+    expect(store.getState()).toMatchObject({ stage: "waiting", blockers: [{ reason: "plugin-view-without-checkpoint" }] });
+    await vi.advanceTimersByTimeAsync(15_000); await settle();
+    expect(f.deps.preparePluginViews).toHaveBeenCalledTimes(1);
+    expect(f.calls).not.toContain("live_update_begin");
+    f.setOpen(false);
+    await vi.advanceTimersByTimeAsync(3_000); await settle();
+    expect(f.deps.preparePluginViews).toHaveBeenCalledTimes(2);
+    expect(store.getState().stage).toBe("handoff");
+    stop();
   });
 
   it("enriches each native run while retaining unrelated native and frontend blockers", async () => {

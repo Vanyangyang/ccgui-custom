@@ -19,6 +19,7 @@ use tauri::{Emitter, Manager};
 use tokio::sync::{oneshot, watch, Notify, Semaphore};
 
 pub const MCP_SERVER_NAME: &str = "ccgui";
+pub(crate) const DYNAMIC_CONFIG_ENV: &str = "CCGUI_HOST_CHAT_CONFIG_FILE";
 const REQUEST_EVENT: &str = "host-chat://request";
 const RUN_ENDED_EVENT: &str = "host-chat://run-ended";
 const PROCESS_RETIRED_EVENT: &str = "host-chat://process-retired";
@@ -128,17 +129,37 @@ pub(crate) fn validate_worker_session(
 /// Mutable coordinator state must never rewrite an already sequenced event.
 pub(crate) fn annotate_worker_event(event: &mut Value) {
     let (Some(context), Some(Some(presentation))) = (WORKER_HOST.get(), WORKER_EVENT_PRESENTATION.get()) else { return; };
+    annotate_worker_presentation(event, &context.engine, &context.run_id, presentation);
+}
+
+fn annotate_worker_presentation(event: &mut Value, engine: &str, base_run: &str, presentation: &Value) {
     let Some(run_id) = event["runId"].as_str() else { return; };
-    if event["engine"].as_str() != Some(context.engine.as_str())
-        || !(run_id == context.run_id || run_id.strip_prefix(&context.run_id)
+    if event["engine"].as_str() != Some(engine)
+        || !(run_id == base_run || run_id.strip_prefix(base_run)
             .and_then(|suffix| suffix.strip_prefix("-c"))
             .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())))
     { return; }
     let mut metadata = presentation.clone();
-    if event["kind"] != "session" {
-        if let Some(metadata) = metadata.as_object_mut() { metadata.remove("assignment"); }
+    if event["kind"] != "session" || run_id != base_run {
+        if let Some(metadata) = metadata.as_object_mut() {
+            metadata.remove("assignment");
+            metadata.remove("assignmentSource");
+        }
     }
     event["leader"] = metadata;
+}
+
+#[test]
+fn worker_assignment_metadata_is_only_on_the_original_session_event() {
+    let presentation = serde_json::json!({"branchId":"child", "assignment":"task",
+        "assignmentSource":{"engine":"codex","sessionId":"parent","workspacePath":"parent-workspace"}});
+    for (run, kind, expected) in [("run", "session", true), ("run", "delta", false), ("run-c1", "session", false)] {
+        let mut event = serde_json::json!({"runId":run,"engine":"claude","kind":kind});
+        annotate_worker_presentation(&mut event, "claude", "run", &presentation);
+        assert_eq!(event["leader"]["branchId"], "child");
+        assert_eq!(event["leader"].get("assignment").is_some(), expected);
+        assert_eq!(event["leader"].get("assignmentSource").is_some(), expected);
+    }
 }
 
 pub(crate) fn install_worker_context(context: WorkerHostContext, run_id: &str) -> Result<(), String> {
@@ -745,7 +766,17 @@ impl Relay {
             return Ok(capabilities);
         }
         let request_id = uuid::Uuid::new_v4().to_string();
-        let timeout = if method == "get_inbox_status" { self.timeout.min(Duration::from_millis(800)) } else { self.timeout };
+        let timeout = if method == "get_inbox_status" {
+            self.timeout.min(Duration::from_millis(800))
+        } else if method == "task_wait" {
+            let wait_secs = arguments
+                .get("timeout_seconds")
+                .and_then(Value::as_u64)
+                .unwrap_or(20);
+            self.timeout.max(Duration::from_secs(wait_secs.saturating_add(10)))
+        } else {
+            self.timeout
+        };
         let deadline = Instant::now() + timeout;
         let (tx, rx) = oneshot::channel();
         let guard = PendingGuard {
@@ -2194,6 +2225,14 @@ struct RelayClient {
     client: reqwest::Client,
     url: reqwest::Url,
     token: String,
+    config_file: Option<PathBuf>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DynamicRelayEndpoint {
+    url: String,
+    token: String,
 }
 
 enum AttemptFailure { Retry(String), Final(String) }
@@ -2218,7 +2257,7 @@ impl RelayClient {
         Ok(result)
     }
 
-    fn new(url: &str, token: String) -> Result<Self, String> {
+    fn parse_endpoint(url: &str, token: String) -> Result<(reqwest::Url, String), String> {
         let parsed =
             reqwest::Url::parse(url).map_err(|_| "Invalid host chat relay URL".to_string())?;
         if parsed.scheme() != "http"
@@ -2236,23 +2275,77 @@ impl RelayClient {
         if token.len() != 36 || uuid::Uuid::parse_str(&token).is_err() {
             return Err("Invalid host chat relay token".into());
         }
-        let client = reqwest::Client::builder()
+        Ok((parsed, token))
+    }
+
+    fn build_http_client() -> Result<reqwest::Client, String> {
+        reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
             .connect_timeout(Duration::from_secs(2))
             .timeout(Duration::from_secs(35))
             .build()
-            .map_err(|_| "Create private host chat relay client failed".to_string())?;
+            .map_err(|_| "Create private host chat relay client failed".to_string())
+    }
+
+    fn new(url: &str, token: String) -> Result<Self, String> {
+        let (parsed, token) = Self::parse_endpoint(url, token)?;
         Ok(Self {
-            client,
+            client: Self::build_http_client()?,
             url: parsed,
             token,
+            config_file: None,
         })
+    }
+
+    fn from_config_file(path: PathBuf) -> Result<Self, String> {
+        if !path.is_absolute() {
+            return Err("Host chat config file must be an absolute path".into());
+        }
+        let placeholder = reqwest::Url::parse(&format!("http://127.0.0.1:1{ROUTE}"))
+            .map_err(|_| "Invalid host chat relay URL".to_string())?;
+        let client = Self {
+            client: Self::build_http_client()?,
+            url: placeholder,
+            token: String::new(),
+            config_file: Some(path),
+        };
+        let _ = client.resolve_endpoint()?;
+        Ok(client)
+    }
+
+    fn resolve_endpoint(&self) -> Result<(reqwest::Url, String), String> {
+        let Some(path) = &self.config_file else {
+            return Ok((self.url.clone(), self.token.clone()));
+        };
+        let meta = std::fs::symlink_metadata(path)
+            .map_err(|_| "Host chat capability is not active for this run".to_string())?;
+        if !meta.is_file() || meta.file_type().is_symlink() || meta.len() == 0 || meta.len() > 4096 {
+            return Err("Host chat capability is not active for this run".into());
+        }
+        let bytes = std::fs::read(path)
+            .map_err(|_| "Host chat capability is not active for this run".to_string())?;
+        let endpoint: DynamicRelayEndpoint = serde_json::from_slice(&bytes)
+            .map_err(|_| "Host chat capability is not active for this run".to_string())?;
+        Self::parse_endpoint(&endpoint.url, endpoint.token)
+    }
+
+    fn request_timeout_for(method: &str, arguments: &Value) -> Duration {
+        if method == "task_wait" {
+            let wait_secs = arguments
+                .get("timeout_seconds")
+                .and_then(Value::as_u64)
+                .unwrap_or(20);
+            Duration::from_secs(wait_secs.saturating_add(15).max(35))
+        } else {
+            Duration::from_secs(35)
+        }
     }
 
     async fn call(&self, method: &str, arguments: Value) -> Result<Value, String> {
         let arguments = validate_arguments(method, arguments)?;
+        let request_timeout = Self::request_timeout_for(method, &arguments);
         // One transport ID for the entire call, including every reconnect. The
         // model's business request_id remains unchanged inside arguments too.
         let request_id = uuid::Uuid::new_v4().to_string();
@@ -2267,7 +2360,7 @@ impl RelayClient {
         // a temporary update outage must not turn into a second send.
         let deadline = Instant::now() + Duration::from_secs(240);
         loop {
-            match self.call_once(&body).await {
+            match self.call_once(&body, request_timeout).await {
                 Ok(value) => return Ok(value),
                 Err(AttemptFailure::Final(error)) => return Err(error),
                 Err(AttemptFailure::Retry(error)) => {
@@ -2278,7 +2371,7 @@ impl RelayClient {
         }
     }
 
-    async fn call_once(&self, body: &[u8]) -> Result<Value, AttemptFailure> {
+    async fn call_once(&self, body: &[u8], request_timeout: Duration) -> Result<Value, AttemptFailure> {
         let unknown = || {
             Failure::unknown(
                 StatusCode::BAD_GATEWAY,
@@ -2286,13 +2379,15 @@ impl RelayClient {
             )
             .message
         };
+        let (url, token) = self.resolve_endpoint().map_err(AttemptFailure::Final)?;
         // reqwest's implicit retries remain disabled. The caller controls the
         // bounded retry policy and reuses these exact bytes and request ID.
         let mut response = self
             .client
-            .post(self.url.clone())
-            .bearer_auth(&self.token)
+            .post(url)
+            .bearer_auth(&token)
             .header(header::CONTENT_TYPE, "application/json")
+            .timeout(request_timeout)
             .body(body.to_vec())
             .send()
             .await
@@ -2538,32 +2633,32 @@ mod mcp {
             .await
         }
 
-        #[tool(description = "Delegate work within the user's authorized task to a new real Claude Code, Codex, AGY or Cursor child chat. Omitted workspace_path inherits this workspace; an explicit cross-workspace target must be a registered, local, unarchived, available development member of the same registered project as the native parent. Reference members and arbitrary directories are not execution targets. Available in ordinary local chats without enabling a separate mode. The child cannot see this conversation: the task text is all it receives. Children in the same workspace share files; cross-workspace children execute in their own selected cwd. Shared project membership does not widen inherited permission. Choose delegation to suit the task. Omitted model uses the host's default for the selected engine. Choose a valid engine effort autonomously or omit effort to use the user's default. Omitted ttl_seconds uses the child engine's default: Claude Code 3600 seconds (60 minutes), Codex, AGY and Cursor 1800 seconds (30 minutes). Explicit TTL must be 60-86400 seconds. Expiry only prompts inspection and never automatically stops, reassigns, deletes or compresses work. The host binds the parent identity and inherits permission; arguments cannot impersonate a parent or elevate permission. Use a stable request_id for idempotency. On uncertainty inspect task_list and reuse the same id; do not create duplicate work. Completed children retain their conversation and results. The human manages archive, restore and confirmed permanent deletion of the task group in the local GUI.")]
+        #[tool(description = "Delegate work within the user's authorized task to a new real Claude Code, Codex, AGY or Cursor child chat. Omitted workspace_path inherits this workspace. All four engines may dispatch across projects to any registered, available, unarchived local workspace without a source-to-target grant. Project membership and member roles do not restrict dispatch. The target must still exist and be local; remote and WSL workspaces are unsupported. The host verifies the launch reservation, engine and selected cwd before starting or continuing a child. Available in ordinary local chats without enabling a separate mode. The child cannot see this conversation: the task text is all it receives. Children in the same workspace share files; cross-workspace children execute in their own selected cwd. Cross-workspace dispatch preserves inherited permissions and cost approval rules. Choose delegation to suit the task. Omitted model uses the host's default for the selected engine. Choose a valid engine effort autonomously or omit effort to use the user's default. Omitted ttl_seconds uses the child engine's default: Claude Code 3600 seconds (60 minutes), Codex, AGY and Cursor 1800 seconds (30 minutes). Explicit TTL must be 60-86400 seconds. Expiry only prompts inspection and never automatically stops, reassigns, deletes or compresses work. The host binds the parent identity and inherits permission; arguments cannot impersonate a parent or elevate permission. Use a stable request_id for idempotency. On uncertainty inspect task_list and reuse the same id; do not create duplicate work. Completed children retain their conversation and results. The human manages archive, restore and confirmed permanent deletion of the task group in the local GUI.")]
         async fn task_spawn(&self, Parameters(args): Parameters<crate::leader::SpawnArgs>) -> Result<CallToolResult, McpError> {
             self.result("task_spawn", serde_json::to_value(args).map_err(|_| McpError::internal_error("Encode task spawn arguments failed", None))?).await
         }
 
-        #[tool(description = "Read this chat's direct child branches. When present, delegation contains your latest assignment's requestId, execution runId, state and bounded result; use delegation.state/result to assess that assignment. The branch's top-level state/result describe the child's current conversation activity, which may be a later human follow-up. A completed delegation is not reopened by that follow-up. Available in an authenticated ordinary local chat, including its host-registered worker; no separate mode is required. Completed, failed, waiting and expired are distinct; expiry does not delete a branch. Legacy unknown delegation results require inspecting the child history, not assuming success. Identity comes from this native chat, never a claimed parent in arguments.")]
+        #[tool(description = "Read this chat's direct child branches. Compact by default: taskPreview up to 160 characters unless include_task=true, and result previews up to 500 characters for all states, including completed tasks. Use task_wait with selected branch_ids or include_result=true here for bounded terminal bodies. When the branch and delegation share a long result, only delegation.result carries the full body; the branch keeps a preview with resultSource=delegation.result. Preview-only reads do not consume unread completion notices. When present, delegation contains your latest assignment's requestId, execution runId, state and bounded result; use delegation.state/result to assess that assignment. The branch's top-level state/result describe the child's current conversation activity, which may be a later human follow-up. A completed delegation is not reopened by that follow-up. Available in an authenticated ordinary local chat, including its host-registered worker; no separate mode is required. Completed, failed, waiting and expired are distinct; expiry does not delete a branch. A human handoff marks the old child handed_off and creates a successor under the same parent; handed_off is not task completion. Legacy unknown delegation results require inspecting the child history, not assuming success. Identity comes from this native chat, never a claimed parent in arguments.")]
         async fn task_list(&self, Parameters(args): Parameters<crate::leader::ListArgs>) -> Result<CallToolResult, McpError> {
             self.result("task_list", serde_json::to_value(args).map_err(|_| McpError::internal_error("Encode task list arguments failed", None))?).await
         }
 
-        #[tool(description = "Wait up to 20 seconds for selected direct children (default: all unreclaimed) and return their status and bounded results. When delegation is present, readiness and results belong to that assignment: read delegation.requestId/state/result, even if the child's top-level state is running a later human follow-up. Returns early when an assignment finishes, fails, stops, becomes unknown, expires or starts waiting for the human during this call (listed in changedBranchIds), or at once when none is still pending; assignments already finished when the call starts do not end a wait for other active assignments. Children never notify you after your turn ends, so call again while you still need results. timedOut only means nothing new happened yet: it is not failure or permission to replay. A child waiting for user input needs the human to answer in that child's GUI.")]
+        #[tool(description = "Wait up to timeout_seconds (0-120, default 20; pass 60-120 for long tasks) for selected direct children (default: all unreclaimed) and return their compact status and bounded results (taskPreview by default unless include_task=true, tail resultPreview while running/starting/queued, full result when terminal). When delegation is present, readiness and results belong to that assignment: read delegation.requestId/state/result, even if the child's top-level state is running a later human follow-up. Returns early when an assignment finishes, fails, stops, becomes unknown, expires or starts waiting for the human during this call (listed in changedBranchIds), or at once when none is still pending; assignments already finished when the call starts do not end a wait for other active assignments. A selected original child ID follows its verified handoff chain; the view keeps that requested id and reports the current actualBranchId. A completed managed assignment durably schedules one continuation in its actual parent to read the saved result, including after a human Handoff. Busy parents wait for an idle boundary; existing approvals and explicit Stop remain in force. A pending notice is consumed only when this call or task_list delivers the completed assignment's full stored result, without a tool preview; the stored history limit may still be marked resultTruncated. Shared long bodies appear in delegation.result once; the branch keeps a linked preview. If timedOut is true while the child is still starting/queued/running (see waitHint) and you have no other local parallel work, stop calling tools and end this turn instead of polling task_wait in a loop: the host will wake this parent when the child finishes, fails, or needs approval. Do not redispatch completed work or replay an uncertain continuation. timedOut only means nothing new happened yet: it is not failure or permission to replay. A child waiting for user input needs the human to answer in that child's GUI.")]
         async fn task_wait(&self, Parameters(args): Parameters<crate::leader::WaitArgs>) -> Result<CallToolResult, McpError> {
             self.result("task_wait", serde_json::to_value(args).map_err(|_| McpError::internal_error("Encode task wait arguments failed", None))?).await
         }
 
-        #[tool(description = "Continue a direct child chat with a new follow-up assignment, preserving its engine and settings. Its delegation.requestId identifies this assignment separately from any human follow-up in the child's tab. Busy or approval-waiting children cannot be silently interrupted. Cold or unknown prompt cache, or at most 10 seconds until its earliest estimated expiration, requires human cost approval before the target model starts. Hot cache with more than 10 seconds left sends directly. If status is awaiting_cost_approval, report it and stop polling: the human must approve or cancel the chat's cost review card; never bypass it or resend with a new request_id. Use a stable request_id; an unknown outcome must be inspected before retrying. This tool cannot target arbitrary or sibling chats.")]
+        #[tool(description = "Continue a direct child chat with a new follow-up assignment, preserving its engine and settings. Its delegation.requestId identifies this assignment separately from any human follow-up in the child's tab. Busy or approval-waiting children cannot be silently interrupted. Cold or unknown prompt cache, or at most 10 seconds until its earliest estimated expiration, requires human cost approval before the target model starts. Hot cache with more than 10 seconds left sends directly. If status is awaiting_cost_approval, report it and stop polling: the human must approve, cancel, or hand off the chat's cost review card; never bypass it or resend with a new request_id. After a handoff, an original child ID follows the verified successor chain. Use a stable request_id; an unknown outcome must be inspected before retrying. This tool cannot target arbitrary or sibling chats.")]
         async fn task_send(&self, Parameters(args): Parameters<crate::leader::SendArgs>) -> Result<CallToolResult, McpError> {
             self.result("task_send", serde_json::to_value(args).map_err(|_| McpError::internal_error("Encode task send arguments failed", None))?).await
         }
 
-        #[tool(description = "Extend a direct child's task deadline after considering its progress or blockers. Expiry is a check signal, not proof of failure. The host verifies the caller is its parent. Does not restart, replay or delete the child.")]
+        #[tool(description = "Extend a direct child's task deadline after considering its progress or blockers. Expiry is a check signal, not proof of failure. The host verifies the caller is its parent. An original handed-off child ID resolves to its current successor. Does not restart, replay or delete the child.")]
         async fn task_renew(&self, Parameters(args): Parameters<crate::leader::RenewArgs>) -> Result<CallToolResult, McpError> {
             self.result("task_renew", serde_json::to_value(args).map_err(|_| McpError::internal_error("Encode task renewal arguments failed", None))?).await
         }
 
-        #[tool(description = "Stop execution in a direct child branch while preserving its conversation and result for inspection or later work. Does not delete history. The host verifies parent ownership; a child cannot stop itself through this tool.")]
+        #[tool(description = "Stop execution in a direct child branch while preserving its conversation and result for inspection or later work. Does not delete history. An original handed-off child ID stops its current successor. The host verifies parent ownership; a child cannot stop itself through this tool.")]
         async fn task_stop(&self, Parameters(args): Parameters<crate::leader::BranchArgs>) -> Result<CallToolResult, McpError> {
             self.result("task_stop", serde_json::to_value(args).map_err(|_| McpError::internal_error("Encode task stop arguments failed", None))?).await
         }
@@ -2634,15 +2729,21 @@ mod mcp {
 
 /// stdout is reserved for MCP frames. Neither tokens nor user text are logged.
 pub fn serve_stdio() -> Result<(), String> {
-    let url = std::env::var("CCGUI_HOST_CHAT_URL")
-        .map_err(|_| "Host chat relay URL is missing".to_string())?;
-    let token = std::env::var("CCGUI_HOST_CHAT_TOKEN")
-        .map_err(|_| "Host chat relay token is missing".to_string())?;
+    let client = match std::env::var(DYNAMIC_CONFIG_ENV) {
+        Ok(path) if !path.trim().is_empty() => RelayClient::from_config_file(PathBuf::from(path))?,
+        _ => {
+            let url = std::env::var("CCGUI_HOST_CHAT_URL")
+                .map_err(|_| "Host chat relay URL is missing".to_string())?;
+            let token = std::env::var("CCGUI_HOST_CHAT_TOKEN")
+                .map_err(|_| "Host chat relay token is missing".to_string())?;
+            RelayClient::new(&url, token)?
+        }
+    };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|_| "Start host chat MCP runtime failed".to_string())?;
-    runtime.block_on(async { mcp::serve(RelayClient::new(&url, token)?).await })
+    runtime.block_on(async { mcp::serve(client).await })
 }
 
 #[cfg(test)]
@@ -2837,5 +2938,42 @@ mod continuity_tests {
         })).unwrap();
         assert!(!context.managed_task_parent);
         assert!(context.validate_for("r", "claude", Some("saved"), "workspace").is_ok());
+    }
+
+    #[test]
+    fn dynamic_config_file_rotates_token_and_fails_closed_when_scrubbed() {
+        let dir = std::env::temp_dir().join(format!("ccgui-hc-dyn-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("host-chat.json");
+        let t1 = uuid::Uuid::new_v4().to_string();
+        let t2 = uuid::Uuid::new_v4().to_string();
+        std::fs::write(&cfg, serde_json::to_vec(&json!({
+            "url": "http://127.0.0.1:43111/host-chat",
+            "token": t1,
+        })).unwrap()).unwrap();
+
+        let client = RelayClient::from_config_file(cfg.clone()).unwrap();
+        let (u1, resolved1) = client.resolve_endpoint().unwrap();
+        assert_eq!(u1.as_str(), "http://127.0.0.1:43111/host-chat");
+        assert_eq!(resolved1, t1);
+
+        std::fs::write(&cfg, serde_json::to_vec(&json!({
+            "url": "http://127.0.0.1:43222/host-chat",
+            "token": t2,
+        })).unwrap()).unwrap();
+        let (u2, resolved2) = client.resolve_endpoint().unwrap();
+        assert_eq!(u2.as_str(), "http://127.0.0.1:43222/host-chat");
+        assert_eq!(resolved2, t2);
+
+        // Reject non-loopback URL and scrubbed file (fail-closed between turns).
+        std::fs::write(&cfg, serde_json::to_vec(&json!({
+            "url": "http://example.com:43222/host-chat",
+            "token": t2,
+        })).unwrap()).unwrap();
+        assert!(client.resolve_endpoint().is_err());
+
+        std::fs::remove_file(&cfg).unwrap();
+        assert!(client.resolve_endpoint().is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

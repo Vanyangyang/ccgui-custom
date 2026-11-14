@@ -102,6 +102,9 @@ export function appendCommittedRows(
         [key]: {
           ...prev,
           ...patch,
+          // A new user input revokes a previous history read's error identity,
+          // even when a later send happens to fail with the same text.
+          ...(rows.some((row) => row.role === "user") ? { historyReloadError: undefined } : {}),
           messages: [
             ...prev.messages,
             ...rows.map((row, i) => ({ ...row, seq: lastSeq + 1 + i })),

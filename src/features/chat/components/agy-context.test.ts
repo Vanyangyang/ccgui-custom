@@ -1,11 +1,20 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import {
-  readAgyReferenceWindow,
-  selectAgyContext,
-  writeAgyReferenceWindow,
-} from "./agy-context";
+import { selectAgyContext } from "./agy-context";
 
 describe("AGY context provenance", () => {
+  it("shows empty official occupancy and prioritizes its capacity over model windows", () => {
+    for (const used of [100_000, 20_000, 0]) {
+      expect(selectAgyContext({
+        context_usage_kind: "current_context", context_usage_source: "acp_usage_update",
+        context_usage: { input_tokens: used, output_tokens: 0 }, model_context_window: 1_000_000,
+      }, 500_000)).toMatchObject({
+        total: used, pct: used / 10_000, max: 1_000_000,
+        parts: used ? [{ kind: "total", tokens: used }] : [],
+        countsKnown: true, occupancyKnown: true, capacityKnown: true, noteKey: undefined,
+      });
+    }
+  });
+
   beforeEach(() => {
     localStorage.clear();
   });
@@ -43,7 +52,7 @@ describe("AGY context provenance", () => {
     ]);
   });
 
-  it("requires explicit current-context provenance and real capacity for a percentage when no reference window is set", () => {
+  it("requires explicit current-context provenance and real capacity for a percentage ", () => {
     const base = { context_usage: { input_tokens: 100 }, model_context_window: 1000 };
     expect(selectAgyContext({ ...base, context_usage_kind: "last_prompt" }).pct).toBeUndefined();
     expect(selectAgyContext({ ...base, context_usage_kind: "current_context" }).pct).toBe(10);
@@ -66,46 +75,18 @@ describe("AGY context provenance", () => {
     expect(result.pct).toBeUndefined();
   });
 
-  it("calculates reference percentage from last_prompt when a valid frontend reference window is configured", () => {
-    const usage = {
-      context_usage_kind: "last_prompt",
-      context_usage: { input_tokens: 40_000, output_tokens: 10_000 },
-    };
-    const result = selectAgyContext(usage, 200_000);
-    expect(result).toMatchObject({
-      max: 200_000,
-      reportedMax: undefined,
-      capacityKnown: true,
-      occupancyKnown: true,
-      countsKnown: true,
-      total: 50_000,
-      pct: 25,
-      labelKey: "chat.agyLatestModelRequest",
-      noteKey: "chat.agyReferenceWindowNote",
-    });
-  });
-
-  it("reads, validates, and clears the persisted frontend reference window", () => {
-    expect(readAgyReferenceWindow()).toBeUndefined();
-    writeAgyReferenceWindow(1_000_000);
-    expect(readAgyReferenceWindow()).toBe(1_000_000);
-    expect(() => writeAgyReferenceWindow(50_000)).toThrow();
-    expect(() => writeAgyReferenceWindow(2_500_000)).toThrow();
-    expect(readAgyReferenceWindow()).toBe(1_000_000);
-    writeAgyReferenceWindow(undefined);
-    expect(readAgyReferenceWindow()).toBeUndefined();
-  });
-
   it("shows a known model capacity without inventing current occupancy", () => {
+    localStorage.setItem("ccgui.agy.reference-context-window", "200000");
     const usage = { context_usage_kind: "last_prompt", context_usage: { input_tokens: 100 } };
-    expect(selectAgyContext(usage, undefined, 1_000_000)).toMatchObject({
+    expect(selectAgyContext(usage).capacityKnown).toBe(false);
+    expect(selectAgyContext(usage, 1_000_000)).toMatchObject({
       max: 1_000_000, capacityKnown: true, occupancyKnown: false, pct: undefined,
     });
-    expect(selectAgyContext(null, undefined, 1_000_000).capacityKnown).toBe(true);
-    expect(selectAgyContext(usage, 200_000, 1_000_000).max).toBe(200_000);
-    expect(selectAgyContext({ ...usage, model_context_window: 500_000 }, 200_000, 1_000_000).max).toBe(500_000);
+    expect(selectAgyContext(null, 1_000_000).capacityKnown).toBe(true);
+    expect(selectAgyContext({ ...usage, model_context_window: 500_000 }, 1_000_000).max).toBe(500_000);
     for (const invalid of [NaN, Infinity, -1, 0, 1.5]) {
-      expect(selectAgyContext(null, undefined, invalid).capacityKnown).toBe(false);
+      expect(selectAgyContext(null, invalid).capacityKnown).toBe(false);
     }
   });
+
 });

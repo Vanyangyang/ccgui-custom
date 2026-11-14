@@ -18,6 +18,8 @@ import {
   getAgyVertexCreditsSnapshot,
   getAgyVertexCreditsUrl,
   getAgyVertexProjectUrl,
+  agyVertexErrorKey,
+  requestAgyVertexAutoRefresh,
   syncAgyVertexCredits,
   useAgyVertexCredits,
 } from "./agy-vertex-guardrail";
@@ -218,6 +220,82 @@ describe("agy-vertex-guardrail helper", () => {
       });
       await p1;
       spy.mockRestore();
+    });
+  });
+
+  describe("automatic background refresh", () => {
+    const connected = {
+      billingAccountId: SYNTHETIC_ACCOUNT,
+      freeTrialCredit: "$100.00",
+      freeTrialOriginalCredit: "$200.00",
+      freeTrialRemainingPercent: 50,
+      gdpMonthlyCredit: null,
+      gdpMonthlyRemainingPercent: null,
+      collectedAt: 1,
+    };
+    // Distinct, far-apart clocks keep the module-level throttle from coupling cases.
+    let clock = 0;
+    const next = () => (clock += 3_600_000);
+
+    it("never connects an account on the user's behalf", async () => {
+      const spy = vi.spyOn(ipc, "agyVertexCreditsRead");
+      await requestAgyVertexAutoRefresh(next());
+      expect(spy).not.toHaveBeenCalled();
+      applyCreditsSnapshot({ ...DEFAULT_CREDITS_SNAPSHOT, billingAccountId: SYNTHETIC_ACCOUNT, errorCode: "permission_denied" });
+      await requestAgyVertexAutoRefresh(next());
+      expect(spy).not.toHaveBeenCalled();
+      spy.mockRestore();
+    });
+
+    it("asks silently, applies the refreshed balance, and is throttled", async () => {
+      applyCreditsSnapshot(connected);
+      const spy = vi.spyOn(ipc, "agyVertexCreditsRead").mockResolvedValue({ ...connected, freeTrialCredit: "$90.00", collectedAt: 2 });
+      const at = next();
+      await requestAgyVertexAutoRefresh(at);
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(spy).toHaveBeenCalledWith({ silent: true });
+      expect(getAgyVertexCreditsSnapshot().freeTrialCredit).toBe("$90.00");
+      await requestAgyVertexAutoRefresh(at + 60_000);
+      expect(spy).toHaveBeenCalledTimes(1);
+      await requestAgyVertexAutoRefresh(at + 10 * 60_000);
+      expect(spy).toHaveBeenCalledTimes(2);
+      spy.mockRestore();
+    });
+
+    it("keeps the balance when the host cannot refresh and reports why", async () => {
+      applyCreditsSnapshot(connected);
+      const spy = vi.spyOn(ipc, "agyVertexCreditsRead")
+        .mockResolvedValueOnce({ ...connected, refreshError: "login_required" })
+        .mockRejectedValueOnce(new Error("ipc down"));
+      await requestAgyVertexAutoRefresh(next());
+      expect(getAgyVertexCreditsSnapshot().freeTrialCredit).toBe("$100.00");
+      expect(getAgyVertexCreditsSnapshot().refreshError).toBe("login_required");
+      await requestAgyVertexAutoRefresh(next());
+      expect(getAgyVertexCreditsSnapshot().freeTrialCredit).toBe("$100.00");
+      spy.mockRestore();
+    });
+
+    it("drops a late silent result once the user started a manual sync", async () => {
+      applyCreditsSnapshot(connected);
+      let resolveAuto!: (value: typeof connected) => void;
+      const spy = vi.spyOn(ipc, "agyVertexCreditsRead").mockImplementation(({ force } = {}) =>
+        force
+          ? Promise.resolve({ ...connected, billingAccountId: "111111-111111-111111", freeTrialCredit: "$7.00" })
+          : new Promise((resolve) => { resolveAuto = resolve; }),
+      );
+      const auto = requestAgyVertexAutoRefresh(next());
+      await syncAgyVertexCredits();
+      resolveAuto({ ...connected, freeTrialCredit: "$99.00" });
+      await auto;
+      expect(getAgyVertexCreditsSnapshot().billingAccountId).toBe("111111-111111-111111");
+      expect(getAgyVertexCreditsSnapshot().freeTrialCredit).toBe("$7.00");
+      spy.mockRestore();
+    });
+
+    it("maps host error codes to translated messages instead of raw codes", () => {
+      expect(agyVertexErrorKey("login_required")).toBe("settings.agyVertexErrorLoginRequired");
+      expect(agyVertexErrorKey("vertex_sync_in_progress")).toBe("settings.agyVertexErrorInProgress");
+      expect(agyVertexErrorKey("something_new")).toBe("settings.agyVertexErrorGeneric");
     });
   });
 

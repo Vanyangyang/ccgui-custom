@@ -1,6 +1,12 @@
 import type { NativeTask } from "@/lib/events";
 import type { NativeTaskStopResult } from "@/lib/ipc";
+import { staleAcpContextUsage } from "../usage";
 import { setNativeBackgroundActive, type BySessionSlice, type SessionState, type SetFn } from "./stream";
+
+/** Engines that publish authoritative native `tasks` snapshots (`EngineEvent::Tasks`). */
+export function supportsNativeTasks(engine: string): boolean {
+  return engine === "claude" || engine === "agy";
+}
 
 /** Within one run, a task id denotes one execution. A confirmed terminal from
  * an event or stop result must survive a delayed running/paused snapshot;
@@ -52,6 +58,7 @@ export function beginNativeRun(session: SessionState, runId: string): Partial<Se
   if (session.nativeTaskRunId === runId) return {};
   return {
     nativeTaskRunId: runId,
+    usage: staleAcpContextUsage(session.usage),
     // The stop flag drops late events of `nativeTaskRunId` (the stopped run).
     // A run adopted without sendPrompt (leader child, remote client) is a new
     // run: its events must not be dropped on the strength of the old stop.

@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import i18n from "@/lib/i18n";
 import { SelfUpdateStatusChip, formatLiveUpdateBlocker } from "./SelfUpdateStatusChip";
 import { SelfUpdateDetails } from "./SelfUpdateDetails";
+import { LiveUpdateSection } from "@/features/settings/LiveUpdateSection";
 import { useLiveUpdateStore } from "./live-update";
 import { OnboardingTourHost } from "@/features/onboarding/OnboardingTour";
 import { useOnboardingStore } from "@/features/onboarding/store";
@@ -14,6 +15,7 @@ describe("self-update status action", () => {
   let container: HTMLDivElement;
   let root: Root;
   const initial = useLiveUpdateStore.getState();
+  const initialLanguage = i18n.language;
   const requestUpdate = vi.fn(async () => {});
   const change = { id: "c1", changeId: "fix", summary: "Verified fix", sourceRoot: "G:/source" };
   const active = { manifestSha256: "a".repeat(64), channel: "protected-custom" as const, releaseId: "auto-one", version: "1.1.1+protected.34", workerProtocol: 1, checkpointSchema: 1, schemaHash: "b".repeat(64), executable: "ccgui-next.exe" };
@@ -28,6 +30,7 @@ describe("self-update status action", () => {
   afterEach(async () => {
     await act(async () => { root.unmount(); }); container.remove(); useLiveUpdateStore.setState(initial, true);
     useOnboardingStore.setState({ open: false });
+    await i18n.changeLanguage(initialLanguage);
     vi.restoreAllMocks();
   });
   const button = () => container.querySelector<HTMLButtonElement>("button")!;
@@ -38,6 +41,24 @@ describe("self-update status action", () => {
       .toBe(`${t("settings.liveUpdateBlockers.pluginUpdateClose")} · Draft write failed`);
     expect(formatLiveUpdateBlocker(t, { reason: "plugin-update-close-timeout" }))
       .toBe(t("settings.liveUpdateBlockers.pluginUpdateCloseTimeout"));
+    expect(formatLiveUpdateBlocker(t, { reason: "plugin-window-unconfirmed-edits" }))
+      .toBe(t("settings.liveUpdateBlockers.pluginWindowUnconfirmedEdits"));
+  });
+
+  it("explains the paused switch and offers an explicit retry rather than promising automatic continuation", async () => {
+    const retrySwitch = vi.fn(async () => {});
+    await act(async () => useLiveUpdateStore.setState({
+      transaction: { ...transaction, phase: "Preparing" }, stage: "waiting", channel: { version: 1, ready: [] },
+      blockers: [{ participant: "plugin-update-close", reason: "plugin-window-unconfirmed-edits" }], retrySwitch,
+    }));
+    expect(button().title).toContain(i18n.t("settings.liveUpdateRetryReasons"));
+    expect(button().title).not.toContain(i18n.t("settings.liveUpdateWaitingReasons"));
+    await act(async () => root.render(<LiveUpdateSection />));
+    expect(container.textContent).toContain(i18n.t("settings.liveUpdateBlockers.pluginWindowUnconfirmedEdits"));
+    const retry = [...container.querySelectorAll("button")].find(item => item.textContent?.includes(i18n.t("settings.liveUpdateRetrySwitch")));
+    expect(retry).toBeDefined();
+    await act(async () => retry!.click());
+    expect(retrySwitch).toHaveBeenCalledOnce();
   });
 
   it.each(["zh", "en"])("shows individual blockers and observed states in tooltip and details (%s)", async language => {
@@ -179,6 +200,42 @@ describe("self-update status action", () => {
     expect(button().title).toContain("CandidateHealthTimeout");
     expect(button().title).toContain("auto-previous");
     expect(button().disabled).toBe(false);
+  });
+
+  it.each(["zh", "en"])("explains an aborted schema mismatch as a failed update (%s)", async language => {
+    await act(async () => {
+      await i18n.changeLanguage(language);
+      useLiveUpdateStore.setState({ active, transaction: null, stage: "idle",
+        channel: { version: 1, ready: [], batch: { ...batch, phase: "Aborted", error: "database schema hash mismatch" } },
+      });
+    });
+    expect(button().dataset.selfUpdateKind).toBe("error");
+    expect(button().textContent).toContain(i18n.t("statusbar.selfUpdateFailed"));
+    expect(button().title).toContain(i18n.t("settings.liveUpdateSchemaMismatchHint"));
+    expect(button().title).toContain(language === "zh"
+      ? "请先确认安装包支持从当前版本升级" : "First confirm that the installer supports upgrading from your current version.");
+    expect(button().title).toContain(language === "zh" ? "兼容的完整安装包" : "a compatible full installer");
+    expect(button().title).not.toContain("database schema hash mismatch");
+    await act(async () => { root.render(<SelfUpdateDetails state={useLiveUpdateStore.getState()} />); });
+    expect(container.querySelector('[role="status"]')?.textContent).toContain(i18n.t("statusbar.selfUpdateFailed"));
+    expect(container.querySelector('[role="alert"]')?.textContent).toBe(i18n.t("settings.liveUpdateSchemaMismatchHint"));
+    expect(requestUpdate).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["Aborted", undefined, "aborted"],
+    ["Aborted", "User cancelled", "aborted"],
+    ["Aborted", "database schema hash mismatch: unexpected suffix", "aborted"],
+    ["Failed", "Unknown build failure", "error"],
+  ])("preserves %s results and unrecognized reasons (%s)", async (phase, error, kind) => {
+    await act(async () => useLiveUpdateStore.setState({ transaction: null, stage: "idle",
+      channel: { version: 1, ready: [], batch: { ...batch, phase: phase!, error } },
+    }));
+    expect(button().dataset.selfUpdateKind).toBe(kind);
+    expect(button().title).not.toContain(i18n.t("settings.liveUpdateSchemaMismatchHint"));
+    if (error) expect(button().title).toContain(error);
+    await act(async () => { root.render(<SelfUpdateDetails state={useLiveUpdateStore.getState()} />); });
+    expect(container.querySelector('[role="alert"]')?.textContent).toBe(error);
   });
 
   it("allows inspecting queued changes without submitting them", async () => {

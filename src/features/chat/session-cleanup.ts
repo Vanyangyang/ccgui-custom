@@ -2,12 +2,24 @@ import type { CSSProperties } from "react";
 import { create } from "zustand";
 import i18n from "@/lib/i18n";
 import { ipc, type SessionMeta, type HandoffCompressionSelection } from "@/lib/ipc";
+import {
+  nativeHandoffProgressAdvances,
+  type HandoffProgressCallback,
+  type NativeHandoffProgress,
+} from "@/lib/handoff-progress";
+import { runtimeCheckpoint } from "@/lib/runtime-checkpoint";
 import { EMPTY_SESSION, type SessionState } from "./store/stream";
-import type { LeaderSnapshot } from "@/features/leader/types";
-import { isLeaderGroupMember } from "@/features/leader/types";
+import type { GroupCleanupExpectation, LeaderIdentity, LeaderSnapshot } from "@/features/leader/types";
+import { isLeaderGroupMember, parentWorkspacePath, sameIdentity } from "@/features/leader/types";
 import { parseDraftSessionKey, sessionKey } from "./store/persistence";
 import { useChatStore } from "./store";
-import { buildHandoffChildren, type HandoffChildrenDigest } from "./handoff-children";
+import {
+  buildHandoffChildrenForSelection,
+  discoverHandoffChildren,
+  type HandoffChildCandidate,
+  type HandoffChildrenDigest,
+} from "./handoff-children";
+import { formatHandoffError } from "./handoff-error";
 import {
   isHandoffCompressionModel,
   isHandoffCompressionSelection,
@@ -66,13 +78,19 @@ export type SessionCleanupCategory = "recommend" | "attention" | "protected";
 export type SessionCleanupReason =
   | "settled_idle"
   | "settled_recent"
+  | "unknown_activity"
   | "running"
   | "awaiting_confirm"
   | "last_error"
   | "unsent_draft"
   | "unseen"
   | "pinned"
-  | "leader_group";
+  | "leader_group_idle"
+  | "leader_group_recent"
+  | "leader_group"
+  | "leader_child_idle"
+  | "leader_child_recent"
+  | "leader_child";
 
 export interface SessionCleanupItem {
   key: string;
@@ -81,11 +99,19 @@ export interface SessionCleanupItem {
   reason: SessionCleanupReason;
   heat: CacheHeat;
   heatRatio: number;
-  idleMs: number;
+  idleMs: number | null;
   /** Whether the row can be toggled in the batch selection. Running/Leader rows are locked. */
   selectable: boolean;
   /** Pre-selected when opening the cleanup dialog. */
   defaultSelected: boolean;
+  /** A root row representing a whole task group, or an expired child row
+   * representing its own subtree (`parent` and `branchId` are then set). */
+  group?: {
+    root: LeaderIdentity; memberCount: number; lastActivityAt: number; signature: string; expected: GroupCleanupExpectation;
+    parent?: LeaderIdentity; branchId?: string;
+  };
+  /** Direct parent of a managed child row, used for task management links. */
+  managedParent?: LeaderIdentity;
 }
 
 export function classifySessionForCleanup({
@@ -106,22 +132,41 @@ export function classifySessionForCleanup({
   now?: number;
 }): SessionCleanupItem {
   const key = sessionKey(session.engine, session.sessionId, session.workspacePath);
-  const isRunning = Boolean(streaming || state?.streaming || state?.loading || state?.queue.length);
+  const isRunning = Boolean(streaming || state?.streaming || state?.loading || state?.draftLaunching || state?.queue.length);
   const heat = getSessionCacheHeat(promptCacheForEngine(session.engine, session.promptCache), now);
   const heatRatio = getPromptCacheHeatRatio(promptCacheForEngine(session.engine, session.promptCache), session.updatedAt, isRunning, now, session.engine);
   const idleMs =
     typeof session.updatedAt === "number" && Number.isFinite(session.updatedAt) && session.updatedAt > 0
       ? Math.max(0, now - session.updatedAt)
-      : Number.POSITIVE_INFINITY;
+      : null;
 
   const isLeaderMember = !!leaderSnapshot && isLeaderGroupMember(leaderSnapshot, session);
 
   if (isLeaderMember) {
+    const ownBranch = leaderSnapshot.branches.find((branch) => branch.state !== "reclaimed" && branch.sessionId !== null
+      && sameIdentity({ engine: branch.engine, sessionId: branch.sessionId, workspacePath: branch.workspacePath }, session));
     return {
       key,
       session,
       category: "protected",
-      reason: "leader_group",
+      reason: ownBranch ? "leader_child" : "leader_group",
+      heat,
+      heatRatio,
+      idleMs,
+      selectable: false,
+      defaultSelected: false,
+      ...(ownBranch ? { managedParent: {
+        engine: ownBranch.parentEngine, sessionId: ownBranch.parentSessionId, workspacePath: parentWorkspacePath(ownBranch),
+      } } : {}),
+    };
+  }
+
+  if (isRunning) {
+    return {
+      key,
+      session,
+      category: "attention",
+      reason: "running",
       heat,
       heatRatio,
       idleMs,
@@ -140,20 +185,6 @@ export function classifySessionForCleanup({
       heatRatio,
       idleMs,
       selectable: true,
-      defaultSelected: false,
-    };
-  }
-
-  if (isRunning) {
-    return {
-      key,
-      session,
-      category: "attention",
-      reason: "running",
-      heat,
-      heatRatio,
-      idleMs,
-      selectable: false,
       defaultSelected: false,
     };
   }
@@ -214,6 +245,20 @@ export function classifySessionForCleanup({
       session,
       category: "attention",
       reason: "unseen",
+      heat,
+      heatRatio,
+      idleMs,
+      selectable: true,
+      defaultSelected: false,
+    };
+  }
+
+  if (idleMs === null) {
+    return {
+      key,
+      session,
+      category: "attention",
+      reason: "unknown_activity",
       heat,
       heatRatio,
       idleMs,
@@ -327,10 +372,21 @@ export const HANDOFF_SECTION_HEADINGS: Record<HandoffCompressionMode, string> = 
   detailed: "上一会话多轮对话摘录：",
 };
 
+const TRANSIENT_CLI_LIMIT_BANNER_RE =
+  /^(?:>\s*)?(?:you['’]ve hit your (?:\d+-hour|weekly|daily|usage|rate) limit\b|claude ai usage limit reached\b|hit your (?:\d+-hour|usage) limit\b|rate limit reached\b)/i;
+
+function isTransientCliLimitBanner(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed || trimmed.length > 280) return false;
+  return TRANSIENT_CLI_LIMIT_BANNER_RE.test(trimmed);
+}
+
 function extractLastAssistantConclusion(state?: SessionState, maxChars = 600): string {
-  const lastAssistant = [...(state?.messages ?? [])]
+  const assistantMessages = [...(state?.messages ?? [])]
     .reverse()
-    .find((m) => m.role === "assistant" && m.text.trim().length > 0);
+    .filter((m) => m.role === "assistant" && m.text.trim().length > 0);
+  const lastAssistant =
+    assistantMessages.find((m) => !isTransientCliLimitBanner(m.text)) ?? assistantMessages[0];
   return lastAssistant ? extractMarkdownConclusion(lastAssistant.text, maxChars) : "";
 }
 
@@ -339,12 +395,18 @@ function extractLastAssistantConclusion(state?: SessionState, maxChars = 600): s
  */
 export function buildDetailedHandoffSummary(state?: SessionState, maxTurns = 6): string {
   const messages = state?.messages ?? [];
+  const hasRealAssistantReply = messages.some(
+    (msg) => msg.role === "assistant" && msg.text.trim().length > 0 && !isTransientCliLimitBanner(msg.text),
+  );
   const turns: { role: "user" | "assistant"; text: string }[] = [];
 
   for (const msg of messages) {
     if (msg.role !== "user" && msg.role !== "assistant") continue;
     const text = (msg.text || "").trim();
     if (!text) continue;
+    if (msg.role === "assistant" && hasRealAssistantReply && isTransientCliLimitBanner(text)) {
+      continue;
+    }
     const maxLen = msg.role === "user" ? 320 : 520;
     const compact = extractMarkdownConclusion(text, maxLen);
     if (!compact) continue;
@@ -499,6 +561,32 @@ function handoffSummarySection(currentDraft: string) {
   };
 }
 
+const sameIdList = (a: readonly string[] = [], b: readonly string[] = []) =>
+  a.length === b.length && a.every((id, index) => id === b[index]);
+
+export function spliceHandoffChildrenBlock(currentDraft: string, heading: string, nextBlock: string): string | null {
+  const section = handoffSummarySection(currentDraft);
+  if (!section) return null;
+  const { headerIdx, footerIdx, lines } = section;
+  const normalized = lines.map((line) => line.replace(/\r$/, ""));
+  const start = normalized.indexOf(heading);
+  const cleaned = nextBlock.trim();
+  if (start < 0) {
+    if (!cleaned) return currentDraft;
+    return currentDraft.slice(0, footerIdx) + `\n\n${cleaned}` + currentDraft.slice(footerIdx);
+  }
+  let end = start + 1;
+  while (end < normalized.length && normalized[end] === "") end++;
+  while (end < normalized.length && /^>($| )/.test(normalized[end])) end++;
+  const nextLines = [...lines];
+  if (!cleaned && start > 0 && normalized[start - 1] === "") {
+    nextLines.splice(start - 1, end - start + 1);
+  } else {
+    nextLines.splice(start, end - start, ...(cleaned ? cleaned.split(/\r?\n/) : []));
+  }
+  return currentDraft.slice(0, headerIdx) + nextLines.join("\n") + currentDraft.slice(footerIdx);
+}
+
 /** Child context is a separate quote block, outside the replaceable main summary. */
 function handoffChildrenBlock(currentDraft: string, heading?: string): string {
   if (!heading) return "";
@@ -543,43 +631,60 @@ export function replaceHandoffDraftSummary(
  * Keeps the local draft on failure and reports status through the optional callbacks.
  */
 export async function upgradeHandoffDraftWithGrok({
+  requestId,
   engine,
   sessionId,
   title,
-  state,
   compressionModel,
   compressionSelection,
+  sourceWorkspacePath,
   childContext,
+  childBranchIds,
   getCurrentDraft,
   getExpectedSummary,
   applyDraft,
+  onProgress,
   onSuccess,
   onError,
 }: {
+  requestId?: string;
   engine: string;
   sessionId: string;
   title: string;
   state?: SessionState;
   compressionModel?: string;
   compressionSelection?: HandoffCompressionSelection;
+  sourceWorkspacePath?: string;
   childContext?: string;
+  childBranchIds?: string[];
   getCurrentDraft: () => string;
   getExpectedSummary?: () => string | undefined;
   applyDraft: (nextDraft: string) => void;
+  onProgress?: HandoffProgressCallback;
   onSuccess?: (distilled: string) => void;
   onError?: (reason: string) => void;
 }): Promise<boolean> {
   try {
+    runtimeCheckpoint.assertAllowed();
     const originalSummary = handoffSummarySection(getCurrentDraft())?.snapshot;
-    const transcriptExcerpt = buildSessionHandoffExcerpt(state);
+    const frozenSelection = compressionSelection ? { ...compressionSelection } : undefined;
+    const frozenChildBranchIds = childBranchIds && childBranchIds.length > 0 ? [...childBranchIds] : undefined;
+    // This is a real history handoff. A short local excerpt is only a draft
+    // fallback, never the input for a purported complete model summary.
+    if (await ipc.handoffFullHistorySupported().catch(() => false) !== true) throw new Error("Full-history Handoff requires an updated native host");
+    runtimeCheckpoint.assertAllowed();
     const distilled = await ipc.summarizeSessionHandoff({
+      ...(requestId ? { requestId } : {}),
       engine,
       sessionId,
       title,
-      transcriptExcerpt: transcriptExcerpt || null,
+      historyScope: "full",
+      ...(frozenChildBranchIds && sourceWorkspacePath ? { sourceWorkspacePath } : {}),
       ...(childContext?.trim() ? { childContext } : {}),
+      ...(frozenChildBranchIds ? { childBranchIds: frozenChildBranchIds } : {}),
       ...(compressionModel ? { compressionModel } : {}),
-      ...(compressionSelection ? { compressionSelection } : {}),
+      ...(frozenSelection ? { compressionSelection: frozenSelection } : {}),
+      ...(onProgress ? { onProgress } : {}),
     });
     if (!distilled || !distilled.trim()) {
       onError?.("Empty summary");
@@ -598,7 +703,7 @@ export async function upgradeHandoffDraftWithGrok({
     return true;
   } catch (err) {
     // Graceful fallback: keep the zero-token local handoff draft untouched
-    const msg = err instanceof Error ? err.message : String(err || "Unavailable");
+    const msg = formatHandoffError(err || "Unavailable");
     onError?.(msg);
     return false;
   }
@@ -618,13 +723,19 @@ export interface PendingHandoffSession {
   compressionModel: string;
   compressionSelection?: HandoffCompressionSelection;
   compressionPreferenceError?: boolean;
+  /** Native remains active even when the user abandons its result. */
+  compressionRunning?: boolean;
+  /** Set when the user explicitly stops an in-flight compression without closing handoff. */
+  compressionStopped?: boolean;
   grokStatus: HandoffGrokStatus;
   grokSummary: string | null;
   /** Child block used by the cached summary, to prevent restoring removed content. */
   grokChildrenBlock?: string;
+  grokChildIds?: string[];
   grokError: string | null;
   grokStartedAt: number | null;
   grokDurationMs: number | null;
+  grokProgress?: NativeHandoffProgress | null;
   archiveSourceOnSend: boolean;
   sourceArchived: boolean;
   createdAt: number;
@@ -633,6 +744,9 @@ export interface PendingHandoffSession {
   managedSummary?: string;
   childrenStatus?: "loading" | "ready" | "error";
   children?: HandoffChildrenDigest;
+  childCandidates?: HandoffChildCandidate[];
+  selectedChildIds?: string[];
+  childrenSelectionModified?: boolean;
   childrenApplied?: boolean;
   childrenError?: string;
   /** Exact generated prefix; remove only this text, preserving user additions. */
@@ -695,6 +809,7 @@ function applyHandoffModeDraft(
   const localBody = extractLastAssistantConclusion(entry.sourceState, 600);
   const detailedBody = buildDetailedHandoffSummary(entry.sourceState, 6);
   const grokBody = (entry.grokChildrenBlock ?? "") === handoffChildrenBlock(currentDraft, entry.children?.heading)
+    && sameIdList(entry.grokChildIds ?? entry.selectedChildIds ?? [], entry.selectedChildIds ?? [])
     ? entry.grokSummary?.trim() || "" : "";
 
   let heading = HANDOFF_SECTION_HEADINGS.local;
@@ -735,6 +850,10 @@ export interface HandoffStoreState {
   setCompressionMode: (workspacePath: string, mode: HandoffCompressionMode) => void;
   setCompressionModel: (workspacePath: string, model: string) => void;
   setCompressionSelection: (workspacePath: string, selection: HandoffCompressionSelection) => void;
+  lowerCompressionEffort: (workspacePath: string, effort?: "low" | "medium") => void;
+  setSelectedChildIds: (workspacePath: string, branchIds: string[]) => void;
+  stopCompression: (workspacePath: string) => void;
+  recompressSelectedChildren: (workspacePath: string) => void;
   retryGrok: (workspacePath: string) => void;
   setArchiveSourceOnSend: (workspacePath: string, enabled: boolean) => void;
   archiveSourceNow: (workspacePath: string) => Promise<void>;
@@ -745,10 +864,23 @@ export interface HandoffStoreState {
 }
 
 let handoffSeq = 0;
+let handoffRequestSeq = 0;
 const movingHandoffs = new Set<string>();
 
 export const useHandoffStore = create<HandoffStoreState>((set, get) => {
   const requests = new Map<string, number>();
+  const nativeFlights = new Set<string>();
+  const activeFlightRequests = new Map<string, string>();
+  const queuedReruns = new Map<string, string>();
+  runtimeCheckpoint.registerBlocker("session-handoff-compression", () => nativeFlights.size ? ["handoff-native-submission"] : []);
+  const sourceIdentity = (entry: Pick<PendingHandoffSession, "workspacePath" | "sourceEngine" | "sourceSessionId">) =>
+    JSON.stringify([entry.workspacePath, entry.sourceEngine, entry.sourceSessionId]);
+  const cancelSourceFlight = (source: string) => {
+    const reqId = activeFlightRequests.get(source);
+    if (reqId && typeof ipc.cancelSessionHandoff === "function") {
+      void Promise.resolve(ipc.cancelSessionHandoff(reqId)).catch(() => false);
+    }
+  };
   const insertCapturedChildren = (workspacePath: string, handoffId: string) => {
     const entry = get().byWorkspace[workspacePath];
     if (!entry || entry.id !== handoffId || entry.sending || entry.childrenApplied || !entry.children?.block) return;
@@ -768,22 +900,30 @@ export const useHandoffStore = create<HandoffStoreState>((set, get) => {
   };
   const runGrokDistillation = (workspacePath: string, handoffId: string) => {
     const entry = get().byWorkspace[workspacePath];
-    if (!entry || entry.id !== handoffId || entry.mode !== "grok" || entry.sending || entry.childrenStatus === "loading") return;
+    if (!entry || entry.id !== handoffId || entry.mode !== "grok" || entry.sending || entry.childrenStatus === "loading" || nativeFlights.has(sourceIdentity(entry))) return;
     const draftKey = resolveHandoffTargetDraftKey(workspacePath, entry.sourceEngine);
     const initialDraft = useChatStore.getState().drafts[draftKey] ?? "";
     if (!isHandoffDraft(initialDraft, entry)) return;
     const expectedChildren = handoffChildrenBlock(initialDraft, entry.children?.heading);
     // Only the untouched generated block can use the longer source excerpt.
     // Explicit re-distillation after an edit uses exactly the visible child text.
+    const untouchedChildren = expectedChildren === (entry.children?.block.trim() ?? "");
+    const selectedChildIds = untouchedChildren && (entry.selectedChildIds?.length ?? 0) > 0
+      ? [...entry.selectedChildIds!] : undefined;
     const childContext = expectedChildren && expectedChildren === entry.children?.block.trim()
       ? entry.children.context : expectedChildren;
     const startedAt = Date.now();
+    const source = sourceIdentity(entry);
+    const requestId = `handoff-req-${startedAt}-${++handoffRequestSeq}`;
+    nativeFlights.add(source);
+    activeFlightRequests.set(source, requestId);
+    queuedReruns.delete(source);
     const request = (requests.get(handoffId) ?? 0) + 1;
     requests.set(handoffId, request);
     set((s) => ({
       byWorkspace: {
         ...s.byWorkspace,
-        [workspacePath]: { ...entry, grokStatus: "running", grokStartedAt: startedAt, grokDurationMs: null, grokError: null },
+        [workspacePath]: { ...entry, compressionRunning: true, compressionStopped: false, grokStatus: "running", grokStartedAt: startedAt, grokDurationMs: null, grokProgress: null, grokError: null },
       },
     }));
     const isCurrent = () => {
@@ -794,14 +934,18 @@ export const useHandoffStore = create<HandoffStoreState>((set, get) => {
     };
     const childrenUnchanged = () => {
       const key = resolveHandoffTargetDraftKey(workspacePath, entry.sourceEngine);
-      return handoffChildrenBlock(useChatStore.getState().drafts[key] ?? "", entry.children?.heading) === expectedChildren;
+      return handoffChildrenBlock(useChatStore.getState().drafts[key] ?? "", entry.children?.heading) === expectedChildren
+        && sameIdList(get().byWorkspace[workspacePath]?.selectedChildIds ?? [], entry.selectedChildIds ?? []);
     };
     void upgradeHandoffDraftWithGrok({
+      requestId,
       engine: entry.sourceEngine,
       sessionId: entry.sourceSessionId,
       title: entry.sourceTitle,
       state: entry.sourceState,
+      sourceWorkspacePath: entry.sourceMeta?.workspacePath || entry.workspacePath,
       childContext,
+      childBranchIds: selectedChildIds,
       compressionModel: entry.compressionModel,
       compressionSelection: entry.compressionSelection ?? legacyHandoffSelection(entry.compressionModel),
       getCurrentDraft: () => {
@@ -823,6 +967,20 @@ export const useHandoffStore = create<HandoffStoreState>((set, get) => {
           return { byWorkspace: { ...s.byWorkspace, [workspacePath]: { ...cur, managedSummary: handoffSummarySection(nextDraft)?.snapshot } } };
         });
       },
+      onProgress: (progress) => {
+        if (!isCurrent()) return;
+        set((s) => {
+          const cur = s.byWorkspace[workspacePath];
+          if (!cur || cur.id !== handoffId || cur.grokStatus !== "running") return s;
+          if (!nativeHandoffProgressAdvances(cur.grokProgress ?? undefined, progress)) return s;
+          return {
+            byWorkspace: {
+              ...s.byWorkspace,
+              [workspacePath]: { ...cur, grokProgress: progress },
+            },
+          };
+        });
+      },
       onSuccess: (distilled) => {
         if (!isCurrent()) return;
         const unchanged = childrenUnchanged();
@@ -838,6 +996,8 @@ export const useHandoffStore = create<HandoffStoreState>((set, get) => {
                 grokStatus: unchanged ? "done" : "stale",
                 grokSummary: unchanged ? distilled : null,
                 grokChildrenBlock: unchanged ? expectedChildren : undefined,
+                grokChildIds: unchanged ? [...(entry.selectedChildIds ?? [])] : undefined,
+                childrenSelectionModified: unchanged ? false : cur.childrenSelectionModified,
                 grokError: null,
                 grokDurationMs: durationMs,
               },
@@ -862,6 +1022,22 @@ export const useHandoffStore = create<HandoffStoreState>((set, get) => {
           };
         });
       },
+    }).finally(() => {
+      nativeFlights.delete(source);
+      if (activeFlightRequests.get(source) === requestId) activeFlightRequests.delete(source);
+      const queuedHandoffId = queuedReruns.get(source);
+      queuedReruns.delete(source);
+      set(s => {
+        const byWorkspace = { ...s.byWorkspace };
+        for (const [path, candidate] of Object.entries(byWorkspace)) {
+          if (sourceIdentity(candidate) === source && candidate.compressionRunning) byWorkspace[path] = { ...candidate, compressionRunning: false };
+        }
+        return { byWorkspace };
+      });
+      if (queuedHandoffId) {
+        const nextPath = Object.keys(get().byWorkspace).find((path) => get().byWorkspace[path]?.id === queuedHandoffId);
+        if (nextPath !== undefined) runGrokDistillation(nextPath, queuedHandoffId);
+      }
     });
   };
 
@@ -965,11 +1141,13 @@ export const useHandoffStore = create<HandoffStoreState>((set, get) => {
         mode: initialMode,
         compressionModel: preferences.model,
         compressionSelection: preferences.selection,
+        compressionRunning: nativeFlights.has(sourceIdentity({ workspacePath, sourceEngine, sourceSessionId })),
         grokStatus: "idle",
         grokSummary: null,
         grokError: null,
         grokStartedAt: null,
         grokDurationMs: null,
+        grokProgress: null,
         archiveSourceOnSend,
         sourceArchived: false,
         createdAt: now,
@@ -1025,12 +1203,12 @@ export const useHandoffStore = create<HandoffStoreState>((set, get) => {
       // Read once for both entry points. Compression waits for this read so it
       // sees child results on its first call, including those absent from the parent.
       void (async () => {
-        let children: HandoffChildrenDigest | undefined;
+        let discovery: ReturnType<typeof discoverHandoffChildren> | undefined;
         let error: string | undefined;
         try {
           const snapshot = await ipc.taskSnapshot();
-          children = buildHandoffChildren(snapshot, {
-            engine: sourceEngine, sessionId: sourceSessionId, workspacePath,
+          discovery = discoverHandoffChildren(snapshot, {
+            engine: sourceEngine, sessionId: sourceSessionId, workspacePath: sourceMeta?.workspacePath || workspacePath,
           }, Date.now());
         } catch (reason) {
           error = reason instanceof Error ? reason.message : String(reason);
@@ -1041,7 +1219,14 @@ export const useHandoffStore = create<HandoffStoreState>((set, get) => {
           const latest = s.byWorkspace[targetPath];
           if (latest?.id !== id) return s;
           return { byWorkspace: { ...s.byWorkspace, [targetPath]: {
-            ...latest, childrenStatus: children ? "ready" : "error", children, childrenApplied: !children?.total, childrenError: error,
+            ...latest,
+            childrenStatus: discovery ? "ready" : "error",
+            children: discovery?.initialDigest,
+            childCandidates: discovery?.candidates,
+            selectedChildIds: discovery?.defaultSelectedIds,
+            childrenSelectionModified: false,
+            childrenApplied: !discovery?.initialDigest.total,
+            childrenError: error,
           } } };
         });
         insertCapturedChildren(targetPath, id);
@@ -1049,25 +1234,93 @@ export const useHandoffStore = create<HandoffStoreState>((set, get) => {
       })();
     },
 
+    setSelectedChildIds: (workspacePath, branchIds) => {
+      const entry = get().byWorkspace[workspacePath];
+      if (!entry || entry.sending || !entry.childCandidates?.length) return;
+      const validIds = new Set(entry.childCandidates.map((c) => c.branch.id));
+      const seen = new Set<string>();
+      const nextSelectedIds: string[] = [];
+      for (const rawId of branchIds) {
+        if (validIds.has(rawId) && !seen.has(rawId)) {
+          seen.add(rawId);
+          nextSelectedIds.push(rawId);
+        }
+      }
+      if (sameIdList(entry.selectedChildIds ?? [], nextSelectedIds)) return;
+
+      const heading = entry.children?.heading ?? i18n.t("chat.handoffChildrenHeading");
+      const nextChildren = buildHandoffChildrenForSelection(entry.childCandidates, nextSelectedIds, Date.now());
+      const key = resolveHandoffTargetDraftKey(workspacePath, entry.sourceEngine);
+      const currentDraft = useChatStore.getState().drafts[key] ?? "";
+      let nextDraft = currentDraft;
+      let childrenApplied = !nextChildren.block;
+      if (isHandoffDraft(currentDraft, entry)) {
+        const spliced = spliceHandoffChildrenBlock(currentDraft, heading, nextChildren.block);
+        if (spliced !== null) {
+          nextDraft = spliced;
+          childrenApplied = true;
+        }
+      }
+
+      const source = sourceIdentity(entry);
+      queuedReruns.delete(source);
+      requests.set(entry.id, (requests.get(entry.id) ?? 0) + 1);
+      if (entry.compressionRunning || entry.grokStatus === "running") {
+        cancelSourceFlight(source);
+      }
+      const updated: PendingHandoffSession = {
+        ...entry,
+        selectedChildIds: nextSelectedIds,
+        childrenSelectionModified: true,
+        compressionStopped: false,
+        children: nextChildren,
+        childrenApplied,
+        grokSummary: null,
+        grokChildrenBlock: undefined,
+        grokChildIds: undefined,
+        grokError: null,
+        grokStatus: entry.mode === "grok" ? "idle" : entry.grokStatus,
+        grokStartedAt: null,
+        grokProgress: null,
+      };
+
+      if (nextDraft !== currentDraft) {
+        useChatStore.getState().setDraft(key, nextDraft);
+        updated.managedSummary = handoffSummarySection(nextDraft)?.snapshot;
+      }
+
+      set((s) => ({
+        byWorkspace: {
+          ...s.byWorkspace,
+          [workspacePath]: updated,
+        },
+      }));
+    },
+
     setCompressionMode: (workspacePath, mode) => {
       const entry = get().byWorkspace[workspacePath];
-      if (!entry || entry.sending) return;
-      const updated: PendingHandoffSession = { ...entry, mode };
+      if (!entry || entry.sending || (mode === "grok" && nativeFlights.has(sourceIdentity(entry)))) return;
+      const source = sourceIdentity(entry);
+      const updated: PendingHandoffSession = { ...entry, mode, compressionStopped: false };
       updated.compressionPreferenceError = !saveHandoffCompressionPreferences({
         enabled: mode === "grok", model: entry.compressionModel,
         selection: entry.compressionSelection ?? legacyHandoffSelection(entry.compressionModel),
       });
       if (mode !== "grok") {
+        queuedReruns.delete(source);
         requests.set(entry.id, (requests.get(entry.id) ?? 0) + 1);
+        cancelSourceFlight(source);
         updated.grokStatus = "idle";
-        updated.grokStartedAt = null;
+        if (!nativeFlights.has(source)) updated.grokStartedAt = null;
+        updated.grokProgress = null;
         updated.grokError = null;
       } else if (entry.grokSummary) {
         updated.grokStatus = "done";
       }
       const key = resolveHandoffTargetDraftKey(workspacePath, entry.sourceEngine);
       const currentDraft = useChatStore.getState().drafts[key] ?? "";
-      if (entry.grokSummary && (entry.grokChildrenBlock ?? "") !== handoffChildrenBlock(currentDraft, entry.children?.heading)) {
+      if (entry.grokSummary && ((entry.grokChildrenBlock ?? "") !== handoffChildrenBlock(currentDraft, entry.children?.heading)
+        || !sameIdList(entry.grokChildIds ?? entry.selectedChildIds ?? [], entry.selectedChildIds ?? []))) {
         updated.grokSummary = null;
         updated.grokStatus = "idle";
       }
@@ -1099,7 +1352,7 @@ export const useHandoffStore = create<HandoffStoreState>((set, get) => {
 
     setCompressionSelection: (workspacePath, selection) => {
       const entry = get().byWorkspace[workspacePath];
-      if (!entry || entry.sending || !isHandoffCompressionSelection(selection)) return;
+      if (!entry || entry.sending || nativeFlights.has(sourceIdentity(entry)) || !isHandoffCompressionSelection(selection)) return;
       const current = entry.compressionSelection ?? legacyHandoffSelection(entry.compressionModel);
       if (current.engine === selection.engine && current.model === selection.model
         && current.providerId === selection.providerId && current.effort === selection.effort) return;
@@ -1118,17 +1371,165 @@ export const useHandoffStore = create<HandoffStoreState>((set, get) => {
             grokError: null,
             grokStartedAt: null,
             grokDurationMs: null,
+            grokProgress: null,
           },
         },
       }));
       // Selecting a model does not authorize overwriting a hand-edited summary.
       // Keep managedSummary, unlike the explicit "refine again" action.
-      if (entry.mode === "grok") runGrokDistillation(workspacePath, entry.id);
+      // A changed route takes effect only on explicit generation/retry.
+    },
+
+    lowerCompressionEffort: (workspacePath, effort = "medium") => {
+      const entry = get().byWorkspace[workspacePath];
+      if (!entry || entry.sending || entry.mode !== "grok") return;
+      const current = entry.compressionSelection ?? legacyHandoffSelection(entry.compressionModel);
+      if (current.engine === "cursor" || current.effort === effort) return;
+      const nextSelection: HandoffCompressionSelection = { ...current, effort };
+      if (!isHandoffCompressionSelection(nextSelection)) return;
+      const compressionPreferenceError = !saveHandoffCompressionPreferences({
+        selection: nextSelection,
+        enabled: true,
+      });
+      const source = sourceIdentity(entry);
+      const key = resolveHandoffTargetDraftKey(workspacePath, entry.sourceEngine);
+      const managedSummary = handoffSummarySection(useChatStore.getState().drafts[key] ?? "")?.snapshot;
+      requests.set(entry.id, (requests.get(entry.id) ?? 0) + 1);
+      if (nativeFlights.has(source)) {
+        cancelSourceFlight(source);
+        queuedReruns.set(source, entry.id);
+        set((s) => {
+          const cur = s.byWorkspace[workspacePath];
+          if (!cur || cur.id !== entry.id) return s;
+          return {
+            byWorkspace: {
+              ...s.byWorkspace,
+              [workspacePath]: {
+                ...cur,
+                compressionModel: nextSelection.model,
+                compressionSelection: { ...nextSelection },
+                compressionPreferenceError,
+                compressionStopped: false,
+                grokStatus: "running",
+                grokSummary: null,
+                grokError: null,
+                grokStartedAt: Date.now(),
+                grokDurationMs: null,
+                grokProgress: null,
+                managedSummary,
+              },
+            },
+          };
+        });
+        return;
+      }
+      queuedReruns.delete(source);
+      set((s) => {
+        const cur = s.byWorkspace[workspacePath];
+        if (!cur || cur.id !== entry.id) return s;
+        return {
+          byWorkspace: {
+            ...s.byWorkspace,
+            [workspacePath]: {
+              ...cur,
+              compressionModel: nextSelection.model,
+              compressionSelection: { ...nextSelection },
+              compressionPreferenceError,
+              compressionStopped: false,
+              grokStatus: "idle",
+              grokSummary: null,
+              grokError: null,
+              grokStartedAt: null,
+              grokDurationMs: null,
+              grokProgress: null,
+              managedSummary,
+            },
+          },
+        };
+      });
+      runGrokDistillation(workspacePath, entry.id);
+    },
+
+    stopCompression: (workspacePath) => {
+      const entry = get().byWorkspace[workspacePath];
+      if (!entry || entry.sending || (!entry.compressionRunning && entry.grokStatus !== "running")) return;
+      const source = sourceIdentity(entry);
+      queuedReruns.delete(source);
+      requests.set(entry.id, (requests.get(entry.id) ?? 0) + 1);
+      cancelSourceFlight(source);
+      set((s) => {
+        const cur = s.byWorkspace[workspacePath];
+        if (!cur || cur.id !== entry.id) return s;
+        return {
+          byWorkspace: {
+            ...s.byWorkspace,
+            [workspacePath]: {
+              ...cur,
+              compressionStopped: true,
+              grokStatus: "idle",
+              grokError: null,
+              grokStartedAt: null,
+              grokProgress: null,
+            },
+          },
+        };
+      });
+    },
+
+    recompressSelectedChildren: (workspacePath) => {
+      const entry = get().byWorkspace[workspacePath];
+      if (!entry || entry.sending || entry.mode !== "grok") return;
+      const source = sourceIdentity(entry);
+      const key = resolveHandoffTargetDraftKey(workspacePath, entry.sourceEngine);
+      const managedSummary = handoffSummarySection(useChatStore.getState().drafts[key] ?? "")?.snapshot;
+      if (nativeFlights.has(source)) {
+        requests.set(entry.id, (requests.get(entry.id) ?? 0) + 1);
+        cancelSourceFlight(source);
+        queuedReruns.set(source, entry.id);
+        set((s) => {
+          const cur = s.byWorkspace[workspacePath];
+          if (!cur || cur.id !== entry.id) return s;
+          return {
+            byWorkspace: {
+              ...s.byWorkspace,
+              [workspacePath]: {
+                ...cur,
+                compressionStopped: false,
+                grokStatus: "running",
+                grokError: null,
+                grokStartedAt: Date.now(),
+                grokProgress: null,
+                managedSummary,
+              },
+            },
+          };
+        });
+        return;
+      }
+      set((s) => {
+        const cur = s.byWorkspace[workspacePath];
+        if (!cur || cur.id !== entry.id) return s;
+        return {
+          byWorkspace: {
+            ...s.byWorkspace,
+            [workspacePath]: {
+              ...cur,
+              compressionStopped: false,
+              grokStatus: "idle",
+              grokError: null,
+              grokStartedAt: null,
+              grokProgress: null,
+              managedSummary,
+            },
+          },
+        };
+      });
+      runGrokDistillation(workspacePath, entry.id);
     },
 
     retryGrok: (workspacePath) => {
       const entry = get().byWorkspace[workspacePath];
-      if (!entry || entry.sending || entry.mode !== "grok") return;
+      if (!entry || entry.sending || entry.mode !== "grok" || nativeFlights.has(sourceIdentity(entry))) return;
       const key = resolveHandoffTargetDraftKey(workspacePath, entry.sourceEngine);
       const managedSummary = handoffSummarySection(useChatStore.getState().drafts[key] ?? "")?.snapshot;
       set((s) => {
@@ -1140,9 +1541,11 @@ export const useHandoffStore = create<HandoffStoreState>((set, get) => {
             [workspacePath]: {
               ...cur,
               mode: "grok",
+              compressionStopped: false,
               grokStatus: "idle",
               grokError: null,
               grokStartedAt: null,
+              grokProgress: null,
               managedSummary,
             },
           },
@@ -1220,8 +1623,13 @@ export const useHandoffStore = create<HandoffStoreState>((set, get) => {
     },
 
     dismissHandoff: (workspacePath) => {
-      const id = get().byWorkspace[workspacePath]?.id;
-      if (id) requests.delete(id);
+      const entry = get().byWorkspace[workspacePath];
+      if (entry) {
+        requests.delete(entry.id);
+        const source = sourceIdentity(entry);
+        queuedReruns.delete(source);
+        cancelSourceFlight(source);
+      }
       set((s) => {
         if (!(workspacePath in s.byWorkspace)) return s;
         const next = { ...s.byWorkspace };
@@ -1240,7 +1648,7 @@ export const useHandoffStore = create<HandoffStoreState>((set, get) => {
         // compression attempt instead of leaving it permanently parked by the lock.
         insertCapturedChildren(workspacePath, id);
         const latest = get().byWorkspace[workspacePath];
-        if (latest?.id === id && latest.grokStatus === "idle" && !latest.grokSummary) {
+        if (latest?.id === id && latest.grokStatus === "idle" && !latest.grokSummary && !latest.compressionStopped) {
           runGrokDistillation(workspacePath, id);
         }
       }

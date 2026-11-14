@@ -81,7 +81,7 @@ pub(crate) fn list_sessions_from(db: &crate::db::Db) -> Result<Vec<SessionMeta>,
                 !(engine == "agy"
                     && model
                         .as_deref()
-                        .is_some_and(crate::engine::agy::model_encodes_effort))
+                        .is_some_and(|model| !crate::engine::agy::model_supports_independent_effort(model)))
             });
             Ok(SessionMeta {
                 prompt_cache: None,
@@ -369,8 +369,25 @@ fn session_file_path(
     engine: &str,
     session_id: &str,
 ) -> Result<PathBuf, String> {
-    find_session_file_path(db, engine, session_id)?
+    resolve_session_file_path(db, engine, session_id)?
         .ok_or_else(|| format!("session not found: {engine}/{session_id}"))
+}
+
+pub(crate) fn resolve_session_file_path(
+    db: &crate::db::Db,
+    engine: &str,
+    session_id: &str,
+) -> Result<Option<PathBuf>, String> {
+    if let Some(path) = find_session_file_path(db, engine, session_id)? {
+        return Ok(Some(path));
+    }
+    if !crate::engine::sidechat::is_hidden_session(engine, session_id)
+        && !db.workspace_paths()?.is_empty()
+    {
+        let _ = super::scanner::scan_with(db, || {});
+        return find_session_file_path(db, engine, session_id);
+    }
+    Ok(None)
 }
 
 pub(crate) fn find_session_file_path(
@@ -401,15 +418,76 @@ struct CachedSession {
     fold: SubagentFold,
 }
 
+/// A request-local fresh AGY parse. The shared timeline cache only keys the
+/// database, whereas full reads also depend on history.jsonl, including absence.
+pub(crate) struct FullAgyHistory {
+    cached: CachedSession,
+}
+
+impl FullAgyHistory {
+    pub(crate) fn page(&self, before_seq: Option<i64>) -> SessionPage {
+        page_from_cached(&self.cached, Some(500), before_seq)
+    }
+}
+
+pub(crate) fn load_full_agy_history_blocking(path: &Path) -> Result<FullAgyHistory, String> {
+    let parsed = super::agy::parse_agy_session_strict(path)?;
+    Ok(FullAgyHistory { cached: CachedSession { parsed, fold: Vec::new() } })
+}
+
 /// Parsed sessions keyed by (path, size, mtime_ms): paging re-slices a cached
 /// parse instead of re-reading the file. Bounded two ways: 32 entries and a
 /// ~128MB byte budget (image data URLs make entries heavy).
-static PARSED_CACHE: LazyLock<Mutex<HashMap<(PathBuf, i64, i64), Arc<CachedSession>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-static PARSED_CACHE_BYTES: LazyLock<Mutex<usize>> = LazyLock::new(|| Mutex::new(0));
+static PARSED_CACHE: LazyLock<Mutex<ParsedCache>> =
+    LazyLock::new(|| Mutex::new(ParsedCache::default()));
 
 const PARSED_CACHE_CAPACITY: usize = 32;
 const PARSED_CACHE_BUDGET_BYTES: usize = 128 * 1024 * 1024;
+
+#[derive(Default)]
+struct ParsedCache {
+    entries: HashMap<(PathBuf, i64, i64), (Arc<CachedSession>, usize)>,
+    bytes: usize,
+}
+
+impl ParsedCache {
+    fn insert(
+        &mut self,
+        key: (PathBuf, i64, i64),
+        cached: Arc<CachedSession>,
+        footprint: usize,
+    ) -> Arc<CachedSession> {
+        // Concurrent misses parse outside the lock. Reuse the first insertion
+        // without charging its footprint again or evicting unrelated entries.
+        if let Some((hit, _)) = self.entries.get(&key) {
+            return Arc::clone(hit);
+        }
+        // Only one physical-file revision belongs in the shared cache. Existing
+        // readers keep their Arc until their request finishes.
+        self.entries.retain(|(path, _, _), (_, bytes)| {
+            if path == &key.0 {
+                self.bytes -= *bytes;
+                false
+            } else {
+                true
+            }
+        });
+        // Large histories still return complete pages, but must not become an
+        // oversized persistent entry or evict other sessions just by being read.
+        if footprint > PARSED_CACHE_BUDGET_BYTES {
+            return cached;
+        }
+        if self.entries.len() >= PARSED_CACHE_CAPACITY
+            || footprint > PARSED_CACHE_BUDGET_BYTES - self.bytes
+        {
+            self.entries.clear();
+            self.bytes = 0;
+        }
+        self.bytes += footprint;
+        self.entries.insert(key, (Arc::clone(&cached), footprint));
+        cached
+    }
+}
 
 /// Rough in-memory footprint of one parsed session. Text and images used to
 /// be the whole story, but tool-result-heavy sessions keep most of their
@@ -476,7 +554,7 @@ fn cached_session(
         return Ok(Arc::new(CachedSession { parsed, fold }));
     };
     let key = (path.to_path_buf(), size, mtime_ms);
-    if let Some(hit) = PARSED_CACHE.lock().map_err(|e| e.to_string())?.get(&key) {
+    if let Some((hit, _)) = PARSED_CACHE.lock().map_err(|e| e.to_string())?.entries.get(&key) {
         return Ok(Arc::clone(hit));
     }
     let parsed = parse_session_file_with_handoffs(engine, path, handed)?;
@@ -497,16 +575,7 @@ fn cached_session(
         return Ok(cached);
     }
     let mut cache = PARSED_CACHE.lock().map_err(|e| e.to_string())?;
-    let mut bytes = PARSED_CACHE_BYTES.lock().map_err(|e| e.to_string())?;
-    // Over budget or capacity: drop everything rather than evicting entries
-    // one by one (pages are re-parseable, and scans are cheap by stat key).
-    if cache.len() >= PARSED_CACHE_CAPACITY || *bytes + footprint > PARSED_CACHE_BUDGET_BYTES {
-        cache.clear();
-        *bytes = 0;
-    }
-    *bytes += footprint;
-    cache.insert(key, Arc::clone(&cached));
-    Ok(cached)
+    Ok(cache.insert(key, cached, footprint))
 }
 
 /// The fold over a whole session, each row tagged with the index of the
@@ -1098,6 +1167,9 @@ fn delete_session_blocking_owned(
         tx.execute("DELETE FROM session_claude_options WHERE session_id=?1", [session_id])
             .map_err(|e| e.to_string())?;
     }
+    if engine == "agy" {
+        crate::db::Db::forget_agy_session_workspace_tx(&tx, session_id)?;
+    }
     crate::db::session_auxiliary::set(&tx, engine, session_id, None).map_err(|e| e.to_string())?;
     crate::session_sidebar::storage::delete_session(&tx, engine, session_id)?;
     super::prompt_cache::set(&tx, engine, session_id, None).map_err(|e| e.to_string())?;
@@ -1196,8 +1268,18 @@ pub(crate) fn refresh_session_prompt_cache(
     if !matches!(engine, "claude" | "codex" | "agy") {
         return;
     }
-    let Ok(Some(path)) = find_session_file_path(db, engine, session_id) else {
-        return;
+    let path = match find_session_file_path(db, engine, session_id) {
+        Ok(Some(path)) => path,
+        Ok(None)
+            if engine == "agy"
+                && !crate::engine::sidechat::is_hidden_session(engine, session_id) =>
+        {
+            let Ok(Some(path)) = crate::engine::agy::session_db(session_id) else {
+                return;
+            };
+            path
+        }
+        _ => return,
     };
     let Ok(summary) = super::scan_summary_file(engine, &path) else {
         return;
@@ -1471,6 +1553,69 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn cache_fixture() -> Arc<CachedSession> {
+        Arc::new(CachedSession {
+            parsed: ParsedSession { messages: vec![plain(1, "user")] },
+            fold: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn parsed_cache_oversized_revision_returns_content_without_retention() {
+        let mut cache = ParsedCache::default();
+        let path = PathBuf::from("growing.jsonl");
+        cache.insert((path.clone(), 1, 1), cache_fixture(), 10);
+        cache.insert((PathBuf::from("other.jsonl"), 1, 1), cache_fixture(), 20);
+        let large = cache_fixture();
+        let returned = cache.insert((path.clone(), 2, 2), large.clone(), PARSED_CACHE_BUDGET_BYTES + 1);
+        assert!(Arc::ptr_eq(&returned, &large));
+        assert_eq!(page_from_cached(&returned, Some(100), None).messages.len(), 1);
+        assert!(cache.entries.keys().all(|(p, _, _)| p != &path));
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.bytes, 20);
+    }
+
+    #[test]
+    fn parsed_cache_replaces_file_revision_and_preserves_inflight_readers() {
+        let mut cache = ParsedCache::default();
+        let path = PathBuf::from("growing.jsonl");
+        let old = cache.insert((path.clone(), 1, 1), cache_fixture(), 40);
+        cache.insert((PathBuf::from("other.jsonl"), 1, 1), cache_fixture(), 20);
+        let latest = cache_fixture();
+        cache.insert((path.clone(), 2, 2), latest.clone(), 50);
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.bytes, 70);
+        assert!(!cache.entries.contains_key(&(path.clone(), 1, 1)));
+        assert!(Arc::ptr_eq(&cache.entries[&(path, 2, 2)].0, &latest));
+        assert_eq!(page_from_cached(&old, Some(100), None).messages.len(), 1);
+    }
+
+    #[test]
+    fn parsed_cache_concurrent_miss_insertion_does_not_double_charge() {
+        let mut cache = ParsedCache::default();
+        let key = (PathBuf::from("same.jsonl"), 1, 1);
+        let first = cache.insert(key.clone(), cache_fixture(), PARSED_CACHE_BUDGET_BYTES);
+        let returned = cache.insert(key, cache_fixture(), PARSED_CACHE_BUDGET_BYTES);
+        assert!(Arc::ptr_eq(&first, &returned));
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.bytes, PARSED_CACHE_BUDGET_BYTES);
+        cache.insert((PathBuf::from("next.jsonl"), 1, 1), cache_fixture(), 1);
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.bytes, 1);
+    }
+
+    #[test]
+    fn parsed_cache_retains_entry_count_limit() {
+        let mut cache = ParsedCache::default();
+        for n in 0..PARSED_CACHE_CAPACITY {
+            cache.insert((PathBuf::from(format!("{n}.jsonl")), 1, 1), cache_fixture(), 1);
+        }
+        assert_eq!(cache.entries.len(), PARSED_CACHE_CAPACITY);
+        cache.insert((PathBuf::from("overflow.jsonl"), 1, 1), cache_fixture(), 2);
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.bytes, 2);
+    }
+
     #[test]
     fn compressed_rollout_cache_invalidates_when_plain_reappears() {
         let scratch = Scratch::new();
@@ -1489,6 +1634,39 @@ mod tests {
     }
 
     struct Scratch(PathBuf);
+
+    #[test]
+    fn agy_first_page_scans_registered_native_session_on_demand() {
+        super::super::scanner::tests::with_unindexed_agy(|db, _, session, sid| {
+            assert!(find_session_file_path(db, "agy", sid).unwrap().is_none());
+            let page = load_session_page_blocking(db, "agy", sid, Some(100), None).unwrap();
+            assert_eq!(page.messages.len(), 1);
+            assert_eq!(page.messages[0].text, "hello");
+            assert_eq!(find_session_file_path(db, "agy", sid).unwrap().as_deref(), Some(session));
+        });
+    }
+
+    #[test]
+    fn agy_on_demand_scan_does_not_expose_hidden_side_session() {
+        super::super::scanner::tests::with_unindexed_agy(|db, _, _, sid| {
+            crate::engine::sidechat::register_hidden_session("agy", sid, Some(db));
+            let result = resolve_session_file_path(db, "agy", sid);
+            crate::engine::sidechat::unregister_hidden_session("agy", sid, Some(db));
+            assert!(result.unwrap().is_none());
+            assert!(find_session_file_path(db, "agy", sid).unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn agy_delete_unindexed_session_clears_workspace_pin() {
+        super::super::scanner::tests::with_unindexed_agy(|db, _, session, sid| {
+            assert!(db.agy_session_workspaces().unwrap().contains_key(sid));
+            delete_session_blocking(db, "agy", sid).unwrap();
+            assert!(!session.exists());
+            assert!(!db.agy_session_workspaces().unwrap().contains_key(sid));
+        });
+    }
+
     impl Scratch {
         fn new() -> Self {
             let dir = std::env::temp_dir().join(format!("ccgui-history-{}", uuid::Uuid::new_v4()));

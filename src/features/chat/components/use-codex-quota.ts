@@ -4,6 +4,8 @@ import { listenCodexQuotaChanged, listenTransportConnected } from "@/lib/events"
 import { QUOTA_STALE_AGE, isNativeSubscriptionProvider, quotaReadFailed, validSubscriptionQuotaSnapshot } from "../subscription-quota";
 
 const EMPTY: CodexQuotaSnapshot = { status: "unavailable", windows: {}, errorCode: "not_loaded" };
+const STARTUP_RETRY_DELAY = 121_000; // Just beyond the native 120-second cooldown.
+const RETRYABLE_STARTUP_ERRORS = new Set(["auth_metadata_unavailable", "cli_unavailable", "query_failed", "query_timeout", "read_failed"]);
 
 export function useCodexQuota(engine: string, providerId: string | undefined, workspacePath?: string) {
   const enabled = engine === "codex" && isNativeSubscriptionProvider(providerId) && !/^(wsl:|ssh:|\\\\wsl)/i.test(workspacePath ?? "");
@@ -22,16 +24,20 @@ export function useCodexQuota(engine: string, providerId: string | undefined, wo
     let missingAttempted = false;
     let initialCacheRead = false;
     let loadMissing = false;
+    let queuedStartupRetry = false;
+    let startupRetryUsed = false;
+    let startupRetryTimer: number | undefined;
     let unlisten: (() => void) | undefined;
     let unlistenConnected: (() => void) | undefined;
     const current = () => !disposed && currentRoute.current === route;
     setState({ route, snapshot: EMPTY, loading: false });
     if (!enabled) { request.current = undefined; return; }
 
-    const read = async (cacheOnly = true): Promise<void> => {
+    const read = async (cacheOnly = true, startup = false): Promise<void> => {
       if (!current() || !subscribed) return;
-      if (inFlight) { if (cacheOnly) queued = true; return; }
+      if (inFlight) { if (cacheOnly) queued = true; else if (startup) queuedStartupRetry = true; return; }
       inFlight = true;
+      let retryStartup = false;
       setState(previous => ({ ...previous, loading: true }));
       try {
         const snapshot = await ipc.codexQuotaRead({ cacheOnly, force: !cacheOnly, providerId, workspacePath });
@@ -39,7 +45,7 @@ export function useCodexQuota(engine: string, providerId: string | undefined, wo
         // requiring the details popup. Later events/minute reads stay passive;
         // only a newly missing auth/config binding can bootstrap again.
         const initial = cacheOnly && !initialCacheRead;
-        if (cacheOnly) initialCacheRead = true;
+        if (cacheOnly && snapshot.errorCode !== "auth_metadata_unavailable") initialCacheRead = true;
         const validated = validSubscriptionQuotaSnapshot(snapshot);
         const identityUnavailable = Boolean(snapshot.errorCode && /auth|provider|custom_channel/.test(snapshot.errorCode));
         const initialNeedsRefresh = initial && (validated.status === "stale"
@@ -47,18 +53,32 @@ export function useCodexQuota(engine: string, providerId: string | undefined, wo
         loadMissing = cacheOnly && !identityUnavailable && (initialNeedsRefresh || (snapshot.errorCode === "not_loaded" && !missingAttempted));
         if (loadMissing) missingAttempted = true;
         if (snapshot.status === "ready" || snapshot.status === "stale") missingAttempted = false;
+        retryStartup = startup && !cacheOnly && Boolean(snapshot.errorCode && RETRYABLE_STARTUP_ERRORS.has(snapshot.errorCode));
+        if (snapshot.status === "ready" && startupRetryTimer !== undefined) {
+          window.clearTimeout(startupRetryTimer);
+          startupRetryTimer = undefined;
+        }
         if (current()) {
           setNow(Date.now() / 1000);
           setState({ route, snapshot, loading: true });
         }
       } catch {
+        retryStartup = startup && !cacheOnly;
         if (current()) setState(previous => ({ route, snapshot: quotaReadFailed(previous.snapshot, EMPTY), loading: true }));
       } finally {
         inFlight = false;
         if (current()) {
           setState(previous => ({ ...previous, loading: false }));
+          if (retryStartup && !startupRetryUsed) {
+            startupRetryUsed = true;
+            startupRetryTimer = window.setTimeout(() => {
+              startupRetryTimer = undefined;
+              void read(false, true);
+            }, STARTUP_RETRY_DELAY);
+          }
           // Invalidation during a query needs a subsequent read of the newest cache.
-          if (loadMissing) { loadMissing = false; queued = false; await read(false); }
+          if (loadMissing) { loadMissing = false; queued = false; queuedStartupRetry = false; await read(false, true); }
+          else if (queuedStartupRetry) { queuedStartupRetry = false; await read(false, true); }
           else if (queued) { queued = false; await read(); }
         }
       }
@@ -86,6 +106,7 @@ export function useCodexQuota(engine: string, providerId: string | undefined, wo
       unlistenConnected?.();
       window.removeEventListener("focus", refreshCache);
       window.clearInterval(timer);
+      if (startupRetryTimer !== undefined) window.clearTimeout(startupRetryTimer);
       if (request.current?.route === route) request.current = undefined;
     };
   }, [route, engine, providerId, workspacePath, enabled]);

@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it } from "vitest";
 import { createRuntimeCheckpointCoordinator, type RuntimeCheckpoint } from "@/lib/runtime-checkpoint";
 import { retainRetiredHostChatCheckpoints } from "./retired-checkpoints";

@@ -2,11 +2,15 @@ use super::*;
 use crate::workspace_projects::{MemberRole, ProjectInput, ProjectMemberInput};
 
 fn project_fixture() -> (Fixture, CostContextScratch, String, String) {
+    project_fixture_with_engine("claude")
+}
+
+fn project_fixture_with_engine(engine: &str) -> (Fixture, CostContextScratch, String, String) {
     let scratch = CostContextScratch::new();
     let parent = scratch.0.join("host").to_string_lossy().into_owned();
     let target = scratch.0.join("game").to_string_lossy().into_owned();
     let reference = scratch.0.join("reference").to_string_lossy().into_owned();
-    let mut f = basic();
+    let mut f = fixture_with_engine(Arc::new(|_, _, _| Ok(())), engine);
     for (index, path) in [&parent, &target, &reference].into_iter().enumerate() {
         std::fs::create_dir(path).unwrap();
         f.manager.db.0.lock().execute("INSERT INTO workspaces(id,path) VALUES(?1,?2)",
@@ -28,6 +32,91 @@ fn project_fixture() -> (Fixture, CostContextScratch, String, String) {
 
 fn cross_args(target: &str) -> SpawnArgs {
     SpawnArgs { workspace_path: Some(target.into()), ..args("cross-spawn") }
+}
+
+#[tokio::test]
+async fn external_workspace_dispatch_ignores_legacy_grants_and_preserves_ownership_and_cost_approval() {
+    let (f, scratch, _, _) = project_fixture();
+    let target = scratch.0.join("external-workbench").to_string_lossy().into_owned();
+    std::fs::create_dir(&target).unwrap();
+    f.manager.db.0.lock().execute("INSERT INTO workspaces(id,path) VALUES('external-workbench',?1)", [&target]).unwrap();
+    let (id, run) = spawn_with_args(&f, &cross_args(&target));
+    assert_eq!(branch(&f, &id).workspace_path, target);
+    assert_eq!(branch(&f, &id).parent_workspace(), f.parent.workspace_path);
+    assert_eq!(f.manager.inner.lock().runs[&run].permission, "manual");
+    f.manager.db.0.lock().execute("INSERT INTO plugin_kv(plugin_id,key,value) VALUES('$ccgui-task-workspace-access','obsolete','bad-json')", []).unwrap();
+    f.manager.prepare(&run, "codex", None, &target, Some("manual")).unwrap();
+    crate::task_workspace_access::recheck_managed_launch(&f.manager.db, &run, "codex", &target).unwrap();
+    for (run_id, engine, cwd) in [("wrong-run", "codex", target.as_str()),
+        (run.as_str(), "claude", target.as_str()), (run.as_str(), "codex", f.parent.workspace_path.as_str())] {
+        assert!(crate::task_workspace_access::recheck_managed_launch(&f.manager.db, run_id, engine, cwd).is_err());
+    }
+    // Removing old permissions during asynchronous preparation has no effect.
+    f.manager.db.0.lock().execute("DELETE FROM plugin_kv WHERE plugin_id='$ccgui-task-workspace-access'", []).unwrap();
+    crate::task_workspace_access::recheck_managed_launch(&f.manager.db, &run, "codex", &target).unwrap();
+    settle(&f, &id, &run, "external-child");
+    let held = held_send(&f, &id, "external-held");
+    assert_eq!(branch(&f, &id).state, "awaiting_cost_approval");
+    assert!(f.manager.prepare(&run, "codex", Some("external-child"), &target, Some("manual")).unwrap_err().contains("cost approval"));
+    assert!(crate::task_workspace_access::recheck_managed_launch(&f.manager.db, &run, "codex", &target).is_err());
+    let wrong_parent = identity(&f.parent.engine, &f.parent.session_id, &target);
+    assert!(f.manager.reserve_send(&f.caller, &wrong_parent, "manual", &held, encoded(&held).unwrap()).is_err());
+    assert!(f.manager.stop(&wrong_parent, &id).await.is_err());
+    assert_eq!(f.manager.stop(&f.parent, &id).await.unwrap().state, "stopped");
+    hot_send_cache(&f, &id);
+    let followup = SendArgs { images: vec![], branch_id: id.clone(), request_id: "external-followup".into(), message: "continue".into() };
+    let Reservation::Start((resumed, next_run)) = f.manager.reserve_send(&f.caller, &f.parent, "manual", &followup, encoded(&followup).unwrap()).unwrap()
+        else { panic!("follow-up should start without a workspace grant"); };
+    assert_eq!(resumed.workspace_path, target);
+    assert_eq!(resumed.parent_workspace(), f.parent.workspace_path);
+    crate::task_workspace_access::recheck_managed_launch(&f.manager.db, &next_run, "codex", &target).unwrap();
+    assert!(f.manager.processes.get(&f.caller.run_id).is_some());
+}
+
+#[test]
+fn all_supported_parent_and_child_engines_dispatch_across_projects_without_grants() {
+    for parent_engine in ["claude", "codex", "agy", "cursor"] {
+        for child_engine in ["claude", "codex", "agy", "cursor"] {
+            let (f, _scratch, target, _) = project_fixture_with_engine(parent_engine);
+            {
+                let mut conn = f.manager.db.0.lock();
+                conn.execute("DELETE FROM plugin_kv WHERE plugin_id='$ccgui-workspace-projects'", []).unwrap();
+                for (index, path) in [&f.parent.workspace_path, &target].into_iter().enumerate() {
+                    crate::workspace_projects::save_inner(&mut conn, ProjectInput {
+                        id: None, name: format!("Independent project {index}"), default_path: path.clone(),
+                        members: vec![ProjectMemberInput { id: index.to_string(), path: path.clone(),
+                            label: index.to_string(), role: MemberRole::Development }],
+                    }, None).unwrap();
+                }
+            }
+            let args = SpawnArgs { engine: child_engine.into(), ..cross_args(&target) };
+            let (id, run) = spawn_with_args(&f, &args);
+            f.manager.prepare(&run, child_engine, None, &target, Some("manual")).unwrap();
+            crate::task_workspace_access::recheck_managed_launch(&f.manager.db, &run, child_engine, &target).unwrap();
+            assert_eq!(branch(&f, &id).parent_engine, parent_engine);
+            assert_eq!(branch(&f, &id).engine, child_engine);
+            assert_eq!(f.manager.inner.lock().runs[&run].permission, "manual");
+        }
+    }
+}
+
+#[test]
+fn native_handoff_cross_workspace_preserves_parent_and_execution_cwd() {
+    let (f, _scratch, target, _) = project_fixture();
+    f.manager.db.0.lock().execute("DELETE FROM plugin_kv WHERE plugin_id='$ccgui-workspace-projects'", []).unwrap();
+    let args = cross_args(&target);
+    let Reservation::Start((id, run)) = f.manager.reserve_spawn(&f.caller, &f.parent, "manual",
+        &args, encoded(&args).unwrap(), Some("test-model".into()), Some("high".into())).unwrap()
+        else { panic!("new child expected"); };
+    settle(&f, &id, &run, "cross-handoff-source");
+    let held = held_send(&f, &id, "cross-held");
+    let (successor, _, _, _) = handoff(&f, &id, &held.request_id, "cross-op", "Cross-workspace summary").unwrap().unwrap();
+    assert_eq!(successor.workspace_path, target);
+    assert_eq!(successor.parent_workspace_path.as_deref(), Some(f.parent.workspace_path.as_str()));
+    assert_eq!(successor.parent_session_id, f.parent.session_id);
+    let wrong_parent = identity(&f.parent.engine, &f.parent.session_id, &target);
+    assert!(f.manager.resolve_child_id(&f.manager.inner.lock(), &wrong_parent, &id).is_err());
+    assert_eq!(f.manager.resolve_child_id(&f.manager.inner.lock(), &f.parent, &id).unwrap(), successor.id);
 }
 
 fn directory_alias(scratch: &CostContextScratch, alias: &std::path::Path, target: &str) {
@@ -56,7 +145,7 @@ fn remove_alias(alias: &std::path::Path) {
 }
 
 #[test]
-fn registered_directory_alias_uses_member_identity_but_retargeting_cannot_gain_authority() {
+fn registered_directory_alias_needs_no_project_role_and_missing_targets_still_fail() {
     let (f, scratch, target, reference) = project_fixture();
     let alias = scratch.0.join("game-alias");
     directory_alias(&scratch, &alias, &target);
@@ -64,19 +153,16 @@ fn registered_directory_alias_uses_member_identity_but_retargeting_cannot_gain_a
     // Canonical equivalence alone cannot substitute for executable registration.
     assert!(f.manager.spawn_workspace(&f.parent, Some(&alias_path)).is_err());
     f.manager.db.0.lock().execute("INSERT INTO workspaces(id,path) VALUES('registered-alias',?1)", [&alias_path]).unwrap();
-    // Workspace registration alone does not assign this new alias a project role.
-    assert!(f.manager.spawn_workspace(&f.parent, Some(&alias_path)).is_err());
-    let project = crate::workspace_projects::list_inner(&f.manager.db.0.lock()).unwrap().remove(0);
-    crate::workspace_projects::save_inner(&mut f.manager.db.0.lock(), ProjectInput {
-        id: Some(project.id), name: project.name, default_path: project.default_path,
-        members: project.members.into_iter().map(|m| ProjectMemberInput {
-            id: m.id, path: if m.path == target { alias_path.clone() } else { m.path }, label: m.label, role: m.role,
-        }).collect(),
-    }, None).unwrap();
     assert_eq!(f.manager.spawn_workspace(&f.parent, Some(&alias_path)).unwrap(), alias_path);
+    let (id, run) = spawn_with_args(&f, &cross_args(&alias_path));
+    crate::task_workspace_access::recheck_managed_launch(&f.manager.db, &run, "codex", &alias_path).unwrap();
     remove_alias(&alias);
+    assert!(crate::task_workspace_access::recheck_managed_launch(&f.manager.db, &run, "codex", &alias_path).is_err());
     directory_alias(&scratch, &alias, &reference);
-    assert!(f.manager.spawn_workspace(&f.parent, Some(&alias_path)).is_err());
+    assert_eq!(f.manager.spawn_workspace(&f.parent, Some(&alias_path)).unwrap(), alias_path);
+    crate::task_workspace_access::recheck_managed_launch(&f.manager.db, &run, "codex", &alias_path).unwrap();
+    assert_eq!(branch(&f, &id).workspace_path, alias_path);
+    assert!(crate::task_workspace_access::recheck_managed_launch(&f.manager.db, &run, "codex", &reference).is_err());
     remove_alias(&alias);
 }
 
@@ -103,29 +189,32 @@ fn omitted_cwd_preserves_legacy_fingerprint_and_record_identity() {
 }
 
 #[test]
-fn native_project_authorization_rejects_reference_external_archived_missing_and_remote() {
+fn native_dispatch_accepts_reference_and_external_but_rejects_unavailable_workspaces() {
     let (f, scratch, target, reference) = project_fixture();
     assert_eq!(f.manager.spawn_workspace(&f.parent, Some(&target)).unwrap(), target);
-    assert!(f.manager.spawn_workspace(&f.parent, Some(&reference)).is_err());
+    assert_eq!(f.manager.spawn_workspace(&f.parent, Some(&reference)).unwrap(), reference);
     let external = scratch.0.join("external").to_string_lossy().into_owned();
     std::fs::create_dir(&external).unwrap();
     f.manager.db.0.lock().execute("INSERT INTO workspaces(id,path) VALUES('external',?1)", [&external]).unwrap();
-    assert!(f.manager.spawn_workspace(&f.parent, Some(&external)).is_err());
+    assert_eq!(f.manager.spawn_workspace(&f.parent, Some(&external)).unwrap(), external);
     let other_parent = identity(&f.parent.engine, &f.parent.session_id, &external);
-    assert!(f.manager.spawn_workspace(&other_parent, Some(&target)).is_err());
+    assert!(validate_parent(&f.manager.db, &other_parent, false).is_err());
+    let forged_caller = Caller { workspace_path: external.clone(), ..f.caller.clone() };
+    let args = cross_args(&target);
+    assert!(f.manager.reserve_spawn(&forged_caller, &other_parent, "manual", &args, encoded(&args).unwrap(), None, None).is_err());
     let nested = std::path::Path::new(&target).join("unregistered").to_string_lossy().into_owned();
     std::fs::create_dir(&nested).unwrap();
     assert!(f.manager.spawn_workspace(&f.parent, Some(&nested)).is_err());
     let id: String = f.manager.db.0.lock().query_row("SELECT id FROM workspaces WHERE path=?1", [&target], |r| r.get(0)).unwrap();
     assert!(validate_workspace_registration(&f.manager.db.0.lock(), &target, &[id], true).unwrap_err().contains("archived"));
-    for meta in [r#"{"remote":{}}"#, r#"{"wsl":{}}"#, "invalid-json"] {
+    for meta in [r#"{"remote":{}}"#, r#"{"wsl":{}}"#, "invalid-json", "[]", "null"] {
         f.manager.db.0.lock().execute("UPDATE workspaces SET meta=?1 WHERE path=?2", params![meta, target]).unwrap();
         assert!(f.manager.spawn_workspace(&f.parent, Some(&target)).is_err());
     }
     f.manager.db.0.lock().execute("UPDATE workspaces SET meta=NULL WHERE path=?1", [&target]).unwrap();
-    // The recorded member identity must still agree with the live directory.
+    // Project metadata no longer controls registered local dispatch.
     f.manager.db.0.lock().execute("UPDATE plugin_kv SET value=json_set(value,'$.projects[0].members[1].canonicalIdentity','stale') WHERE plugin_id='$ccgui-workspace-projects'", []).unwrap();
-    assert!(f.manager.spawn_workspace(&f.parent, Some(&target)).is_err());
+    assert_eq!(f.manager.spawn_workspace(&f.parent, Some(&target)).unwrap(), target);
     std::fs::remove_dir(&nested).unwrap();
     std::fs::remove_dir(&target).unwrap();
     assert!(f.manager.spawn_workspace(&f.parent, Some(&target)).is_err());
@@ -177,7 +266,7 @@ async fn cross_workspace_restart_retains_parent_controls_child_cwd_and_permissio
         assert_eq!(receipt["branch"]["parentWorkspacePath"], f.parent.workspace_path);
     }
     assert!(f.manager.stop(&impostor, &id).await.is_err());
-    let send = SendArgs { branch_id: id.clone(), request_id: "follow-up".into(), message: "Continue".into() };
+    let send = SendArgs { images: Vec::new(), branch_id: id.clone(), request_id: "follow-up".into(), message: "Continue".into() };
     assert!(f.manager.reserve_send(&f.caller, &impostor, "manual", &send, encoded(&send).unwrap()).is_err());
     let Reservation::Start((resumed, next_run)) = f.manager.reserve_send(&f.caller, &f.parent,
         "manual", &send, encoded(&send).unwrap()).unwrap() else { panic!("send did not start") };

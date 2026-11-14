@@ -2,7 +2,7 @@ import type { Disposer } from "./manifest";
 import type { ComponentType } from "react";
 import type { HostFixedInstructions } from "./fixed-instructions";
 
-export type ConversationEngine = "claude" | "codex";
+export type ConversationEngine = "claude" | "codex" | "agy";
 export interface ConversationSelection {
   engine: ConversationEngine;
   model?: string;
@@ -53,6 +53,8 @@ export interface ConversationCatalog {
     label: string;
     available: boolean;
     supportsImages?: boolean;
+    /** Exact native engine capability; do not infer from the global flag. */
+    supportsFixedInstructions?: boolean;
     models: Array<{ id: string; label: string }>;
     providers: Array<{ id: string; label: string }>;
     efforts?: Array<{ id: string; label: string }>;
@@ -64,12 +66,13 @@ export interface ConversationCatalog {
 }
 /** Desktop-owner-only host:chat capability. Runs persistent read-only native
  * Sidechat branches (Claude: Read/Grep/Glob, no MCP; Codex: verified read-only
- * sandbox, no network). It can read files in the registered local workspace and
+ * sandbox, no network; AGY: native plan mode). It can read files in the registered local workspace and
  * sends prompts and inspected context to the selected provider. It consumes
  * provider quota. No execution, promotion, task ledger, or global settings edits
  * are exposed. Closing UI / disposing listeners does not cancel work.
  * A thread's workspace and selection are immutable. Rotate threadId to change
- * either. Missing model/effort resolve once from host defaults; if a default
+ * either. AGY effort is encoded in the selected model ID; omit separate effort.
+ * Missing model/effort resolve once from host defaults; if a default
  * cannot be resolved, open requires an explicit choice instead of relying on
  * mutable CLI defaults. Persisted in-flight work without native proof restores as unknown;
  * it is never silently replayed. Only the latest request is retained per thread;

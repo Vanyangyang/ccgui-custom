@@ -61,6 +61,9 @@ function VariantHarness() {
     modelsByEngine={{ ...MODELS, agy: [
       { id: "claude-opus-5-5-medium", label: "Claude Opus 5.5 (Medium)" },
       { id: "claude-opus-5-5-high", label: "Claude Opus 5.5 (High)" },
+      { id: "gemini-4-hydrogen-high", label: "Gemini 4 Hydrogen (High)" },
+      { id: "gemini-4-hydrogen-xhigh", label: "Gemini 4 Hydrogen (XHigh)" },
+      { id: "gemini-pro-orchestrator", label: "Orchestrator" },
     ] }}
     models={models} onModelChange={(id, model) => setModels((previous) => ({ ...previous, [id]: model }))}
     efforts={{ codex: "xhigh", agy: "medium" }} onEffortChange={() => {}}
@@ -251,6 +254,48 @@ describe("CliMenu flyout switching", () => {
     await click(document.querySelector('[aria-label="Claude Opus 5.5 · 中"]')!);
     expect(container.querySelector("button")?.getAttribute("aria-label")).toBe("Antigravity CLI / Claude Opus 5.5 · 中");
   });
+  it.each([false, true])("Hydrogen 极高选择在摘要中保持可见且可切回高（mobile=%s）", async (mobile) => {
+    if (mobile) {
+      vi.stubGlobal("matchMedia", (media: string) => ({
+        matches: media.includes("max-width"), media,
+        addEventListener() {}, removeEventListener() {},
+      }));
+    }
+    act(() => root.render(<VariantHarness />));
+    await openMenu();
+    await click(engineRow("Antigravity")!);
+    const xhigh = document.querySelector('[aria-label="Gemini 4 Hydrogen · 极高"]');
+    expect(xhigh).not.toBeNull();
+    await click(xhigh!);
+    const trigger = container.querySelector("button")!;
+    expect(trigger.getAttribute("aria-label")).toBe("Antigravity CLI / Gemini 4 Hydrogen · 极高");
+    const visibleEffort = trigger.querySelector('span[aria-hidden="false"]');
+    expect(visibleEffort?.textContent).toBe("极高");
+    expect(visibleEffort?.classList.contains("invisible")).toBe(false);
+    await click(document.querySelector('[aria-label="Gemini 4 Hydrogen · 高"]')!);
+    expect(trigger.getAttribute("aria-label")).toBe("Antigravity CLI / Gemini 4 Hydrogen · 高");
+  });
+
+  it.each([false, true])("Orchestrator 不继承上个模型的努力层级（mobile=%s）", async (mobile) => {
+    if (mobile) {
+      vi.stubGlobal("matchMedia", (media: string) => ({
+        matches: media.includes("max-width"), media,
+        addEventListener() {}, removeEventListener() {},
+      }));
+    }
+    act(() => root.render(<VariantHarness />));
+    await openMenu();
+    await click(engineRow("Antigravity")!);
+    await click(document.querySelector('[aria-label="Gemini 4 Hydrogen · 极高"]')!);
+    const choice = [...document.querySelectorAll<HTMLButtonElement>('[role="radio"]')]
+      .find(button => button.textContent === "Orchestrator")!;
+    await click(choice);
+    const trigger = container.querySelector("button")!;
+    expect(trigger.getAttribute("aria-label")).toBe("Antigravity CLI / Orchestrator");
+    expect(trigger.querySelector(".inline-grid")).toBeNull();
+    expect(document.querySelector(`[role="radiogroup"][aria-label="${i18n.t("chat.effort")}"]`)).toBeNull();
+  });
+
   const taskProps = () => ({
     selectionScope: "task" as const, options: OPTIONS, value: "codex",
     modelsByEngine: MODELS, models: {}, efforts: {},

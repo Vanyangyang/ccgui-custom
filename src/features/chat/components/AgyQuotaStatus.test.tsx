@@ -76,6 +76,9 @@ describe("AGY remaining usage status", () => {
           agyQuotaPromoTrial: "Free Trial",
           agyQuotaPromoGdp: "GDP monthly",
           agyQuotaPromoGuardrail: "Google Cloud promo credits",
+          agyVertexCreditsUpdated: "Credits updated {{time}}",
+          agyVertexRefreshLoginRequired: "Background refresh needs a Google sign-in",
+          agyVertexRefreshTimeout: "Background refresh timed out",
         },
         settings: {
           agyVertexNotConnected: "Not connected",
@@ -303,6 +306,28 @@ describe("AGY remaining usage status", () => {
     const openBtn = vertex!.querySelectorAll("button")[1];
     await act(async () => openBtn.click());
     expect(openExternal).toHaveBeenCalledWith(getAgyVertexCreditsUrl(SYNTHETIC_ACCOUNT));
+  });
+
+  it("keeps an old balance visible with its age and why the background refresh could not update it", async () => {
+    const connected: AgyVertexCreditsSnapshot = {
+      billingAccountId: SYNTHETIC_ACCOUNT,
+      freeTrialCredit: "$100.00",
+      freeTrialOriginalCredit: "$200.00",
+      freeTrialRemainingPercent: 50,
+      gdpMonthlyCredit: null,
+      gdpMonthlyRemainingPercent: null,
+      collectedAt: NOW - 7 * 3600,
+    };
+    creditsMock.mockResolvedValue({ ...connected, refreshError: "login_required" });
+    await act(async () => applyCreditsSnapshot({ ...connected, refreshError: "login_required" }));
+    await render(quota());
+    const vertex = (await open()).querySelector('section[aria-label="Vertex promotional credits"]')!;
+    expect(vertex.textContent).toContain("$100.00");
+    expect(vertex.textContent).toContain(new Date(connected.collectedAt! * 1000).toLocaleString("en"));
+    expect(vertex.textContent).toContain("Background refresh needs a Google sign-in");
+    // A successful refresh drops the notice.
+    await act(async () => applyCreditsSnapshot({ ...connected, collectedAt: NOW }));
+    expect(vertex.textContent).not.toContain("Background refresh needs a Google sign-in");
   });
 
   it("clears old credits and reports localized failure when sync is cancelled or permission denied", async () => {

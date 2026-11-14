@@ -26,7 +26,7 @@ const sample: ThroughputState = { ...beginThroughput("fixture-run"), ended:true,
 function Footer({sessionId}: {sessionId:string}) {
   const quota = useCodexQuota(agy ? "agy" : "codex", "__local_settings_json__", "C:/fixture");
   if (agy) {
-    const context = selectAgyContext(null, undefined, 1_000_000);
+    const context = selectAgyContext(null, 1_000_000);
     return <StatusBar branch="main" folders={["Workspace"]} selectedFolder="Workspace"
       contextMax={context.max} contextMaxKnown={context.capacityKnown} contextOccupancyKnown={context.occupancyKnown} contextShowCapacity
       quotaStatus={<AgyQuotaStatus model="gemini-pro" now={1_900_000_000} loading={false} refresh={async () => {}}

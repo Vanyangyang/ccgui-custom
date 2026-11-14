@@ -1,4 +1,6 @@
 use super::*;
+#[path = "task_lifecycle_tests.rs"]
+mod task_lifecycle_tests;
 #[path = "delegation_tests.rs"]
 mod delegation_tests;
 #[path = "delegation_storage_tests.rs"]
@@ -7,6 +9,12 @@ mod delegation_storage_tests;
 mod cross_workspace_tests;
 #[path = "parent_message_tests.rs"]
 mod parent_message_tests;
+#[path = "image_tests.rs"]
+mod image_tests;
+#[path = "parent_wakeup_tests.rs"]
+mod parent_wakeup_tests;
+#[path = "subtree_archive_tests.rs"]
+mod subtree_archive_tests;
 use crate::engine::ChildEntry;
 use std::sync::atomic::{AtomicI64, Ordering};
 
@@ -46,6 +54,10 @@ fn fixture(delete: Arc<Delete>) -> Fixture {
 }
 
 fn fixture_with_engine(delete: Arc<Delete>, engine: &str) -> Fixture {
+    fixture_with_workspace(delete, engine, "known-local-workspace")
+}
+
+fn fixture_with_workspace(delete: Arc<Delete>, engine: &str, workspace: &str) -> Fixture {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     conn.execute_batch(
         "CREATE TABLE workspaces(id TEXT,path TEXT,meta TEXT);
@@ -64,7 +76,7 @@ fn fixture_with_engine(delete: Arc<Delete>, engine: &str) -> Fixture {
     .unwrap();
     let db = Arc::new(Db(Mutex::new(conn)));
     ensure_schema(&db).unwrap();
-    let parent = identity(engine, "parent-session", "known-local-workspace");
+    let parent = identity(engine, "parent-session", workspace);
     db.0.lock()
         .execute(
             "INSERT INTO leader_roles(engine,session_id,workspace_path) VALUES(?1,?2,?3)",
@@ -365,7 +377,7 @@ fn legacy_request_methods_migrate_durably_without_restarting_spawn_or_send() {
     settle(&f, &id, &run, "migrated-child");
     f.manager.acknowledge(&f.parent, &spawn_args.request_id, &run,
         Ok(crate::engine::SendResult { run_id: run.clone(), session_id: Some("migrated-child".into()) })).unwrap();
-    let send_args = SendArgs { branch_id: id.clone(), request_id: "migrated-send".into(), message: "Continue the same task".into() };
+    let send_args = SendArgs { images: Vec::new(), branch_id: id.clone(), request_id: "migrated-send".into(), message: "Continue the same task".into() };
     hot_send_cache(&f, &id);
     let Reservation::Start((_, send_run)) = f.manager.reserve_send(&f.caller, &f.parent, "manual",
         &send_args, encoded(&send_args).unwrap()).unwrap() else { panic!("unexpected replay") };
@@ -513,7 +525,8 @@ fn workspace_separator_keys_preserve_authority_boundaries() {
     assert!(!same_workspace(r"G:repo\\child", r"G:repo\child"));
     assert!(!same_workspace(r"\\server\share", r"\\server\\share"));
     assert!(!same_workspace(r"/tmp/a\b", "/tmp/a/b"));
-    assert!(!same_workspace("G:/repo", "g:/repo"));
+    assert_eq!(same_workspace("G:/repo", "g:/repo"), cfg!(windows));
+    assert!(!same_workspace("G:/repo", "g:/REPO"));
     assert!(!same_workspace("G:/repo", "G:/repo/child"));
     assert!(!same_workspace("G:/repo", "G:/other/../repo"));
     assert!(!same_workspace(r"G:repo\child", "G:repo/child"));
@@ -901,6 +914,7 @@ fn pending_first_root_keeps_foreign_claims_after_retired_run_pruning() {
 
 fn args(request_id: &str) -> SpawnArgs {
     SpawnArgs {
+        images: Vec::new(),
         workspace_path: None,
         request_id: request_id.into(),
         engine: "codex".into(),
@@ -948,7 +962,7 @@ fn leader_model_policy_changes_do_not_interfere_with_send_settings() {
     f.manager.finish(&run);
     let settings: crate::settings::AppSettings = serde_json::from_value(json!({"leaderAllowedModels":{"codex":[]}})).unwrap();
     assert!(model_policy::resolve(&settings, "codex", Some("saved-model")).is_err());
-    let send = SendArgs { branch_id: id, request_id: "policy-followup".into(), message: "Continue the existing task".into() };
+    let send = SendArgs { images: Vec::new(), branch_id: id, request_id: "policy-followup".into(), message: "Continue the existing task".into() };
     hot_send_cache(&f, &send.branch_id);
     let Reservation::Start((branch, _)) = f.manager.reserve_send(
         &f.caller, &f.parent, "manual", &send, encoded(&send).unwrap(),
@@ -1027,6 +1041,7 @@ fn hot_send_cache(f: &Fixture, id: &str) {
 
 fn held_send(f: &Fixture, id: &str, request_id: &str) -> SendArgs {
     let args = SendArgs {
+        images: Vec::new(),
         branch_id: id.into(), request_id: request_id.into(), message: "Continue 中文 😀".into(),
     };
     let Reservation::Replay(receipt) = f.manager.reserve_send(
@@ -1036,6 +1051,585 @@ fn held_send(f: &Fixture, id: &str, request_id: &str) -> SendArgs {
     assert_eq!(receipt["submitted_to_model"], false);
     assert_eq!(receipt["mayHaveStarted"], false);
     args
+}
+
+fn handoff_fixture() -> (Fixture, String, String, SendArgs) {
+    let f = basic();
+    let spawn_args = args("handoff-source");
+    let Reservation::Start((id, run)) = f.manager.reserve_spawn(
+        &f.caller, &f.parent, "manual", &spawn_args, encoded(&spawn_args).unwrap(),
+        Some("handoff-test-model".into()), Some("high".into()),
+    ).unwrap() else { panic!("unexpected replay"); };
+    settle(&f, &id, &run, "handoff-source-session");
+    let send = held_send(&f, &id, "handoff-held");
+    (f, id, run, send)
+}
+
+fn handoff(f: &Fixture, id: &str, request: &str, op: &str, summary: &str)
+    -> Result<Option<(LeaderBranch, String, String, String)>, String>
+{
+    let source = branch(f, id);
+    f.manager.reserve_handoff(&f.parent, id, request, source.session_id.as_deref().unwrap(),
+        source.model.as_deref(), op, summary)
+}
+
+#[test]
+fn native_handoff_selected_target_is_durable_and_part_of_operation_identity() {
+    let (f, id, _, args) = handoff_fixture();
+    let source = branch(&f, &id);
+    assert_eq!(source.engine, "codex");
+    let selection = crate::plugin_conversations::Selection {
+        engine: "claude".into(), model: "explicit-target".into(), effort: Some("high".into()),
+        provider_id: "chosen-provider".into(),
+    };
+    let reserve = |selection: &crate::plugin_conversations::Selection| f.manager.reserve_handoff_with_selection(
+        &f.parent, &id, &args.request_id, source.session_id.as_deref().unwrap(), source.model.as_deref(),
+        "selected-op", "summary", Some(selection));
+    let (next, _, _, _) = reserve(&selection).unwrap().unwrap();
+    assert_eq!(next.engine, "claude");
+    assert_eq!(next.model.as_deref(), Some("explicit-target"));
+    assert_eq!(next.effort.as_deref(), Some("high"));
+    assert_eq!(next.provider_id.as_deref(), Some("chosen-provider"));
+    assert_eq!(branch(&f, &id).model, source.model);
+    assert_eq!(branch(&f, &id).engine, source.engine);
+    assert!(reserve(&selection).unwrap().is_none());
+    assert!(reserve(&crate::plugin_conversations::Selection { provider_id: "other".into(), ..selection }).is_err());
+    let raw: String = f.manager.db.0.lock().query_row("SELECT record_json FROM leader_branches WHERE id=?1", [&next.id], |r| r.get(0)).unwrap();
+    assert_eq!(serde_json::from_str::<LeaderBranch>(&raw).unwrap().provider_id, next.provider_id);
+    let restored = reload(&f).unwrap();
+    assert_eq!(restored.inner.lock().branches[&next.id].branch.provider_id, next.provider_id);
+}
+
+#[test]
+fn native_handoff_incompatible_target_permission_keeps_held_approval() {
+    let (f, id, _, args) = handoff_fixture();
+    let source = branch(&f, &id);
+    let selection = crate::plugin_conversations::Selection {
+        engine: "agy".into(), model: "gemini-explicit-high".into(), effort: None, provider_id: "official".into(),
+    };
+    // AGY cannot honor the held child's manual approval mode.
+    let error = f.manager.reserve_handoff_with_selection(&f.parent, &id, &args.request_id,
+        source.session_id.as_deref().unwrap(), source.model.as_deref(), "permission-op", "summary", Some(&selection)).unwrap_err();
+    assert!(error.contains("permission"), "{error}");
+    assert_eq!(encoded(&branch(&f, &id)).unwrap(), encoded(&source).unwrap());
+    assert_eq!(f.manager.inner.lock().branches.len(), 1);
+}
+
+#[test]
+fn native_handoff_invalid_selection_keeps_held_approval() {
+    let (f, id, _, args) = handoff_fixture();
+    let source = branch(&f, &id);
+    for selection in [
+        json!({"engine":"codex", "model":"chosen", "providerId":"official"}),
+        json!({"engine":"agy", "model":"chosen", "providerId":"official", "effort":"high"}),
+        json!({"engine":"codex", "model":"chosen", "providerId":"", "effort":"high"}),
+        json!({"engine":"unknown", "model":"chosen", "providerId":"official", "effort":"high"}),
+    ] {
+        let selection = serde_json::from_value(selection).unwrap();
+        assert!(f.manager.reserve_handoff_with_selection(&f.parent, &id, &args.request_id,
+            source.session_id.as_deref().unwrap(), source.model.as_deref(), "invalid-op", "summary", Some(&selection)).is_err());
+        assert_eq!(encoded(&branch(&f, &id)).unwrap(), encoded(&source).unwrap());
+        assert_eq!(f.manager.inner.lock().branches.len(), 1);
+    }
+}
+
+#[test]
+fn native_handoff_preserves_held_identity_and_commits_before_launch_once() {
+    let (f, id, old_run, args) = handoff_fixture();
+    let original = f.manager.inner.lock().requests[&(key(&f.parent), args.request_id.clone())].clone();
+    let source = branch(&f, &id);
+    let (next, run, spawn_request, permission) = handoff(&f, &id, &args.request_id, "op-one", "已经核对中文 😀").unwrap().unwrap();
+    assert_ne!(next.id, id);
+    assert_eq!(next.session_id, None);
+    assert_eq!(permission, "manual");
+    assert_eq!(next.parent_engine, f.parent.engine);
+    assert_eq!(next.parent_session_id, f.parent.session_id);
+    assert_eq!(next.parent_workspace(), f.parent.workspace_path);
+    assert_eq!(next.workspace_path, source.workspace_path);
+    assert_eq!(next.model, source.model);
+    assert_eq!(next.effort, source.effort);
+    assert!(next.task.contains("已经核对中文 😀"));
+    assert!(next.task.ends_with(&args.message));
+    assert_eq!(f.manager.inner.lock().branches.len(), 2);
+    assert!(f.manager.inner.lock().runs[&run].launch_pending);
+    assert!(f.manager.processes.get(&run).is_none(), "reservation must not invoke an engine");
+    let old = branch(&f, &id);
+    assert_eq!(old.task, source.task);
+    assert_eq!(old.session_id, source.session_id);
+    assert_eq!(old.state, "handed_off");
+    assert_eq!(old.delegation.as_ref().unwrap().state, "handed_off");
+    assert!(old.cost_approval.is_none());
+    let held = f.manager.inner.lock().requests[&(key(&f.parent), args.request_id.clone())].clone();
+    assert_eq!(held.method, original.method);
+    assert_eq!(held.arguments_fingerprint, original.arguments_fingerprint);
+    assert_eq!(held.branch_id, original.branch_id);
+    assert_eq!(held.state, "handed_off");
+    let raw: String = f.manager.db.0.lock().query_row("SELECT record_json FROM leader_branches WHERE id=?1", [&next.id], |r| r.get(0)).unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&raw).unwrap()["runId"], run);
+    assert_eq!(f.manager.inner.lock().requests[&(key(&f.parent), spawn_request)].state, "starting");
+    assert!(handoff(&f, &id, &args.request_id, "op-one", "已经核对中文 😀").unwrap().is_none());
+    for (op, summary) in [("op-one", "different"), ("op-two", "已经核对中文 😀")] {
+        assert!(handoff(&f, &id, &args.request_id, op, summary).is_err());
+    }
+    observe(&f, &old_run, "handoff-source-session", "delta", json!("stale source output"), 99);
+    f.manager.finish(&old_run);
+    assert_eq!(encoded(&branch(&f, &id)).unwrap(), encoded(&old).unwrap());
+    assert_eq!(branch(&f, &next.id).result, "");
+    assert!(f.manager.prepare("gui-old", &old.engine, old.session_id.as_deref(), &old.workspace_path, Some("manual")).unwrap_err().contains("handed off"));
+    let replay = f.manager.replay(&f.manager.inner.lock(), &f.parent, &args.request_id, "task_send", &encoded(&args).unwrap()).unwrap().unwrap();
+    assert_eq!(replay["requestState"], "handed_off");
+    assert_eq!(replay["actualBranchId"], next.id);
+    assert_eq!(replay["branch"]["id"], id);
+    assert_eq!(replay["successor"]["id"], next.id);
+    assert_eq!(replay["handoffChain"].as_array().unwrap().len(), 1);
+    assert_eq!(replay["originalSubmittedToModel"], false);
+    assert_eq!(replay["mayHaveStarted"], true);
+    assert!(replay.get("submitted_to_model").is_none());
+}
+
+#[test]
+fn native_handoff_rejects_changed_review_and_keeps_held_request() {
+    let (f, id, _, args) = handoff_fixture();
+    let before = content_rows(&f);
+    let source = branch(&f, &id);
+    let parent = &f.parent;
+    let wrong_parent = identity(&parent.engine, "foreign-parent", &parent.workspace_path);
+    let wrong_workspace = identity(&parent.engine, &parent.session_id, "foreign-workspace");
+    for (who, request, session, model, summary) in [
+        (&wrong_parent, args.request_id.as_str(), "handoff-source-session", source.model.as_deref(), "summary"),
+        (&wrong_workspace, args.request_id.as_str(), "handoff-source-session", source.model.as_deref(), "summary"),
+        (parent, "other-request", "handoff-source-session", source.model.as_deref(), "summary"),
+        (parent, args.request_id.as_str(), "changed-session", source.model.as_deref(), "summary"),
+        (parent, args.request_id.as_str(), "handoff-source-session", Some("changed-model"), "summary"),
+        (parent, args.request_id.as_str(), "handoff-source-session", source.model.as_deref(), " \n "),
+        (parent, args.request_id.as_str(), "handoff-source-session", source.model.as_deref(), "bad\0summary"),
+    ] {
+        assert!(f.manager.reserve_handoff(who, &id, request, session, model, "op", summary).is_err());
+        assert_eq!(content_rows(&f), before);
+    }
+    assert!(handoff(&f, &id, &args.request_id, "op", &"😀".repeat(4001)).is_err());
+    {
+        let mut inner = f.manager.inner.lock();
+        let source = &mut inner.branches.get_mut(&id).unwrap().branch;
+        source.task.push('!');
+        source.delegation.as_mut().unwrap().task = source.task.clone();
+    }
+    assert!(handoff(&f, &id, &args.request_id, "op", "summary").unwrap_err().contains("message"));
+    assert_eq!(content_rows(&f), before);
+    assert_eq!(f.manager.inner.lock().requests[&(key(parent), args.request_id)].state, "awaiting_cost_approval");
+}
+
+#[test]
+fn native_handoff_database_failure_rolls_back_every_record_and_memory() {
+    let (f, id, _, args) = handoff_fixture();
+    let before = content_rows(&f);
+    let held = encoded(&branch(&f, &id)).unwrap();
+    let runs = f.manager.inner.lock().runs.len();
+    f.manager.db.0.lock().execute_batch("CREATE TRIGGER reject_handoff BEFORE INSERT ON leader_branches BEGIN SELECT RAISE(ABORT,'handoff transaction failed'); END;").unwrap();
+    assert!(handoff(&f, &id, &args.request_id, "op", "summary").unwrap_err().contains("transaction failed"));
+    assert_eq!(content_rows(&f), before);
+    assert_eq!(encoded(&branch(&f, &id)).unwrap(), held);
+    assert_eq!(f.manager.inner.lock().runs.len(), runs);
+    f.manager.db.0.lock().execute_batch("DROP TRIGGER reject_handoff").unwrap();
+    assert!(handoff(&f, &id, &args.request_id, "op", "summary").unwrap().is_some());
+}
+
+#[test]
+fn native_handoff_concurrent_same_operation_reserves_once() {
+    let (f, id, _, args) = handoff_fixture();
+    let source = branch(&f, &id);
+    let launches = std::thread::scope(|scope| {
+        let threads: Vec<_> = (0..2).map(|_| scope.spawn(|| f.manager.reserve_handoff(
+            &f.parent, &id, &args.request_id, "handoff-source-session", source.model.as_deref(), "op", "summary",
+        ).unwrap())).collect();
+        threads.into_iter().filter_map(|t| t.join().unwrap()).count()
+    });
+    assert_eq!(launches, 1);
+    assert_eq!(f.manager.inner.lock().branches.len(), 2);
+}
+
+#[test]
+fn native_handoff_and_approve_or_cancel_are_mutually_exclusive() {
+    for approve in [true, false] {
+        for _ in 0..8 {
+            let (f, id, _, args) = handoff_fixture();
+            let source = branch(&f, &id);
+            let (handoff_result, approval_result) = std::thread::scope(|scope| {
+                let handoff = scope.spawn(|| f.manager.reserve_handoff(&f.parent, &id, &args.request_id,
+                    "handoff-source-session", source.model.as_deref(), "op", "summary"));
+                let approval = scope.spawn(|| f.manager.resolve_cost_approval(&f.parent, &id,
+                    &args.request_id, approve, source.model.as_deref()));
+                (handoff.join().unwrap(), approval.join().unwrap())
+            });
+            assert_ne!(handoff_result.is_ok(), approval_result.is_ok());
+            assert_eq!(f.manager.inner.lock().branches.len(), if handoff_result.is_ok() { 2 } else { 1 });
+        }
+    }
+}
+
+#[test]
+fn native_handoff_restart_never_replays_reserved_or_failed_launch() {
+    for failed in [false, true] {
+        let (f, id, _, args) = handoff_fixture();
+        let (next, run, request, _) = handoff(&f, &id, &args.request_id, "op", "summary").unwrap().unwrap();
+        if failed {
+            assert!(f.manager.acknowledge(&f.parent, &request, &run, Err("launch failed".into())).is_err());
+        }
+        let restored = reload(&f).unwrap();
+        let inner = restored.inner.lock();
+        assert_eq!(inner.branches[&id].branch.state, "handed_off");
+        assert_eq!(inner.branches[&next.id].branch.state, if failed { "failed" } else { "unknown" });
+        assert_eq!(inner.requests[&(key(&f.parent), request)].state, if failed { "failed" } else { "unknown" });
+        assert_eq!(inner.branches[&id].branch.delegation.as_ref().unwrap().state, "handed_off");
+        drop(inner);
+        assert!(restored.reserve_handoff(&f.parent, &id, &args.request_id, "handoff-source-session",
+            branch(&f, &id).model.as_deref(), "op", "summary").unwrap().is_none());
+        assert_eq!(restored.inner.lock().branches.len(), 2);
+        let replay = restored.replay(&restored.inner.lock(), &f.parent, &args.request_id, "task_send", &encoded(&args).unwrap()).unwrap().unwrap();
+        assert_eq!(replay["mayHaveStarted"], true);
+        assert_eq!(replay["originalSubmittedToModel"], false);
+        assert_eq!(replay["successor"]["state"], if failed { "failed" } else { "unknown" });
+    }
+}
+
+#[test]
+fn native_handoff_receipt_distinguishes_unsent_original_from_successor_uncertainty() {
+    for state in ["starting", "running", "completed", "failed", "unknown"] {
+        let (f, id, _, args) = handoff_fixture();
+        let (_successor, run, request, _) = handoff(&f, &id, &args.request_id, "op", "summary").unwrap().unwrap();
+        if matches!(state, "running" | "completed") {
+            f.manager.acknowledge(&f.parent, &request, &run,
+                Ok(crate::engine::SendResult { run_id: run.clone(), session_id: Some("receipt-successor".into()) })).unwrap();
+        }
+        match state {
+            "completed" => { observe(&f, &run, "receipt-successor", "done", json!({}), 1); }
+            "failed" => { assert!(f.manager.acknowledge(&f.parent, &request, &run, Err("transport outcome unavailable".into())).is_err()); }
+            "unknown" => f.manager.finish(&run),
+            _ => {},
+        }
+        let replay = f.manager.replay(&f.manager.inner.lock(), &f.parent, &args.request_id,
+            "task_send", &encoded(&args).unwrap()).unwrap().unwrap();
+        assert_eq!(replay["successor"]["state"], state);
+        assert_eq!(replay["originalSubmittedToModel"], false);
+        assert_eq!(replay["mayHaveStarted"], true);
+        assert!(replay.get("submitted_to_model").is_none());
+    }
+}
+
+#[tokio::test]
+async fn native_handoff_alias_wait_send_stop_and_renew_target_successor() {
+    for target_engine in ["codex", "claude"] {
+    let (f, id, _, args) = handoff_fixture();
+    let source = branch(&f, &id);
+    let selection = crate::plugin_conversations::Selection {
+        engine: target_engine.into(), model: "explicit-alias-target".into(), effort: Some("high".into()),
+        provider_id: "chosen-provider".into(),
+    };
+    let (next, run, _, _) = f.manager.reserve_handoff_with_selection(&f.parent, &id, &args.request_id,
+        source.session_id.as_deref().unwrap(), source.model.as_deref(), "op", "summary", Some(&selection)).unwrap().unwrap();
+    assert_eq!(source.engine, "codex");
+    assert_eq!(next.engine, target_engine);
+    let view = f.manager.views(&f.manager.inner.lock(), &f.parent, Some(&[id.clone()])).unwrap();
+    assert_eq!(view[0]["id"], id);
+    assert_eq!(view[0]["actualBranchId"], next.id);
+    assert!(!wait_mark(&view[0]).0);
+    let start = HashMap::from([(id.clone(), wait_mark(&view[0]).1)]);
+    let all = f.manager.views(&f.manager.inner.lock(), &f.parent, None).unwrap();
+    assert_eq!(all.len(), 2);
+    assert_eq!(all.iter().filter(|v| !wait_mark(v).0).count(), 1);
+    let old_deadline = branch(&f, &id).deadline_at;
+    assert_eq!(f.manager.renew(&f.parent, &id, Some(120)).unwrap().id, next.id);
+    assert_eq!(branch(&f, &id).deadline_at, old_deadline);
+    for (kind, data, seq) in [("session", json!("handoff-new-session"), 1),
+        ("delta", json!("new task result 中文 😀"), 2), ("done", json!({}), 3)] {
+        let mut event = event(&run, Some("handoff-new-session"), kind, data, seq);
+        event["engine"] = json!(target_engine);
+        f.manager.observe(&mut event);
+    }
+    f.manager.finish(&run);
+    let views = f.manager.views(&f.manager.inner.lock(), &f.parent, Some(&[id.clone()])).unwrap();
+    let (news, pending) = wait_news(&start, &views);
+    assert_eq!(news, vec![id.clone()]);
+    assert!(!pending);
+    assert_eq!(views[0]["delegation"]["result"], "new task result 中文 😀");
+    let alias_args = held_send(&f, &id, "alias-send");
+    let request = f.manager.inner.lock().requests[&(key(&f.parent), alias_args.request_id.clone())].clone();
+    assert_eq!(request.branch_id, next.id);
+    assert_eq!(request.requested_branch_id.as_deref(), Some(id.as_str()));
+    assert_eq!(request.arguments_fingerprint, Some(arguments_fingerprint(&encoded(&alias_args).unwrap()).unwrap()));
+    let model = branch(&f, &next.id).model;
+    let (approved, approved_run, _) = f.manager.resolve_cost_approval(&f.parent, &next.id,
+        &alias_args.request_id, true, model.as_deref()).unwrap().unwrap();
+    assert_eq!(approved.id, next.id);
+    assert_eq!(approved.task, alias_args.message);
+    // No real process is launched by manager fixtures. Release the reservation
+    // through the normal ACK path before exercising stop's retirement wait.
+    f.manager.acknowledge(&f.parent, &alias_args.request_id, &approved_run,
+        Ok(crate::engine::SendResult { run_id: approved_run.clone(), session_id: Some("handoff-new-session".into()) })).unwrap();
+    assert_eq!(f.manager.stop(&f.parent, &id).await.unwrap().id, next.id);
+    assert_eq!(branch(&f, &next.id).state, "stopped");
+    assert_eq!(branch(&f, &id).state, "handed_off");
+    }
+}
+
+#[tokio::test]
+async fn native_handoff_multihop_wait_wakes_on_successor_completion() {
+    use std::future::{poll_fn, Future};
+
+    let (f, original, _, held) = handoff_fixture();
+    let (second, second_run, _, _) = handoff(&f, &original, &held.request_id, "first", "summary").unwrap().unwrap();
+    settle(&f, &second.id, &second_run, "second-session");
+    let second_held = held_send(&f, &original, "second-held");
+    let (third, third_run, _, _) = handoff(&f, &second.id, &second_held.request_id, "second", "next summary").unwrap().unwrap();
+    observe(&f, &third_run, "third-session", "session", json!("third-session"), 1);
+
+    let (subscribed, subscription) = tokio::sync::oneshot::channel();
+    let manager = Arc::clone(&f.manager);
+    let caller = f.caller.clone();
+    let parent = f.parent.clone();
+    let args = WaitArgs { branch_ids: Some(vec![original.clone()]), timeout_seconds: Some(20), include_task: None };
+    let mut waiting = tokio::spawn(async move {
+        // Poll the same loop used by dispatch. Signal only after it actually
+        // parks with a registered waker, not merely when its task is scheduled.
+        let wait = manager.wait_for_children(&caller, &parent, &args);
+        tokio::pin!(wait);
+        let mut subscribed = Some(subscribed);
+        poll_fn(|cx| {
+            let result = wait.as_mut().poll(cx);
+            if result.is_pending() {
+                if let Some(subscribed) = subscribed.take() {
+                    subscribed.send(()).unwrap();
+                }
+            }
+            result
+        }).await
+    });
+    tokio::time::timeout(Duration::from_secs(1), subscription).await
+        .expect("task_wait did not subscribe").expect("task_wait returned before subscribing");
+    assert!(!waiting.is_finished(), "an active successor must keep the original selector waiting");
+
+    observe(&f, &third_run, "third-session", "delta", json!("final result 中文 😀"), 2);
+    observe(&f, &third_run, "third-session", "done", json!({}), 3);
+    // Await the parked task's JoinHandle: polling the wait future here would
+    // hide a missing notification by manually giving it another poll.
+    let response = match tokio::time::timeout(Duration::from_secs(1), &mut waiting).await {
+        Ok(response) => response.unwrap().unwrap(),
+        Err(_) => {
+            waiting.abort();
+            panic!("successor completion failed to wake task_wait before its 20-second timeout");
+        }
+    };
+    assert_eq!(response["timedOut"], false);
+    assert_eq!(response["changedBranchIds"], json!([original]));
+    assert_eq!(response["branches"].as_array().unwrap().len(), 1);
+    assert_eq!(response["branches"][0]["id"], original);
+    assert_eq!(response["branches"][0]["actualBranchId"], third.id);
+    assert_eq!(response["branches"][0]["delegation"]["state"], "completed");
+    assert_eq!(response["branches"][0]["delegation"]["result"], "final result 中文 😀");
+}
+
+#[tokio::test]
+async fn native_handoff_stop_between_commit_and_launch_fences_the_reservation() {
+    let (f, id, _, held) = handoff_fixture();
+    let (successor, run, spawn_request, permission) = handoff(&f, &id, &held.request_id, "op", "summary").unwrap().unwrap();
+    let (stopped, ()) = tokio::join!(
+        f.manager.stop(&f.parent, &id),
+        async {
+            // stop() runs first until its retirement wait, marking the effective
+            // successor as stopping before the launch admission is attempted.
+            tokio::task::yield_now().await;
+            assert!(f.manager.inner.lock().branches[&successor.id].stopping);
+            let error = f.manager.prepare(&run, &successor.engine, None, &successor.workspace_path, Some(&permission)).unwrap_err();
+            assert!(error.contains("retired"));
+            assert!(f.manager.acknowledge(&f.parent, &spawn_request, &run, Err(error)).is_err());
+        }
+    );
+    assert_eq!(stopped.unwrap().id, successor.id);
+    assert_eq!(branch(&f, &successor.id).state, "stopped");
+    assert!(f.manager.processes.get(&run).is_none());
+    assert!(f.manager.inner.lock().runs[&run].retired);
+
+    let (f, id, _, held) = handoff_fixture();
+    f.manager.stop(&f.parent, &id).await.unwrap();
+    assert!(handoff(&f, &id, &held.request_id, "op", "summary").is_err());
+    assert_eq!(f.manager.inner.lock().branches.len(), 1);
+}
+
+#[test]
+fn native_handoff_chains_validate_both_links_and_preserve_parent() {
+    let (f, id, _, args) = handoff_fixture();
+    let (second, run, _, _) = handoff(&f, &id, &args.request_id, "first", "summary").unwrap().unwrap();
+    settle(&f, &second.id, &run, "second-session");
+    let alias = held_send(&f, &id, "second-held");
+    let (third, _, _, _) = handoff(&f, &second.id, &alias.request_id, "second", "next summary").unwrap().unwrap();
+    assert_eq!(f.manager.resolve_child_id(&f.manager.inner.lock(), &f.parent, &id).unwrap(), third.id);
+    let replay = f.manager.replay(&f.manager.inner.lock(), &f.parent, &args.request_id, "task_send", &encoded(&args).unwrap()).unwrap().unwrap();
+    assert_eq!(replay["actualBranchId"], third.id);
+    assert_eq!(replay["handoffChain"].as_array().unwrap().len(), 2);
+    let restored = reload(&f).unwrap();
+    assert_eq!(restored.resolve_child_id(&restored.inner.lock(), &f.parent, &id).unwrap(), third.id);
+    let restored_views = restored.views(&restored.inner.lock(), &f.parent, Some(&[id.clone()])).unwrap();
+    assert_eq!(restored_views[0]["id"], id);
+    assert_eq!(restored_views[0]["actualBranchId"], third.id);
+    assert_eq!(restored_views[0]["delegation"]["state"], "unknown");
+    let restored_replay = restored.replay(&restored.inner.lock(), &f.parent, &args.request_id, "task_send", &encoded(&args).unwrap()).unwrap().unwrap();
+    assert_eq!(restored_replay["actualBranchId"], third.id);
+    assert_eq!(restored.renew(&f.parent, &id, Some(180)).unwrap().id, third.id);
+    let foreign = identity("codex", "foreign", &f.parent.workspace_path);
+    assert!(f.manager.resolve_child_id(&f.manager.inner.lock(), &foreign, &id).is_err());
+    {
+        let mut inner = f.manager.inner.lock();
+        inner.branches.get_mut(&third.id).unwrap().branch.handoff_from.as_mut().unwrap().operation_id = "forged".into();
+        assert!(f.manager.resolve_child_id(&inner, &f.parent, &id).unwrap_err().contains("inconsistent"));
+        inner.branches.get_mut(&third.id).unwrap().branch.handoff_from.as_mut().unwrap().operation_id = "second".into();
+        inner.branches.get_mut(&third.id).unwrap().branch.parent_session_id = "foreign".into();
+        assert!(f.manager.resolve_child_id(&inner, &f.parent, &id).is_err());
+        inner.branches.get_mut(&third.id).unwrap().branch.parent_session_id = f.parent.session_id.clone();
+        let to = TaskHandoffLink { branch_id: id.clone(), request_id: "cycle".into(), operation_id: "cycle".into(), payload_fingerprint: "cycle".into() };
+        inner.branches.get_mut(&third.id).unwrap().branch.state = "handed_off".into();
+        inner.branches.get_mut(&third.id).unwrap().branch.handoff_to = Some(to.clone());
+        inner.branches.get_mut(&id).unwrap().branch.handoff_from = Some(TaskHandoffLink { branch_id: third.id.clone(), ..to });
+        assert!(f.manager.resolve_child_id(&inner, &f.parent, &id).unwrap_err().contains("cycle"));
+    }
+}
+
+#[tokio::test]
+async fn native_handoff_chain_after_restart_routes_send_and_cancel_from_root_alias() {
+    let (f, id, _, args) = handoff_fixture();
+    let (second, second_run, _, _) = handoff(&f, &id, &args.request_id, "first", "summary").unwrap().unwrap();
+    settle(&f, &second.id, &second_run, "second-session");
+    let second_send = held_send(&f, &id, "second-held");
+    let (third, third_run, _, _) = handoff(&f, &second.id, &second_send.request_id, "second", "next summary").unwrap().unwrap();
+    settle(&f, &third.id, &third_run, "third-session");
+    let manager = Arc::new(reload(&f).unwrap());
+    manager.processes.insert(f.caller.run_id.clone(), reservation(&f.caller.run_id));
+    manager.prepare(&f.caller.run_id, &f.caller.engine, Some(&f.caller.session_id), &f.caller.workspace_path, Some("manual")).unwrap();
+    let followup = SendArgs { images: Vec::new(), branch_id: id.clone(), request_id: "after-restart".into(), message: "Final question".into() };
+    let Reservation::Replay(held) = manager.reserve_send(&f.caller, &f.parent, "manual", &followup, encoded(&followup).unwrap()).unwrap() else { panic!("cold send must be held"); };
+    assert_eq!(held["branch"]["id"], third.id);
+    assert_eq!(manager.inner.lock().requests[&(key(&f.parent), followup.request_id)].requested_branch_id.as_deref(), Some(id.as_str()));
+    assert_eq!(manager.stop(&f.parent, &id).await.unwrap().id, third.id);
+    assert_eq!(manager.inner.lock().branches[&third.id].branch.state, "stopped");
+    assert_eq!(manager.inner.lock().branches[&id].branch.state, "handed_off");
+    assert_eq!(manager.inner.lock().branches[&second.id].branch.state, "handed_off");
+}
+
+#[test]
+fn native_handoff_old_worker_checkpoint_and_late_ack_cannot_reopen_successor() {
+    let f = basic();
+    let a = args("checkpoint-source");
+    let Reservation::Start((id, old_run)) = f.manager.reserve_spawn(&f.caller, &f.parent,
+        "manual", &a, encoded(&a).unwrap(), Some("test-model".into()), None).unwrap() else { panic!("new spawn"); };
+    f.manager.processes.insert(old_run.clone(), reservation(&old_run));
+    observe(&f, &old_run, "checkpoint-old-session", "session", json!("checkpoint-old-session"), 1);
+    let checkpoint = f.manager.try_capture_worker_registration(&old_run).unwrap().unwrap();
+    observe(&f, &old_run, "checkpoint-old-session", "done", json!({}), 2);
+    f.manager.processes.remove_reservation(&old_run);
+    f.manager.finish(&old_run);
+    let held = held_send(&f, &id, "checkpoint-held");
+    let (successor, _, _, _) = handoff(&f, &id, &held.request_id, "op", "summary").unwrap().unwrap();
+    let before = encoded(&branch(&f, &successor.id)).unwrap();
+    f.manager.acknowledge(&f.parent, &a.request_id, &old_run,
+        Ok(crate::engine::SendResult { run_id: old_run.clone(), session_id: Some("checkpoint-old-session".into()) })).unwrap();
+    observe(&f, &old_run, "checkpoint-old-session", "done", json!({}), 100);
+    assert_eq!(encoded(&branch(&f, &successor.id)).unwrap(), before);
+    let restored = reload(&f).unwrap();
+    let mut proxy = reservation(&old_run);
+    proxy.pid = 42; // Fake routing entry only; no OS process is started or killed.
+    restored.processes.insert(old_run.clone(), proxy);
+    assert!(restored.restore_worker_registration(&checkpoint).unwrap_err().contains("conflicts"));
+    assert_eq!(restored.inner.lock().branches[&id].branch.state, "handed_off");
+    assert_eq!(restored.inner.lock().branches[&successor.id].branch.state, "unknown");
+}
+
+#[test]
+fn native_handoff_successor_worker_restores_only_host_owned_links() {
+    let (f, id, _, held) = handoff_fixture();
+    let (successor, run, _, _) = handoff(&f, &id, &held.request_id, "op", "summary").unwrap().unwrap();
+    f.manager.processes.insert(run.clone(), reservation(&run));
+    observe(&f, &run, "worker-successor", "session", json!("worker-successor"), 1);
+    observe(&f, &run, "worker-successor", "delta", json!("safe output"), 2);
+    let saved = f.manager.try_capture_worker_registration(&run).unwrap().unwrap();
+    let raw = serde_json::to_value(&saved).unwrap();
+    assert!(raw["managed"]["branch"].get("handoffFrom").is_none());
+    assert!(raw["managed"]["branch"].get("handoffTo").is_none());
+    let restored = reload(&f).unwrap();
+    let mut proxy = reservation(&run);
+    proxy.pid = 42;
+    restored.processes.insert(run.clone(), proxy);
+    let mut forged = raw.clone();
+    forged["managed"]["branch"]["handoffFrom"] = encoded(successor.handoff_from.as_ref().unwrap()).unwrap();
+    let forged: WorkerTaskRegistration = serde_json::from_value(forged).unwrap();
+    assert!(restored.restore_worker_registration(&forged).unwrap_err().contains("metadata"));
+    let mut forged_provider = raw.clone();
+    forged_provider["managed"]["branch"]["providerId"] = json!("unreviewed-provider");
+    let forged_provider: WorkerTaskRegistration = serde_json::from_value(forged_provider).unwrap();
+    assert!(restored.restore_worker_registration(&forged_provider).is_err());
+    restored.restore_worker_registration(&saved).unwrap();
+    let inner = restored.inner.lock();
+    assert_eq!(inner.branches[&successor.id].branch.handoff_from, successor.handoff_from);
+    assert_eq!(inner.branches[&successor.id].branch.result, "safe output");
+    assert_eq!(restored.resolve_child_id(&inner, &f.parent, &id).unwrap(), successor.id);
+}
+
+#[test]
+fn native_handoff_rejects_unsettled_descendants_and_keeps_settled_ones() {
+    for state in ["completed", "running", "waiting", "unknown", "awaiting_cost_approval"] {
+        let f = basic();
+        let (id, grand, _, _) = user_delete_tree(&f);
+        let args = held_send(&f, &id, "tree-held");
+        f.manager.inner.lock().branches.get_mut(&grand).unwrap().branch.state = state.into();
+        let before = content_rows(&f);
+        let result = handoff(&f, &id, &args.request_id, "op", "summary");
+        if state == "completed" {
+            let (next, _, _, _) = result.unwrap().unwrap();
+            assert_eq!(branch(&f, &grand).parent_session_id, "delete-child-session");
+            assert_eq!(next.parent_session_id, f.parent.session_id);
+            let mut descendants = Vec::new();
+            LeaderManager::subtree(&f.manager.inner.lock(), &id, &mut HashSet::new(), &mut descendants).unwrap();
+            assert!(descendants.contains(&grand));
+        } else {
+            assert!(result.is_err(), "{state}");
+            assert_eq!(content_rows(&f), before);
+            assert_eq!(branch(&f, &id).state, "awaiting_cost_approval");
+        }
+    }
+}
+
+#[test]
+fn native_handoff_native_identity_fences_and_payload_limits_fail_closed() {
+    for fence in ["process", "launch", "binding", "retiring", "shutdown", "unknown-descendant"] {
+        let (f, id, run, args) = handoff_fixture();
+        let before = content_rows(&f);
+        {
+            let mut inner = f.manager.inner.lock();
+            match fence {
+                "process" => { f.manager.processes.insert("handoff-source-session".into(), reservation("foreign")); }
+                "launch" => { let r = inner.runs.get_mut(&run).unwrap(); r.retired = false; r.launch_pending = true; }
+                "binding" => { inner.pending_bindings.insert(run.clone(), ("codex".into(), "new-uncommitted".into())); }
+                "retiring" => { inner.retiring.insert(("codex".into(), "handoff-source-session".into())); }
+                "shutdown" => inner.shutdown = true,
+                "unknown-descendant" => { let b = inner.branches.get_mut(&id).unwrap(); b.branch.session_id = None; }
+                _ => unreachable!(),
+            }
+        }
+        let result = f.manager.reserve_handoff(&f.parent, &id, &args.request_id, "handoff-source-session", Some("handoff-test-model"), "op", "summary");
+        assert!(result.is_err(), "{fence}");
+        assert_eq!(content_rows(&f), before);
+    }
+    let (f, id, _, original) = handoff_fixture();
+    // Establish a valid original fingerprint for a maximal-size assignment;
+    // the additional summary must be rejected, never truncated.
+    let oversized = SendArgs { message: "x".repeat(MAX_INPUT_CHARS), ..original.clone() };
+    {
+        let mut inner = f.manager.inner.lock();
+        inner.branches.get_mut(&id).unwrap().branch.task = oversized.message.clone();
+        inner.branches.get_mut(&id).unwrap().branch.delegation.as_mut().unwrap().task = oversized.message.clone();
+        inner.requests.get_mut(&(key(&f.parent), original.request_id.clone())).unwrap().arguments_fingerprint = Some(arguments_fingerprint(&encoded(&oversized).unwrap()).unwrap());
+    }
+    let before = content_rows(&f);
+    assert!(handoff(&f, &id, &original.request_id, "op", "summary").is_err());
+    assert_eq!(content_rows(&f), before);
 }
 
 #[test]
@@ -1132,7 +1726,7 @@ fn write_cost_agy_context(path: &std::path::Path, estimate: Option<u64>, max: Op
 }
 
 fn assert_cost_context_send(f: &Fixture, id: &str, bypass: bool) {
-    let send = SendArgs { branch_id: id.into(), request_id: "context-send".into(), message: "Continue".into() };
+    let send = SendArgs { images: Vec::new(), branch_id: id.into(), request_id: "context-send".into(), message: "Continue".into() };
     let result = f.manager.reserve_send(&f.caller, &f.parent, "manual", &send, encoded(&send).unwrap()).unwrap();
     assert_eq!(matches!(result, Reservation::Start(_)), bypass);
     assert_eq!(branch(f, id).cost_approval.is_none(), bypass);
@@ -1305,6 +1899,7 @@ fn task_cost_approval_small_context_concurrent_duplicate_send_starts_once() {
     let f = basic();
     let id = cost_context_branch(&f, "agy", &path);
     let send = SendArgs {
+        images: Vec::new(),
         branch_id: id.clone(), request_id: "concurrent-context-send".into(),
         message: "Continue once 中文 😀".into(),
     };
@@ -1422,6 +2017,7 @@ fn task_cost_approval_codex_gpt_has_no_cache_time_gate() {
                 f.manager.db.0.lock().execute("INSERT INTO session_providers VALUES(?1,'policy-session','custom-channel')", [engine]).unwrap();
             }
             let send = SendArgs {
+                images: Vec::new(),
                 branch_id: id.clone(),
                 request_id: "policy-send".into(),
                 message: "Next".into(),
@@ -1607,7 +2203,7 @@ fn task_cost_approval_hot_sends_but_cold_and_expiring_evidence_hold() {
         settle(&f, &id, &run, "cache-session");
         hot_send_cache(&f, &id);
         f.clock.fetch_add(elapsed, Ordering::SeqCst);
-        let args = SendArgs { branch_id: id.clone(), request_id: "cache-send".into(), message: "Next".into() };
+        let args = SendArgs { images: Vec::new(), branch_id: id.clone(), request_id: "cache-send".into(), message: "Next".into() };
         let result = f.manager.reserve_send(&f.caller, &f.parent, "manual", &args, encoded(&args).unwrap()).unwrap();
         assert_eq!(matches!(result, Reservation::Replay(_)), holds);
         assert_eq!(branch(&f, &id).cost_approval.is_some(), holds);
@@ -1685,7 +2281,7 @@ async fn task_cost_approval_cancel_stop_and_wrong_identity_never_launch() {
 fn task_cost_approval_busy_and_failed_persistence_keep_request_held() {
     let f = basic();
     let (id, run) = spawn(&f, "busy-approval-spawn");
-    let args = SendArgs { branch_id: id.clone(), request_id: "busy-approval-send".into(), message: "Next".into() };
+    let args = SendArgs { images: Vec::new(), branch_id: id.clone(), request_id: "busy-approval-send".into(), message: "Next".into() };
     assert!(f.manager.reserve_send(&f.caller, &f.parent, "manual", &args, encoded(&args).unwrap()).is_err());
     settle(&f, &id, &run, "busy-approval-session");
     let args = held_send(&f, &id, "busy-approval-send");
@@ -1836,8 +2432,12 @@ fn argument_schemas_reject_parent_spoofing_permission_and_invalid_ttl() {
     args["ttl_seconds"] = json!(60);
     args["permission"] = json!("bypass");
     assert!(validate_arguments("task_spawn", args).is_err());
-    assert!(validate_arguments("task_wait", json!({"timeout_seconds":21})).is_err());
-    assert!(validate_arguments("task_wait", json!({"timeout_seconds":20})).is_ok());
+    assert!(validate_arguments("task_wait", json!({"timeout_seconds":121})).is_err());
+    assert!(validate_arguments("task_wait", json!({"timeout_seconds":120})).is_ok());
+    assert!(validate_arguments("task_wait", json!({"timeout_seconds":20, "include_task":true})).is_ok());
+    assert!(validate_arguments("task_list", json!({"include_task":true})).is_ok());
+    assert!(validate_arguments("task_list", json!({"include_result":true})).is_ok());
+    assert!(validate_arguments("task_list", json!({"include_result":"yes"})).is_err());
 }
 
 #[test]
@@ -2063,6 +2663,7 @@ fn duplicate_requests_launch_once_and_conflicts_fail() {
         )
         .is_err());
     let send = SendArgs {
+        images: Vec::new(),
         branch_id: id,
         request_id: "stable-key".into(),
         message: "next turn".into(),
@@ -3768,6 +4369,7 @@ async fn reclamation_erases_branch_and_all_requests_without_touching_sibling() {
     assert_eq!(cached["branch"]["result"], "private-first-result-sentinel");
 
     let send_args = SendArgs {
+        images: Vec::new(),
         branch_id: id.clone(),
         request_id: "private-send".into(),
         message: "private-message-sentinel".into(),
@@ -4434,6 +5036,51 @@ fn archive_count(f: &Fixture) -> i64 {
         .unwrap()
 }
 
+fn cleanup_checked_fixture() -> (Fixture, GroupCleanupExpectation) {
+    let f = basic();
+    let (child, run) = spawn(&f, "cleanup-child");
+    settle(&f, &child, &run, "cleanup-child-session");
+    f.manager.acknowledge(&f.parent, "cleanup-child", &run, Ok(crate::engine::SendResult {
+        run_id: run.clone(), session_id: Some("cleanup-child-session".into()),
+    })).unwrap();
+    idle_group_root(&f);
+    let child_identity = identity("codex", "cleanup-child-session", &f.parent.workspace_path);
+    save_group_session(&f, &child_identity, "Child", "");
+    let last_activity_at = f.clock.load(Ordering::SeqCst);
+    f.manager.db.0.lock().execute("UPDATE sessions SET updated_at=?1", [last_activity_at]).unwrap();
+    let expected = GroupCleanupExpectation {
+        branch_ids: vec![child], members: vec![f.parent.clone(), child_identity], last_activity_at,
+    };
+    (f, expected)
+}
+
+#[test]
+fn checked_cleanup_archive_revalidates_members_activity_status_and_pins_atomically() {
+    for changed in ["branch-set", "member-set", "branch-activity", "session-activity", "status", "pin"] {
+        let (f, mut expected) = cleanup_checked_fixture();
+        match changed {
+            "branch-set" => expected.branch_ids.clear(),
+            "member-set" => { expected.members.pop(); },
+            "branch-activity" => f.manager.inner.lock().branches.get_mut(&expected.branch_ids[0]).unwrap().branch.last_activity_at += 1,
+            "session-activity" => { f.manager.db.0.lock().execute("UPDATE sessions SET updated_at=?1 WHERE session_id='cleanup-child-session'", [expected.last_activity_at + 1]).unwrap(); },
+            "status" => f.manager.inner.lock().branches.get_mut(&expected.branch_ids[0]).unwrap().branch.state = "failed".into(),
+            "pin" => { f.manager.db.0.lock().execute("UPDATE sessions SET pinned=1 WHERE session_id='cleanup-child-session'", []).unwrap(); },
+            _ => unreachable!(),
+        }
+        assert!(f.manager.archive_group_checked(&f.parent, Some(&expected)).is_err(), "{changed}");
+        assert_eq!(archive_count(&f), 0, "{changed}");
+        assert!(f.manager.snapshot().unwrap().archived_groups.is_empty(), "{changed}");
+    }
+
+    let (f, expected) = cleanup_checked_fixture();
+    let group = f.manager.archive_group_checked(&f.parent, Some(&expected)).unwrap();
+    assert_eq!(group.members.len(), 2);
+    assert_eq!(archive_count(&f), 2);
+    assert!(f.manager.archive_group_checked(&f.parent, Some(&expected)).is_err());
+    f.manager.restore_group(&f.parent).unwrap();
+    assert_eq!(archive_count(&f), 0);
+}
+
 #[test]
 fn group_archive_restart_restore_preserves_recursive_mixed_engines_and_transcripts() {
     let f = basic();
@@ -5071,4 +5718,95 @@ async fn gui_group_delete_uses_owned_native_deletion_and_keeps_foreign_transcrip
     assert!(manager.snapshot().unwrap().branches.is_empty());
     std::fs::remove_file(foreign_file).unwrap();
     std::fs::remove_dir(dir).unwrap();
+}
+
+#[tokio::test]
+async fn task_list_and_wait_compact_payloads_and_emit_wait_hint_while_running() {
+    let f = basic();
+    let long_task = format!("{}{}", "派单前缀🚀".repeat(32), "尾部说明".repeat(120));
+    assert!(long_task.chars().count() > 512);
+    let mut spawn_args = args("compact-child");
+    spawn_args.task = long_task.clone();
+    let (id, run) = spawn_with_args(&f, &spawn_args);
+    let stream_head = "前期流式日志A".repeat(120);
+    let stream_tail = "最新进度摘要Z🎯".repeat(70);
+    let stream_full = format!("{stream_head}{stream_tail}");
+    assert!(stream_full.chars().count() > RUNNING_RESULT_PREVIEW_CHARS);
+    observe(&f, &run, "compact-session", "session", json!("compact-session"), 1);
+    observe(&f, &run, "compact-session", "delta", json!(stream_full.clone()), 2);
+
+    let default_list = f.manager.list_response(&f.manager.inner.lock(), &f.parent).unwrap();
+    let b = &default_list["branches"][0];
+    let expected_task_preview: String = long_task.chars().take(TASK_PREVIEW_CHARS).collect();
+    let expected_tail: String = stream_full
+        .chars()
+        .skip(stream_full.chars().count() - RUNNING_RESULT_PREVIEW_CHARS)
+        .collect();
+    assert_eq!(b["taskPreview"], expected_task_preview);
+    assert_eq!(b["taskTruncated"], true);
+    assert!(b.get("task").is_none());
+    assert_eq!(b["delegation"]["taskPreview"], expected_task_preview);
+    assert_eq!(b["delegation"]["taskTruncated"], true);
+    assert!(b["delegation"].get("task").is_none());
+    assert_eq!(b["state"], "running");
+    assert_eq!(b["result"], expected_tail);
+    assert_eq!(b["resultPreview"], true);
+    assert_eq!(b["resultTruncated"], true);
+    assert_eq!(b["delegation"]["state"], "running");
+    assert_eq!(b["delegation"]["result"], expected_tail);
+    assert_eq!(b["delegation"]["resultPreview"], true);
+    assert_eq!(b["delegation"]["resultTruncated"], true);
+
+    let full_task_list = f
+        .manager
+        .list_response_with_options(&f.manager.inner.lock(), &f.parent, true, false)
+        .unwrap();
+    let b_full = &full_task_list["branches"][0];
+    assert_eq!(b_full["taskPreview"], expected_task_preview);
+    assert_eq!(b_full["task"].as_str().unwrap().chars().count(), 512);
+    assert_eq!(b_full["delegation"]["task"].as_str().unwrap().chars().count(), 512);
+
+    let timed_out_wait = f
+        .manager
+        .wait_for_children(
+            &f.caller,
+            &f.parent,
+            &WaitArgs {
+                branch_ids: Some(vec![id.clone()]),
+                timeout_seconds: Some(0),
+                include_task: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(timed_out_wait["timedOut"], true);
+    assert_eq!(timed_out_wait["waitHint"], TASK_WAIT_ACTIVE_HINT);
+    assert!(timed_out_wait["branches"][0].get("task").is_none());
+    assert_eq!(timed_out_wait["branches"][0]["delegation"]["result"], expected_tail);
+    assert_eq!(timed_out_wait["branches"][0]["delegation"]["resultPreview"], true);
+
+    observe(&f, &run, "compact-session", "done", json!({}), 3);
+    f.manager.finish(&run);
+
+    let settled_wait = f
+        .manager
+        .wait_for_children(
+            &f.caller,
+            &f.parent,
+            &WaitArgs {
+                branch_ids: Some(vec![id]),
+                timeout_seconds: Some(0),
+                include_task: Some(true),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(settled_wait["timedOut"], false);
+    assert!(settled_wait.get("waitHint").is_none());
+    let settled_branch = &settled_wait["branches"][0];
+    assert_eq!(settled_branch["delegation"]["state"], "completed");
+    assert_eq!(settled_branch["delegation"]["result"], stream_full);
+    assert!(settled_branch["delegation"].get("resultPreview").is_none());
+    assert_eq!(settled_branch["delegation"]["resultTruncated"], false);
+    assert!(settled_branch["delegation"].get("task").is_some());
 }

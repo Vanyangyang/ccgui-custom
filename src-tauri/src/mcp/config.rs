@@ -435,6 +435,7 @@ fn build_entry(
         path: path.to_string_lossy().into_owned(),
         format: "json".to_string(),
         enabled,
+        enablement_known: None,
         transport,
         command,
         args_count,
@@ -444,6 +445,7 @@ fn build_entry(
         writable: spec.writable,
         readonly_reason: spec.readonly_reason.map(str::to_string),
         readonly_reason_code: spec.readonly_reason_code.map(str::to_string),
+        probe_allowed: None,
         version: version.to_string(),
     }
 }
@@ -520,6 +522,7 @@ fn read_codex_toml(path: &Path, source: &str) -> Result<Vec<McpConfigEntry>, Mcp
             path: path.to_string_lossy().into_owned(),
             format: "toml".to_string(),
             enabled,
+            enablement_known: None,
             transport,
             command,
             args_count,
@@ -529,6 +532,7 @@ fn read_codex_toml(path: &Path, source: &str) -> Result<Vec<McpConfigEntry>, Mcp
             writable: spec.writable,
             readonly_reason: spec.readonly_reason.map(str::to_string),
             readonly_reason_code: spec.readonly_reason_code.map(str::to_string),
+            probe_allowed: None,
             version: version.clone(),
         };
         entry.env_keys.sort();
@@ -572,8 +576,8 @@ pub(super) fn is_sensitive_key(key: &str) -> bool {
     })
 }
 
-/// URL 默认脱敏：去掉 userinfo，敏感查询参数值改为 `***`。
-/// 解析失败时保守地把查询串整体抹掉，只保留 origin + path。
+/// URL 默认脱敏：隐藏 userinfo、敏感查询参数值与 fragment。
+/// 解析失败时显示固定占位，避免无效 authority 中的凭据泄漏。
 pub(super) fn redact_url(raw: &str) -> String {
     match reqwest::Url::parse(raw) {
         Ok(url) => {
@@ -606,12 +610,13 @@ pub(super) fn redact_url(raw: &str) -> String {
                 }
                 drop(serializer);
             }
+            if url.fragment().is_some() {
+                url.set_fragment(Some("***"));
+            }
             url.to_string()
         }
-        Err(_) => match raw.split_once('?') {
-            Some((head, _)) => format!("{head}?***"),
-            None => raw.to_string(),
-        },
+        // Even the authority of an invalid URL can contain credentials.
+        Err(_) => "[invalid URL]".to_string(),
     }
 }
 
@@ -996,8 +1001,9 @@ mod tests {
             redact_url("https://example.com/mcp"),
             "https://example.com/mcp"
         );
-        // 非 URL：保守抹掉查询串。
-        assert_eq!(redact_url("not a url?token=abc"), "not a url?***");
+        assert_eq!(redact_url("not a url?token=abc"), "[invalid URL]");
+        assert_eq!(redact_url("https://alice:SECRET@bad host/mcp"), "[invalid URL]");
+        assert_eq!(redact_url("https://example.com/mcp#SECRET"), "https://example.com/mcp#***");
     }
 
     #[test]

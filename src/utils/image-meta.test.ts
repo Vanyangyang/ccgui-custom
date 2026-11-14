@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it } from "vitest";
 
 import { dataUrlBytes, formatFileSize, imageMetaText } from "./image-meta";

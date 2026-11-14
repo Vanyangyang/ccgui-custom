@@ -1564,9 +1564,10 @@ pub async fn assistant_notices_focus_ack(
     document_id: String,
     request_id: String,
     success: bool,
+    target_window_id: Option<String>,
 ) -> Result<(), String> {
     gate(&window, true)?;
-    let focused = state.focused();
+    let focused = target_window_id.as_deref().map_or_else(|| state.focused(), |id| crate::plugin_windows::notice_window_focused(&state.app, id));
     let changed = {
         let mut inner = state.inner.lock();
         let store = state.usable(&inner)?;

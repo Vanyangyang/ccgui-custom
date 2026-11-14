@@ -10,9 +10,10 @@ import { subscribeLeaderStream } from "./event-state";
 import { removeLeaderSessions } from "./session-cleanup";
 import { useLeaderStore } from "./store";
 import type { LeaderBranch, LeaderSnapshot } from "./types";
-import { parentWorkspacePath } from "./types";
+import { archivedBranchIds, parentWorkspacePath, taskImageRefs } from "./types";
 import { sameLeaderWorkspace } from "./workspace-path";
 import { getSessionCacheHeat } from "@/features/chat/prompt-cache";
+import { startParentWakeupRuntime } from "./parent-wakeup";
 
 function removeReclaimed(branches: LeaderBranch[]) {
   removeLeaderSessions(branches.flatMap((branch) => branch.sessionId ? [{ engine: branch.engine, sessionId: branch.sessionId, workspacePath: branch.workspacePath }] : []), branches, true);
@@ -30,6 +31,8 @@ function branchToCommsStatus(state: LeaderBranch["state"]): CrossSessionCommunic
       return "awaiting_permission";
     case "completed":
       return "completed";
+    case "handed_off":
+      return "handed_off";
     case "failed":
     case "stopped":
       return "failed";
@@ -44,7 +47,7 @@ export function syncLeaderBranchComms(
   snapshot: LeaderSnapshot,
   options?: { markInitialTerminalReviewed?: boolean },
 ) {
-  const archivedIds = new Set((snapshot.archivedGroups ?? []).flatMap((group) => group.branchIds));
+  const archivedIds = archivedBranchIds(snapshot);
   const activeBranches = snapshot.branches.filter(
     (b) => b.state !== "reclaimed" && b.state !== "reclaiming" && !archivedIds.has(b.id),
   );
@@ -74,8 +77,8 @@ export function syncLeaderBranchComms(
       // New assignments have strictly increasing native timestamps. For one
       // assignment, a terminal sample wins over an active sample in the same ms.
       if (branch.delegation.requestId !== existing.leaderDelegationId) continue;
-      const wasTerminal = ["completed", "failed", "unknown"].includes(existing.status);
-      if (wasTerminal && !["completed", "failed", "unknown"].includes(status)) continue;
+      const wasTerminal = ["completed", "failed", "handed_off", "unknown"].includes(existing.status);
+      if (wasTerminal && !["completed", "failed", "handed_off", "unknown"].includes(status)) continue;
     }
     const parentMeta = sessions.find(
       (s) => s.engine === branch.parentEngine && s.sessionId === branch.parentSessionId && sameLeaderWorkspace(s.workspacePath, parentWorkspacePath(branch)),
@@ -95,7 +98,7 @@ export function syncLeaderBranchComms(
       workspacePath: branch.workspacePath,
       title: childMeta?.customTitle || childMeta?.title || branch.title,
     };
-    const isTerminal = status === "completed" || status === "failed" || status === "unknown";
+    const isTerminal = status === "completed" || status === "failed" || status === "handed_off" || status === "unknown";
     const initialReviewed =
       !existing && options?.markInitialTerminalReviewed && isTerminal
         ? [crossSessionParticipantKey(sender), crossSessionParticipantKey(target)]
@@ -111,6 +114,8 @@ export function syncLeaderBranchComms(
         && (!branch.delegation || existing.requestId === branch.delegation.requestId)
         ? existing.replyText
         : undefined);
+    const imageRefs = taskImageRefs(assignment.images);
+    Object.freeze(imageRefs);
     const record: CrossSessionCommunicationRecord = {
       scopedId,
       requestId: branch.delegation?.requestId ?? (status === "awaiting_cost_approval" && assignment.costApproval ? assignment.costApproval.requestId : branch.id),
@@ -119,6 +124,8 @@ export function syncLeaderBranchComms(
       sender,
       target,
       message: assignment.task || branch.title,
+      // Upsert merges records: an empty assignment must explicitly clear old refs.
+      imageRefs,
       status,
       leaderCostApproval: assignment.costApproval && status === "awaiting_cost_approval" ? {
         branchId: branch.id, requestId: assignment.costApproval.requestId, model: assignment.costApproval.model,
@@ -152,6 +159,7 @@ export function syncLeaderBranchComms(
 }
 
 export function startLeaderRuntime() {
+  const parentWakeups = startParentWakeupRuntime();
   let disposed = false;
   const offEvents: Array<() => void> = [];
   let known = useLeaderStore.getState().snapshot.branches;
@@ -173,7 +181,7 @@ export function startLeaderRuntime() {
     }
     // Archival hides a retained group; it must never permanently retire its
     // identities, even while a snapshot is being reconciled.
-    const archivedIds = new Set((s.snapshot.archivedGroups ?? []).flatMap((group) => group.branchIds));
+    const archivedIds = archivedBranchIds(s.snapshot);
     const ids = new Set([...next.filter((b) => b.state !== "reclaimed").map((b) => b.id), ...archivedIds]);
     const reclaimed = new Map(known.filter((branch) => !ids.has(branch.id)).map((branch) => [branch.id, branch]));
     for (const branch of next) if (branch.state === "reclaimed" && !archivedIds.has(branch.id)) reclaimed.set(branch.id, branch);
@@ -196,7 +204,9 @@ export function startLeaderRuntime() {
       // and status so subsequent snapshots cannot oscillate with this preview.
     });
   });
-  const refresh = () => { if (!disposed) void useLeaderStore.getState().refresh(); };
+  const refresh = () => {
+    if (!disposed) void useLeaderStore.getState().refresh().then(() => { if (!disposed) void parentWakeups.refresh(); });
+  };
   for (const event of ["task://changed", "transport://connected"]) {
     void listen(event, refresh)
       .then((off) => {
@@ -205,5 +215,5 @@ export function startLeaderRuntime() {
       })
       .catch((error) => { if (!disposed) useLeaderStore.setState({ error: String(error) }); });
   }
-  return () => { disposed = true; offStream(); offEvents.forEach((off) => off()); offStore(); };
+  return () => { disposed = true; parentWakeups.dispose(); offStream(); offEvents.forEach((off) => off()); offStore(); };
 }

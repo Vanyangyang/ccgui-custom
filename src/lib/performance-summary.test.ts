@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it } from "vitest";
 import { collectPerformanceReport } from "./performance-report";
 import { summarizePerformanceReport, SUMMARY_MAX_BYTES } from "./performance-summary";

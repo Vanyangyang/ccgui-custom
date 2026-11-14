@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
@@ -101,14 +102,19 @@ function batchSnapshot(filename, root) {
   }
   return digest(JSON.stringify(value));
 }
-export function buildEnvironment(base = process.env) {
+// Half the logical CPUs, at least 2 and at most 12: rustc codegen threads also
+// take jobserver tokens, while the cap leaves memory for the running desktop.
+export function defaultCargoJobs(cpus = os.availableParallelism()) {
+  return String(Math.min(12, Math.max(2, Math.floor(cpus / 2))));
+}
+export function buildEnvironment(base = process.env, cpus = os.availableParallelism()) {
   const env = {};
   for (const [key, value] of Object.entries(base)) {
     if (/^(path|systemroot|windir|comspec|pathext|temp|tmp|userprofile|home|localappdata|appdata|programfiles(?:\(x86\))?|programdata|number_of_processors|processor_architecture|cargo_home|rustup_home|rustup_toolchain|rustflags|cargo_encoded_rustflags|cc|cxx|ar|cflags|cxxflags|ldflags|include|lib|libpath|vctoolsinstalldir|vsinstalldir|windowssdkdir|windowssdkversion|perl|source_date_epoch|vite_[a-z0-9_]+|(?:http|https|all|no)_proxy|cargo_http_proxy)$/i.test(key)) env[key] = value;
   }
   // The native graph is large; bound simultaneous rustc processes while each
   // crate can still use the self-update profile's parallel codegen units.
-  const jobs = base.CARGO_BUILD_JOBS ?? '2';
+  const jobs = base.CARGO_BUILD_JOBS ?? defaultCargoJobs(cpus);
   if (!/^[1-9][0-9]*$/.test(jobs) || Number(jobs) > 64) throw new Error('CARGO_BUILD_JOBS must be an integer from 1 to 64');
   env.CARGO_BUILD_JOBS = jobs;
   return env;
@@ -156,6 +162,21 @@ async function execute(command, args, options) {
     child.on('error', reject);
     child.on('close', code => code === 0 && !overflow ? resolve(stdout.trim()) : reject(new Error(`Build command ${path.basename(command)} failed (${code}${overflow ? ', captured output limit exceeded' : ''}); see build log ${logFile ?? '(unavailable)'}`)));
   });
+}
+// The schema hash of the release the user is running now, if it can be read.
+export function activeSchemaHash(profileDirectory) {
+  try {
+    const state = JSON.parse(fs.readFileSync(path.join(profileDirectory, '.ccgui-next/runtime-updates/state.json'), 'utf8'));
+    const hash = state?.active?.schemaHash;
+    return typeof hash === 'string' && /^[a-f0-9]{64}$/.test(hash) ? hash : null;
+  } catch { return null; }
+}
+// A schema change can never be applied live, and the host would only reject the
+// candidate after it was packaged. Legacy aliases only exist for the first
+// contract, so any other difference is a real incompatibility.
+export function assertSchemaCompatible(candidateHash, profileDirectory) {
+  const active = activeSchemaHash(profileDirectory);
+  if (active && active !== candidateHash) throw new Error('The candidate database schema differs from the running release and cannot be applied live. Build and install a complete standalone package instead.');
 }
 function validateProbe(probe, fingerprint) {
   if (probe.protocol !== 1 || probe.checkpointSchema !== 1 || !/^[a-f0-9]{64}$/.test(probe.schemaHash ?? '') || probe.capabilities?.launchProtection !== 1
@@ -307,7 +328,8 @@ async function buildLocked(options, hooks) {
   // path can become a file:// URL and bypass the verified runtime asset provider.
   // This path is relative to the project's src-tauri configuration directory.
   config.build = { ...config.build, beforeBuildCommand: '', frontendDist: '../scripts/self-update-shell' };
-  const metadata = { format: 2, profile, config, tools, platform: process.platform, arch: process.arch, environmentHash: digest(JSON.stringify(Object.entries(env).sort())) };
+  // Job count only schedules the same compilation; it must not invalidate caches.
+  const metadata = { format: 2, profile, config, tools, platform: process.platform, arch: process.arch, environmentHash: digest(JSON.stringify(Object.entries(env).filter(([key]) => key !== 'CARGO_BUILD_JOBS').sort())) };
   const externalInputs = () => ({ cargoConfiguration: cargoConfiguration(root, env), dependencyInstallation: dependencyInstallation(root) });
   const cacheRoot = path.join(root, '.artifacts/self-update-cache');
   plain(cacheRoot, true);
@@ -396,6 +418,7 @@ async function buildLocked(options, hooks) {
   const executable = path.join(native.directory, 'payload/ccgui-next.exe');
   const probe = JSON.parse(await stage('verifyProbe', () => command(executable, ['--task-worker-probe'])));
   validateProbe(probe, nativeFingerprint);
+  if (options.activeProfile) assertSchemaCompatible(probe.schemaHash, options.activeProfile);
   unchanged();
   verifyArtifact(native.directory, nativeFingerprint);
   verifyArtifact(frontend.directory, frontendFingerprint);
@@ -424,6 +447,7 @@ export async function main(args = process.argv.slice(2)) {
     if (!key || options[key] !== undefined || !args[index + 1] || args[index + 1].startsWith('--')) throw new Error(`Invalid argument: ${args[index]}`);
     options[key] = args[++index];
   }
+  options.activeProfile = process.env.USERPROFILE ?? process.env.HOME;
   console.log(JSON.stringify(await buildSelfUpdate(options), null, 2));
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) main().catch(error => { console.error(error.message); process.exitCode = 1; });

@@ -239,6 +239,21 @@ function engineTab(label: string): HTMLButtonElement {
 }
 
 describe("McpSection", () => {
+  it("shows plugin declarations without offering a direct probe", async () => {
+    const plugin: McpConfigEntry = { ...claudeUser(), id: "claude_plugin:opaque", name: "plugin-server",
+      source: "claude_plugin", probeAllowed: false, enablementKnown: false };
+    api.inventory.mockResolvedValue(payload({ engines: [engine("claude", { config: { entries: [plugin], errors: [] } })] }));
+    await renderSection();
+    expect(api.probe).not.toHaveBeenCalled();
+    await act(async () => {
+      (document.querySelector('[aria-label="查看 plugin-server 详情"]') as HTMLButtonElement).click();
+    });
+    expect(document.body.textContent).toContain("该来源需要 CLI 的原生上下文");
+    expect(document.body.textContent).toContain("配置状态未知");
+    expect(document.querySelector('[aria-label="检测 plugin-server"]')).toBeNull();
+    expect(api.probe).not.toHaveBeenCalled();
+  });
+
   it("keeps config and runtime separate, with the read-only reason on the lock", async () => {
     await renderSection();
     expect(document.body.textContent).toContain("alpha");

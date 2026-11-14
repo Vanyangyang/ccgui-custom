@@ -10,6 +10,28 @@ fn call<'a>(schema: &'a Value) -> StructuredCall<'a> {
 fn scratch() -> PathBuf { std::env::temp_dir().join(format!("ccgui-agy-test-{}", uuid::Uuid::new_v4())) }
 
 #[test]
+fn native_settings_bom_stages_only_allowlisted_fields_without_changing_source() {
+    let root = scratch();
+    std::fs::create_dir(&root).unwrap();
+    let source = root.join("settings.json");
+    let content = concat!("\u{feff}", r#"{"modelProvider":"gemini","unknown":{"command":"\"C:\\Program Files\\AGY\\agy.exe\""},"hooks":{"startup":"forbidden"}}"#);
+    std::fs::write(&source, content).unwrap();
+    let settings = read_native_settings(&source).unwrap();
+    let schema = json!({"type":"object"});
+    let (home, _) = stage(&root, &call(&schema), &settings).unwrap();
+    let staged = std::fs::read(home.join(".gemini/antigravity-cli/settings.json")).unwrap();
+    assert_eq!(serde_json::from_slice::<Value>(&staged).unwrap(), json!({"modelProvider":"gemini"}));
+    assert_eq!(std::fs::read(&source).unwrap(), content.as_bytes());
+    for invalid in ["\u{feff}{broken", "\u{feff}\u{feff}{}", "\u{feff}null"] {
+        std::fs::write(&source, invalid).unwrap();
+        assert!(read_native_settings(&source).is_err());
+        assert_eq!(std::fs::read(&source).unwrap(), invalid.as_bytes());
+        assert_eq!(std::fs::read(home.join(".gemini/antigravity-cli/settings.json")).unwrap(), staged);
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn only_supported_agent_versions_are_accepted() {
     for version in ["1.3.4", "v1.4.7\n", "Antigravity CLI 1.4.9"] { assert!(version_result(version.as_bytes()).is_ok()); }
     for version in ["", "unknown", "1.2.11", "1.3.3", "1.3.4-rc1", "0.99.9"] { assert!(version_result(version.as_bytes()).is_err()); }
@@ -91,4 +113,84 @@ async fn failed_cli_start_removes_its_private_home_without_a_session_registratio
     let context = Context { bin:format!("ccgui-absent-agy-{}",uuid::Uuid::new_v4()),env:HashMap::new(),settings:NativeSettings::default() };
     assert!(execute_in(context,call(&schema),&root).await.is_err());
     assert!(!root.exists());
+}
+
+#[tokio::test]
+async fn version_probe_is_cached_per_binary_fingerprint_and_revalidated_on_change() {
+    let fixture = scratch();
+    std::fs::create_dir_all(&fixture).unwrap();
+    let log = fixture.join("invocations.log");
+    #[cfg(windows)]
+    let bin = fixture.join("fake-agy.cmd");
+    #[cfg(not(windows))]
+    let bin = fixture.join("fake-agy.sh");
+
+    let write_fake_agy = |version: &str, pad: &str| {
+        #[cfg(windows)]
+        let script = format!(
+            "@echo off\r\nrem {pad}\r\necho %1>>\"{}\"\r\nif \"%~1\"==\"--version\" (\r\n  echo Antigravity CLI {version}\r\n  exit /b 0\r\n)\r\nmore >nul\r\necho {{\"event\":\"init\",\"init\":{{\"agent\":\"ccgui-notice\"}}}}\r\necho {{\"event\":\"result\",\"result\":{{\"status\":\"SUCCESS\",\"structured_output\":{{\"thought\":null}},\"usage\":{{\"input_tokens\":4}}}}}}\r\n",
+            log.display()
+        );
+        #[cfg(not(windows))]
+        let script = format!(
+            "#!/bin/sh\n# {pad}\nprintf '%s\\n' \"$1\" >> \"{}\"\nif [ \"$1\" = \"--version\" ]; then\n  echo \"Antigravity CLI {version}\"\n  exit 0\nfi\ncat >/dev/null\nprintf '%s\\n' '{{\"event\":\"init\",\"init\":{{\"agent\":\"ccgui-notice\"}}}}'\nprintf '%s\\n' '{{\"event\":\"result\",\"result\":{{\"status\":\"SUCCESS\",\"structured_output\":{{\"thought\":null}},\"usage\":{{\"input_tokens\":4}}}}}}'\n",
+            log.display()
+        );
+        std::fs::write(&bin, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    };
+
+    write_fake_agy("1.4.9", "v1");
+    let schema = json!({"type":"object"});
+    let make_ctx = || Context {
+        bin: bin.to_string_lossy().to_string(),
+        env: HashMap::new(),
+        settings: NativeSettings::default(),
+    };
+
+    let run1 = scratch();
+    let out1 = execute_in(make_ctx(), call(&schema), &run1).await.unwrap();
+    assert_eq!(out1.structured, json!({"thought": null}));
+    let lines1: Vec<String> = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(|s| s.trim().to_string())
+        .collect();
+    assert_eq!(lines1, vec!["--version", "--app_data_dir"]);
+
+    let run2 = scratch();
+    let out2 = execute_in(make_ctx(), call(&schema), &run2).await.unwrap();
+    assert_eq!(out2.structured, json!({"thought": null}));
+    let lines2: Vec<String> = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(|s| s.trim().to_string())
+        .collect();
+    assert_eq!(
+        lines2,
+        vec!["--version", "--app_data_dir", "--app_data_dir"],
+        "unchanged binary must skip redundant --version spawn"
+    );
+
+    // Changing the binary on disk (different size/content) must invalidate the cache.
+    write_fake_agy("1.3.3", "downgraded-binary-payload");
+    let run3 = scratch();
+    let err = execute_in(make_ctx(), call(&schema), &run3).await.unwrap_err();
+    assert!(matches!(err, SideCallError::Unavailable));
+    let lines3: Vec<String> = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(|s| s.trim().to_string())
+        .collect();
+    assert_eq!(
+        lines3,
+        vec!["--version", "--app_data_dir", "--app_data_dir", "--version"],
+        "modified binary must re-run --version and stop before sending request"
+    );
+
+    let _ = std::fs::remove_dir_all(fixture);
 }

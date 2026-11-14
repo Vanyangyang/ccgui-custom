@@ -12,16 +12,23 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 mod handoff_diagnostics;
+mod handoff_timing;
+mod full_handoff;
+mod full_handoff_cache;
+mod handoff_selected_children;
 #[cfg(test)]
 mod stack_tests;
 
 const HANDOFF_MODEL: &str = "grok-4.7-low-fast";
 const HANDOFF_FALLBACK_MODEL: &str = "grok-4.7-low";
-// This covers CLI startup and shutdown as well as inference. On Windows a
-// successful short summary can already take ~25s with only ~7s spent on the API.
-const HANDOFF_TIMEOUT: Duration = Duration::from_secs(60);
-const MAX_EXCERPT_CHARS: usize = 6000;
+// Handoff includes full-history segments and high-effort reasoning, not just
+// short titles. Keep a bounded budget per model invocation (including local
+// setup); a total one-minute cutoff discarded valid long completions. Other
+// side-call users retain their own budgets. Never retry on timeout.
+pub(crate) const HANDOFF_TIMEOUT: Duration = Duration::from_secs(600);
+pub(crate) const MAX_EXCERPT_CHARS: usize = 6000;
 const MAX_CHILD_CONTEXT_CHARS: usize = 6000;
+const MIN_DISTILLED_SUMMARY_CHARS: usize = 12;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -92,6 +99,13 @@ fn handoff_route<'a>(selection: Option<&'a HandoffCompressionSelection>, legacy:
         }
         None => Ok(HandoffRoute::Legacy(handoff_models(legacy)?)),
     }
+}
+
+fn handoff_parallelism(selection: Option<&HandoffCompressionSelection>) -> usize {
+    // Only Codex's isolated HTTP calls have a verified concurrent lifecycle.
+    // Other adapters (notably Cursor's workspace-wide side-call cleanup) retain
+    // their existing serial behavior. Never change the selected model/effort.
+    if selection.is_some_and(|selection| selection.engine == "codex") { full_handoff::MAX_PARALLEL_CALLS } else { 1 }
 }
 
 async fn run_handoff_route(route: HandoffRoute<'_>, input: &str) -> Result<String, SideCallError> {
@@ -309,10 +323,163 @@ pub(crate) fn sanitize_distilled_summary(raw: &str) -> Option<String> {
         .skip_while(|line| line.trim().is_empty())
         .collect();
     let joined = lines.join("\n").trim().to_string();
-    if joined.chars().count() < 12 {
+    if joined.chars().count() < MIN_DISTILLED_SUMMARY_CHARS {
         return None;
     }
     Some(joined)
+}
+
+#[tauri::command]
+pub fn handoff_full_history_supported() -> bool { true }
+
+/// Progress contains only stage counters, never source or model content.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HandoffProgress {
+    pub phase: HandoffPhase,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub round: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timing: Option<handoff_timing::HandoffTiming>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum HandoffPhase { Reading, Segments, Merging, Verifying }
+
+impl HandoffProgress {
+    fn stage(phase: HandoffPhase) -> Self {
+        Self { phase, completed: None, total: None, round: None, timing: None }
+    }
+}
+
+/// Tauri supports Channel as CommandArg, but not Option<Channel>. Parse the
+/// optional JavaScript channel id with the same command-bound webview instead.
+#[derive(Default)]
+pub struct OptionalHandoffProgress(Option<tauri::ipc::Channel<HandoffProgress>>);
+
+impl OptionalHandoffProgress {
+    pub(crate) fn as_ref(&self) -> Option<&tauri::ipc::Channel<HandoffProgress>> { self.0.as_ref() }
+}
+
+impl<'de, R: tauri::Runtime> tauri::ipc::CommandArg<'de, R> for OptionalHandoffProgress {
+    fn from_command(command: tauri::ipc::CommandItem<'de, R>) -> Result<Self, tauri::ipc::InvokeError> {
+        let name = command.name;
+        let key = command.key;
+        let webview = command.message.webview();
+        let id: Option<tauri::ipc::JavaScriptChannelId> = serde::Deserialize::deserialize(command)
+            .map_err(|error| tauri::Error::InvalidArgs(name, key, error))?;
+        Ok(Self(id.map(|id| id.channel_on(webview))))
+    }
+}
+
+pub(crate) fn send_handoff_progress(channel: Option<&tauri::ipc::Channel<HandoffProgress>>, event: HandoffProgress) {
+    // A detached/closed receiver must never fail or retry compression.
+    if let Some(channel) = channel { let _ = channel.send(event); }
+}
+
+const MAX_PRE_CANCELLED_HANDOFF_IDS: usize = 64;
+
+struct HandoffCancelToken {
+    cancelled: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl HandoffCancelToken {
+    fn new(cancelled: bool) -> Arc<Self> {
+        Arc::new(Self {
+            cancelled: std::sync::atomic::AtomicBool::new(cancelled),
+            notify: tokio::sync::Notify::new(),
+        })
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    async fn cancelled(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if self.cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+#[derive(Default)]
+struct HandoffCancelState {
+    active: std::collections::HashMap<String, Arc<HandoffCancelToken>>,
+    pre_cancelled: std::collections::VecDeque<String>,
+}
+
+static HANDOFF_CANCEL_STATE: std::sync::LazyLock<parking_lot::Mutex<HandoffCancelState>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(HandoffCancelState::default()));
+
+struct HandoffCancelGuard {
+    id: String,
+    token: Arc<HandoffCancelToken>,
+}
+
+impl Drop for HandoffCancelGuard {
+    fn drop(&mut self) {
+        let mut state = HANDOFF_CANCEL_STATE.lock();
+        if state
+            .active
+            .get(&self.id)
+            .is_some_and(|existing| Arc::ptr_eq(existing, &self.token))
+        {
+            state.active.remove(&self.id);
+        }
+    }
+}
+
+fn valid_handoff_request_id(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > 128 || trimmed.chars().any(char::is_control) {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+fn register_handoff_cancel(request_id: Option<&str>) -> Option<HandoffCancelGuard> {
+    let id = valid_handoff_request_id(request_id?)?.to_owned();
+    let mut state = HANDOFF_CANCEL_STATE.lock();
+    let pre_cancelled = if let Some(pos) = state.pre_cancelled.iter().position(|item| item == &id) {
+        state.pre_cancelled.remove(pos);
+        true
+    } else {
+        false
+    };
+    let token = HandoffCancelToken::new(pre_cancelled);
+    state.active.insert(id.clone(), Arc::clone(&token));
+    Some(HandoffCancelGuard { id, token })
+}
+
+#[tauri::command]
+pub fn cancel_session_handoff(request_id: String) -> bool {
+    let Some(id) = valid_handoff_request_id(&request_id) else {
+        return false;
+    };
+    let mut state = HANDOFF_CANCEL_STATE.lock();
+    if let Some(token) = state.active.get(id) {
+        token.cancel();
+        return true;
+    }
+    if !state.pre_cancelled.iter().any(|existing| existing == id) {
+        if state.pre_cancelled.len() >= MAX_PRE_CANCELLED_HANDOFF_IDS {
+            state.pre_cancelled.pop_front();
+        }
+        state.pre_cancelled.push_back(id.to_owned());
+    }
+    false
 }
 
 #[tauri::command]
@@ -320,41 +487,244 @@ pub async fn summarize_session_handoff(
     state: tauri::State<'_, crate::AppState>,
     engine: String,
     session_id: String,
+    source_workspace_path: Option<String>,
     title: Option<String>,
     transcript_excerpt: Option<String>,
     child_context: Option<String>,
+    child_branch_ids: Option<Vec<String>>,
     compression_model: Option<String>,
     compression_selection: Option<HandoffCompressionSelection>,
+    history_scope: Option<String>,
+    request_id: Option<String>,
+    progress: OptionalHandoffProgress,
 ) -> Result<String, String> {
-    let route = handoff_route(compression_selection.as_ref(), compression_model.as_deref())?;
-    let mut excerpt = bounded_handoff_context(transcript_excerpt.as_deref(), MAX_EXCERPT_CHARS);
-
-    if excerpt.is_empty() && !engine.trim().is_empty() && !session_id.trim().is_empty() {
-        let db = Arc::clone(&state.db);
-        let eng = engine.clone();
-        let sid = session_id.clone();
-        if let Ok(Ok(page)) = tauri::async_runtime::spawn_blocking(move || {
-            crate::history::reader::load_session_page_blocking(&db, &eng, &sid, Some(40), None)
-        })
-        .await
-        {
-            excerpt = build_fallback_excerpt(&page.messages);
+    // Validate before the optional history read, as the original command did.
+    handoff_route(compression_selection.as_ref(), compression_model.as_deref())?;
+    let cancel_guard = register_handoff_cancel(request_id.as_deref());
+    match history_scope.as_deref() {
+        Some("full") => {
+            let selected_engine = compression_selection.as_ref().map(|s| s.engine.as_str()).unwrap_or("cursor");
+            let run = handoff_timing::HandoffRun::logged(selected_engine, HandoffPhase::Reading);
+            send_handoff_progress(progress.as_ref(), run.progress());
+            enum FullHandoffOutcome {
+                Finished(Result<String, String>),
+                Cancelled,
+            }
+            let outcome = Box::pin(async {
+                let work = async {
+                    let db = Arc::clone(&state.db);
+                    let eng = engine.clone();
+                    let sid = session_id.clone();
+                    let source_ws = source_workspace_path.clone();
+                    let selected_ids = child_branch_ids.clone().unwrap_or_default();
+                    let snapshot = if selected_ids.is_empty() {
+                        None
+                    } else {
+                        Some(crate::leader::snapshot()?)
+                    };
+                    let (text, source_stamp, resolved_children, child_stamps) =
+                        tauri::async_runtime::spawn_blocking(move || -> Result<_, String> {
+                            let (text, source_stamp) = full_handoff::read_saved_history(&db, &eng, &sid)?;
+                            if let Some(snapshot) = snapshot.as_ref() {
+                                let (sections, stamps) =
+                                    handoff_selected_children::resolve_selected_child_histories(
+                                        &db,
+                                        snapshot,
+                                        &eng,
+                                        &sid,
+                                        source_ws.as_deref(),
+                                        &selected_ids,
+                                        text.len(),
+                                    )?;
+                                Ok((text, source_stamp, Some(sections), stamps))
+                            } else {
+                                Ok((text, source_stamp, None, Vec::new()))
+                            }
+                        })
+                        .await
+                        .map_err(|e| format!("full handoff history task failed: {e}"))??;
+                    let effective_children = resolved_children.as_deref().or(child_context.as_deref());
+                    let summary = Box::pin(summarize_full_handoff_in_run(
+                        &engine, &session_id, title.as_deref(), &text, effective_children,
+                        compression_model.as_deref(), compression_selection.as_ref(), Some(&source_stamp), &run,
+                        |event| send_handoff_progress(progress.as_ref(), event),
+                    )).await?;
+                    let db = Arc::clone(&state.db);
+                    send_handoff_progress(progress.as_ref(), run.observe(HandoffProgress::stage(HandoffPhase::Verifying)));
+                    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+                        full_handoff::ensure_saved_history_unchanged(&db, &engine, &session_id, &source_stamp)?;
+                        handoff_selected_children::verify_selected_child_stamps(&db, &child_stamps)
+                    }).await.map_err(|e| format!("full handoff source verification failed: {e}"))??;
+                    Ok(summary)
+                };
+                if let Some(guard) = cancel_guard.as_ref() {
+                    tokio::select! {
+                        biased;
+                        _ = guard.token.cancelled() => FullHandoffOutcome::Cancelled,
+                        res = work => FullHandoffOutcome::Finished(res),
+                    }
+                } else {
+                    FullHandoffOutcome::Finished(work.await)
+                }
+            }).await;
+            return match outcome {
+                FullHandoffOutcome::Finished(result) => {
+                    run.finish(if result.is_ok() { handoff_timing::Outcome::Completed } else { handoff_timing::Outcome::Failed });
+                    send_handoff_progress(progress.as_ref(), run.progress());
+                    result
+                }
+                FullHandoffOutcome::Cancelled => {
+                    run.finish(handoff_timing::Outcome::Cancelled);
+                    send_handoff_progress(progress.as_ref(), run.progress());
+                    Err("handoff compression cancelled".into())
+                }
+            };
         }
+        None => {}
+        Some(_) => return Err("unsupported handoff history scope".into()),
     }
+    Box::pin(async move {
+        let work = async {
+            let mut excerpt = bounded_handoff_context(transcript_excerpt.as_deref(), MAX_EXCERPT_CHARS);
 
-    let input = build_handoff_input(
-        &engine, &session_id, title.as_deref(), &excerpt, child_context.as_deref(),
-    )?;
+            if excerpt.is_empty() && !engine.trim().is_empty() && !session_id.trim().is_empty() {
+                let db = Arc::clone(&state.db);
+                let eng = engine.clone();
+                let sid = session_id.clone();
+                if let Ok(Ok(page)) = tauri::async_runtime::spawn_blocking(move || {
+                    crate::history::reader::load_session_page_blocking(&db, &eng, &sid, Some(40), None)
+                })
+                .await
+                {
+                    excerpt = build_fallback_excerpt(&page.messages);
+                }
+            }
 
-    let selected_engine = compression_selection.as_ref().map(|s| s.engine.as_str()).unwrap_or("cursor");
-    let started = std::time::Instant::now();
-    side_call::diagnostics::capture(async {
-        let raw = run_handoff_route(route, &input).await?;
-        sanitize_distilled_summary(&raw).ok_or_else(|| {
-            side_call::diagnostics::record("summary_too_short");
-            SideCallError::BadOutput
-        })
-    }).await.map_err(|failure| handoff_diagnostics::format_failure(selected_engine, failure, started.elapsed()))
+            summarize_handoff_text(
+                &engine, &session_id, title.as_deref(), &excerpt, child_context.as_deref(),
+                compression_model.as_deref(), compression_selection.as_ref(),
+            ).await
+        };
+        if let Some(guard) = cancel_guard.as_ref() {
+            tokio::select! {
+                biased;
+                _ = guard.token.cancelled() => Err("handoff compression cancelled".into()),
+                res = work => res,
+            }
+        } else {
+            work.await
+        }
+    }).await
+}
+
+/// Compress all supplied visible text without the legacy excerpt cap.
+/// The caller owns provenance; this never substitutes a recent-history excerpt.
+pub(crate) async fn summarize_full_handoff_text(
+    engine: &str,
+    session_id: &str,
+    title: Option<&str>,
+    text: &str,
+    child_context: Option<&str>,
+    compression_model: Option<&str>,
+    compression_selection: Option<&HandoffCompressionSelection>,
+) -> Result<String, String> {
+    summarize_full_handoff_text_with_progress(engine, session_id, title, text, child_context,
+        compression_model, compression_selection, |_| {}).await
+}
+
+pub(crate) async fn summarize_full_handoff_text_with_progress(
+    engine: &str,
+    session_id: &str,
+    title: Option<&str>,
+    text: &str,
+    child_context: Option<&str>,
+    compression_model: Option<&str>,
+    compression_selection: Option<&HandoffCompressionSelection>,
+    mut progress: impl FnMut(HandoffProgress) + Send,
+) -> Result<String, String> {
+    let selected_engine = compression_selection.map(|s| s.engine.as_str()).unwrap_or("cursor");
+    let run = handoff_timing::HandoffRun::logged(selected_engine, HandoffPhase::Reading);
+    progress(run.progress());
+    let result = Box::pin(summarize_full_handoff_in_run(engine, session_id, title, text, child_context,
+        compression_model, compression_selection, None, &run, &mut progress)).await;
+    run.finish(if result.is_ok() { handoff_timing::Outcome::Completed } else { handoff_timing::Outcome::Failed });
+    progress(run.progress());
+    result
+}
+
+async fn summarize_full_handoff_in_run(
+    engine: &str,
+    session_id: &str,
+    title: Option<&str>,
+    text: &str,
+    child_context: Option<&str>,
+    compression_model: Option<&str>,
+    compression_selection: Option<&HandoffCompressionSelection>,
+    source_stamp: Option<&full_handoff::SourceStamp>,
+    run: &handoff_timing::HandoffRun,
+    progress: impl FnMut(HandoffProgress) + Send,
+) -> Result<String, String> {
+    let route = handoff_route(compression_selection, compression_model)?;
+    // Freeze the legacy default too: full-history calls never retry another model.
+    let legacy_model = match &route {
+        HandoffRoute::Legacy(models) => Some(models.primary),
+        _ => None,
+    };
+    let selected_engine = compression_selection.map(|s| s.engine.as_str()).unwrap_or("cursor");
+    let cache_route = match compression_selection {
+        Some(selection) => serde_json::json!([selection.engine, selection.model, selection.provider_id, selection.effort]).to_string(),
+        None => serde_json::json!(["legacy-cursor", legacy_model]).to_string(),
+    };
+    let cache = source_stamp.map(|source| source.cache(&cache_route));
+    Box::pin(full_handoff::compress_cached_in_run(engine, session_id, title, text, child_context, run, handoff_parallelism(compression_selection), cache.as_ref(), |input| async move {
+        let route = match compression_selection {
+            Some(selection) => HandoffRoute::Explicit(selection),
+            None => HandoffRoute::Legacy(HandoffModels { primary: legacy_model.expect("validated route"), fallback: None }),
+        };
+        let started = std::time::Instant::now();
+        side_call::diagnostics::capture(async {
+            side_call::diagnostics::deadline(HANDOFF_TIMEOUT);
+            let raw = Box::pin(run_handoff_route(route, &input)).await?;
+            sanitize_distilled_summary(&raw).ok_or_else(|| {
+                side_call::diagnostics::record("summary_too_short");
+                SideCallError::BadOutput
+            })
+        }).await.map_err(|failure| handoff_diagnostics::format_failure(selected_engine, failure, started.elapsed()))
+    }, progress)).await
+}
+
+/// Text-only distillation shared by ordinary handoff and plugin-owned excerpts.
+/// No database or session lookup is available here. Callers own input provenance.
+pub(crate) async fn summarize_handoff_text(
+    engine: &str,
+    session_id: &str,
+    title: Option<&str>,
+    excerpt: &str,
+    child_context: Option<&str>,
+    compression_model: Option<&str>,
+    compression_selection: Option<&HandoffCompressionSelection>,
+) -> Result<String, String> {
+    let route = handoff_route(compression_selection, compression_model)?;
+    let selected_engine = compression_selection.map(|s| s.engine.as_str()).unwrap_or("cursor");
+    let run = handoff_timing::HandoffRun::logged(selected_engine, HandoffPhase::Reading);
+    let result = Box::pin(async {
+        let input = build_handoff_input(engine, session_id, title, excerpt, child_context)?;
+        run.observe(HandoffProgress::stage(HandoffPhase::Segments));
+        let timer = run.start_call(HandoffPhase::Segments, 1, 1, None);
+        let started = std::time::Instant::now();
+        let result = side_call::diagnostics::capture(async {
+            side_call::diagnostics::deadline(HANDOFF_TIMEOUT);
+            let raw = run_handoff_route(route, &input).await?;
+            sanitize_distilled_summary(&raw).ok_or_else(|| {
+                side_call::diagnostics::record("summary_too_short");
+                SideCallError::BadOutput
+            })
+        }).await.map_err(|failure| handoff_diagnostics::format_failure(selected_engine, failure, started.elapsed()));
+        timer.finish(if result.is_ok() { handoff_timing::Outcome::Completed } else { handoff_timing::Outcome::Failed });
+        result
+    }).await;
+    run.finish(if result.is_ok() { handoff_timing::Outcome::Completed } else { handoff_timing::Outcome::Failed });
+    result
 }
 
 fn dir_bytes(path: &Path) -> u64 {
@@ -400,6 +770,26 @@ struct ReclaimPlan {
     staging_paths: Vec<(PathBuf, u64)>,
 }
 
+fn executable_release_names<'a>(
+    releases_dir: &Path,
+    executables: impl IntoIterator<Item = &'a Path>,
+) -> HashSet<String> {
+    let mut releases = HashSet::new();
+    let Ok(canon_releases) = dunce::canonicalize(releases_dir) else {
+        return releases;
+    };
+    for exe in executables {
+        if let Ok(canon_exe) = dunce::canonicalize(exe) {
+            if let Ok(rel) = canon_exe.strip_prefix(&canon_releases) {
+                if let Some(first) = rel.components().next() {
+                    releases.insert(first.as_os_str().to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+    releases
+}
+
 fn collect_runtime_update_targets(
     app_home: &Path,
     update_in_flight: bool,
@@ -440,15 +830,13 @@ fn collect_runtime_update_targets(
     }
 
     let releases_dir = updates_root.join("releases");
-    if let (Some(exe), Ok(canon_releases)) = (current_exe, dunce::canonicalize(&releases_dir)) {
-        if let Ok(canon_exe) = dunce::canonicalize(exe) {
-            if let Ok(rel) = canon_exe.strip_prefix(&canon_releases) {
-                if let Some(first) = rel.components().next() {
-                    protected_releases.insert(first.as_os_str().to_string_lossy().to_string());
-                }
-            }
-        }
-    }
+    // A surviving ACP broker may still use a release older than the GUI's
+    // active/previous pair. Only the broker's verified live identity protects it.
+    let broker_exe = crate::engine::agy_acp::live_broker_executable(app_home);
+    protected_releases.extend(executable_release_names(
+        &releases_dir,
+        current_exe.into_iter().chain(broker_exe.as_deref()),
+    ));
 
     let mut targets = Vec::new();
     if let Ok(entries) = fs::read_dir(&releases_dir) {
@@ -783,6 +1171,39 @@ pub(crate) fn spawn_startup_cache_maintenance() {
 mod tests {
     use super::*;
 
+    #[tokio::test(start_paused = true)]
+    async fn full_history_handoff_allows_long_selected_completions_without_replay() {
+        let selection = HandoffCompressionSelection {
+            engine: "codex".into(), model: "gpt-6.1-sol".into(),
+            provider_id: Some("fixture-channel".into()), effort: Some("max".into()),
+        };
+        let schema = serde_json::json!({"type":"object"});
+        let source = "中".repeat(full_handoff::CHUNK_CHARS + 1); // Two map calls, then one merge.
+        for (parallelism, elapsed) in [(1, 195), (handoff_parallelism(Some(&selection)), 130)] {
+            let calls = std::cell::Cell::new(0usize);
+            let started = tokio::time::Instant::now();
+            let run = handoff_timing::HandoffRun::silent(HandoffPhase::Reading);
+            let result = full_handoff::compress_in_run("fixture", "isolated", None, &source, None, &run, parallelism, |input| {
+                let selection = &selection;
+                let schema = &schema;
+                let calls = &calls;
+                async move {
+                    calls.set(calls.get() + 1);
+                    let call = selection.structured_call(&input, schema);
+                    assert_eq!((call.model, call.provider_id, call.effort), ("gpt-6.1-sol", Some("fixture-channel"), "max"));
+                    tokio::time::timeout(call.timeout, async {
+                        tokio::time::sleep(Duration::from_secs(65)).await;
+                        Ok::<_, String>("完整分段摘要，保留已验证结论和仍需完成的工作。".to_owned())
+                    }).await.map_err(|_| "fixture completion was cut off before its valid answer".to_owned())?
+                }
+            }, |_| {}).await;
+            assert!(result.is_ok(), "a valid long completion must not hit the former one-minute cutoff: {result:?}");
+            assert_eq!(result.unwrap(), "完整分段摘要，保留已验证结论和仍需完成的工作。");
+            assert_eq!(calls.get(), 3, "each map and merge is submitted once in either mode");
+            assert_eq!(started.elapsed(), Duration::from_secs(elapsed));
+        }
+    }
+
     #[tokio::test]
     #[ignore = "explicitly enabled live Codex handoff smoke test"]
     async fn live_codex_handoff_smoke() {
@@ -896,6 +1317,42 @@ mod tests {
     }
 
     #[test]
+    fn handoff_parallelism_is_bounded_to_the_verified_codex_adapter() {
+        assert_eq!(full_handoff::MAX_PARALLEL_CALLS, 4);
+        assert_eq!(handoff_parallelism(None), 1);
+        for engine in ["codex", "claude", "pi", "cursor"] {
+            let selection = HandoffCompressionSelection {
+                engine: engine.into(), model: "explicit-model".into(),
+                provider_id: Some(crate::config::LOCAL_PROVIDER_ID.into()), effort: Some("max".into()),
+            };
+            assert_eq!(handoff_parallelism(Some(&selection)), if engine == "codex" { full_handoff::MAX_PARALLEL_CALLS } else { 1 });
+            let schema = serde_json::json!({});
+            let call = selection.structured_call("unchanged source", &schema);
+            assert_eq!(call.model, "explicit-model");
+            assert_eq!(call.effort, "max");
+            assert_eq!(call.input, "unchanged source");
+            assert_eq!(call.timeout, HANDOFF_TIMEOUT);
+        }
+    }
+
+    #[test]
+    fn handoff_shared_text_core_keeps_existing_prompt_budgets_and_source_labels() {
+        let excerpt = format!("recent-prefix{}late-suffix", "甲".repeat(6000));
+        let children = "子".repeat(6001);
+        let input = build_handoff_input("plugin", "owned-plugin", Some("Topic"), &excerpt, Some(&children)).unwrap();
+        assert!(input.starts_with(HANDOFF_WITH_CHILDREN_PROMPT));
+        assert!(input.contains("plugin/owned-plugin"));
+        assert!(input.contains("recent-prefix"));
+        assert!(!input.contains("late-suffix")); // ordinary handoff retains its prefix budget
+        assert!(input.ends_with(&"子".repeat(6000)));
+        let selection: HandoffCompressionSelection = serde_json::from_value(serde_json::json!({
+            "engine":"codex", "model":"explicit", "providerId":"channel", "effort":"high"
+        })).unwrap();
+        assert!(matches!(handoff_route(Some(&selection), None).unwrap(), HandoffRoute::Explicit(_)));
+        assert_eq!(selection.structured_call("text", &serde_json::json!({})).timeout, Duration::from_secs(600));
+    }
+
+    #[test]
     fn handoff_structured_request_pins_official_or_explicit_provider() {
         let schema = serde_json::json!({"type": "object"});
         for engine in ["claude", "codex", "pi"] {
@@ -1003,6 +1460,28 @@ mod tests {
             Some("- **目标与背景**：实现 /handoff 指令\n- **已完成改动与结论**：修改了 cli-menu.tsx")
         );
         assert_eq!(sanitize_distilled_summary("太短"), None);
+    }
+
+    #[test]
+    fn executable_releases_protect_gui_and_older_broker_but_not_outside_paths() {
+        let root = std::env::temp_dir().join(format!("ccgui-cache-executables-{}", uuid::Uuid::new_v4()));
+        let releases = root.join("runtime-updates/releases");
+        let gui_hash = "1".repeat(64);
+        let broker_hash = "2".repeat(64);
+        let outside_hash = "3".repeat(64);
+        let gui = releases.join(&gui_hash).join("ccgui-next.exe");
+        let broker = releases.join(&broker_hash).join("bin/ccgui-next.exe");
+        let outside = root.join("runtime-updates/releases-other").join(&outside_hash).join("ccgui-next.exe");
+        for exe in [&gui, &broker, &outside] {
+            fs::create_dir_all(exe.parent().unwrap()).unwrap();
+            fs::write(exe, b"fixture").unwrap();
+        }
+        let missing = releases.join("missing").join("ccgui-next.exe");
+        assert_eq!(
+            executable_release_names(&releases, [gui.as_path(), broker.as_path(), outside.as_path(), missing.as_path()]),
+            HashSet::from([gui_hash, broker_hash]),
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1114,5 +1593,42 @@ mod tests {
         assert_eq!(result.remaining.total_reclaimable_bytes, 0);
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn cancel_session_handoff_aborts_active_and_pre_cancelled_requests() {
+        let active_id = format!("test-active-{}", uuid::Uuid::new_v4());
+        let guard = register_handoff_cancel(Some(&active_id)).unwrap();
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dropped_clone = Arc::clone(&dropped);
+        struct DropProbe(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let waiter = tokio::spawn(async move {
+            let _probe = DropProbe(dropped_clone);
+            tokio::select! {
+                biased;
+                _ = guard.token.cancelled() => "cancelled",
+                _ = tokio::time::sleep(Duration::from_secs(60)) => "timed_out",
+            }
+        });
+        tokio::task::yield_now().await;
+        assert!(cancel_session_handoff(active_id.clone()));
+        assert_eq!(waiter.await.unwrap(), "cancelled");
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        // Guard dropped with task; second cancel sees no active entry
+        assert!(!cancel_session_handoff(active_id));
+
+        // Pre-cancel before registration immediately trips the registered token
+        let pre_id = format!("test-pre-{}", uuid::Uuid::new_v4());
+        assert!(!cancel_session_handoff(pre_id.clone()));
+        let pre_guard = register_handoff_cancel(Some(&pre_id)).unwrap();
+        tokio::time::timeout(Duration::from_millis(50), pre_guard.token.cancelled())
+            .await
+            .expect("pre-cancelled token must resolve immediately");
     }
 }

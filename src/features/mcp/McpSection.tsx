@@ -92,9 +92,9 @@ function ConfigRow({
           <span className="shrink-0 rounded-full bg-background-tertiary-default px-1.5 py-0.5 text-[10px] text-text-secondary">
             {t(`mcp.source.${entry.source}`)}
           </span>
-          {!entry.enabled ? (
+          {entry.enablementKnown === false || !entry.enabled ? (
             <span className="shrink-0 rounded-full bg-background-tertiary-default px-1.5 py-0.5 text-[10px] text-text-tertiary">
-              {t("mcp.disabled")}
+              {t(entry.enablementKnown === false ? "mcp.enablementUnknown" : "mcp.disabled")}
             </span>
           ) : null}
         </span>
@@ -529,9 +529,9 @@ function EngineNotices({ engine }: { engine: McpEngineInventory }) {
       ) : null}
       {engine.config.errors.length > 0 ? (
         <ul className="flex flex-col gap-1">
-          {engine.config.errors.map((error) => (
+          {engine.config.errors.map((error, index) => (
             <li
-              key={`${error.source}:${error.path}`}
+              key={`${error.source}:${error.path}:${index}`}
               className="rounded-2lg border border-separator-border px-3 py-2 text-caption-1-regular"
             >
               <span className="text-text-error-primary">{error.message}</span>

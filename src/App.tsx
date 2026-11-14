@@ -22,6 +22,7 @@ import { startCollaborationRuntime } from "@/features/chat/collaboration-runtime
 import { startWorktreeRuntime } from "@/features/worktree/store";
 import { LeaderManagementHost } from "@/features/leader/LeaderManagementHost";
 import { OnboardingTourHost } from "@/features/onboarding/OnboardingTour";
+import { WorkerRecoveryNotice } from "@/features/chat/components/WorkerRecoveryNotice";
 
 // Settings is a rare route; load it on demand so startup ships less JS.
 // Warm the chunk shortly after startup so the first click has no fetch gap.
@@ -102,6 +103,7 @@ function MainApp() {
         </Routes>
       </HashRouter>
       <UpdateToast />
+      <WorkerRecoveryNotice />
       <GrantAccessDialogHost />
       <CloseConfirmDialogHost />
       <ShortcutsGuideModal />

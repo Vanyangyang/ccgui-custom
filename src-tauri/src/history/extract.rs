@@ -31,6 +31,9 @@ pub fn parse_session_file_with_handoffs(
     path: &Path,
     digests: std::collections::HashSet<String>,
 ) -> Result<ParsedSession, String> {
+    if engine == "agy" {
+        return super::agy::parse_agy_session_timeline_strict(path);
+    }
     let handed = (engine == "codex" && !digests.is_empty())
         .then(|| codex_rollout_thread(path))
         .flatten()

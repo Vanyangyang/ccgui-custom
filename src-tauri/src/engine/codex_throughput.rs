@@ -1,17 +1,23 @@
-//! Independent, constant-space app-server telemetry. Never estimates tokens.
+//! Independent, bounded app-server telemetry with active-time (`model_ms`)
+//! subtraction of tool execution and parked user/approval waits.
+use super::throughput_common::{
+    breakdown_json, compute_breakdown, validate_complete_gate, IntervalTracker,
+    StreamTokenEstimator, MAX_SAFE_INTEGER,
+};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::time::Instant;
 
-const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+const MAX_SEEDS: usize = 64;
 
 #[derive(Default)]
 pub(super) struct CodexThroughput {
-    seed: Option<(String, u64)>,
+    seeds: HashMap<String, u64>,
     started: Option<Instant>,
     thread: Option<String>,
     turn: Option<String>,
     baseline: Option<u64>,
-    /// Resume sends its restored usage after the RPC reply, before the next
+    /// Resume/fork sends its restored usage after the RPC reply, before the next
     /// turn lifecycle. Accept that same-thread replay until start is observed.
     awaiting_resume_baseline: bool,
     total: Option<u64>,
@@ -19,19 +25,47 @@ pub(super) struct CodexThroughput {
     reason: Option<&'static str>,
     invalid: bool,
     finished: bool,
+    tools: IntervalTracker,
+    waits: IntervalTracker,
+    estimator: StreamTokenEstimator,
 }
 
 impl CodexThroughput {
+    pub(super) fn seed_thread_total(&mut self, thread: &str, total: u64) {
+        if thread.is_empty() || total > MAX_SAFE_INTEGER {
+            return;
+        }
+        if self.seeds.len() >= MAX_SEEDS && !self.seeds.contains_key(thread) {
+            self.seeds.clear();
+        }
+        self.seeds.insert(thread.to_string(), total);
+        if self.awaiting_resume_baseline && self.thread.as_deref() == Some(thread) {
+            self.baseline = Some(total);
+        }
+    }
+
+    pub(super) fn seed_from_thread_reply(&mut self, thread: &str, reply: &Value) {
+        for ptr in [
+            "/thread/tokenUsage/total/outputTokens",
+            "/tokenUsage/total/outputTokens",
+            "/thread/usage/total/outputTokens",
+        ] {
+            if let Some(total) = count(reply.pointer(ptr)) {
+                self.seed_thread_total(thread, total);
+                return;
+            }
+        }
+    }
+
     pub(super) fn begin(&mut self, thread: &str, fresh: bool) {
+        let seeds = std::mem::take(&mut self.seeds);
         let baseline = if fresh {
             Some(0)
         } else {
-            self.seed
-                .as_ref()
-                .filter(|(id, _)| id == thread)
-                .map(|(_, n)| *n)
+            seeds.get(thread).copied()
         };
         *self = Self {
+            seeds,
             started: Some(Instant::now()),
             thread: Some(thread.to_string()),
             baseline,
@@ -49,6 +83,18 @@ impl CodexThroughput {
             } else {
                 self.turn = Some(turn.to_string());
             }
+        }
+    }
+
+    pub(super) fn park_wait(&mut self, id: &Value) {
+        if let Some(key) = request_id_key(id) {
+            self.park_wait_at(&key, self.elapsed());
+        }
+    }
+
+    fn park_wait_at(&mut self, request_id: &str, now_ms: u64) {
+        if self.started.is_some() && !self.finished && !request_id.is_empty() {
+            self.waits.open(request_id.to_string(), now_ms as f64);
         }
     }
 
@@ -71,12 +117,18 @@ impl CodexThroughput {
                     thread,
                     count(params.pointer("/tokenUsage/total/outputTokens")),
                 ) {
-                    self.seed = Some((thread.to_string(), total));
+                    self.seed_thread_total(thread, total);
                 }
             }
             return None;
         }
         if self.finished || thread != self.thread.as_deref() {
+            return None;
+        }
+        if method == "serverRequest/resolved" {
+            if let Some(key) = params.get("requestId").and_then(request_id_key) {
+                self.waits.close(&key, now_ms as f64);
+            }
             return None;
         }
         let turn = params
@@ -87,7 +139,12 @@ impl CodexThroughput {
             // The restored counter is not output produced by this turn. Once
             // turn/started or its RPC acknowledgement arrives, old-turn frames
             // remain rejected by the normal identity gate below.
-            self.baseline = count(params.pointer("/tokenUsage/total/outputTokens"));
+            if let Some(total) = count(params.pointer("/tokenUsage/total/outputTokens")) {
+                self.baseline = Some(total);
+                if let Some(thread) = thread {
+                    self.seeds.insert(thread.to_string(), total);
+                }
+            }
             return None;
         }
         if method == "turn/started" && self.turn.is_none() {
@@ -99,7 +156,68 @@ impl CodexThroughput {
             return None;
         }
         match method {
-            "thread/tokenUsage/updated" => self.usage(params),
+            "thread/tokenUsage/updated" => {
+                self.waits.close_all(now_ms as f64);
+                let prev_output = self.output();
+                self.usage(params);
+                let next_output = self.output();
+                if let Some(tokens) = next_output {
+                    self.estimator.clear_inflight();
+                    self.estimator.set_completed_tokens(tokens);
+                }
+                if next_output == prev_output && self.last_emit_ms.is_some() {
+                    return None;
+                }
+            }
+            "item/started" => {
+                if let Some(item) = params.get("item") {
+                    if is_non_model_item(item) {
+                        if let Some(id) = item
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                        {
+                            self.tools.open(id.to_string(), now_ms as f64);
+                        }
+                    }
+                }
+                return None;
+            }
+            "item/completed" => {
+                if let Some(item) = params.get("item") {
+                    if let Some(id) = item
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                    {
+                        self.tools.close(id, now_ms as f64);
+                    }
+                }
+                return None;
+            }
+            "item/agentMessage/delta"
+            | "item/reasoning/textDelta"
+            | "item/reasoning/summaryTextDelta"
+            | "item/plan/delta" => {
+                if let Some(delta) = params
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                {
+                    self.waits.close_all(now_ms as f64);
+                    self.estimator.push_delta(delta);
+                    let active_b = self.running_breakdown(now_ms);
+                    if active_b.model_ms >= 500.0
+                        && self
+                            .last_emit_ms
+                            .is_none_or(|previous| now_ms.saturating_sub(previous) >= 1000)
+                    {
+                        self.last_emit_ms = Some(now_ms);
+                        return Some(self.payload("running", now_ms, false));
+                    }
+                }
+                return None;
+            }
             "turn/completed" | "turn/failed" => {
                 let turn = params.get("turn").unwrap_or(&Value::Null);
                 let partial = method == "turn/failed"
@@ -137,13 +255,16 @@ impl CodexThroughput {
             return;
         }
         self.total = Some(total);
+        if let Some(thread) = self.thread.as_deref() {
+            self.seeds.insert(thread.to_string(), total);
+        }
     }
 
     pub(super) fn finish(&mut self, partial: bool) -> Option<Value> {
         self.finish_at(partial, self.elapsed())
     }
 
-    fn finish_at(&mut self, partial: bool, elapsed_ms: u64) -> Option<Value> {
+    fn finish_at(&mut self, partial: bool, wall_ms: u64) -> Option<Value> {
         if self.finished {
             return None;
         }
@@ -154,9 +275,13 @@ impl CodexThroughput {
                 "outputTokens":null,"elapsedMs":null,"generation":null,
                 "generationReason":"unavailable_timing","turnReason":"unsupported"}));
         }
+        if partial {
+            self.tools.close_all(wall_ms as f64);
+            self.waits.close_all(wall_ms as f64);
+        }
         Some(self.payload(
             if partial { "partial" } else { "complete" },
-            elapsed_ms,
+            wall_ms,
             partial,
         ))
     }
@@ -168,8 +293,30 @@ impl CodexThroughput {
         self.total?.checked_sub(self.baseline?)
     }
 
-    fn payload(&self, status: &str, elapsed_ms: u64, partial: bool) -> Value {
+    fn running_breakdown(&self, wall_ms: u64) -> super::throughput_common::TimeBreakdown {
+        let tool_segs = self.tools.segments_at(wall_ms as f64);
+        let wait_segs = self.waits.segments_at(wall_ms as f64);
+        compute_breakdown(wall_ms as f64, 0.0, &tool_segs, &wait_segs)
+    }
+
+    fn terminal_breakdown(&self, wall_ms: u64) -> super::throughput_common::TimeBreakdown {
+        compute_breakdown(
+            wall_ms as f64,
+            0.0,
+            self.tools.closed_segments(),
+            self.waits.closed_segments(),
+        )
+    }
+
+    fn payload(&self, status: &str, wall_ms: u64, partial: bool) -> Value {
         let output = self.output();
+        let breakdown = if status == "running" {
+            self.running_breakdown(wall_ms)
+        } else {
+            self.terminal_breakdown(wall_ms)
+        };
+        let model_ms_u64 = breakdown.model_ms.round() as u64;
+        let model_ms_opt = (model_ms_u64 > 0).then_some(breakdown.model_ms);
         let reason = if partial {
             Some("interrupted")
         } else if let Some(reason) = self.reason {
@@ -178,22 +325,64 @@ impl CodexThroughput {
             Some("missing_baseline")
         } else if self.total.is_none() {
             Some("missing_usage")
-        } else if elapsed_ms == 0 {
+        } else if wall_ms == 0 {
             Some("missing_timing")
+        } else {
+            validate_complete_gate(output, model_ms_opt)
+        };
+        let live = if status == "running" {
+            self.estimator.live_estimate_json(breakdown.model_ms)
         } else {
             None
         };
-        // App-server exposes turn totals and wall time, not a matched model
-        // request token count and decode interval. Text chunks cannot supply it.
-        json!({"version":1,"source":"codex_app_server","status":status,
-            "outputTokens":output,"elapsedMs":if elapsed_ms > 0 { Some(elapsed_ms) } else { None },
-            "generation":null,"generationReason":"unavailable_timing",
-            "turnReason":if status == "running" { None } else { reason }})
+        let mut out = json!({
+            "version": 1,
+            "source": "codex_app_server",
+            "status": status,
+            "outputTokens": output,
+            "elapsedMs": if model_ms_u64 > 0 { Some(model_ms_u64) } else { None },
+            "generation": null,
+            "generationReason": "unavailable_timing",
+            "turnReason": if status == "running" { None } else { reason },
+        });
+        if let Some(b) = breakdown_json(breakdown) {
+            out["breakdown"] = b;
+        }
+        if let Some(est) = live {
+            out["liveEstimate"] = est;
+        }
+        out
     }
+}
+
+fn is_non_model_item(item: &Value) -> bool {
+    matches!(
+        item.get("type").and_then(Value::as_str),
+        Some(
+            "commandExecution"
+                | "mcpToolCall"
+                | "dynamicToolCall"
+                | "fileChange"
+                | "webSearch"
+                | "imageGeneration"
+                | "collabAgentToolCall"
+                | "contextCompaction"
+        )
+    )
 }
 
 fn count(value: Option<&Value>) -> Option<u64> {
     value?.as_u64().filter(|n| *n <= MAX_SAFE_INTEGER)
+}
+
+fn request_id_key(id: &Value) -> Option<String> {
+    if let Some(s) = id.as_str() {
+        (!s.is_empty()).then(|| s.to_string())
+    } else if id.is_number() {
+        Some(id.to_string())
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -224,21 +413,21 @@ mod tests {
     #[test]
     fn terminal_reasons_preserve_success_and_duration_fallback() {
         let mut missing = tracker(true);
-        let report = missing.finish_at(false, 10).unwrap();
+        let report = missing.finish_at(false, 2000).unwrap();
         assert_eq!(report["status"], "complete");
         assert_eq!(report["turnReason"], "missing_usage");
 
         let mut reset = tracker(true);
         reset.observe_at("thread/tokenUsage/updated", &usage(10, 10), 1);
         reset.observe_at("thread/tokenUsage/updated", &usage(9, 9), 2);
-        let report = reset.finish_at(false, 10).unwrap();
+        let report = reset.finish_at(false, 2000).unwrap();
         assert_eq!(report["turnReason"], "counter_reset");
         assert!(report["outputTokens"].is_null());
 
         let mut identity = tracker(true);
         identity.acknowledge(Some("different"));
         assert_eq!(
-            identity.finish_at(false, 10).unwrap()["turnReason"],
+            identity.finish_at(false, 2000).unwrap()["turnReason"],
             "invalid_identity"
         );
 
@@ -247,10 +436,16 @@ mod tests {
             t.observe_at("thread/tokenUsage/updated", &usage(10, 10), 1);
             let terminal = json!({"threadId":"thread","turn":{
                 "id":"turn","status":"completed","durationMs":native}});
-            let report = t.observe_at("turn/completed", &terminal, 20).unwrap();
-            assert_eq!(report["elapsedMs"], 20);
+            let report = t.observe_at("turn/completed", &terminal, 2000).unwrap();
+            assert_eq!(report["elapsedMs"], 2000);
             assert!(report["turnReason"].is_null());
         }
+        let mut short = tracker(true);
+        short.observe_at("thread/tokenUsage/updated", &usage(10, 10), 1);
+        let short_report = short.finish_at(false, 20).unwrap();
+        assert_eq!(short_report["elapsedMs"], 20);
+        assert_eq!(short_report["turnReason"], "insufficient_timing");
+
         let mut no_time = tracker(true);
         no_time.observe_at("thread/tokenUsage/updated", &usage(0, 0), 0);
         let report = no_time.finish_at(false, 0).unwrap();
@@ -321,6 +516,83 @@ mod tests {
         assert!(final_report["outputTokens"].is_null());
         assert_eq!(final_report["status"], "complete");
         assert_eq!(final_report["turnReason"], "missing_baseline");
+    }
+
+    #[test]
+    fn forked_thread_preserves_multi_thread_seed_and_rejects_implausible_parent_spike() {
+        let mut t = CodexThroughput::default();
+        // Pre-turn notification for forked thread arrives alongside another thread's event.
+        t.observe_at(
+            "thread/tokenUsage/updated",
+            &json!({"threadId":"fork-thread","turnId":"parent-turn","tokenUsage":{"total":{"outputTokens":109_000}}}),
+            0,
+        );
+        t.observe_at(
+            "thread/tokenUsage/updated",
+            &json!({"threadId":"other-thread","turnId":"other-turn","tokenUsage":{"total":{"outputTokens":50}}}),
+            0,
+        );
+        t.begin("fork-thread", false);
+        t.acknowledge(Some("fork-turn-1"));
+        t.observe_at(
+            "thread/tokenUsage/updated",
+            &json!({"threadId":"fork-thread","turnId":"fork-turn-1","tokenUsage":{"total":{"outputTokens":109_240}}}),
+            2000,
+        );
+        let sample = t.finish_at(false, 4400).unwrap();
+        assert_eq!(sample["outputTokens"], 240);
+        assert_eq!(sample["elapsedMs"], 4400);
+        assert!(sample["turnReason"].is_null());
+
+        // Even if fresh=true were erroneously used with 109k tokens in 4.4s, implausible gate blocks it.
+        let mut spiked = tracker(true);
+        spiked.observe_at("thread/tokenUsage/updated", &usage(109_240, 240), 1000);
+        let rejected = spiked.finish_at(false, 4400).unwrap();
+        assert_eq!(rejected["turnReason"], "implausible");
+    }
+
+    #[test]
+    fn tool_execution_and_parked_user_waits_are_subtracted_from_model_ms() {
+        let mut t = tracker(true);
+        t.observe_at("thread/tokenUsage/updated", &usage(40, 40), 1000);
+        // Parallel tool calls [1000, 4000] and [2000, 6000] => union 5000ms.
+        t.observe_at(
+            "item/started",
+            &json!({"threadId":"thread","turnId":"turn","item":{"id":"cmd_1","type":"commandExecution"}}),
+            1000,
+        );
+        t.observe_at(
+            "item/started",
+            &json!({"threadId":"thread","turnId":"turn","item":{"id":"mcp_1","type":"mcpToolCall"}}),
+            2000,
+        );
+        t.observe_at(
+            "item/completed",
+            &json!({"threadId":"thread","turnId":"turn","item":{"id":"cmd_1","type":"commandExecution"}}),
+            4000,
+        );
+        t.observe_at(
+            "item/completed",
+            &json!({"threadId":"thread","turnId":"turn","item":{"id":"mcp_1","type":"mcpToolCall"}}),
+            6000,
+        );
+        // Parked requestUserInput wait [7000, 17000] => 10000ms.
+        t.park_wait_at("req_42", 7000);
+        t.observe_at(
+            "serverRequest/resolved",
+            &json!({"threadId":"thread","requestId":"req_42"}),
+            17000,
+        );
+        t.observe_at("thread/tokenUsage/updated", &usage(120, 80), 19000);
+        let report = t.finish_at(false, 20000).unwrap();
+        // wall=20000, tool=5000, wait=10000 => model=5000ms!
+        assert_eq!(report["outputTokens"], 120);
+        assert_eq!(report["elapsedMs"], 5000);
+        assert_eq!(report["breakdown"]["wallMs"], 20000.0);
+        assert_eq!(report["breakdown"]["toolMs"], 5000.0);
+        assert_eq!(report["breakdown"]["waitMs"], 10000.0);
+        assert_eq!(report["breakdown"]["modelMs"], 5000.0);
+        assert!(report["turnReason"].is_null());
     }
 
     #[test]
@@ -470,6 +742,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(final_report["outputTokens"], 5);
+        assert_eq!(final_report["turnReason"], "insufficient_timing");
     }
 
     #[test]

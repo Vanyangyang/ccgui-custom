@@ -76,8 +76,10 @@ describe("context window memory", () => {
   it("shows the documented Gemini 4 API capacity without guessing subscription aliases", () => {
     const opts = { engine: "agy", model: "gemini-4-argon", usage: null };
     expect(resolveContextMaxInfo(opts)).toEqual({ max: 1_048_576, known: true });
+    expect(resolveContextMaxInfo({ ...opts, model: "gemini-4-carbon" })).toEqual({ max: 1_048_576, known: true });
     expect(resolveContextMaxInfo({ ...opts, usage: { model_context_window: 256_000 } })).toEqual({ max: 256_000, known: true });
     expect(resolveContextMaxInfo({ ...opts, model: "gemini-4-argon-high" }).known).toBe(false);
+    expect(resolveContextMaxInfo({ ...opts, model: "gemini-4-carbon-high" }).known).toBe(false);
     expect(resolveContextMaxInfo({ ...opts, model: "custom-model" }).known).toBe(false);
   });
 

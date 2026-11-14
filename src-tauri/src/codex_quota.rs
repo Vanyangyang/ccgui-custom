@@ -1,5 +1,5 @@
 //! Account quotas come from Codex's official app-server, independently of token usage.
-//! Cache keys use auth metadata and normalized configuration hashes; credentials never leave the CLI.
+//! Cache keys use local account identity and normalized configuration hashes; credentials are never persisted or logged.
 use crate::claude_quota::{QuotaAccount, QuotaWindow, QuotaWindows};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -113,15 +113,42 @@ pub(crate) struct QueryResult {
 #[derive(Clone)]
 pub(crate) struct Binding {
     stamp: String,
+    legacy_stamp: Option<String>,
+    auth_identity: Option<String>,
     provider: Option<String>,
     pub home: PathBuf,
     pub workspace: PathBuf,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BindingStatus { Current, Changed, Unavailable }
+
+impl From<bool> for BindingStatus {
+    fn from(current: bool) -> Self {
+        if current { Self::Current } else { Self::Changed }
+    }
+}
+
 impl Binding {
+    pub(crate) fn status(&self) -> BindingStatus {
+        match binding(self.provider.as_deref(), Some(&self.workspace)) {
+            Ok(other) => self.compare(&other),
+            Err(_) => BindingStatus::Unavailable,
+        }
+    }
+
+    fn compare(&self, other: &Binding) -> BindingStatus {
+        if other.stamp == self.stamp { return BindingStatus::Current; }
+        // A partial auth/config rewrite or a route change cannot by itself
+        // prove that the previously saved account was revoked.
+        match (&self.auth_identity, &other.auth_identity) {
+            (Some(old), Some(new)) if old != new => BindingStatus::Changed,
+            _ => BindingStatus::Unavailable,
+        }
+    }
+
     pub(crate) fn current(&self) -> bool {
-        binding(self.provider.as_deref(), Some(&self.workspace))
-            .is_ok_and(|other| other.stamp == self.stamp)
+        self.status() == BindingStatus::Current
     }
 }
 
@@ -201,7 +228,7 @@ pub(crate) fn official_config(config: &Value) -> bool {
     true
 }
 
-fn stamp_file(stamp: &mut String, path: &Path) -> Result<(), &'static str> {
+fn stamp_file_metadata(stamp: &mut String, path: &Path) -> Result<(), &'static str> {
     stamp.push_str(&path.to_string_lossy());
     match std::fs::metadata(path) {
         Ok(meta) if meta.is_file() => {
@@ -211,6 +238,64 @@ fn stamp_file(stamp: &mut String, path: &Path) -> Result<(), &'static str> {
         _ => return Err("auth_metadata_unavailable"),
     }
     Ok(())
+}
+
+/// Extract only a stable local account identity. Tokens and claims stay in
+/// memory; unsupported authentication formats retain the older metadata key.
+fn stable_auth_identity(bytes: &[u8]) -> Option<String> {
+    use base64::Engine;
+
+    let auth: Value = serde_json::from_slice(bytes).ok()?;
+    if auth.get("auth_mode").is_some_and(|v| !v.is_null() && v.as_str() != Some("chatgpt"))
+        || ["OPENAI_API_KEY", "agent_identity", "personal_access_token", "bedrock_api_key", "bedrock_access_keys"]
+            .iter().any(|key| auth.get(*key).is_some_and(|v| !v.is_null()))
+        || !auth.pointer("/tokens/access_token").and_then(Value::as_str).is_some_and(|v| !v.is_empty())
+    {
+        return None;
+    }
+    let valid_identity = |s: &str| !s.is_empty() && s.len() <= 1024 && s.trim() == s && !s.chars().any(char::is_control);
+    let account = auth.pointer("/tokens/account_id").and_then(Value::as_str).filter(|s| valid_identity(s))?;
+    let token = auth.pointer("/tokens/id_token").and_then(Value::as_str)?;
+    let mut parts = token.split('.');
+    let header = parts.next()?;
+    let payload = parts.next()?;
+    let signature = parts.next()?;
+    if header.is_empty() || payload.is_empty() || signature.is_empty() || parts.next().is_some() { return None; }
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload.trim_end_matches('=')).ok()?;
+    let claims: Value = serde_json::from_slice(&decoded).ok()?;
+    let subject = claims.get("sub").and_then(Value::as_str).filter(|s| valid_identity(s))?;
+    let mut hash = Sha256::new();
+    hash.update(b"ccgui-codex-account-v1\0");
+    for value in [account, subject] {
+        hash.update((value.len() as u64).to_be_bytes());
+        hash.update(value.as_bytes());
+    }
+    Some(format!("{:x}", hash.finalize()))
+}
+
+/// Return the old metadata fragment as well, so an exactly matching cache can
+/// be migrated. Check the file on both sides of the read to avoid associating
+/// one account's old metadata with a different account during a switch.
+fn stamp_file(stamp: &mut String, path: &Path) -> Result<(String, Option<String>), &'static str> {
+    use std::io::Read;
+
+    const MAX_AUTH_BYTES: u64 = 128 * 1024;
+    let mut legacy = String::new();
+    stamp_file_metadata(&mut legacy, path)?;
+    let mut bytes = Vec::new();
+    let read = std::fs::File::open(path)
+        .and_then(|file| file.take(MAX_AUTH_BYTES + 1).read_to_end(&mut bytes));
+    let mut after = String::new();
+    stamp_file_metadata(&mut after, path)?;
+    if legacy != after { return Err("auth_metadata_unavailable"); }
+    let identity = read.ok().filter(|_| bytes.len() <= MAX_AUTH_BYTES as usize)
+        .and_then(|_| stable_auth_identity(&bytes));
+    if let Some(identity) = identity.as_ref() {
+        stamp.push_str(&format!("{}|identity-v1:{identity};", path.to_string_lossy()));
+    } else {
+        stamp.push_str(&legacy);
+    }
+    Ok((legacy, identity))
 }
 
 fn stamp_config(stamp: &mut String, path: &Path) -> Result<(), &'static str> {
@@ -280,18 +365,27 @@ pub(crate) fn binding(
     }
     let workspace = std::fs::canonicalize(workspace).map_err(|_| "unsupported_auth_context")?;
     let mut stamp = format!("{}|{}|", home.display(), workspace.display());
-    stamp_file(&mut stamp, &home.join("auth.json"))?;
-    stamp_config(&mut stamp, &home.join("config.toml"))?;
+    let mut legacy_stamp = stamp.clone();
+    let (legacy_auth, auth_identity) = stamp_file(&mut stamp, &home.join("auth.json"))?;
+    legacy_stamp.push_str(&legacy_auth);
+    let mut config_stamp = String::new();
+    stamp_config(&mut config_stamp, &home.join("config.toml"))?;
     // Project config can override the native account route. Include all ancestors
     // so changing/removing an identity-relevant override invalidates old snapshots immediately.
     for ancestor in workspace.ancestors() {
         let config = ancestor.join(".codex/config.toml");
         if config != home.join("config.toml") {
-            stamp_config(&mut stamp, &config)?;
+            stamp_config(&mut config_stamp, &config)?;
         }
     }
+    stamp.push_str(&config_stamp);
+    legacy_stamp.push_str(&config_stamp);
+    let stamp = format!("{:x}", Sha256::digest(stamp.as_bytes()));
+    let legacy_stamp = format!("{:x}", Sha256::digest(legacy_stamp.as_bytes()));
     Ok(Binding {
-        stamp: format!("{:x}", Sha256::digest(stamp.as_bytes())),
+        legacy_stamp: (legacy_stamp != stamp).then_some(legacy_stamp),
+        auth_identity,
+        stamp,
         provider: provider.map(str::to_owned),
         home,
         workspace,
@@ -469,6 +563,7 @@ pub struct CodexQuotaState {
     persistence_path: Option<PathBuf>,
     persistence_enabled: std::sync::atomic::AtomicBool,
     persistence_loaded: std::sync::atomic::AtomicBool,
+    persistence_dirty: std::sync::atomic::AtomicBool,
     persistence_warned: std::sync::atomic::AtomicBool,
 }
 pub static STATE: LazyLock<Arc<CodexQuotaState>> =
@@ -528,18 +623,29 @@ impl CodexQuotaState {
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         self.restore(&mut cache);
         cache.remove(stamp);
-        self.persist(&cache);
+        self.persist_revocation(&cache);
     }
 
     fn register_binding(&self, binding: &Binding) {
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         self.restore(&mut cache);
+        // Only the exact old key for the current auth file and config is safe
+        // to migrate. An email match alone cannot identify a workspace/account.
+        let migrated = if !cache.contains_key(&binding.stamp) {
+            binding.legacy_stamp.as_ref().and_then(|old| cache.remove(old)).is_some_and(|entry| {
+                cache.insert(binding.stamp.clone(), entry);
+                true
+            })
+        } else {
+            false
+        };
         if cache.len() >= MAX_BINDINGS && !cache.contains_key(&binding.stamp) {
             if let Some(oldest) = cache.iter().min_by_key(|(_, entry)| entry.last_attempt).map(|(key, _)| key.clone()) {
                 cache.remove(&oldest);
             }
         }
         cache.entry(binding.stamp.clone()).or_default().binding = Some(binding.clone());
+        if migrated { self.persist(&cache); }
     }
 
     fn notify(&self) {
@@ -553,23 +659,50 @@ impl CodexQuotaState {
         }
     }
 
-    fn cached(&self, stamp: &str, current: impl Fn() -> bool) -> CodexQuotaSnapshot {
-        if !current() {
-            self.invalidate_account_at(stamp, now_millis());
-            return CodexQuotaSnapshot::unavailable("auth_changed");
+    fn cached<S: Into<BindingStatus>>(&self, stamp: &str, current: impl Fn() -> S) -> CodexQuotaSnapshot {
+        match current().into() {
+            BindingStatus::Current => {}
+            BindingStatus::Changed => {
+                self.invalidate_account_at(stamp, now_millis());
+                return CodexQuotaSnapshot::unavailable("auth_changed");
+            }
+            BindingStatus::Unavailable => return CodexQuotaSnapshot::unavailable("auth_metadata_unavailable"),
         }
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         self.restore(&mut cache);
+        if self.persistence_dirty.load(std::sync::atomic::Ordering::Relaxed) {
+            self.persist(&cache);
+        }
         let mut result = cache.get(stamp)
             .and_then(|entry| entry.snapshot.clone())
             .unwrap_or_else(|| CodexQuotaSnapshot::unavailable("not_loaded"));
         drop(cache);
         result.expire(now_seconds());
-        if !current() {
-            self.invalidate_account_at(stamp, now_millis());
-            return CodexQuotaSnapshot::unavailable("auth_changed");
+        match current().into() {
+            BindingStatus::Current => {}
+            BindingStatus::Changed => {
+                self.invalidate_account_at(stamp, now_millis());
+                return CodexQuotaSnapshot::unavailable("auth_changed");
+            }
+            BindingStatus::Unavailable => return CodexQuotaSnapshot::unavailable("auth_metadata_unavailable"),
         }
         result
+    }
+
+    fn query_binding_failure(&self, stamp: &str, status: BindingStatus) -> Option<CodexQuotaSnapshot> {
+        match status {
+            BindingStatus::Current => None,
+            BindingStatus::Changed => {
+                self.discard_binding(stamp);
+                Some(CodexQuotaSnapshot::unavailable("auth_changed"))
+            }
+            BindingStatus::Unavailable => {
+                if let Some(entry) = self.cache.lock().unwrap_or_else(|p| p.into_inner()).get_mut(stamp) {
+                    entry.last_attempt = None;
+                }
+                Some(CodexQuotaSnapshot::unavailable("auth_metadata_unavailable"))
+            }
+        }
     }
 
     #[cfg(test)]
@@ -616,17 +749,14 @@ impl CodexQuotaState {
         self.notify();
     }
 
-    async fn read_bound(
+    async fn read_bound<S: Into<BindingStatus>>(
         &self,
         stamp: &str,
         query: impl std::future::Future<Output = Result<QueryResult, &'static str>>,
-        current: impl Fn() -> bool,
+        current: impl Fn() -> S,
     ) -> CodexQuotaSnapshot {
         let _query = self.query.lock().await;
-        if !current() {
-            self.discard_binding(stamp);
-            return CodexQuotaSnapshot::unavailable("auth_changed");
-        }
+        if let Some(failure) = self.query_binding_failure(stamp, current().into()) { return failure; }
         let (revision, auth_revision, query_started_at_ms) = {
             let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
             self.restore(&mut cache);
@@ -646,21 +776,26 @@ impl CodexQuotaState {
         let result = tokio::time::timeout(Duration::from_secs(25), query)
             .await
             .unwrap_or(Err("query_timeout"));
-        if !current() {
-            self.discard_binding(stamp);
-            return CodexQuotaSnapshot::unavailable("auth_changed");
-        }
+        if let Some(failure) = self.query_binding_failure(stamp, current().into()) { return failure; }
         let snapshot = {
             let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-            if !current() {
-                cache.remove(stamp);
-                self.persist(&cache);
-                return CodexQuotaSnapshot::unavailable("auth_changed");
+            match current().into() {
+                BindingStatus::Current => {}
+                BindingStatus::Changed => {
+                    cache.remove(stamp);
+                    self.persist_revocation(&cache);
+                    return CodexQuotaSnapshot::unavailable("auth_changed");
+                }
+                BindingStatus::Unavailable => {
+                    if let Some(entry) = cache.get_mut(stamp) { entry.last_attempt = None; }
+                    return CodexQuotaSnapshot::unavailable("auth_metadata_unavailable");
+                }
             }
             let entry = cache.entry(stamp.to_owned()).or_default();
             if entry.auth_revision != auth_revision {
                 return CodexQuotaSnapshot::unavailable("auth_changed");
             }
+            let mut revoke_persisted = false;
             let snapshot = match result {
                 Ok(result) => {
                     let new_identity = identity_hash(result.account.as_ref());
@@ -668,6 +803,7 @@ impl CodexQuotaState {
                         .is_some_and(|(old, new)| old != new);
                     if identity_changed {
                         entry.snapshot = None;
+                        revoke_persisted = true;
                     }
                     if new_identity.is_some() { entry.identity_hash = new_identity; }
                     let account = merge_account(entry.snapshot.as_ref().and_then(|s| s.account.as_ref()), result.account);
@@ -734,6 +870,7 @@ impl CodexQuotaState {
                 {
                     entry.verified = false;
                     entry.identity_hash = None;
+                    revoke_persisted = true;
                     entry.observed_at_ms = entry.observed_at_ms.max(query_started_at_ms);
                     entry.auth_checked_at_ms = query_started_at_ms;
                     CodexQuotaSnapshot::unavailable(code)
@@ -752,16 +889,14 @@ impl CodexQuotaState {
             };
             entry.snapshot = Some(snapshot.clone());
             entry.revision = entry.revision.wrapping_add(1);
-            self.persist(&cache);
+            if revoke_persisted { self.persist_revocation(&cache); }
+            else { self.persist(&cache); }
             snapshot
         };
         self.notify();
         let mut snapshot = snapshot;
         snapshot.expire(now_seconds());
-        if !current() {
-            self.discard_binding(stamp);
-            return CodexQuotaSnapshot::unavailable("auth_changed");
-        }
+        if let Some(failure) = self.query_binding_failure(stamp, current().into()) { return failure; }
         snapshot
     }
 
@@ -787,7 +922,7 @@ impl CodexQuotaState {
                 entry.revision = entry.revision.wrapping_add(1);
                 entry.last_attempt = None;
             }
-            self.persist(&cache);
+            self.persist_revocation(&cache);
         }
         self.notify();
     }
@@ -849,16 +984,26 @@ impl CodexQuotaState {
     }
 
     fn ingest_worker_payload(&self, payload: &Value, current: impl Fn(&Binding) -> bool) {
-        let Ok(observation) = serde_json::from_value::<Observation>(payload.clone()) else {
+        let Ok(mut observation) = serde_json::from_value::<Observation>(payload.clone()) else {
             return;
         };
-        let binding = self
-            .cache
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(&observation.stamp)
-            .and_then(|entry| entry.binding.clone());
+        let binding = {
+            let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+            cache.get(&observation.stamp).and_then(|entry| entry.binding.clone()).or_else(|| {
+                // A worker started before an update can still emit the former
+                // metadata key. Accept only its post-verification observations
+                // for the exact old binding, never an old journal replay.
+                cache.values().find_map(|entry| {
+                    let binding = entry.binding.as_ref()?;
+                    (entry.verified
+                        && observation.observed_at_ms >= entry.auth_checked_at_ms
+                        && binding.legacy_stamp.as_deref() == Some(observation.stamp.as_str()))
+                        .then(|| binding.clone())
+                })
+            })
+        };
         if let Some(binding) = binding {
+            observation.stamp = binding.stamp.clone();
             self.accept_observation(observation, || current(&binding));
         }
     }
@@ -917,16 +1062,16 @@ pub async fn codex_quota_read(
         Ok(binding) => binding,
         Err(code) => return Ok(CodexQuotaSnapshot::unavailable(code)),
     };
-    if cache_only.unwrap_or(false) {
-        return Ok(state.cached(&binding.stamp, || binding.current()));
-    }
     state.register_binding(&binding);
+    if cache_only.unwrap_or(false) {
+        return Ok(state.cached(&binding.stamp, || binding.status()));
+    }
     Ok(tokio::time::timeout(
         Duration::from_secs(29),
         state.read_bound(
             &binding.stamp,
             crate::engine::codex_app::read_account_quota(&binding),
-            || binding.current(),
+            || binding.status(),
         ),
     )
     .await
@@ -1089,6 +1234,55 @@ mod tests {
         let mut missing = String::new();
         stamp_config(&mut missing, &path).unwrap();
         assert_ne!(empty, missing);
+    }
+
+    #[test]
+    fn codex_quota_auth_stamp_survives_token_refresh_but_isolates_identity() {
+        use base64::Engine;
+
+        let path = std::env::temp_dir().join(format!("ccgui-quota-auth-{}.json", uuid::Uuid::new_v4()));
+        let stamp = |account: &str, subject: &str, token: &str| {
+            let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(serde_json::to_vec(&json!({"sub": subject})).unwrap());
+            std::fs::write(&path, serde_json::to_vec(&json!({
+                "auth_mode": "chatgpt",
+                "tokens": {"account_id": account, "access_token": token,
+                    "id_token": format!("header.{claims}.signature")}
+            })).unwrap()).unwrap();
+            let mut result = String::new();
+            stamp_file(&mut result, &path).unwrap();
+            result
+        };
+        let first = stamp("workspace-a", "user-a", "old-token");
+        let refreshed = stamp("workspace-a", "user-a", "a-much-longer-refreshed-token");
+        let other_workspace = stamp("workspace-b", "user-a", "a-much-longer-refreshed-token");
+        let other_user = stamp("workspace-a", "user-b", "a-much-longer-refreshed-token");
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(first, refreshed, "refreshing tokens must not discard the same account's cache");
+        assert_ne!(first, other_workspace);
+        assert_ne!(first, other_user);
+        for secret in ["workspace-a", "user-a", "old-token"] {
+            assert!(!first.contains(secret));
+        }
+    }
+
+    #[test]
+    fn codex_quota_stable_auth_identity_rejects_unsupported_or_incomplete_auth() {
+        use base64::Engine;
+        let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"sub":"user-a"}"#);
+        let valid = json!({"auth_mode":"chatgpt", "tokens": {
+            "account_id":"workspace-a", "access_token":"secret", "id_token":format!("header.{claims}.signature")
+        }});
+        assert!(stable_auth_identity(&serde_json::to_vec(&valid).unwrap()).is_some());
+        let mut variants = Vec::new();
+        let mut api_key = valid.clone(); api_key["OPENAI_API_KEY"] = json!("key"); variants.push(api_key);
+        let mut other_mode = valid.clone(); other_mode["auth_mode"] = json!("apikey"); variants.push(other_mode);
+        let mut missing_account = valid.clone(); missing_account["tokens"]["account_id"] = Value::Null; variants.push(missing_account);
+        let mut missing_access = valid.clone(); missing_access["tokens"]["access_token"] = Value::Null; variants.push(missing_access);
+        let mut invalid_claims = valid.clone(); invalid_claims["tokens"]["id_token"] = json!("not-a-jwt"); variants.push(invalid_claims);
+        for variant in variants {
+            assert!(stable_auth_identity(&serde_json::to_vec(&variant).unwrap()).is_none());
+        }
     }
 
     #[tokio::test]
@@ -1301,10 +1495,25 @@ mod tests {
     pub(super) fn fixture_binding() -> Binding {
         Binding {
             stamp: format!("{:x}", Sha256::digest(b"fixture-metadata")),
+            legacy_stamp: None,
+            auth_identity: Some(format!("{:x}", Sha256::digest(b"fixture-account"))),
             provider: None,
             home: PathBuf::from("fixture-home"),
             workspace: PathBuf::from("fixture-workspace"),
         }
+    }
+
+    #[test]
+    fn binding_distinguishes_changed_identity_from_unavailable_metadata() {
+        let original = fixture_binding();
+        let mut other = original.clone();
+        assert!(matches!(original.compare(&other), BindingStatus::Current));
+        other.stamp = "different-route".into();
+        assert!(matches!(original.compare(&other), BindingStatus::Unavailable));
+        other.auth_identity = None;
+        assert!(matches!(original.compare(&other), BindingStatus::Unavailable));
+        other.auth_identity = Some("different-account".into());
+        assert!(matches!(original.compare(&other), BindingStatus::Changed));
     }
 
     #[tokio::test]
@@ -1340,6 +1549,29 @@ mod tests {
             assert!(matches!(observation(&binding, "account/updated", &params).unwrap().update, ObservationUpdate::AccountChanged));
         }
         assert!(!account_notification_invalidates(&json!({"authMode":"chatgpt"})));
+    }
+
+    #[tokio::test]
+    async fn prior_worker_binding_accepts_only_post_verification_observations() {
+        let host = CodexQuotaState::default();
+        let mut binding = fixture_binding();
+        let old_stamp = format!("{:x}", Sha256::digest(b"legacy-worker-binding"));
+        binding.legacy_stamp = Some(old_stamp.clone());
+        host.register_binding(&binding);
+        let payload = |observed_at_ms, percentage| serde_json::to_value(Observation {
+            stamp: old_stamp.clone(), observed_at_ms,
+            update: ObservationUpdate::Limits { windows: query(percentage).windows },
+        }).unwrap();
+        host.ingest_worker_payload(&payload(now_millis(), 90.0), |_| true);
+        assert_eq!(host.cached(&binding.stamp, || true).error_code, Some("not_loaded"));
+        host.read_bound(&binding.stamp, async { Ok(query(10.0)) }, || true).await;
+        let checked = host.cache.lock().unwrap()[&binding.stamp].auth_checked_at_ms;
+        host.ingest_worker_payload(&payload(checked - 1, 70.0), |_| true);
+        assert_eq!(host.cached(&binding.stamp, || true).windows.seven_day.unwrap().used_percentage, 10.0);
+        host.ingest_worker_payload(&payload(now_millis(), 40.0), |_| false);
+        assert_eq!(host.cached(&binding.stamp, || true).windows.seven_day.unwrap().used_percentage, 10.0);
+        host.ingest_worker_payload(&payload(now_millis(), 50.0), |_| true);
+        assert_eq!(host.cached(&binding.stamp, || true).windows.seven_day.unwrap().used_percentage, 50.0);
     }
 
     #[tokio::test]

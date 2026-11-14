@@ -6,7 +6,7 @@ import { Button } from "@/components/base/buttons/button";
 import { useGitStore } from "@/features/git/store";
 import { ipc, type GitStatus, type Message, type TodoItem } from "@/lib/ipc";
 import { useChatStore } from "../store";
-import { applyConfirmedNativeTaskStop, readNativeTaskStopResult } from "../store/native-tasks";
+import { applyConfirmedNativeTaskStop, readNativeTaskStopResult, supportsNativeTasks } from "../store/native-tasks";
 import {
   deriveAgentTaskSteps,
   deriveNativeTaskSteps,
@@ -990,7 +990,7 @@ export const RunStatusStrip = memo(function RunStatusStrip({
   );
   const nativeTasks = useChatStore((s) => sessionKey ? s.bySession[sessionKey]?.nativeTasks : undefined);
   const nativeRunId = useChatStore((s) => sessionKey ? s.bySession[sessionKey]?.nativeTaskRunId : undefined);
-  const native = engine === "claude" && nativeTasks !== undefined;
+  const native = supportsNativeTasks(engine) && nativeTasks !== undefined;
   const allHistory = useMemo(
     () => (subagentHistory.length ? [...subagentHistory, ...messages] : messages),
     [subagentHistory, messages],

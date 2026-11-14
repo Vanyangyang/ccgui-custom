@@ -9,6 +9,7 @@ import { sessionKey } from "@/features/chat/store/persistence";
 import i18n from "@/lib/i18n";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { AssistantNoticeSource } from "./types";
+import { resolvePluginNoticeDestination } from "./plugin-destination";
 
 export interface AssistantNoticeFocusRequest { id: string; documentId: string; noticeId: string; engine: string; sessionId: string; workspacePath: string; action: "open" | "draft"; text?: string }
 interface HostChatState { openTabs: ActiveSession[]; active: ActiveSession | null; sessions: Pick<SessionMeta, "engine" | "sessionId" | "workspacePath" | "customTitle" | "title">[]; selectSession(engine: string, id: string, workspace: string): Promise<void> }
@@ -20,6 +21,7 @@ export interface AssistantNoticesRuntimeDependencies {
   insertDraft(sessionKey: string, text: string): void;
   language: { language?: string; on?(event: "languageChanged", callback: () => void): unknown; off?(event: "languageChanged", callback: () => void): unknown };
   windowLabel?(): string | undefined;
+  resolveDestination: typeof resolvePluginNoticeDestination;
 }
 const runtimes = new WeakMap<Document, () => void>();
 const validId = (id: unknown): id is string => typeof id === "string" && /^[A-Za-z0-9_-]{1,160}$/.test(id);
@@ -50,7 +52,8 @@ export function assistantNoticeSources(state: HostChatState): { sources: Assista
 export function startAssistantNoticesRuntime(overrides: Partial<AssistantNoticesRuntimeDependencies> = {}): () => void {
   const deps: AssistantNoticesRuntimeDependencies = { web: isWeb, invoke, listen, store: useChatStore,
     visible: chatHostVisible, subscribePresence: subscribeChatHostPresence, dismiss: dismissCenterSurfaces, window, document,
-    insertDraft: insertSideAnswer, language: i18n, windowLabel: () => { try { return getCurrentWindow().label; } catch { return undefined; } }, ...overrides };
+    insertDraft: insertSideAnswer, language: i18n, resolveDestination: resolvePluginNoticeDestination,
+    windowLabel: () => { try { return getCurrentWindow().label; } catch { return undefined; } }, ...overrides };
   if (deps.web) return () => {};
   if (/^#\/(assistant-notices|pet-overlay)(?:[/?]|$)/.test(deps.window.location.hash)
     || ["assistant-notices", "pet-overlay"].includes(deps.windowLabel?.() ?? "")) return () => {};
@@ -61,6 +64,7 @@ export function startAssistantNoticesRuntime(overrides: Partial<AssistantNotices
   let connecting = false;
   let lastSync: Promise<unknown> = Promise.resolve();
   let activeFocus: string | null = null;
+  let focusAbort: AbortController | null = null;
   const recent = new Map<string, number>();
   const timers = new Set<ReturnType<typeof setTimeout>>();
   const frames = new Map<number, () => void>();
@@ -103,8 +107,8 @@ export function startAssistantNoticesRuntime(overrides: Partial<AssistantNotices
   const observer = new MutationObserver(() => { const next = attentive(); if (next !== lastAttentive) { lastAttentive = next; changed(); } });
   observer.observe(deps.document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ["aria-modal", "open", "hidden", "aria-hidden"] });
   const heartbeat = setInterval(() => { void connect(); schedule(false); }, 10_000);
-  function ack(requestId: string, success: boolean) {
-    if (!disposed) void deps.invoke("assistant_notices_focus_ack", { documentId, requestId, success }).catch(() => {});
+  function ack(requestId: string, success: boolean, targetWindowId?: string) {
+    if (!disposed) void deps.invoke("assistant_notices_focus_ack", { documentId, requestId, success, ...(targetWindowId ? { targetWindowId } : {}) }).catch(() => {});
   }
   async function focus(request: AssistantNoticeFocusRequest) {
     if (disposed || !documentId || !request || request.documentId !== documentId || !validId(request.id)) return;
@@ -118,9 +122,25 @@ export function startAssistantNoticesRuntime(overrides: Partial<AssistantNotices
     if (activeFocus) { ack(request.id, false); return; }
     activeFocus = request.id;
     let expired = false;
-    const expiry = setTimeout(() => { timers.delete(expiry); expired = true; ack(request.id, false); }, 6500);
+    const abort = new AbortController();
+    focusAbort = abort;
+    const expiry = setTimeout(() => { timers.delete(expiry); expired = true; abort.abort(); ack(request.id, false); }, 6500);
     timers.add(expiry);
     try {
+      const source = { engine: request.engine, sessionId: request.sessionId, workspacePath: request.workspacePath };
+      const destination = await deps.resolveDestination(source);
+      if (disposed || expired) return;
+      if (destination) {
+        const delivered = await destination.deliver({ source, requestId: destination.requestId, noticeId: request.noticeId,
+          action: request.action, ...(request.text !== undefined ? { text: request.text } : {}), signal: abort.signal });
+        if (disposed || expired) return;
+        if (!delivered) { ack(request.id, false); return; }
+        const target = await destination.present();
+        if (disposed || expired) return;
+        ack(request.id, Date.now() - now < 6500 && (!!target.windowId || deps.document.hasFocus()), target.windowId);
+        schedule(true);
+        return;
+      }
       deps.dismiss();
       deps.window.location.hash = "#/";
       await deps.store.getState().selectSession(request.engine, request.sessionId, request.workspacePath);
@@ -144,7 +164,7 @@ export function startAssistantNoticesRuntime(overrides: Partial<AssistantNotices
       ack(request.id, success && Date.now() - now < 6500);
       schedule(true);
     } catch { if (!expired) ack(request.id, false); }
-    finally { clearTimeout(expiry); timers.delete(expiry); if (activeFocus === request.id) activeFocus = null; }
+    finally { abort.abort(); if (focusAbort === abort) focusAbort = null; clearTimeout(expiry); timers.delete(expiry); if (activeFocus === request.id) activeFocus = null; }
   }
   async function connect(initialAttention = false) {
     if (disposed || connecting || stopFocus) return;
@@ -163,6 +183,7 @@ export function startAssistantNoticesRuntime(overrides: Partial<AssistantNotices
   function stopRuntime() {
     if (disposed) return;
     disposed = true; dirty = false;
+    focusAbort?.abort(); focusAbort = null;
     if (runtimes.get(deps.document) === stopRuntime) runtimes.delete(deps.document);
     clearInterval(heartbeat); timers.forEach(clearTimeout); timers.clear();
     frames.forEach((resolve, frame) => { deps.window.cancelAnimationFrame(frame); resolve(); }); frames.clear();

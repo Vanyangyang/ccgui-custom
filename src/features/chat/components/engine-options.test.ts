@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it } from "vitest";
 import { filterEngineOptions, orderEngineOptions } from "./engine-options";
 import type { EngineInfo } from "@/lib/ipc";

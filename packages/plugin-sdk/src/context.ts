@@ -5,6 +5,7 @@ import type { ComposerSlotId, SessionMenuTarget } from "./registry";
 import type { PluginDetachedSurfaceDefinition } from "./detached-surface";
 import type { HostConversationsApi, ConversationViewComponent, HostImagesApi } from "./conversations";
 import type { HostMemoryExtractionApi } from "./memory-extraction";
+import type { HostHandoffApi } from "./handoff";
 
 /**
  * PluginContext（plan §5.2）：插件唯一能力门面。宿主 runtime/context.ts
@@ -101,6 +102,8 @@ export interface HostChatActivationEvent {
 }
 
 export interface PluginContext {
+  /** Host /handoff compression of supplied excerpts; desktop owner, host:chat (0.3.29). */
+  handoff: HostHandoffApi;
   /** Persistent read-only native discussions; requires host:chat. */
   conversations: HostConversationsApi & { View: ConversationViewComponent };
   /** Durable host-managed plugin image attachments; requires host:chat or host:tasks (0.3.23). */
@@ -373,15 +376,22 @@ export interface PluginContext {
    * Declared write paths order conflicting requests (unknown = whole
    * workspace); they are not an OS sandbox. See ./tasks.ts. */
   tasks: {
-    /** Attach only this plugin's initial owned task request to its proven native coordinator (0.3.24). */
+    /** Project this plugin's proven native coordinator from submit or attachConversation. */
     conversation(requestId: string): Promise<import("./task-conversations").HostTaskConversationSnapshot>;
     /** Durable exact-session input CAS; received means native accepted, never applied. */
     sendMessage(request: import("./task-conversations").HostTaskMessageRequest): Promise<import("./task-conversations").HostTaskMessageReceipt>;
     messageReceipt(conversationRequestId: string, requestId: string): Promise<import("./task-conversations").HostTaskMessageReceipt | null>;
     cancelMessage(conversationRequestId: string, requestId: string): Promise<import("./task-conversations").HostTaskMessageReceipt | null>;
+    /** 0.3.30, capability immediateMessages: prioritize the original queued input.
+     * Uses the selected receipt's inputRevision; queued is not delivery proof.
+     * May yield the current reply, without stopping managed descendants. */
+    sendMessageNow(conversationRequestId: string, requestId: string, expectedInputRevision: number): Promise<import("./task-conversations").HostTaskMessageReceipt | null>;
     /** Cancels pending inputs and requests stop of the exact coordinator and its real managed descendants. */
     stopConversation(requestId: string): Promise<import("./task-conversations").HostTaskConversationSnapshot>;
     conversationAction(requestId: string, action: import("./task-conversations").HostTaskConversationAction): Promise<import("./task-conversations").HostTaskConversationSnapshot | void>;
+    /** Read-only exact-source preview; never approves, cancels or sends the held request. */
+    previewCostHandoff?(request: import("./task-conversations").HostTaskCostHandoffRequest): Promise<import("./task-conversations").HostTaskCostHandoffPreview>;
+    handoffManagedChild?(request: import("./task-conversations").HostTaskManagedHandoffRequest): Promise<import("./task-conversations").HostTaskManagedHandoffResult>;
     onConversationEvent(callback: (snapshot: import("./task-conversations").HostTaskConversationSnapshot) => void): Disposer;
     /** Engines (with the user's defaults), registered workspaces and project organization. No credentials or settings. */
     catalog(options?: { includeModels?: boolean }): Promise<import("./tasks").HostTaskCatalog>;
@@ -395,15 +405,26 @@ export interface PluginContext {
     getPlan(requestId: string): Promise<import("./tasks").HostTaskPlanRecord | null>;
     /** Stops a running planner call; true when one was running. */
     cancelPlan(requestId: string): Promise<boolean>;
-    /** Durable acceptance before resolving; delivery continues in the background. */
+    /** Durable acceptance before resolving; delivery continues in the background.
+     * New native chats use private first-turn state on current hosts, preserving
+     * user draft text/images, per-tab choices, sidechats, modes and focus. A real
+     * conversation tab appears only after exact native identity is confirmed.
+     * Existing-session sends retain their original busy/approval guards. */
     submit(request: import("./tasks").HostTaskSubmission): Promise<import("./tasks").HostTaskReceipt>;
+    /** Exclusively associate an existing native coordinator; never sends an initial turn. */
+    attachConversation(request: import("./tasks").HostTaskAttachmentRequest): Promise<import("./tasks").HostTaskReceipt>;
     /** This plugin's receipt; null for an unknown id, never permission to resubmit under a new id. */
     receipt(requestId: string): Promise<import("./tasks").HostTaskReceipt | null>;
     /** This plugin's receipts in acceptance order. */
     list(query?: { projectId?: string; slotKey?: string; taskId?: string }): Promise<import("./tasks").HostTaskReceipt[]>;
-    /** Queued requests are withdrawn; a running turn of this request is interrupted. */
+    /** Queued requests are withdrawn; a running turn of this request is interrupted.
+     * An attached receipt has no initial turn; use stopConversation for its native coordinator. */
     cancel(requestId: string): Promise<import("./tasks").HostTaskReceipt | null>;
-    /** Focus the request's conversation (user-initiated). */
+    /** User-initiated focus of the request's conversation. For a legacy shared
+     * pending-slot request, hosts may also reveal the exact native draft blocked
+     * by unsent text/images, reopening its tab without changing the draft.
+     * This does not send, cancel, clear content or bypass launch protection;
+     * hosts that cannot locate or reveal the target reject the operation. */
     open(requestId: string): Promise<void>;
     /** Prune large assistant output from a settled receipt while retaining its non-replayable tombstone and identity. */
     forget(requestId: string): Promise<boolean>;
@@ -495,6 +516,8 @@ export interface PluginContext {
     invoke<T>(command: string, args?: Record<string, unknown>): Promise<T>;
   };
   host: {
+    /** Controlled project memory reconciliation (host:memory, desktop owner). */
+    memoryReview: import("./memory-review").HostMemoryReviewApi;
     /** Wait until restored runtime ownership permits plugin I/O (SDK 0.3.18).
      * Resolves immediately during ordinary operation. Register UI/chat owners
      * synchronously in activate; await this only before starting background I/O.

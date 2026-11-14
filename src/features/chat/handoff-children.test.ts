@@ -1,7 +1,11 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import i18n from "@/lib/i18n";
 import type { LeaderBranch, LeaderIdentity, LeaderSnapshot } from "@/features/leader/types";
-import { buildHandoffChildren } from "./handoff-children";
+import {
+  buildHandoffChildren,
+  buildHandoffChildrenForSelection,
+  discoverHandoffChildren,
+} from "./handoff-children";
 
 const source: LeaderIdentity = { engine: "codex", sessionId: "root", workspacePath: "G:/project" };
 function branch(id: string, overrides: Partial<LeaderBranch> = {}): LeaderBranch {
@@ -147,5 +151,58 @@ describe("handoff children", () => {
       expect(text).not.toContain("~~~");
       expect(text).not.toContain("still running");
     }
+  });
+
+  it("discovers descendants preselected within budget and same-group siblings unselected by default", () => {
+    const branches = [
+      ...Array.from({ length: 15 }, (_, index) =>
+        branch(`d-${index}`, { updatedAt: 100 - index, result: `Descendant ${index}` }),
+      ),
+      branch("archived-sub", { sessionId: "session-archived-sub" }),
+    ];
+    const snapshot: LeaderSnapshot = {
+      leaders: [],
+      branches,
+      archivedGroups: [
+        {
+          root: { engine: "codex", sessionId: "session-archived-sub", workspacePath: source.workspacePath },
+          title: "Archived Child",
+          archivedAt: 10,
+          members: [{ engine: "codex", sessionId: "session-archived-sub", workspacePath: source.workspacePath }],
+          branchIds: ["archived-sub"],
+        },
+      ],
+    };
+
+    // From root parent: 15 visible descendants (archived-sub hidden), 12 preselected
+    const fromParent = discoverHandoffChildren(snapshot, source, 0);
+    expect(fromParent.candidates).toHaveLength(15);
+    expect(fromParent.candidates.every((c) => c.relation === "descendant")).toBe(true);
+    expect(fromParent.defaultSelectedIds).toHaveLength(12);
+    expect(fromParent.candidates.filter((c) => c.defaultSelected)).toHaveLength(12);
+    expect(fromParent.candidates.some((c) => c.branch.id === "archived-sub")).toBe(false);
+
+    // Selecting previously omitted items or clearing to 0 rebuilds digest cleanly
+    const tailOnly = buildHandoffChildrenForSelection(fromParent.candidates, ["d-13", "d-14"], 0);
+    expect(tailOnly).toMatchObject({ total: 2, included: 2, omitted: 0 });
+    expect(tailOnly.block).toContain("Descendant 13");
+    expect(tailOnly.block).toContain("Descendant 14");
+    expect(tailOnly.block).not.toContain("Descendant 0");
+
+    const cleared = buildHandoffChildrenForSelection(fromParent.candidates, [], 0);
+    expect(cleared).toMatchObject({ block: "", context: "", total: 0, included: 0, omitted: 0 });
+
+    // From child d-0: excludes self, exposes remaining 14 peers as unselected siblings
+    const childIdentity: LeaderIdentity = {
+      engine: "codex",
+      sessionId: "session-d-0",
+      workspacePath: source.workspacePath,
+    };
+    const fromSibling = discoverHandoffChildren(snapshot, childIdentity, 0);
+    expect(fromSibling.defaultSelectedIds).toEqual([]);
+    expect(fromSibling.initialDigest.block).toBe("");
+    expect(fromSibling.candidates).toHaveLength(14);
+    expect(fromSibling.candidates.every((c) => c.relation === "sibling" && !c.defaultSelected)).toBe(true);
+    expect(fromSibling.candidates.some((c) => c.branch.id === "d-0")).toBe(false);
   });
 });

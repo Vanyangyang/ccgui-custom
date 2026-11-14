@@ -12,6 +12,12 @@ const models = [
   { id: "claude-opus-5-5-high", label: "Claude Opus 5.5 (High)", provider: "anthropic" },
   { id: "gpt-oss-120b-medium", label: "GPT-OSS 120B (Medium)", provider: "openai" },
   { id: "custom-model", label: "Custom model" },
+  { id: "gemini-4-hydrogen-high", label: "Gemini 4 Hydrogen (High)", provider: "google" },
+  { id: "gemini-4-hydrogen-xhigh", label: "Gemini 4 Hydrogen (XHigh)", provider: "google" },
+  { id: "gemini-4-hydrogen-medium", label: "Gemini 4 Hydrogen (Medium)", provider: "google" },
+  { id: "gemini-4-hydrogen-low", label: "Gemini 4 Hydrogen (Low)", provider: "google" },
+  { id: "gemini-pro-orchestrator", label: "Orchestrator", provider: "google" },
+  { id: "gemini-pro-orchestrator-argon", label: "Orchestrator (Argon)", provider: "google" },
 ];
 
 describe("model effort selection", () => {
@@ -64,6 +70,27 @@ describe("model effort selection", () => {
     expect(container.textContent).not.toContain("GPT-OSS");
   });
 
+  it("groups Hydrogen XHigh into the same row in effort order and keeps its exact model ID", () => {
+    render("gemini-4-hydrogen-xhigh");
+    expect(container.textContent?.match(/Gemini 4 Hydrogen/g)).toHaveLength(1);
+    const choices = [...container.querySelectorAll<HTMLButtonElement>('[aria-label^="Gemini 4 Hydrogen ·"]')];
+    expect(choices.map(choice => choice.textContent)).toEqual(["低", "中", "高", "极高"]);
+    expect(choices.map(choice => choice.getAttribute("aria-checked"))).toEqual(["false", "false", "false", "true"]);
+    act(() => choices[3].click());
+    expect(onPickModel).toHaveBeenCalledWith("agy", "gemini-4-hydrogen-xhigh");
+    expect(onEffortChange).not.toHaveBeenCalled();
+    expect(effortGroup()).toBeNull();
+    expect(container.textContent).not.toContain("(XHigh)");
+  });
+
+  it("keeps an exact XHigh search as the only available Hydrogen variant", () => {
+    render("gemini-4-hydrogen-xhigh", "agy", "gemini-4-hydrogen-xhigh");
+    const choices = container.querySelectorAll('[aria-label^="Gemini 4 Hydrogen ·"]');
+    expect(choices).toHaveLength(1);
+    expect(choices[0].textContent).toBe("极高");
+    expect(choices[0].getAttribute("aria-checked")).toBe("true");
+  });
+
   it("does not invent extra levels for a single-variant model", () => {
     render("gpt-oss-120b-medium");
     const choices = container.querySelectorAll('[aria-label^="GPT-OSS 120B ·"]');
@@ -86,8 +113,31 @@ describe("model effort selection", () => {
     expect(onPickModel).not.toHaveBeenCalled();
   });
 
-  it("hides ineffective effort even when the saved encoded ID is missing from the catalog", () => {
-    render("retired-model-high");
+  it("offers Orchestrator variants as exact models without effort controls", () => {
+    for (const [id, label] of [
+      ["gemini-pro-orchestrator", "Orchestrator"],
+      ["gemini-pro-orchestrator-argon", "Orchestrator (Argon)"],
+    ] as const) {
+      onPickModel.mockClear();
+      onEffortChange.mockClear();
+      render(id);
+      const choice = [...container.querySelectorAll<HTMLButtonElement>('[role="radio"]')]
+        .find(button => button.textContent === label)!;
+      expect(choice.getAttribute("aria-checked")).toBe("true");
+      expect(effortGroup()).toBeNull();
+      act(() => choice.click());
+      expect(onPickModel).toHaveBeenCalledWith("agy", id);
+      expect(onEffortChange).not.toHaveBeenCalled();
+    }
+  });
+
+  it("keeps other engines' Orchestrator IDs independent of the native AGY policy", () => {
+    render("gemini-pro-orchestrator", "codex");
+    expect(effortGroup()).not.toBeNull();
+  });
+
+  it.each(["high", "xhigh"])("hides ineffective effort even when a saved %s ID is missing from the catalog", (effort) => {
+    render(`retired-model-${effort}`);
     expect(effortGroup()).toBeNull();
     expect(container.querySelector('[role="slider"]')).toBeNull();
   });

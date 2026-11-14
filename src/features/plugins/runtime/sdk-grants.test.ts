@@ -19,6 +19,13 @@ describe("isKnownPermission", () => {
     expect(isKnownPermission("ui:conversation-mode")).toBe(true);
   });
 
+  it("rejects the withdrawn experimental Decisions permission", () => {
+    expect(isKnownPermission("host:decisions")).toBe(false);
+    expect(KNOWN_PERMISSIONS).not.toHaveProperty("host:decisions");
+    expect(execGrantAllows(["host:decisions"], "ccgui-next")).toBe(false);
+    expect(networkGrantAllows(["host:decisions"], "https://api.openai.com/v1/decisions")).toBe(false);
+  });
+
   it("accepts well-shaped network: grants (bare host / port / port range)", () => {
     expect(isKnownPermission("network:127.0.0.1")).toBe(true);
     expect(isKnownPermission("network:example.com")).toBe(true);

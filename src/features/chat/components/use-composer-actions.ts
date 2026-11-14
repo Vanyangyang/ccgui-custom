@@ -25,7 +25,7 @@ import { recordPrompt } from "../prompt-history";
 import { clearComposerPrediction } from "../composer-prediction";
 import { IMAGE_EXTENSIONS } from "./use-composer-images";
 import { isHandoffDraft, useHandoffStore } from "../session-cleanup";
-import { crossSessionCostReview, requiresSessionSendCostApproval, useSessionSendCostGuardStore } from "../cross-session-cost";
+import { crossSessionCostReview, requiresSessionSendCostApproval, sameSessionCostWorkspace, useSessionSendCostGuardStore } from "../cross-session-cost";
 
 /** Composer submit/draft/attach/stop handlers plus the pending-@mention
  * bridge, so ChatConversation stays a composition layer. */
@@ -176,10 +176,10 @@ export function useComposerActions({
             (item) =>
               item.engine === liveActive.engine &&
               item.sessionId === liveActive.sessionId &&
-              (!item.workspacePath || item.workspacePath === liveActive.workspacePath),
+              (!item.workspacePath || sameSessionCostWorkspace(item.workspacePath, liveActive.workspacePath)),
           );
           if (activeMeta && sessionState) {
-            const review = crossSessionCostReview(activeMeta, current, "idle");
+            const review = crossSessionCostReview({ ...activeMeta, workspacePath: liveActive.workspacePath }, current, "idle");
             const guardStore = useSessionSendCostGuardStore.getState();
             if (requiresSessionSendCostApproval(review, activeMeta, sessionState) && !guardStore.isApproved(liveKey, review)) {
               const heldImages = [...images];

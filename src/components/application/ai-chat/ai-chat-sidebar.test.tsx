@@ -11,7 +11,7 @@ import { CacheHeatHoverBadge } from "./repo-tree";
 import { cacheHeatChipStyle } from "@/features/chat/session-cleanup";
 
 vi.mock("react-i18next", () => ({
-  useTranslation: () => ({ t: (key: string) => key }),
+  useTranslation: () => ({ t: (key: string, values?: { path?: string }) => values?.path ? `${key}: ${values.path}` : key }),
   // The palette's content-hit rows format relative time via the real i18n
   // instance (time.ts), which initializes i18next with this plugin.
   initReactI18next: { type: "3rdParty", init: () => {} },
@@ -54,6 +54,25 @@ async function render(repos: AiChatRepo[]) {
     root.render(<AiChatSidebar repos={repos} />);
   });
 }
+
+it.each(["workspace", "recent"])("%s rows expose grouping and execution paths on title hover, including children", async (mode) => {
+  localStorage.setItem("ccgui-next.sidebarChatListMode:v1", mode);
+  await act(async () => root.render(<AiChatSidebar activeThreadId="codex/child" repos={[{
+    id: "organized", label: "归属项目", path: "/grouped", defaultOpen: true,
+    threads: [{ id: "codex/root", label: "父任务", time: "2m", workspacePath: "/source", sidebarWorkspacePath: "/grouped",
+      children: [{ id: "codex/child", label: "子任务", time: "1m", workspacePath: "/child-source" }] }],
+  }]} />));
+  for (const [label, path] of [["父任务", "/source"], ["子任务", "/child-source"]]) {
+    const button = threadRow(label).querySelector<HTMLButtonElement>("button[data-thread-select]")!;
+    expect(button.title).toContain("归属项目");
+    expect(button.title).toContain("/grouped");
+    expect(button.title).toContain(path);
+    // The title span must not override its button with the old title-only hint.
+    const title = button.querySelector<HTMLSpanElement>("span.truncate")!;
+    expect(title.getAttribute("title") ?? button.title).toBe(button.title);
+  }
+  if (mode === "recent") expect(threadRow("子任务").textContent).not.toContain("归属项目");
+});
 
 it("keeps the Codex time badge permanently red after its old cache window expires", async () => {
   vi.useFakeTimers();

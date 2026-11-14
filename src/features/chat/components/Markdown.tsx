@@ -1,6 +1,7 @@
 import { createContext, isValidElement, lazy, memo, Suspense, useContext, useMemo, useState, type ComponentProps, type ReactNode } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { cjk } from "@streamdown/cjk";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
 import "katex/dist/katex.min.css";
@@ -34,7 +35,9 @@ import {
   toFileLink,
 } from "@/lib/fileLinks";
 
-const REMARK_PLUGINS = [remarkGfm, remarkMath, remarkDisplayMath, remarkGithubAlerts];
+// Emphasis-only CJK tokenizer (`**“文字”**中文`). It must precede remark-gfm;
+// the package's "after" autolink/strikethrough changes are deliberately omitted.
+const REMARK_PLUGINS = [...cjk.remarkPluginsBefore, remarkGfm, remarkMath, remarkDisplayMath, remarkGithubAlerts];
 const InteractiveAnswer = lazy(() => import("@/features/interactive-answer/InteractiveAnswer"));
 const InteractiveContext = createContext<{ enabled: boolean; source: string; streaming: boolean; identity?: string }>({ enabled: false, source: "", streaming: false });
 const FileOpenContext = createContext<((path: string) => void) | undefined>(undefined);

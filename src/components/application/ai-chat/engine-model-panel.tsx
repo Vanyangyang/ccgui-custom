@@ -18,7 +18,7 @@ import { OmpSpeedSection } from "./omp-speed-section";
 import { filterModels, groupModelsByProvider, type ModelGroup } from "./model-list";
 import { EFFORT_LABEL_KEYS, getEffortLevels, normalizeEffortLevel, supportsEffort, type EffortLevel } from "./effort-levels";
 import { EffortPicker } from "./effort-picker";
-import { encodedModelEffort, modelChoiceRows, type ModelChoiceRow } from "./model-effort";
+import { supportsIndependentModelEffort, modelChoiceRows, type ModelChoiceRow } from "./model-effort";
 import { CursorModelList } from "./cursor-model-picker";
 import type { CursorModel } from "./cursor-models";
 import type { MenuOption, ModelOption } from "./cli-menu";
@@ -259,13 +259,13 @@ function ModelVariantsRow({ row, selectedModelId, engineId, onPick }: {
 }) {
   const { t } = useTranslation();
   const selected = row.variants!.some(({ model }) => model.id === selectedModelId);
-  return <div className={cx("flex w-full items-center gap-2 rounded-md px-2 py-1.5", selected && "bg-background-primary-hover")}>
+  return <div className={cx("flex w-full flex-wrap items-center gap-x-2 gap-y-1 rounded-md px-2 py-1.5", selected && "bg-background-primary-hover")}>
     <EngineIcon engine={inferModelEngine(row.model.label) ?? engineId} size={18} className="shrink-0 text-foreground-icon-primary" />
-    <span className="min-w-0 flex-1" title={row.model.label}>
+    <span className="min-w-28 flex-1" title={row.model.label}>
       <span className="block truncate text-body-medium text-text-primary">{row.model.label}</span>
       {row.model.description && <span className="block truncate text-body-2-regular text-text-secondary">{row.model.description}</span>}
     </span>
-    <span className="flex shrink-0 gap-0.5">
+    <span className="ml-auto flex shrink-0 gap-0.5">
       {row.variants!.map(({ model, effort }) => <button
         key={model.id} type="button" role="radio" aria-checked={model.id === selectedModelId}
         aria-label={`${row.model.label} · ${t(EFFORT_LABEL_KEYS[effort])}`}
@@ -675,7 +675,7 @@ export function EngineModelPanel({
         onPickModel={onPickModel}
       />
       )}
-      {option.id !== "cursor" && supportsEffort(option.id) && !encodedModelEffort(option.id, selectedModelId) && (
+      {option.id !== "cursor" && supportsEffort(option.id) && supportsIndependentModelEffort(option.id, selectedModelId) && (
         <EffortFooter
           selectionScope={selectionScope}
           engineId={option.id}

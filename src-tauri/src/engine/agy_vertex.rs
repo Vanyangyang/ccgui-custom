@@ -44,7 +44,9 @@ pub(crate) const BRIDGE_PREFIX: &str = "gemini-api://ccgui-vertex/";
 /// Relative to `~/.gemini`; agy refuses absolute `--app_data_dir` values.
 const APP_DIR_NAME: &str = "antigravity-cli-vertex";
 const KEY_FILE: &str = "vertex-gemini-4-argon.txt";
-const DEFAULT_MODEL: &str = "gemini-4-argon";
+pub(crate) const DEFAULT_MODEL: &str = "gemini-4-argon";
+pub(crate) const CARBON_MODEL: &str = "gemini-4-carbon";
+const VERTEX_MODELS: [&str; 2] = [DEFAULT_MODEL, CARBON_MODEL];
 const VERTEX_HOST: &str = "aiplatform.googleapis.com";
 /// Appended to route failures: Vertex is an optional, user-owned project; the
 /// Antigravity subscription stays usable without it.
@@ -59,6 +61,18 @@ pub(crate) struct VertexTarget {
     location: String,
     pub(crate) model: String,
     api_key: String,
+}
+
+pub(crate) fn is_known_vertex_model(model: &str) -> bool {
+    VERTEX_MODELS
+        .iter()
+        .any(|known| model.eq_ignore_ascii_case(known))
+}
+
+impl VertexTarget {
+    pub(crate) fn supports_model(&self, candidate: &str) -> bool {
+        candidate.eq_ignore_ascii_case(&self.model) || is_known_vertex_model(candidate)
+    }
 }
 
 fn gemini_dir() -> PathBuf {
@@ -155,7 +169,7 @@ pub(crate) fn route(
 ) -> Result<Option<String>, String> {
     let via_channel = vertex_channel(provider)?;
     let model = model.map(str::trim).filter(|m| !m.is_empty());
-    let exact = model.is_some_and(|m| m.eq_ignore_ascii_case(DEFAULT_MODEL) || is_bridge_model(m));
+    let exact = model.is_some_and(|m| is_known_vertex_model(m) || is_bridge_model(m));
     if !via_channel && !exact {
         return Ok(None);
     }
@@ -166,14 +180,40 @@ pub(crate) fn route(
     if via_channel {
         validate_channel_target(provider, &target)?;
     }
-    let level = selected_model_effort(model, &target.model)?
+    let channel_model = if via_channel {
+        channel_target_model(provider, &target)
+    } else {
+        target.model.clone()
+    };
+    let (resolved_model, model_effort) =
+        resolve_model_and_effort(model, &channel_model, &target)?;
+    let level = model_effort
         .or(effort)
         .map(normalize_effort)
         .unwrap_or("high");
     Ok(Some(format!(
-        "{BRIDGE_PREFIX}{level}/models/{}",
-        target.model
+        "{BRIDGE_PREFIX}{level}/models/{resolved_model}"
     )))
+}
+
+fn resolve_model_and_effort<'a>(
+    model: Option<&'a str>,
+    channel_model: &str,
+    target: &VertexTarget,
+) -> Result<(String, Option<&'a str>), String> {
+    match selected_model_effort(model, channel_model) {
+        Ok(effort) => Ok((channel_model.to_string(), effort)),
+        Err(primary_err) => {
+            for known in VERTEX_MODELS {
+                if !known.eq_ignore_ascii_case(channel_model) && target.supports_model(known) {
+                    if let Ok(effort) = selected_model_effort(model, known) {
+                        return Ok((known.to_string(), effort));
+                    }
+                }
+            }
+            Err(primary_err)
+        }
+    }
 }
 
 /// Validate the requested identity before translating it to the bridge URL.
@@ -243,22 +283,67 @@ fn vertex_channel(provider: Option<&Value>) -> Result<bool, String> {
 }
 
 fn validate_channel_target(provider: Option<&Value>, target: &VertexTarget) -> Result<(), String> {
+    let mismatch_err = || {
+        format!("Vertex channel project, location and model must match the local key file; refusing a different billing target. Re-save the Vertex mount in Settings to rebuild this channel from your own key file.{NATIVE_HINT}")
+    };
+    let provider_model = provider
+        .and_then(|value| value.get("model"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|m| !m.is_empty());
+    if let Some(m) = provider_model {
+        if !safe_segment(m) || !target.supports_model(m) {
+            return Err(mismatch_err());
+        }
+    }
     let Some(raw) = provider.and_then(|value| value.get("baseUrl")).and_then(Value::as_str) else {
         return Ok(());
     };
     let url = reqwest::Url::parse(raw).map_err(|_| "Invalid Vertex channel URL")?;
     let segments: Vec<_> = url.path().trim_matches('/').split('/').collect();
-    if segments.get(1) != Some(&"projects") { return Ok(()); }
+    if segments.get(1) != Some(&"projects") {
+        return Ok(());
+    }
     let model = segments.get(8).and_then(|part| part.split(':').next());
-    if segments.len() != 9 || segments.get(3) != Some(&"locations")
-        || segments.get(5) != Some(&"publishers") || segments.get(6) != Some(&"google")
+    if segments.len() != 9
+        || segments.get(3) != Some(&"locations")
+        || segments.get(5) != Some(&"publishers")
+        || segments.get(6) != Some(&"google")
         || segments.get(7) != Some(&"models")
         || segments.get(2).copied() != Some(target.project.as_str())
         || segments.get(4).copied() != Some(target.location.as_str())
-        || model != Some(target.model.as_str()) {
-        return Err(format!("Vertex channel project, location and model must match the local key file; refusing a different billing target. Re-save the Vertex mount in Settings to rebuild this channel from your own key file.{NATIVE_HINT}"));
+        || !model.is_some_and(|m| safe_segment(m) && target.supports_model(m))
+        || provider_model.is_some_and(|pm| model != Some(pm))
+    {
+        return Err(mismatch_err());
     }
     Ok(())
+}
+
+fn channel_target_model(provider: Option<&Value>, target: &VertexTarget) -> String {
+    if let Some(m) = provider
+        .and_then(|value| value.get("model"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|m| !m.is_empty() && safe_segment(m) && target.supports_model(m))
+    {
+        return m.to_string();
+    }
+    if let Some(raw) = provider.and_then(|value| value.get("baseUrl")).and_then(Value::as_str) {
+        if let Ok(url) = reqwest::Url::parse(raw) {
+            let segments: Vec<_> = url.path().trim_matches('/').split('/').collect();
+            if segments.len() == 9 && segments.get(1) == Some(&"projects") {
+                if let Some(m) = segments
+                    .get(8)
+                    .and_then(|part| part.split(':').next())
+                    .filter(|m| safe_segment(m) && target.supports_model(m))
+                {
+                    return m.to_string();
+                }
+            }
+        }
+    }
+    target.model.clone()
 }
 
 pub(crate) fn is_bridge_model(model: &str) -> bool {
@@ -280,8 +365,13 @@ pub(crate) fn prepare_app_dir() -> Result<String, String> {
         return Err("Vertex route requires the default Antigravity home under ~/.gemini".into());
     }
     let dir = app_home();
+    prepare_settings(&native, &dir)?;
+    Ok(APP_DIR_NAME.to_string())
+}
+
+fn prepare_settings(native: &std::path::Path, dir: &std::path::Path) -> Result<(), String> {
     let mut settings = match std::fs::read_to_string(native.join("settings.json")) {
-        Ok(text) => serde_json::from_str::<Value>(&text)
+        Ok(text) => serde_json::from_str::<Value>(text.strip_prefix('\u{feff}').unwrap_or(&text))
             .ok()
             .filter(Value::is_object)
             .ok_or("Cannot prepare Vertex settings: native settings.json is not a JSON object")?,
@@ -297,7 +387,7 @@ pub(crate) fn prepare_app_dir() -> Result<String, String> {
     if std::fs::read_to_string(&path).ok().as_deref() != Some(rendered.as_str()) {
         crate::settings::atomic_write(&path, &rendered)?;
     }
-    Ok(APP_DIR_NAME.to_string())
+    Ok(())
 }
 
 /// Points the agy process at the loopback bridge and removes variables that
@@ -418,9 +508,9 @@ fn json_error(status: StatusCode, message: &str) -> Response {
 }
 
 /// `/v1beta/models/<model path>:<method>` → (effort, method).
-/// `<model path>` is `<effort>/models/<model>` for the main chat request; the
-/// helper requests agy makes (e.g. title generation) name other models and are
-/// served by the same Vertex model at the lowest effort.
+/// `<model path>` is `[ccgui-vertex/]<effort>/models/<model>` for the main chat
+/// request; the helper requests agy makes (e.g. title generation) name other
+/// models and are served by the same Vertex model at the lowest effort.
 pub(crate) fn parse_path(path: &str) -> Option<(&'static str, &str)> {
     let rest = path
         .strip_prefix("/v1beta/models/")
@@ -429,6 +519,9 @@ pub(crate) fn parse_path(path: &str) -> Option<(&'static str, &str)> {
     if !matches!(method, "streamGenerateContent" | "generateContent") {
         return None;
     }
+    let model_path = model_path
+        .strip_prefix("ccgui-vertex/")
+        .unwrap_or(model_path);
     let effort = model_path
         .split_once("/models/")
         .map(|(effort, _)| effort)
@@ -438,12 +531,65 @@ pub(crate) fn parse_path(path: &str) -> Option<(&'static str, &str)> {
     Some((effort, method))
 }
 
+pub(crate) fn parse_path_model(path: &str) -> Option<&str> {
+    let rest = path
+        .strip_prefix("/v1beta/models/")
+        .or_else(|| path.strip_prefix("/v1/models/"))?;
+    let (model_path, method) = rest.rsplit_once(':')?;
+    if !matches!(method, "streamGenerateContent" | "generateContent") {
+        return None;
+    }
+    let model_path = model_path
+        .strip_prefix("ccgui-vertex/")
+        .unwrap_or(model_path);
+    let (effort, model) = model_path.split_once("/models/")?;
+    if !matches!(effort, "low" | "medium" | "high") || !safe_segment(model) {
+        return None;
+    }
+    Some(model)
+}
+
+fn sanitize_leaked_thought_summary(text: &str) -> Option<String> {
+    if !text.contains("Thinking Process:")
+        || (!text.contains("Summarize the provided thoughts")
+            && !text.contains("Summarize the thoughts provided"))
+    {
+        return None;
+    }
+    // Keep only the trailing `**Header**\n\nSummary` after the last backtick fence
+    // if present, or empty string so leaked internal summarizer prompts are not echoed.
+    if let Some(pos) = text.rfind("`**") {
+        let tail = &text[pos + 1..];
+        if tail.starts_with("**") {
+            return Some(tail.trim().to_string());
+        }
+    }
+    Some(String::new())
+}
+
 /// Vertex takes `thinkingLevel`; agy sends the Gemini-API `thinkingBudget`.
 pub(crate) fn rewrite_body(raw: &[u8], effort: &str) -> Vec<u8> {
     let Ok(mut value) = serde_json::from_slice::<Value>(raw) else {
         return raw.to_vec();
     };
     if let Some(object) = value.as_object_mut() {
+        if let Some(contents) = object.get_mut("contents").and_then(Value::as_array_mut) {
+            for content in contents {
+                if let Some(parts) = content.get_mut("parts").and_then(Value::as_array_mut) {
+                    for part in parts {
+                        if part.get("thought").and_then(Value::as_bool) == Some(true) {
+                            if let Some(cleaned) = part
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .and_then(sanitize_leaked_thought_summary)
+                            {
+                                part["text"] = Value::String(cleaned);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let generation = object
             .entry("generationConfig")
             .or_insert_with(|| json!({}));
@@ -466,6 +612,10 @@ pub(crate) fn rewrite_body(raw: &[u8], effort: &str) -> Vec<u8> {
 }
 
 fn vertex_url(target: &VertexTarget, method: &str) -> String {
+    vertex_url_for_model(target, &target.model, method)
+}
+
+fn vertex_url_for_model(target: &VertexTarget, model: &str, method: &str) -> String {
     let host = if target.location == "global" {
         VERTEX_HOST.to_string()
     } else {
@@ -477,8 +627,8 @@ fn vertex_url(target: &VertexTarget, method: &str) -> String {
         ""
     };
     format!(
-        "https://{host}/v1/projects/{}/locations/{}/publishers/google/models/{}:{method}{stream}",
-        target.project, target.location, target.model
+        "https://{host}/v1/projects/{}/locations/{}/publishers/google/models/{model}:{method}{stream}",
+        target.project, target.location
     )
 }
 
@@ -521,9 +671,12 @@ async fn handle(
             )
         }
     };
+    let requested_model = parse_path_model(uri.path())
+        .filter(|m| target.supports_model(m))
+        .unwrap_or(&target.model);
     forward(
         &client,
-        &vertex_url(&target, method),
+        &vertex_url_for_model(&target, requested_model, method),
         &target.api_key,
         rewrite_body(&body, effort),
         lease,
@@ -640,6 +793,25 @@ mod tests {
         let provider = |project: &str| json!({"baseUrl":format!("https://aiplatform.googleapis.com/v1/projects/{project}/locations/global/publishers/google/models/{DEFAULT_MODEL}:generateContent")});
         assert!(validate_channel_target(Some(&provider("project-a")), &target).is_ok());
         assert!(validate_channel_target(Some(&provider("project-b")), &target).is_err());
+        let carbon_provider = json!({"baseUrl":format!("https://aiplatform.googleapis.com/v1/projects/project-a/locations/global/publishers/google/models/{CARBON_MODEL}:generateContent"),"model":CARBON_MODEL});
+        assert!(validate_channel_target(Some(&carbon_provider), &target).is_ok());
+        assert_eq!(channel_target_model(Some(&carbon_provider), &target), CARBON_MODEL);
+        assert_eq!(
+            resolve_model_and_effort(Some(CARBON_MODEL), DEFAULT_MODEL, &target).unwrap(),
+            (CARBON_MODEL.to_string(), None)
+        );
+        assert_eq!(
+            resolve_model_and_effort(None, CARBON_MODEL, &target).unwrap(),
+            (CARBON_MODEL.to_string(), None)
+        );
+        assert_eq!(
+            parse_path_model("/v1beta/models/high/models/gemini-4-carbon:streamGenerateContent"),
+            Some("gemini-4-carbon")
+        );
+        assert_eq!(
+            vertex_url_for_model(&target, CARBON_MODEL, "streamGenerateContent"),
+            "https://aiplatform.googleapis.com/v1/projects/project-a/locations/global/publishers/google/models/gemini-4-carbon:streamGenerateContent?alt=sse"
+        );
     }
 
     #[test]
@@ -647,6 +819,14 @@ mod tests {
         assert_eq!(
             parse_path("/v1beta/models/high/models/gemini-4-argon:streamGenerateContent"),
             Some(("high", "streamGenerateContent"))
+        );
+        assert_eq!(
+            parse_path("/v1beta/models/ccgui-vertex/high/models/gemini-4-carbon:streamGenerateContent"),
+            Some(("high", "streamGenerateContent"))
+        );
+        assert_eq!(
+            parse_path_model("/v1beta/models/ccgui-vertex/high/models/gemini-4-carbon:streamGenerateContent"),
+            Some("gemini-4-carbon")
         );
         assert_eq!(
             parse_path("/v1beta/models/medium/models/gemini-4-argon:generateContent"),
@@ -662,7 +842,7 @@ mod tests {
 
     #[test]
     fn body_rewrite_swaps_budget_for_level_and_keeps_everything_else() {
-        let raw = br#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"maxOutputTokens":10,"thinkingConfig":{"includeThoughts":true,"thinkingBudget":-1}}}"#;
+        let raw = br#"{"contents":[{"role":"user","parts":[{"text":"hi"}]},{"role":"model","parts":[{"thought":true,"text":"Thinking Process:\n\n1. **Analyze the Request:**\n * **Goal:** Summarize the provided thoughts in the first person.\n\n`**Checking status**\\n\\nI am checking.`**Checking status**\n\nI am checking."}]}],"generationConfig":{"maxOutputTokens":10,"thinkingConfig":{"includeThoughts":true,"thinkingBudget":-1}}}"#;
         let out: Value = serde_json::from_slice(&rewrite_body(raw, "medium")).unwrap();
         let config = &out["generationConfig"]["thinkingConfig"];
         assert!(config.get("thinkingBudget").is_none());
@@ -670,6 +850,10 @@ mod tests {
         assert_eq!(config["includeThoughts"], true);
         assert_eq!(out["generationConfig"]["maxOutputTokens"], 10);
         assert_eq!(out["contents"][0]["parts"][0]["text"], "hi");
+        assert_eq!(
+            out["contents"][1]["parts"][0]["text"],
+            "**Checking status**\n\nI am checking."
+        );
         // The selected effort remains authoritative even without a CLI budget.
         let plain = br#"{"contents":[]}"#;
         let out: Value = serde_json::from_slice(&rewrite_body(plain, "high")).unwrap();
@@ -956,6 +1140,30 @@ mod tests {
         // The same bridge is reused, never re-bound per launch.
         assert_eq!(ensure_bridge().unwrap().0, base);
         std::fs::remove_file(lease).unwrap();
+    }
+
+    #[test]
+    fn vertex_settings_bom_preserves_native_and_unknown_fields() {
+        let root = std::env::temp_dir().join(format!("ccgui-vertex-bom-{}", uuid::Uuid::new_v4()));
+        let native = root.join("native");
+        let derived = root.join("derived");
+        std::fs::create_dir_all(&native).unwrap();
+        let source = native.join("settings.json");
+        let content = concat!("\u{feff}", r#"{"modelProvider":"antigravity","unknown":{"command":"\"C:\\Program Files\\AGY\\agy.exe\""}}"#);
+        std::fs::write(&source, content).unwrap();
+        prepare_settings(&native, &derived).unwrap();
+        let rendered = std::fs::read(derived.join("settings.json")).unwrap();
+        let value: Value = serde_json::from_slice(&rendered).unwrap();
+        assert_eq!(value["modelProvider"], "gemini");
+        assert_eq!(value["unknown"]["command"], r#""C:\Program Files\AGY\agy.exe""#);
+        assert_eq!(std::fs::read(&source).unwrap(), content.as_bytes());
+        for invalid in ["\u{feff}{broken", "\u{feff}\u{feff}{}", "\u{feff}[]"] {
+            std::fs::write(&source, invalid).unwrap();
+            assert!(prepare_settings(&native, &derived).is_err());
+            assert_eq!(std::fs::read(derived.join("settings.json")).unwrap(), rendered);
+            assert_eq!(std::fs::read(&source).unwrap(), invalid.as_bytes());
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// `cargo test --lib agy_vertex_live -- --ignored --nocapture`

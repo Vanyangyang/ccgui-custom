@@ -20,6 +20,7 @@ import type { ChatStore } from "./types";
 import type { StoreGet, StoreSet } from "./context";
 import { useSidechatStore } from "@/features/sidechat/store";
 import { hasComposerImageDraft } from "../components/use-composer-images";
+import type { SessionMemoryCache } from "./session-memory-cache";
 
 /**
  * Tab-strip actions: new/close/focus/move and the engine picker's pending-tab
@@ -30,54 +31,62 @@ import { hasComposerImageDraft } from "../components/use-composer-images";
 export interface TabDeps {
   set: StoreSet;
   get: StoreGet;
+  memoryCache?: Pick<SessionMemoryCache, "schedule" | "forget" | "touch">;
 }
 
 /** Shared check for whether a pending new-chat draft is free for a background
  *  host task to open or send into. Protects user focus, unsent text/image
  *  drafts (even when no pending tab is currently open), sidechats, conversation
  *  modes, and mismatched per-tab starting choices. */
-export function isBackgroundDraftAvailable(
+export type BackgroundDraftBlockReason = `user-draft:${
+  | "uninitialized" | "missing-tab" | "focused" | "text" | "images"
+  | "streaming" | "loading" | "launching" | "messages" | "queue" | "retrying"
+  | "sidechat" | "mode" | "provider" | "model" | "effort"}`;
+
+/** The first blocking condition, without exposing draft content or acquiring a tab. */
+export function backgroundDraftBlockReason(
   s: ChatStore,
   engine: string,
   workspacePath: string,
   launch?: HostLaunchChoices,
   options?: { requireOpenTab?: boolean; allowDraftLaunchingId?: string },
-): boolean {
-  if (!s.initialized) return false;
+): BackgroundDraftBlockReason | null {
+  if (!s.initialized) return "user-draft:uninitialized";
   const key = sessionKey(engine, null, workspacePath);
   const existing = s.openTabs.find((t) => sameTab(t, engine, null, workspacePath));
-  if (options?.requireOpenTab && !existing) return false;
+  if (options?.requireOpenTab && !existing) return "user-draft:missing-tab";
   const state = s.bySession?.[key];
   const sidechat = useSidechatStore.getState();
   const launching = state?.draftLaunching && state.draftLaunching !== options?.allowDraftLaunchingId;
-  if (
-    (s.active && sameTab(s.active, engine, null, workspacePath)) ||
-    s.drafts?.[key]?.trim() ||
-    hasComposerImageDraft(key) ||
-    state?.streaming ||
-    state?.loading ||
-    launching ||
-    state?.messages?.length ||
-    state?.queue?.length ||
-    s.streamingByKey?.[key] ||
-    s.retryingByKey?.[key] ||
-    sidechat.btwBySession[key] ||
-    sidechat.sidechatBySession[key] ||
-    getConversationModeState().hasTabMode(key, workspacePath)
-  ) {
-    return false;
-  }
+  if (s.active && sameTab(s.active, engine, null, workspacePath)) return "user-draft:focused";
+  if (s.drafts?.[key]?.trim()) return "user-draft:text";
+  if (hasComposerImageDraft(key)) return "user-draft:images";
+  if (state?.streaming) return "user-draft:streaming";
+  if (state?.loading) return "user-draft:loading";
+  if (launching) return "user-draft:launching";
+  if (state?.messages?.length) return "user-draft:messages";
+  if (state?.queue?.length) return "user-draft:queue";
+  if (s.streamingByKey?.[key]) return "user-draft:streaming";
+  if (s.retryingByKey?.[key]) return "user-draft:retrying";
+  if (sidechat.btwBySession[key] || sidechat.sidechatBySession[key]) return "user-draft:sidechat";
+  if (getConversationModeState().hasTabMode(key, workspacePath)) return "user-draft:mode";
   if (launch && (launch.providerId !== undefined || launch.defaultProvider !== undefined)) {
     const expectedProvider = launch.providerId ?? launch.defaultProvider ?? null;
     const retainedProvider = existing?.provider || state?.activeProvider || expectedProvider;
-    if (retainedProvider !== expectedProvider) return false;
+    if (retainedProvider !== expectedProvider) return "user-draft:provider";
   }
   if (existing) {
-    if (launch?.model !== undefined && existing.model !== launch.model) return false;
-    if (launch?.effort !== undefined && existing.effort !== launch.effort) return false;
-    if (launch?.providerId !== undefined && existing.provider !== launch.providerId) return false;
+    if (launch?.model !== undefined && existing.model !== launch.model) return "user-draft:model";
+    if (launch?.effort !== undefined && existing.effort !== launch.effort) return "user-draft:effort";
+    if (launch?.providerId !== undefined && existing.provider !== launch.providerId) return "user-draft:provider";
   }
-  return true;
+  return null;
+}
+
+export function isBackgroundDraftAvailable(
+  ...args: Parameters<typeof backgroundDraftBlockReason>
+): boolean {
+  return backgroundDraftBlockReason(...args) === null;
 }
 
 /** Shared activation path for tab actions and lifecycle cleanup. */
@@ -152,47 +161,6 @@ export function createTabActions(
     });
   }
 
-  /** Reopen cache for closed tabs: keys whose bySession entry survives tab
-   * close so selectSession skips a backend reload, most-recently-closed
-   * last. Bounded — the oldest non-streaming entries beyond the cap are
-   * evicted, so the cache cannot grow forever. */
-  const CLOSED_CACHE_LIMIT = 10;
-  const closedTabCache: string[] = [];
-
-  function rememberClosedTab(key: string) {
-    const i = closedTabCache.indexOf(key);
-    if (i >= 0) closedTabCache.splice(i, 1);
-    closedTabCache.push(key);
-    // Keys whose tab is open again are not "closed" anymore.
-    const openKeys = new Set(
-      get().openTabs.map((t) =>
-        sessionKey(t.engine, t.sessionId, t.workspacePath),
-      ),
-    );
-    for (let j = closedTabCache.length - 1; j >= 0; j--) {
-      if (openKeys.has(closedTabCache[j])) closedTabCache.splice(j, 1);
-    }
-    let overflow = closedTabCache.length - CLOSED_CACHE_LIMIT;
-    if (overflow <= 0) return;
-    const evict: string[] = [];
-    for (const cached of closedTabCache) {
-      if (overflow <= 0) break;
-      // A streaming closed tab still receives events — never evict it.
-      if (get().streamingByKey[cached]) continue;
-      evict.push(cached);
-      overflow--;
-    }
-    if (evict.length === 0) return;
-    for (const cached of evict) {
-      closedTabCache.splice(closedTabCache.indexOf(cached), 1);
-    }
-    set((s) => {
-      const bySession = { ...s.bySession };
-      for (const cached of evict) delete bySession[cached];
-      return { bySession };
-    });
-  }
-
   /** Remove a tab; when it was active, fall back to its nearest neighbor. */
   function removeTab(
     engine: string,
@@ -212,7 +180,8 @@ export function createTabActions(
     set({ openTabs, ...(sessionId === null && s.bySession[key] ? {
       bySession: { ...s.bySession, [key]: { ...s.bySession[key], draftLaunching: undefined } },
     } : {}) });
-    rememberClosedTab(sessionKey(engine, sessionId, workspacePath));
+    deps.memoryCache?.touch(key);
+    deps.memoryCache?.schedule();
     if (s.active && sameTab(s.active, engine, sessionId, workspacePath)) {
       activateTab(openTabs[Math.min(idx, openTabs.length - 1)] ?? null);
     } else {
@@ -222,15 +191,12 @@ export function createTabActions(
 
   /** Drop a key from the closed-tab reopen cache (session deleted/archived). */
   function forgetClosedTab(key: string) {
-    const cacheIdx = closedTabCache.indexOf(key);
-    if (cacheIdx >= 0) closedTabCache.splice(cacheIdx, 1);
+    deps.memoryCache?.forget(key);
   }
 
   /** Drop reopen-cache entries for a removed workspace's dead keys. */
   function forgetClosedTabs(keys: Set<string>) {
-    for (let i = closedTabCache.length - 1; i >= 0; i--) {
-      if (keys.has(closedTabCache[i])) closedTabCache.splice(i, 1);
-    }
+    for (const key of keys) deps.memoryCache?.forget(key);
   }
 
   return {
@@ -240,26 +206,29 @@ export function createTabActions(
     forgetClosedTab,
     forgetClosedTabs,
 
-    startNewChat: (workspacePath) => {
+    startNewChat: (workspacePath, engine) => {
       // One pending chat per workspace+engine: re-focus it instead of
       // piling up empty "new" tabs.
       set((s) => {
+        // Reveal the exact engine without migrating another pending draft.
+        const targetEngine = engine ?? s.activeEngine;
         const existing = s.openTabs.find(
           (t) =>
             t.sessionId === null &&
-            t.engine === s.activeEngine &&
+            t.engine === targetEngine &&
             t.workspacePath === workspacePath,
         );
         const tab: ActiveSession = existing ?? {
-          engine: s.activeEngine,
+          engine: targetEngine,
           sessionId: null,
           workspacePath,
         };
         const openTabs = existing ? s.openTabs : [...s.openTabs, tab];
         persistTabs(openTabs, tab);
+        if (targetEngine !== s.activeEngine) writeStored(ENGINE_PREF_KEY, targetEngine);
         const key = sessionKey(tab.engine, null, workspacePath);
         adoptedDraftKeys.delete(key);
-        return { openTabs, active: tab };
+        return { openTabs, active: tab, activeEngine: targetEngine };
       });
     },
 

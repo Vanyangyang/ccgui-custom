@@ -84,7 +84,7 @@ async function loadRenderer(info: DetachedInit, images: HostImagesApi) {
   } finally { URL.revokeObjectURL(url); }
 }
 
-function PluginWindow({ client }: { client: DetachedSurfaceClient }) {
+export function PluginWindow({ client }: { client: DetachedSurfaceClient }) {
   const { t } = useTranslation();
   const [loaded, setLoaded] = React.useState<{ info: DetachedInit; component: React.ComponentType<PluginDetachedSurfaceProps> }>();
   const [loadFailed, setLoadFailed] = React.useState(false);
@@ -116,7 +116,9 @@ function PluginWindow({ client }: { client: DetachedSurfaceClient }) {
     : labels?.actionFailed ?? t("plugins.detached.actionFailed");
   const Renderer = loaded?.component;
   const needsRecovery = ["recovering", "unavailable", "error"].includes(status.phase) || Boolean(status.returnBlocked);
-  return <div className="flex h-screen min-h-0 min-w-0 flex-col bg-background-primary-default text-text-primary" data-plugin-window-root>
+  // Own the viewport and the containing block. Out-of-flow renderer content
+  // must not enlarge the document and let scrolling carry the whole window away.
+  return <div className="fixed inset-0 flex min-h-0 min-w-0 flex-col overflow-hidden bg-background-primary-default text-text-primary" data-plugin-window-root>
     <header className="flex min-h-12 shrink-0 items-center gap-3 border-b border-border-primary px-4 py-2">
       <span className="min-w-0 flex-1 truncate text-sm font-medium">{loaded?.info.title ?? t("plugins.detached.loading")}</span>
       <Button variant="secondary" size="small" disabled={status.phase !== "detached"}

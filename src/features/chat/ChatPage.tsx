@@ -346,7 +346,9 @@ export default function ChatPage() {
         <AppStatusBar />
       </div>
 
-      <ChatPageDialogs dialog={dialog} onClose={() => setDialog(null)} />
+      <ChatPageDialogs dialog={dialog} onClose={() => setDialog(null)}
+        newSessionRepos={sections ? sections.flatMap((section) => section.repos) : repos}
+        onNewSessionInWorkspace={handleNewSessionInWorkspace} />
     </div>
     </SplitDragProvider>
   );

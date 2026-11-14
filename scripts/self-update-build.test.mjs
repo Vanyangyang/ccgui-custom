@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { buildEnvironment, buildSelfUpdate, createSourceSnapshot, inputInventory, main, pathIdentity, NATIVE_EMBEDDED_INPUTS } from './self-update-build.mjs';
+import { activeSchemaHash, assertSchemaCompatible, buildEnvironment, buildSelfUpdate, createSourceSnapshot, defaultCargoJobs, inputInventory, main, pathIdentity, NATIVE_EMBEDDED_INPUTS } from './self-update-build.mjs';
 
 test('build tools use the configured environment without a sibling project dependency', () => {
   const env = buildEnvironment({ Path: 'C:/tools/bin', PERL: 'C:/tools/perl.exe', SPELLCAST_STATE_FILE: 'private.sqlite' });
@@ -16,7 +16,7 @@ test('build tools use the configured environment without a sibling project depen
 });
 
 test('build proxy inheritance preserves absence, empty values and case without copying private configuration', () => {
-  assert.deepEqual(buildEnvironment({}), { CARGO_BUILD_JOBS: '2' });
+  assert.deepEqual(buildEnvironment({}, 4), { CARGO_BUILD_JOBS: '2' });
   const proxies = {
     HTTP_PROXY: 'http://fixture-user:fixture-password@proxy.example.invalid:8080',
     http_proxy: '', HTTPS_PROXY: '', https_proxy: 'http://secure.example.invalid:8081',
@@ -27,11 +27,15 @@ test('build proxy inheritance preserves absence, empty values and case without c
   assert.deepEqual(buildEnvironment({ ...proxies, ANTHROPIC_AUTH_TOKEN: 'fixture-secret',
     CLAUDE_CONFIG_DIR: 'fixture-private-config', CCGUI_HOST_CHAT_TOKEN: 'fixture-host-secret',
     CUSTOM_AUTH: 'fixture-auth', CARGO_REGISTRIES_CRATES_IO_TOKEN: 'fixture-registry-secret',
-  }), { ...proxies, CARGO_BUILD_JOBS: '2' });
+  }, 4), { ...proxies, CARGO_BUILD_JOBS: '2' });
 });
 
-test('build job limits retain their default and explicit bounds', () => {
-  assert.equal(buildEnvironment({}).CARGO_BUILD_JOBS, '2');
+test('build job limits scale with the machine and retain explicit bounds', () => {
+  for (const [cpus, jobs] of [[1, '2'], [4, '2'], [8, '4'], [24, '12'], [64, '12']]) {
+    assert.equal(defaultCargoJobs(cpus), jobs);
+    assert.equal(buildEnvironment({}, cpus).CARGO_BUILD_JOBS, jobs);
+  }
+  assert.equal(buildEnvironment({}).CARGO_BUILD_JOBS, defaultCargoJobs());
   for (const jobs of ['1', '64']) assert.equal(buildEnvironment({ CARGO_BUILD_JOBS: jobs }).CARGO_BUILD_JOBS, jobs);
   for (const jobs of ['', '0', '65', '-1', '1.5', 'auto']) {
     assert.throws(() => buildEnvironment({ CARGO_BUILD_JOBS: jobs }), /integer from 1 to 64/);
@@ -415,4 +419,32 @@ test('captureSnapshot isolates the frozen batch build from later working-tree ed
   assert.equal(fs.statSync(mainRsSnap).mtimeMs, mtimeBefore);
   assert.equal(second.frontendCacheHit, true);
   assert.equal(second.nativeCacheHit, true);
+});
+
+function runtimeProfile(t, schemaHash) {
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'ccgui-profile-'));
+  t.after(() => fs.rmSync(profile, { recursive: true, force: true }));
+  const directory = path.join(profile, '.ccgui-next/runtime-updates');
+  fs.mkdirSync(directory, { recursive: true });
+  if (schemaHash !== undefined) fs.writeFileSync(path.join(directory, 'state.json'), JSON.stringify({ stateVersion: 1, active: schemaHash && { schemaHash }, transaction: null }));
+  return profile;
+}
+
+test('the running release schema is read leniently and any difference blocks a live candidate', t => {
+  const hash = 'a'.repeat(64);
+  assert.equal(activeSchemaHash(runtimeProfile(t, hash)), hash);
+  for (const profile of [runtimeProfile(t), runtimeProfile(t, null), runtimeProfile(t, 'not-a-hash'), path.join(os.tmpdir(), 'ccgui-no-such-profile')]) {
+    assert.equal(activeSchemaHash(profile), null);
+    assert.doesNotThrow(() => assertSchemaCompatible(hash, profile));
+  }
+  assert.doesNotThrow(() => assertSchemaCompatible(hash, runtimeProfile(t, hash)));
+  assert.throws(() => assertSchemaCompatible('b'.repeat(64), runtimeProfile(t, hash)), /standalone package/);
+});
+
+test('an incompatible schema is reported after the probe and before anything is packaged', async t => {
+  const f = fixture(t);
+  await assert.rejects(buildSelfUpdate({ ...f.options(), activeProfile: runtimeProfile(t, 'b'.repeat(64)) }, f.hooks), /standalone package/);
+  assert.equal(fs.existsSync(f.options().output), false);
+  const compatible = await buildSelfUpdate({ ...f.options(), activeProfile: runtimeProfile(t, 'a'.repeat(64)) }, f.hooks);
+  assert.ok(compatible.packageRoot);
 });

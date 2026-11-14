@@ -73,6 +73,38 @@ TPS 是独立元数据链，不能复用旧 `genMs` 或上下文占用直接相�
 6. 关闭所有客户端后运行 `pnpm maint:install`，通过「代理保护」入口启动，
    核验窗口设置、额度、失败反馈及原有常用功能后，才推广候选分支。
 
+### 失败重跑、并行出包与隔离构建
+
+`maint:check` 把验证拆成声明式的分组（隐私边界、原生编译路径扫描、发布编译器隐私、自更新构建安全、类型、数据库契约、原生库测试、助手提醒、发送链路、Vitest、维护脚本安全）。每次都会把全部分组跑完，不再在第一个失败处中止，结束时一次列出所有失败组；某个原生组编译失败时，同一原生组里后续只会重复同一错误的分组会被跳过并注明原因。
+
+- **原生库测试一次跑完**：发布前要验证的各功能区（`NATIVE_TEST_AREAS`：Claude 与额度、自动标题、隔离标题调用、单实例、启动模式、内置技能与代理、中继、被动吞吐、任务控制、宿主会话、Codex、插件边界、Leader、更新兼容、历史归档与删除）作为同一个 `cargo test --lib` 进程的多个名称过滤器运行。原先每个功能区单独一次 Cargo 调用，每次约 1.8 秒启动开销，名称同时命中两个过滤器的 37 个用例还会跑两遍；合并后这 898 个用例在本机约 11.5 秒跑完。`assistant_notices` 仍单独以 `--test-threads=1` 运行，并从合并进程中排除。
+- **不需要 DOM 的 Vitest 文件不启动 jsdom**：Vitest 的耗时主要是每个文件的固定开销（jsdom 初始化约 1 秒、模块导入约 1 秒），用例本体合计只占约 130 秒。运行期间从不读写 jsdom 安装的全局对象（只用到 `AbortController`、`URL` 和 `toContain` 内部的 `Node`/`DOMTokenList` 类型检查）、且在 node 环境下同样通过的 `.ts` 测试，首行写 `// @vitest-environment node`；新测试默认仍是 jsdom。本机 70 个文件改用 node 环境后，全量从 128.8 秒降到 121–124 秒。`pool: "threads"` 实测更慢且让 `json-snapshot.test.ts` 超时，`--no-isolate` 会让约 30 个文件因共享 store 状态失败，两者均未采用。
+- **维护脚本测试并行**：`custom-maintain` 的测试按「升级集成/验证/构建记录」「安装成功与运行时状态」「安装拒绝与恢复」拆成三个文件，由 Node 并行执行；不改上游、不推送备份的用例复制同一个预建夹具仓库，不再每个用例重建（每次约 20 次 git 调用、约 2 秒）。本机该组从约 250 秒降到约 70 秒。
+
+- **按组复用**：通过的分组记录在 `artifacts/custom-check-stages.json`，键由命令行、Node/cargo/rustc 版本、相关环境变量，以及该组输入范围内文件在 HEAD 中的 blob id 组成。再次运行时键相同的已通过分组直接复用，输出 `reused`，只重跑失败或输入变化的分组。输入范围宁宽勿窄：前端组读取除 `src-tauri/src`、`src-tauri/tests`、Cargo 与 `build.rs`、`scripts/*.mjs|rs|sh`、`docs/` 和根目录 `*.md` 之外的全部文件（`src` 下没有任何代码导入或读取它们）；原生组读取 `src-tauri/**`、经审计的 Rust 内嵌输入（`NATIVE_EMBEDDED_INPUTS`）、`.cargo`、工具链文件；维护工具测试组只读 `scripts/`、`.custom`、包管理文件和 Tauri 配置；自更新构建安全与编译路径扫描测试组在此基础上加上整个原生范围（它们审计 Rust 源码）。隐私边界与编译路径扫描每次都跑。`CARGO_BUILD_JOBS`、`CARGO_TARGET_DIR`、`CCGUI_VITEST_WORKERS` 只影响调度，不进入键。
+- **`--fresh`**：`pnpm maint:check --fresh` 忽略全部缓存整轮重跑。
+- **验证记录**：`custom-verification.json` 仍要求全部分组对当前 HEAD 通过，并在 `stages` 中逐组标明 `ran`，或 `reused` 及来源 HEAD。任何一组失败都不会写入记录。
+- **发布类型检查复用**：`types` 分组执行 `tsc --noEmit --incremental`，增量信息保存在忽略目录 `artifacts/types.tsbuildinfo`。`maint:release` 的快检确认本轮 `types` 已执行成功或有效复用后，安装包的临时 Tauri 配置只运行 Vite，避免再做一次相同类型检查；`--fresh` 仍先重跑 `types`。独立 `maint:build` 必须重新核对当前输入、命令、工具版本与环境对应的 `types` 缓存键，缺失或失效时保留完整构建检查。只有标准的 `npm run build` 钩子及 `tsc --noEmit && vite build` 脚本可替换；平台/自定义钩子、额外构建步骤与 npm `prebuild`/`postbuild` 生命周期脚本照常执行。`pnpm build` 的独立行为不变；临时 Tauri 配置内容不变时不重写文件。
+- **类型检查局部对照**：2026-10-28，Windows、Node 24.14.0、TypeScript 5.9.3，串行测量同一前端输入指纹：普通 `--noEmit` 两轮为 44.4 / 38.5 秒，增量缓存首次建立为 45.7 秒，输入未变时的热增量检查为 8.0 / 7.8 秒，五轮全部通过。热样本未修改源码；源码小改、Cargo 配额调整和完整 Rust/NSIS 出包的墙钟收益尚未测量。
+- **并发**：Rust 默认并发为 `min(12, max(2, 逻辑核数 / 2))`，显式设置的 `CARGO_BUILD_JOBS` 仍优先（1–64）。并行发布仅在有原生验证分组需要实际执行时分配两份 Cargo 配额；全部原生验证缓存有效时，打包使用完整默认配额。`--fresh`、任一原生缓存缺失/失效或必须执行的原生分组均保留配额拆分，日志中的 `buildJobs` / `checkJobs` 记录实际选择；配额变化不代表耗时按比例下降。Vitest 默认 `min(8, max(2, min(逻辑核数 / 3, 当前空闲内存 GiB 数)))` 个 worker（实测 2 个 worker 约 400 秒，8 个约 130–180 秒；8 个 worker 期间系统可用内存最多下降约 2 GiB），可用 `CCGUI_VITEST_WORKERS` 覆盖；测试文件与超时断言不变。
+- **编译路径扫描**：`scripts/native-path-scan.mjs` 在数秒内扫描发布代码中把 `env!("CARGO_MANIFEST_DIR")`、`OUT_DIR` 等编译期路径写进二进制的用法，命中即失败，而不是等到安装包产出后才被本机路径检查拦下。
+- **数据库契约前置**：`task_worker::tests::schema_` 是第一个原生组。`pnpm maint:self-update` 在候选探针返回后，与正在运行版本（`runtime-updates/state.json` 的 `active.schemaHash`）比较数据库结构哈希，不一致时直接说明需要完整离线安装，不再等宿主在提交时拒绝。
+
+`pnpm maint:release [--fresh]` 对同一个干净提交做验证和安装包构建。当前空闲内存不少于 12 GiB（`CCGUI_RELEASE_PARALLEL=1|0` 可强制并行或串行）时并行：快检（隐私、路径扫描、发布编译器、自更新构建安全、类型）通过后立即开始 `tauri build`，其余检查同时运行。Cargo 对每个 target 目录只持一把锁，所以并行时检查使用独立的 `artifacts/check-target`（只带 `line-tables-only` 调试信息），安装包仍用 `src-tauri/target`；未显式设置 `CARGO_BUILD_JOBS` 时两边各取一半。快检失败则不启动安装包构建，但仍报告其余失败。内存不足时改为串行：先跑完全部检查，通过后才开始安装包构建，不在检查已失败的提交上浪费整轮发布编译。输出首行 `release` 说明所选模式与原因。**只有全部分组通过后才写入 `custom-verification.json` 和 `custom-build.json`**；检查失败时输出 `installerVoided`，该安装包不得安装。
+
+`pnpm maint:isolated <check|build|release> [--fresh] [--paths a,b]` 在固定的短路径快照里执行上述命令，适合工作区里还有未提交的并行改动、或需要在不占用当前检出的情况下出包：
+
+- 快照目录为仓库同级的 `ccgui-iso/snapshot`（`CCGUI_ISOLATED_ROOT` 可覆盖；不得与当前检出互相包含、不含 `=`、快照路径不超过 72 个字符，避开 Windows 路径长度限制）。它是本仓库的固定 detached worktree，路径不变，Cargo 与 pnpm 缓存跨次有效。
+- 每次运行用临时索引把工作区全部改动（含未跟踪但未忽略的文件；忽略文件除外）提交为一个合成提交，不改动你的索引、工作区和分支，只在 `refs/ccgui-iso/latest` 保留引用。`--paths` 则只在 HEAD 之上叠加列出的文件（字面路径，不展开通配符）；注意此时 `scripts/` 等维护脚本也要在列表里，快照里运行的是快照内的脚本。工作区与 HEAD 一致时直接使用 HEAD。
+- 快照切换提交时只改写变化的文件，未变文件的修改时间保留；忽略的构建产物与 `node_modules` 保留，未跟踪的残留源码文件被清除。目录不是本仓库的 worktree 时拒绝复位。
+- 依赖用 `corepack pnpm install --frozen-lockfile --offline`（共享 store 硬链接）安装，锁文件、各 `package.json`、补丁不变时跳过；离线失败再允许联网补齐。
+- 同一时间只允许一个隔离构建：`isolated-build.lock` 原子创建，记录进程号与进程启动时间；持有者已退出或进程号被复用才视为陈旧并接管，无法确认进程状态时按仍在运行处理。退出和 SIGINT/SIGTERM 会释放锁。
+- 快照按提交原样（LF）检出，不受用户全局 `core.autocrlf` 影响：否则 CRLF 会让按字节比对的生成文档（`references/sdk-api.md`）在快照里失败，而它在 LF 的 CI 上是通过的。已有的 CRLF 快照在首次运行时整体重写一次（之后的未变文件保持原修改时间），忽略的构建产物保留。
+- 快照构建使用独立 target，并设置 `CARGO_PROFILE_DEV_DEBUG=line-tables-only`（回溯仍有行号）。实测冷编译 `--lib` 测试与 `send_path`：429 秒、`link.exe` 峰值 14.3 GB（系统可用内存最低 2.5 GB）降到 329 秒、峰值约 4–6 GB（可用内存最低 8 GB 以上）；不影响开发者共享的 `src-tauri/target/debug`。
+- 子进程环境去掉 `CLAUDE*`、`CODEX_*`、`GIT_*`、`ANTHROPIC_*`、`OPENAI_*`、`GEMINI_*` 和多数 `CCGUI_*` 变量，`TEMP`/`TMP` 指向 `ccgui-iso/tmp`，并设置 `CCGUI_SOURCE_SNAPSHOT=1`，使 `src-tauri/build.rs` 不把快照登记为自开发源码根。
+- 构建产物与报告在快照目录的 `artifacts/` 下；成功后按输出中的提示从快照目录执行 `node <快照>/scripts/custom-maintain.mjs install`。安装前提不变：同一干净 HEAD（即该合成提交）的检查记录与构建记录、全部客户端已退出。
+- 不要对含 `node_modules` 的快照目录执行 `git worktree remove --force`；先确认目录内没有指向其他位置的链接。
+
 ## 安装与恢复
 
 `maint:install` 不接受自定义安装路径、可执行文件路径、网络或令牌参数。
@@ -89,8 +121,13 @@ TPS 是独立元数据链，不能复用旧 `genMs` 或上下文占用直接相�
 
 后续工作树中的跨工作区父子任务采用 V3 契约（`496dde53c20f24f52aa37e33af9852ed7feda178ecfa1f2fb97a56361364a1c0`），与 V2 同样不能热切换或共用旧 worker。父工作区和子执行目录分别参与权限及归档验证，不能通过移除字段或认可等价 hash 绕过。V1/V2 → V3 应结束任务并退出全部实例后安装完整 standalone 包；首次冷启动在原有所有权、进程和事务检查后保存 `offline-schema-state-<唯一编号>.json`，保留数据库和会话，移除旧的活动与回退指针。原公开 `protected.35` 安装包仍对应 V2；升级 V3 必须使用另外构建并核验源码及探针的新包，不能仅凭相同显示版本号判断契约。详见[运行中更新的契约说明](runtime-live-update.zh-CN.md)。
 
+受管子任务多跳交接采用 V4 契约（`74a46547d44ad86b643ced0b2a5abd77d24bc4f4d36355ad3179a1cc084a0508`）。旧版写回会丢失交接关联，不得与 V4 热切换、共用 worker 或作为回退基线；遇到 schema hash mismatch 时不要伪造 hash 或放宽检查。V1/V2/V3 → V4 必须等任务收束、关闭所有实例并安装经验证的完整 standalone 包，首次启动沿用离线升级的进程、事务及状态备份保护，保留数据库、会话和旧 release 文件。自更新包的外置前端 EXE 不能代替完整安装包；安装完成仍须核验实际运行版本。
+
+`maint:check` 和 `maint:build` 的新版记录绑定源码 HEAD 及随包 `skills`、`agent-catalogs` 资源清单；旧记录需要重新检查和构建。安装会先备份并核验同名资源，再与程序一起更新，只处理本次清单内的文件，保留其他内容。启动前发生安装错误时会尝试恢复备份；断电或进程被强制终止后需要根据保留的备份人工检查。安装期间不要另行启动客户端或并发运行安装。
+
 旧程序先保存到仓库 `artifacts/custom-install-<唯一编号>/`，复制后再次核验 SHA256；
-复制失败或校验不一致时恢复备份。原有「CC GUI（代理保护）」快捷方式及保护脚本
+复制失败、校验不一致、更新时间戳无法确认或旧更新事务尚未安全收束时恢复备份。完整安装会刷新目标副本的修改时间；存在活动版本时还会验证它严格晚于当前活动版本和更新状态，避免启动时被导回旧版本。时钟异常时停止，不人为写入未来时间。
+原有「CC GUI（代理保护）」快捷方式及保护脚本
 保留，成功后只启动该快捷方式。普通 `Desktop/CC GUI.lnk` 如存在则在绝对路径与
 目录边界检查后移入同一备份目录。脚本拒绝符号链接和 junction，不递归删除现有路径。
 

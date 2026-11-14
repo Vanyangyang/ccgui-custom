@@ -156,7 +156,7 @@ mod tests {
     #[test]
     fn sweep_removes_temporary_root_files_and_preserves_durable_plugin_attachments() {
         let root = std::env::temp_dir().join(format!("ccgui-sweep-test-{}", uuid::Uuid::new_v4()));
-        let plugin_dir = root.join(PLUGIN_ATTACHMENTS_DIR_NAME).join("example-dashboard");
+        let plugin_dir = root.join(PLUGIN_ATTACHMENTS_DIR_NAME).join("fixture-workbench");
         std::fs::create_dir_all(&plugin_dir).expect("create plugin attachment dir");
 
         let temp_file = root.join("paste-temp-1.png");
@@ -312,7 +312,8 @@ pub fn kimi_prompt_with_images(prompt: &str, images: &[String], workspace: &Path
 }
 
 /// Antigravity (`agy`) image injection: absolute image paths the CLI reads via
-/// `view_file` (binary image mode: `AbsolutePath` only, no `StartLine`/`EndLine`).
+/// `read_file` (`Path` only, Gemini 4 toolset) or `view_file` (`AbsolutePath`
+/// only, Gemini 3.8 toolset), omitting `StartLine`/`EndLine`.
 /// Marker lets history parsing strip the instruction block and recover `images`.
 pub const AGY_IMAGE_MARKER: &str = "\n\n<!-- ccgui:agy-image-attachments -->\n";
 
@@ -327,7 +328,7 @@ pub fn agy_prompt_with_images(prompt: &str, images: &[String], workspace: &Path)
     let mut out = prompt.trim_end().to_string();
     out.push_str(AGY_IMAGE_MARKER);
     out.push_str("The user attached the following image file(s). ");
-    out.push_str("You MUST call `view_file` (with `AbsolutePath` only, omitting `StartLine` and `EndLine`) on each path below before answering any question about visual content.\n");
+    out.push_str("You MUST read each image file below with `read_file` (`Path` only) or `view_file` (`AbsolutePath` only), omitting `StartLine` and `EndLine`, before answering any question about visual content.\n");
     for (index, path) in paths.iter().enumerate() {
         out.push_str(&format!("{}. {}\n", index + 1, path.display()));
         out.push_str(&format!("<image path=\"{}\"></image>\n", path.display()));

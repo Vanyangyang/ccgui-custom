@@ -1,7 +1,7 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { Message, PlanReviewDecision } from "@/lib/ipc";
-import { useChatStore } from "../store";
+import { useChatStore, type ChatStore } from "../store";
 import { useScopedSession, useScopedSessionKey } from "../split/session-scope";
 import { isPlanActionable } from "../store/plan-review";
 import {
@@ -26,26 +26,28 @@ import {
  *  the visible effect of the click. Resolved like usePendingQuestion. */
 export function usePendingPlanReview() {
   const key = useScopedSessionKey();
-  return useChatStore((s) => {
-    if (!key) return null;
-    const session = s.bySession[key];
-    const messages = session?.messages ?? [];
-    const resume = session?.planReviewResume;
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const record = messages[i].planReview;
-      if (!record) continue;
-      if (record.status === "awaiting_review" || record.status === "submitting") {
-        return messages[i];
+  const select = useMemo(() => {
+    let previous: Message[] | undefined;
+    let previousResume: string | null | undefined;
+    let pending: Message | null = null;
+    return (s: ChatStore) => {
+      const session = key ? s.bySession[key] : undefined;
+      const messages = session?.messages;
+      const resume = session?.planReviewResume;
+      if (messages === previous && resume === previousResume) return pending;
+      previous = messages; previousResume = resume; pending = null;
+      for (let i = (messages?.length ?? 0) - 1; i >= 0; i--) {
+        const record = messages![i].planReview;
+        if (!record) continue;
+        if (record.status === "awaiting_review" || record.status === "submitting" ||
+          record.status === "deferred" && resume === `${record.planId}:${record.revision}`) {
+          pending = messages![i]; break;
+        }
       }
-      if (
-        record.status === "deferred" &&
-        resume === `${record.planId}:${record.revision}`
-      ) {
-        return messages[i];
-      }
-    }
-    return null;
-  });
+      return pending;
+    };
+  }, [key]);
+  return useChatStore(select);
 }
 
 /** Conversation-mode mutex: true while a plan awaits decision AND its run is
@@ -54,16 +56,22 @@ export function usePendingPlanReview() {
  *  settled plan turn (next_turn) does not block the switch. */
 export function usePlanReviewGateActive(): boolean {
   const key = useScopedSessionKey();
-  return useChatStore((s) => {
-    if (!key) return false;
-    const session = s.bySession[key];
-    if (!session?.streaming) return false;
-    for (let i = session.messages.length - 1; i >= 0; i--) {
-      const record = session.messages[i].planReview;
-      if (record && isPlanActionable(record.status)) return true;
-    }
-    return false;
-  });
+  const select = useMemo(() => {
+    let previous: Message[] | undefined;
+    let actionable = false;
+    return (s: ChatStore) => {
+      const session = key ? s.bySession[key] : undefined;
+      if (!session?.streaming) return false;
+      if (session.messages === previous) return actionable;
+      previous = session.messages; actionable = false;
+      for (let i = session.messages.length - 1; i >= 0; i--) {
+        const record = session.messages[i].planReview;
+        if (record && isPlanActionable(record.status)) { actionable = true; break; }
+      }
+      return actionable;
+    };
+  }, [key]);
+  return useChatStore(select);
 }
 
 type DockNotice = { kind: "conflict" } | { kind: "error"; message: string } | null;

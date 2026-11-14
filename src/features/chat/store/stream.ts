@@ -2,8 +2,9 @@ import type { Message, TodosPayload } from "@/lib/ipc";
 import type { NativeActivity, NativeTask } from "@/lib/events";
 import type { LiveLaunch } from "./live-follow-up";
 import type { ThroughputState } from "../throughput";
+import type { HostTaskOrigin } from "./host-pending-chat";
 import { normalizeEffortLevel } from "@/components/application/ai-chat/effort-levels";
-import { encodedModelEffort } from "@/components/application/ai-chat/model-effort";
+import { supportsIndependentModelEffort } from "@/components/application/ai-chat/model-effort";
 
 /**
  * Streaming buffers and bySession write helpers. Leaf module: functions are
@@ -44,13 +45,26 @@ export interface HandoffState {
 export type QueueMoveDirection = "up" | "down";
 
 export interface SessionState {
+  /** Exact provenance of a host-owned first turn, independent of user drafts. */
+  hostTaskOrigin?: HostTaskOrigin;
   /** A draft's first send is preparing or awaiting native launch. */
   draftLaunching?: string;
   messages: Message[];
+  /** Exact managed input identities survive native-history replacement and
+   * renderer checkpoints; identical text from a new run is still a new input. */
+  managedAssignmentRuns?: string[];
+  /** First local row position of the observed run, even if its assignment
+   * metadata arrives after text/tool output. */
+  managedInputStart?: { runId: string; firstSeq: number };
   /** Older delegation metadata kept outside the paginated message window. */
   subagentHistory: Message[];
   nextBefore: number | null;
   loading: boolean;
+  /** Old AGY renderer caches may contain archive events appended after native
+   * history. Re-read the authoritative page once the timeline is safely idle. */
+  historyReloadRequired?: boolean;
+  /** Error produced by that guarded read, distinct from a failed user send. */
+  historyReloadError?: string;
   streaming: boolean;
   /** Native Claude task catalog: presence suppresses heuristic Agent rows.
    * Statuses are exclusively owned by native task events, including after done. */
@@ -127,6 +141,12 @@ export interface SessionState {
   planReviewResume: string | null;
 }
 
+/** An evicted timeline is unavailable until its history has actually reloaded.
+ * Failed reads clear `loading`, but must not turn the shell into an empty chat. */
+export function isUnloadedHistory(session: Pick<SessionState, "historyReloadRequired" | "messages" | "subagentHistory"> | undefined): boolean {
+  return !!session?.historyReloadRequired && !session.messages.length && !session.subagentHistory?.length;
+}
+
 export const EMPTY_SESSION: SessionState = {
   messages: [],
   subagentHistory: [],
@@ -148,6 +168,37 @@ export const EMPTY_SESSION: SessionState = {
   planReviewResume: null,
 };
 
+// Published message arrays are immutable: stream/metadata/history updates
+// replace the array before notifying the store. Weak keys release old history
+// with its session; cache misses (null) matter for sparse engine transcripts.
+const historyModels = new WeakMap<readonly Message[], string | null>();
+const historyEfforts = new WeakMap<readonly Message[], string | null>();
+
+export function latestHistoryModel(messages: readonly Message[] | undefined): string | null {
+  if (!messages) return null;
+  const cached = historyModels.get(messages);
+  if (cached !== undefined) return cached;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const model = messages[i].model;
+    if (model) { historyModels.set(messages, model); return model; }
+  }
+  historyModels.set(messages, null);
+  return null;
+}
+
+/** Raw transcript value; each engine's existing caller still normalizes it. */
+export function latestHistoryEffort(messages: readonly Message[] | undefined): string | null {
+  if (!messages) return null;
+  const cached = historyEfforts.get(messages);
+  if (cached !== undefined) return cached;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const effort = messages[i].effort;
+    if (effort) { historyEfforts.set(messages, effort); return effort; }
+  }
+  historyEfforts.set(messages, null);
+  return null;
+}
+
 /** The model one session runs with, most specific first:
  *
  *  1. the tab's own pick (an explicit choice for this session),
@@ -167,14 +218,7 @@ export function resolveSessionModel(
   if (!tab) return engineDefault;
   if (tab.model) return tab.model;
   if (session?.activeModel) return session.activeModel;
-  const messages = session?.messages;
-  if (messages) {
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const model = messages[i].model;
-      if (model) return model;
-    }
-  }
-  return engineDefault;
+  return latestHistoryModel(session?.messages) ?? engineDefault;
 }
 
 /** The reasoning level one session runs with. A native session owns its level
@@ -189,13 +233,13 @@ export function resolveSessionEffort(
 ): string | undefined {
   if (!tab) return engineDefault;
   const model = resolveSessionModel(tab, session, modelDefault);
-  if (model && encodedModelEffort(tab.engine, model)) return undefined;
+  if (model && !supportsIndependentModelEffort(tab.engine, model)) return undefined;
   if (tab.sessionId === null && tab.effort) return normalizeEffortLevel(tab.engine, tab.effort);
   if (session?.activeEffort) return normalizeEffortLevel(tab.engine, session.activeEffort);
   const messages = session?.messages;
   if (messages) {
     for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i].model && encodedModelEffort(tab.engine, messages[i].model!)) return undefined;
+      if (messages[i].model && !supportsIndependentModelEffort(tab.engine, messages[i].model!)) return undefined;
       const effort = messages[i].effort;
       if (effort) return normalizeEffortLevel(tab.engine, effort);
     }
@@ -692,7 +736,9 @@ export function patchSession<T extends BySessionSlice>(
   set((s) => ({
     bySession: {
       ...s.bySession,
-      [key]: { ...(s.bySession[key] ?? EMPTY_SESSION), ...patch },
+      [key]: { ...(s.bySession[key] ?? EMPTY_SESSION), ...patch,
+        // Observed native activity likewise supersedes any old history error.
+        ...(patch.streaming === true ? { historyReloadError: undefined } : {}) },
     },
   }) as Partial<T>);
 }

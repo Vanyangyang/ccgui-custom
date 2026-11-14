@@ -20,13 +20,22 @@ export function fixedInstructionsIdentity(value: HostFixedInstructions): HostFix
   return { version: value.version, text: value.text };
 }
 
-export const supportsFixedInstructions = (engine: string) => engine === "claude" || engine === "codex";
+export const supportsFixedInstructions = (engine: string) => engine === "claude" || engine === "codex" || engine === "agy";
 
-let nativeSupport: Promise<boolean> | undefined;
+let nativeSupport: Promise<readonly string[]> | undefined;
 /** A new frontend may be hot-loaded over an older binary: never advertise the
  * channel until that binary explicitly confirms it implements the resolver. */
-export function nativeFixedInstructionsSupported(): Promise<boolean> {
-  return nativeSupport ??= import("@/lib/transport")
-    .then(({ invoke }) => invoke<boolean>("plugin_fixed_instructions_supported"))
-    .then(value => value === true, () => false);
+export async function nativeFixedInstructionsSupported(engine?: string): Promise<boolean> {
+  const engines = await (nativeSupport ??= import("@/lib/transport").then(async ({ invoke }) => {
+    try {
+      const value = await invoke<unknown>("plugin_fixed_instructions_engines");
+      // A successful but malformed response is not evidence of any capability.
+      if (!Array.isArray(value) || value.some(id => typeof id !== "string" || !supportsFixedInstructions(id)) || new Set(value).size !== value.length) return [];
+      return value as string[];
+    } catch {
+      // Old binaries only attest Claude/Codex; never infer AGY from this bool.
+      return await invoke<unknown>("plugin_fixed_instructions_supported").catch(() => false) === true ? ["claude", "codex"] : [];
+    }
+  }).catch(() => []));
+  return engine === undefined ? engines.length > 0 : engines.includes(engine);
 }

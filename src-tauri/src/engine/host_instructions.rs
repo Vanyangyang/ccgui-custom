@@ -79,7 +79,7 @@ mod tests {
 
     #[test]
     fn plugin_policy_preserves_role_presentation_and_staging_cleanup() {
-        for engine in ["claude", "codex"] {
+        for engine in crate::plugin_caps::FIXED_INSTRUCTIONS_ENGINES {
             let native = with_chat_presentation(engine, true, Some("managed-child role".into()));
             let combined = with_plugin_instructions(native, Some("plugin policy v2".into())).unwrap();
             assert!(combined.starts_with("managed-child role\n\n"));

@@ -12,8 +12,76 @@ import {
 } from "@/lib/ipc";
 
 export const DEFAULT_VERTEX_MODEL = "gemini-4-argon";
+export const CARBON_VERTEX_MODEL = "gemini-4-carbon";
+export const DEFAULT_VERTEX_ALIAS = "Gemini 4 Argon (Vertex)";
+export const CARBON_VERTEX_ALIAS = "Gemini 4 Carbon (Vertex)";
+export const VERTEX_CHANNEL_ID = "agy-vertex-byok";
+export const CARBON_VERTEX_CHANNEL_ID = "agy-vertex-carbon-byok";
 export const DEFAULT_KEY_FILE_HINT = ".gemini/vertex-gemini-4-argon.txt";
 export const DEFAULT_LOCATION = "global";
+
+export interface VertexModelPreset {
+  id: string;
+  defaultAlias: string;
+  channelId: string;
+}
+
+export const VERTEX_MODEL_PRESETS: readonly VertexModelPreset[] = [
+  {
+    id: DEFAULT_VERTEX_MODEL,
+    defaultAlias: DEFAULT_VERTEX_ALIAS,
+    channelId: VERTEX_CHANNEL_ID,
+  },
+  {
+    id: CARBON_VERTEX_MODEL,
+    defaultAlias: CARBON_VERTEX_ALIAS,
+    channelId: CARBON_VERTEX_CHANNEL_ID,
+  },
+];
+
+export function getSupportedVertexModels(
+  configuredModel?: string | null,
+): VertexModelPreset[] {
+  const primary = configuredModel?.trim() || DEFAULT_VERTEX_MODEL;
+  const presets = [...VERTEX_MODEL_PRESETS];
+  if (!presets.some((p) => p.id === primary)) {
+    presets.unshift({
+      id: primary,
+      defaultAlias: DEFAULT_VERTEX_ALIAS,
+      channelId: VERTEX_CHANNEL_ID,
+    });
+  }
+  return presets;
+}
+
+export function isSupportedVertexModel(
+  modelId: string,
+  configuredModel?: string | null,
+): boolean {
+  const id = modelId.trim();
+  if (!id) return false;
+  return getSupportedVertexModels(configuredModel).some((p) => p.id === id);
+}
+
+export function defaultVertexAliasForModel(
+  modelId: string,
+  configuredModel?: string | null,
+): string {
+  const preset = getSupportedVertexModels(configuredModel).find(
+    (p) => p.id === modelId.trim(),
+  );
+  return preset?.defaultAlias ?? DEFAULT_VERTEX_ALIAS;
+}
+
+export function vertexChannelIdForModel(
+  modelId: string,
+  configuredModel?: string | null,
+): string {
+  const preset = getSupportedVertexModels(configuredModel).find(
+    (p) => p.id === modelId.trim(),
+  );
+  return preset?.channelId ?? VERTEX_CHANNEL_ID;
+}
 
 export const DEFAULT_CREDITS_SNAPSHOT: AgyVertexCreditsSnapshot = {
   billingAccountId: null,
@@ -88,10 +156,50 @@ export function applyCreditsSnapshot(next: AgyVertexCreditsSnapshot | null | und
           : null,
       collectedAt: next.collectedAt,
       errorCode: undefined,
+      refreshError: next.refreshError,
     };
   }
   notifySubscribers();
 }
+
+/** Stable key for the Vertex credits error codes the host reports. */
+export function agyVertexErrorKey(code: string): string {
+  const keys: Record<string, string> = {
+    sync_cancelled: "Cancelled", permission_denied: "PermissionDenied", login_timeout: "LoginTimeout",
+    scrape_timeout: "ScrapeTimeout", webview_create_failed: "WebviewFailed", login_required: "LoginRequired",
+    vertex_sync_in_progress: "InProgress", no_credits: "NoCredits",
+  };
+  return `settings.agyVertexError${keys[code] ?? "Generic"}`;
+}
+
+// Credits move slowly and Google's page is heavy: the host decides what is due,
+// this only bounds how often the UI asks.
+const AUTO_REFRESH_GAP_MS = 10 * 60_000;
+let lastAutoRequestAt = -Infinity;
+let autoRefreshing = false;
+
+/**
+ * Ask the host to refresh an old balance in the background. It never connects an
+ * account on the user's behalf and never opens a visible window; results that
+ * arrive during or after a manual sync are dropped.
+ */
+export async function requestAgyVertexAutoRefresh(now = Date.now()): Promise<void> {
+  if (typeof ipc?.agyVertexCreditsRead !== "function" || currentSyncing || autoRefreshing) return;
+  if (!currentCreditsSnapshot.billingAccountId || currentCreditsSnapshot.errorCode) return;
+  if (now - lastAutoRequestAt < AUTO_REFRESH_GAP_MS) return;
+  lastAutoRequestAt = now;
+  autoRefreshing = true;
+  const seq = syncSequence;
+  try {
+    const next = await ipc.agyVertexCreditsRead({ silent: true });
+    if (seq === syncSequence && !currentSyncing) applyCreditsSnapshot(next);
+  } catch {
+    // The next focus or mount retries after the gap; the shown balance stays.
+  } finally {
+    autoRefreshing = false;
+  }
+}
+
 
 /**
  * 同步 Google Cloud 赠金（打开网页登录 / 选择结算账号，自动抓取 Credits）。
@@ -164,12 +272,15 @@ export function useAgyVertexCredits() {
         .then((snap) => {
           if (!disposed && snap && seq === syncSequence && !currentSyncing) {
             applyCreditsSnapshot(snap);
+            void requestAgyVertexAutoRefresh();
           }
         })
         .catch(() => {});
     };
 
     readCached();
+    const onFocus = () => void requestAgyVertexAutoRefresh();
+    window.addEventListener("focus", onFocus);
 
     if (typeof listenAgyVertexCreditsChanged === "function") {
       void listenAgyVertexCreditsChanged(readCached)
@@ -183,6 +294,7 @@ export function useAgyVertexCredits() {
     return () => {
       disposed = true;
       subscribers.delete(onUpdate);
+      window.removeEventListener("focus", onFocus);
       unlisten?.();
     };
   }, []);

@@ -1,5 +1,5 @@
 import type { TFunction } from "i18next";
-import { errorText } from "@/lib/errors";
+import { errorText } from "../../lib/errors.ts";
 
 /** `[codex-desktop:<code>] <English text>`, then Desktop's own words on the
  *  following lines (the backend's `codex_desktop::banner`). */

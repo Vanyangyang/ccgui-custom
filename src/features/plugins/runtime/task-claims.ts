@@ -11,6 +11,9 @@ export interface PersistedTaskClaim extends TaskWriteScope {
   sessionProven?: boolean;
   identityMismatch?: boolean;
   cancelRequested?: boolean;
+  /** Session reservation survives terminal runs; it is not a workspace write lock. */
+  exclusiveSession?: boolean;
+  reservationOnly?: boolean;
 }
 
 /** The native scan returns lock metadata from every retained owner, including
@@ -40,8 +43,13 @@ export function decodePersistedTaskClaims(value: unknown): PersistedTaskClaim[] 
         identityMismatch = true;
       } else session = { engine: ref.engine, sessionId: ref.sessionId, workspacePath: ref.workspacePath };
     }
+    if ((r.exclusiveSession !== undefined && typeof r.exclusiveSession !== "boolean") ||
+      (r.reservationOnly !== undefined && typeof r.reservationOnly !== "boolean") ||
+      (r.reservationOnly === true && r.exclusiveSession !== true) ||
+      (r.exclusiveSession === true && (!session || identityMismatch || r.sessionProven !== true))) throw invalid();
     return { pluginId: r.pluginId, requestId: r.requestId, runId: r.runId, workspacePath: r.workspacePath,
       writePaths, session, status: "unknown", sessionProven: r.sessionProven === true,
-      identityMismatch, cancelRequested: r.cancelRequested === true };
+      identityMismatch, cancelRequested: r.cancelRequested === true,
+      exclusiveSession: r.exclusiveSession === true, reservationOnly: r.reservationOnly === true };
   });
 }

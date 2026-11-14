@@ -9,6 +9,8 @@ export default defineConfig({
     },
   },
   test: {
+    // Files that never touch browser globals opt out with `// @vitest-environment node`;
+    // jsdom setup costs about a second per file.
     environment: "jsdom",
     include: ["src/**/*.{test,spec}.{ts,tsx}"],
   },

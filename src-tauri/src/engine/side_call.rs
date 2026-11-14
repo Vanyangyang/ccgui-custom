@@ -227,6 +227,7 @@ fn isolated_command(
     model: Option<&str>,
 ) -> tokio::process::Command {
     let mut command = command_for_binary(bin);
+    command.env("CLAUDE_CODE_ENTRYPOINT", "ccgui");
     command.args([
         "-p",
         "--output-format",

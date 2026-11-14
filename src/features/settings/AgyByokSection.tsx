@@ -36,11 +36,16 @@ import { agyQuotaErrorKey } from "@/features/chat/agy-quota";
 import { cx } from "@/utils/cx";
 import {
   agyVertexEndpoint,
+  DEFAULT_VERTEX_ALIAS,
   DEFAULT_VERTEX_MODEL,
+  defaultVertexAliasForModel,
   getAgyVertexBillingOverviewUrl,
   getAgyVertexCreditsUrl,
+  getSupportedVertexModels,
+  isSupportedVertexModel,
   useAgyVertexConfig,
   useAgyVertexCredits,
+  vertexChannelIdForModel,
 } from "./agy-vertex-guardrail";
 import { Badge } from "./CliChannelRow";
 import { BrandIcon, ROW, StatusDot, TEXT_BTN } from "./PiFamilyAuthShared";
@@ -49,9 +54,6 @@ import type { CliConfigState } from "./useCliConfig";
 
 const ICON_BUTTON =
   "flex size-7 shrink-0 items-center justify-center rounded-lg text-foreground-icon-secondary hover:bg-background-secondary-hover hover:text-foreground-icon-primary disabled:opacity-40";
-
-const VERTEX_CHANNEL_ID = "agy-vertex-byok";
-const DEFAULT_VERTEX_ALIAS = "Gemini 4 Argon (Vertex)";
 
 type NamingMode = "keep_api" | "custom_alias";
 
@@ -153,31 +155,31 @@ export function AgyByokSection({ cli }: { cli: CliConfigState }) {
   );
 
   const activeModel = vertexConfig.model || DEFAULT_VERTEX_MODEL;
-  const isVertexMounted = customModels.includes(activeModel);
-  const vertexMountedAlias = customLabels[activeModel]?.trim() ?? "";
-  const hasVertexChannel = useMemo(
-    () => cli.entries.some((e) => e.id === VERTEX_CHANNEL_ID || e.model === activeModel),
-    [cli.entries, activeModel],
+  const supportedVertexModels = useMemo(
+    () => getSupportedVertexModels(vertexConfig.model),
+    [vertexConfig.model],
   );
 
   const openEditorForModel = useCallback(
     (modelId: string) => {
       const existingAlias = customLabels[modelId]?.trim() ?? "";
+      const presetAlias = defaultVertexAliasForModel(modelId, vertexConfig.model);
+      const isSupported = isSupportedVertexModel(modelId, vertexConfig.model);
       setDraftModelId(modelId);
       if (existingAlias && existingAlias !== modelId) {
         setNamingMode("custom_alias");
         setDraftAlias(existingAlias);
-      } else if (modelId === activeModel && !customModels.includes(modelId)) {
+      } else if (isSupported && !customModels.includes(modelId)) {
         setNamingMode("custom_alias");
-        setDraftAlias(DEFAULT_VERTEX_ALIAS);
+        setDraftAlias(presetAlias);
       } else {
         setNamingMode("keep_api");
-        setDraftAlias(modelId === activeModel ? DEFAULT_VERTEX_ALIAS : "");
+        setDraftAlias(isSupported ? presetAlias : "");
       }
       setActionError(null);
       setEditorOpen(true);
     },
-    [activeModel, customLabels, customModels],
+    [customLabels, customModels, vertexConfig.model],
   );
 
   const toggleEditor = useCallback(() => {
@@ -219,7 +221,7 @@ export function AgyByokSection({ cli }: { cli: CliConfigState }) {
           setActionError(t("settings.agyByokErrorNoConfig"));
           return;
         }
-        if (targetId !== vertexConfig.model) {
+        if (!isSupportedVertexModel(targetId, vertexConfig.model)) {
           setActionError(t("settings.agyByokErrorModelMismatch"));
           return;
         }
@@ -262,8 +264,9 @@ export function AgyByokSection({ cli }: { cli: CliConfigState }) {
           );
           const channelName =
             effectiveAlias || `${vertexConfig.projectId} (${targetId})`;
+          const channelId = vertexChannelIdForModel(targetId, vertexConfig.model);
           await cli.mutate(() =>
-            ipc.upsertProvider("agy", VERTEX_CHANNEL_ID, {
+            ipc.upsertProvider("agy", channelId, {
               name: channelName,
               remark: `${vertexConfig.projectId} · ~/${vertexConfig.keyFileHint}`,
               baseUrl: endpoint || "",
@@ -535,96 +538,114 @@ export function AgyByokSection({ cli }: { cli: CliConfigState }) {
             </div>
           ) : null}
 
-          {/* Detected local Vertex BYOK mount row */}
+          {/* Detected local Vertex BYOK mount rows */}
           <div>
-            <div className={cx(ROW, editorOpen && "border-b-0")}>
-              <BrandIcon iconSrc={null} />
-              <div className="flex min-w-0 flex-1 flex-col">
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <p className="truncate text-body-regular text-text-primary">
-                    {t("settings.agyByokVertexRowTitle", {
-                      project: vertexConfig.projectId || t("settings.agyVertexNoProject"),
-                      model: vertexMountedAlias || activeModel,
-                    })}
-                  </p>
-                  {isVertexMounted && (
-                    <Badge>
-                      {vertexMountedAlias
-                        ? t("settings.agyByokCustomNameBadge")
-                        : t("settings.agyByokKeepApiNameBadge")}
-                    </Badge>
-                  )}
-                  {hasVertexChannel && (
-                    <Badge>{t("settings.agyByokChannelSyncedBadge")}</Badge>
-                  )}
+            {supportedVertexModels.map((preset, index) => {
+              const modelId = preset.id;
+              const isMounted = customModels.includes(modelId);
+              const mountedAlias = customLabels[modelId]?.trim() ?? "";
+              const hasChannel = cli.entries.some(
+                (e) => e.id === preset.channelId || e.model === modelId,
+              );
+              const isLastRow = index === supportedVertexModels.length - 1;
+              return (
+                <div
+                  key={modelId}
+                  className={cx(ROW, editorOpen && isLastRow && "border-b-0")}
+                >
+                  <BrandIcon iconSrc={null} />
+                  <div className="flex min-w-0 flex-1 flex-col">
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <p className="truncate text-body-regular text-text-primary">
+                        {t("settings.agyByokVertexRowTitle", {
+                          project:
+                            vertexConfig.projectId ||
+                            t("settings.agyVertexNoProject"),
+                          model: mountedAlias || modelId,
+                        })}
+                      </p>
+                      {isMounted && (
+                        <Badge>
+                          {mountedAlias
+                            ? t("settings.agyByokCustomNameBadge")
+                            : t("settings.agyByokKeepApiNameBadge")}
+                        </Badge>
+                      )}
+                      {hasChannel && (
+                        <Badge>{t("settings.agyByokChannelSyncedBadge")}</Badge>
+                      )}
+                    </div>
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <code className="w-fit truncate rounded border border-dashed border-border-button-default px-1 py-px text-[11px] text-text-tertiary">
+                        {modelId}
+                      </code>
+                      <code className="w-fit truncate rounded border border-dashed border-border-button-default px-1 py-px text-[11px] text-text-tertiary">
+                        ~/{vertexConfig.keyFileHint}
+                      </code>
+                    </div>
+                  </div>
+
+                  <span className="flex shrink-0 items-center gap-1.5 text-body-2-regular text-text-secondary">
+                    <StatusDot on={isMounted} />
+                    {isMounted
+                      ? t("settings.agyByokMounted")
+                      : t("settings.agyByokDetectedReady")}
+                  </span>
+
+                  {vertexConfig.configured ? (
+                    <span
+                      className="flex size-5 shrink-0 items-center justify-center text-notification-success-foreground"
+                      role="img"
+                      aria-label={t("settings.agyByokKeyDetected")}
+                      title={t("settings.agyByokKeyDetected")}
+                    >
+                      <KeyRound className="size-3.5" aria-hidden />
+                    </span>
+                  ) : null}
+
+                  {!isMounted ? (
+                    <button
+                      type="button"
+                      disabled={saving}
+                      onClick={() =>
+                        void saveMount({
+                          modelId,
+                          mode: "custom_alias",
+                          alias: preset.defaultAlias,
+                          createChannel: Boolean(
+                            vertexConfig.configured && vertexConfig.projectId,
+                          ),
+                        })
+                      }
+                      className="shrink-0 rounded-lg bg-accent-500 px-2.5 py-1 text-body-2-medium text-white hover:opacity-90 disabled:opacity-50"
+                    >
+                      {t("settings.agyByokQuickMount")}
+                    </button>
+                  ) : null}
+
+                  <button
+                    type="button"
+                    className={TEXT_BTN}
+                    onClick={() => openEditorForModel(modelId)}
+                  >
+                    {editorOpen && draftModelId === modelId
+                      ? t("settings.piAuthCollapse")
+                      : t("settings.agyByokConfigureNaming")}
+                  </button>
+
+                  {isMounted ? (
+                    <button
+                      type="button"
+                      disabled={saving}
+                      className={cx(TEXT_BTN, "hover:text-text-error-primary")}
+                      onClick={() => void handleUnmount(modelId)}
+                    >
+                      {t("settings.agyByokUnmount")}
+                    </button>
+                  ) : null}
                 </div>
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <code className="w-fit truncate rounded border border-dashed border-border-button-default px-1 py-px text-[11px] text-text-tertiary">
-                    {activeModel}
-                  </code>
-                  <code className="w-fit truncate rounded border border-dashed border-border-button-default px-1 py-px text-[11px] text-text-tertiary">
-                    ~/{vertexConfig.keyFileHint}
-                  </code>
-                </div>
-              </div>
-
-              <span className="flex shrink-0 items-center gap-1.5 text-body-2-regular text-text-secondary">
-                <StatusDot on={isVertexMounted} />
-                {isVertexMounted
-                  ? t("settings.agyByokMounted")
-                  : t("settings.agyByokDetectedReady")}
-              </span>
-
-              {vertexConfig.configured ? (
-                <span
-                  className="flex size-5 shrink-0 items-center justify-center text-notification-success-foreground"
-                  role="img"
-                  aria-label={t("settings.agyByokKeyDetected")}
-                  title={t("settings.agyByokKeyDetected")}
-                >
-                  <KeyRound className="size-3.5" aria-hidden />
-                </span>
-              ) : null}
-
-              {!isVertexMounted ? (
-                <button
-                  type="button"
-                  disabled={saving}
-                  onClick={() =>
-                    void saveMount({
-                      modelId: activeModel,
-                      mode: "custom_alias",
-                      alias: DEFAULT_VERTEX_ALIAS,
-                      createChannel: Boolean(vertexConfig.configured && vertexConfig.projectId),
-                    })
-                  }
-                  className="shrink-0 rounded-lg bg-accent-500 px-2.5 py-1 text-body-2-medium text-white hover:opacity-90 disabled:opacity-50"
-                >
-                  {t("settings.agyByokQuickMount")}
-                </button>
-              ) : null}
-
-              <button
-                type="button"
-                className={TEXT_BTN}
-                onClick={() => openEditorForModel(activeModel)}
-              >
-                {editorOpen && draftModelId === activeModel
-                  ? t("settings.piAuthCollapse")
-                  : t("settings.agyByokConfigureNaming")}
-              </button>
-
-              {isVertexMounted ? (
-                <button
-                  type="button"
-                  disabled={saving}
-                  className={cx(TEXT_BTN, "hover:text-text-error-primary")}
-                  onClick={() => void handleUnmount(activeModel)}
-                >
-                  {t("settings.agyByokUnmount")}
-                </button>
-              ) : null}
-            </div>
+              );
+            })}
 
             {/* Inline Mount & Naming Editor */}
             {editorOpen ? (
@@ -656,8 +677,8 @@ export function AgyByokSection({ cli }: { cli: CliConfigState }) {
                     aria-pressed={namingMode === "custom_alias"}
                     onClick={() => {
                       setNamingMode("custom_alias");
-                      if (!draftAlias.trim() && draftModelId === activeModel) {
-                        setDraftAlias(DEFAULT_VERTEX_ALIAS);
+                      if (!draftAlias.trim() && isSupportedVertexModel(draftModelId, vertexConfig.model)) {
+                        setDraftAlias(defaultVertexAliasForModel(draftModelId, vertexConfig.model));
                       }
                     }}
                     className={cx(
@@ -780,7 +801,7 @@ export function AgyByokSection({ cli }: { cli: CliConfigState }) {
 
           {/* Other mounted custom models in customModels.agy */}
           {customModels
-            .filter((m) => m !== activeModel)
+            .filter((m) => !supportedVertexModels.some((p) => p.id === m))
             .map((modelId) => {
               const alias = customLabels[modelId]?.trim() ?? "";
               return (

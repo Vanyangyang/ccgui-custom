@@ -18,9 +18,26 @@ use serde_json::Value;
 use std::sync::Arc;
 
 mod config;
+pub(crate) mod plugin_sources;
 pub(crate) mod probe;
 mod runtime;
 mod sources;
+
+pub(crate) fn parse_jsonc_for_plugins(text: &str) -> Result<Value, String> {
+    sources::parse_jsonc_for_plugins(text, "plugin config").map_err(|_| "invalid JSONC".into())
+}
+
+pub(crate) fn redact_plugin_url(url: &str) -> String {
+    let redacted = config::redact_url(url);
+    let Ok(mut parsed) = reqwest::Url::parse(&redacted) else { return redacted; };
+    let keys: Vec<String> = parsed.query_pairs().map(|(key, _)| key.into_owned()).collect();
+    if !keys.is_empty() {
+        let mut query = parsed.query_pairs_mut();
+        query.clear();
+        for key in keys { query.append_pair(&key, "***"); }
+    }
+    parsed.to_string()
+}
 
 use config::*;
 use sources::{engine_of_source, engine_support};
@@ -34,6 +51,9 @@ pub(crate) fn probe_target(
     let (source, name) = entry_id
         .split_once(':')
         .ok_or_else(|| McpError::invalid("invalid MCP entry id"))?;
+    if source == "pi_project" {
+        return Err(McpError::new("readonly", "Pi project MCP requires native project trust and cannot be probed by the host"));
+    }
     let name = name.trim();
     if name.is_empty() {
         return Err(McpError::invalid("MCP server name must not be empty"));
@@ -103,6 +123,10 @@ pub(crate) struct McpConfigEntry {
     pub(crate) path: String,
     pub(crate) format: String,
     pub(crate) enabled: bool,
+    /// Absent means known for legacy sources; false means the plugin's native
+    /// effective enablement was not reported and must not be guessed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) enablement_known: Option<bool>,
     pub(crate) transport: Option<String>,
     pub(crate) command: Option<String>,
     pub(crate) args_count: usize,
@@ -114,6 +138,10 @@ pub(crate) struct McpConfigEntry {
     /// 只读原因码（UI 按 `mcp.readonlyReason.<code>` 本地化）；旧来源为 None。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) readonly_reason_code: Option<String>,
+    /// Some sources require engine-specific expansion and must not be probed
+    /// directly by the host. Absent preserves the existing probe behavior.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) probe_allowed: Option<bool>,
     /// 读取时的文件内容哈希；写入时回读比对，不一致即冲突。
     pub(crate) version: String,
 }
@@ -219,6 +247,42 @@ pub(crate) async fn mcp_inventory(
     // 其余引擎的声明式来源（Kimi / Grok / OMP / OpenCode / Antigravity /
     // Qoder / dsh）追加到同一份清单，按 engine 过滤后分给各自的 tab。
     sources::append_entries(&mut config, workspace.as_deref());
+    // Native plugin lists are independent of the ordinary MCP files. Query
+    // installed CLIs concurrently, preserving per-engine errors, and never
+    // launch any of the declared plugin servers here.
+    let remote_workspace = workspace.as_deref().is_some_and(|path|
+        crate::engine::wsl_transport::transport_for_workspace(&db, path).is_some());
+    let plugin_workspace_error = crate::cli_plugins::validate_workspace(workspace.as_deref(), &db).err();
+    let plugin_engines: Vec<&str> = crate::config::ENGINES.iter().copied()
+        .filter(|engine| (available(engine) || *engine == "kimi") && crate::cli_plugins::has_native_inventory(engine))
+        .collect();
+    let plugin_results = futures_util::future::join_all(plugin_engines.into_iter().map(|engine| {
+        let workspace = workspace.as_deref();
+        let validation_error = plugin_workspace_error.as_deref();
+        async move {
+            let result = if remote_workspace {
+                Err("Plugin MCP discovery for remote workspaces is not available".to_string())
+            } else if let Some(error) = validation_error {
+                Err(error.to_string())
+            } else {
+                crate::cli_plugins::discover(engine, workspace).await
+            };
+            (engine, result)
+        }
+    })).await;
+    for (engine, result) in plugin_results {
+        let source = format!("{engine}_plugin");
+        match result {
+            Ok(discovery) => {
+                let (declarations, warnings) = discovery.into_mcp(engine);
+                config.entries.extend(plugin_sources::entries(declarations));
+                for warning in warnings {
+                    config.errors.push(McpSourceError { source: source.clone(), path: engine.into(), message: warning });
+                }
+            }
+            Err(message) => config.errors.push(McpSourceError { source, path: engine.into(), message }),
+        }
+    }
     let collected_at = now_ms();
 
     let by_engine = |engine: &str, runtime: McpRuntimeSection| {
@@ -232,7 +296,7 @@ pub(crate) async fn mcp_inventory(
             errors: config
                 .errors
                 .iter()
-                .filter(|error| engine_of_source(&error.source) == Some(engine))
+                .filter(|error| engine_of_source(&error.source) == Some(engine) || error.source == format!("{engine}_plugin"))
                 .cloned()
                 .collect(),
         };
@@ -244,6 +308,13 @@ pub(crate) async fn mcp_inventory(
         });
         let mut sources = crate::mcp::config::engine_source_infos(engine, workspace.as_deref());
         sources.extend(sources::engine_source_infos(engine, workspace.as_deref()));
+        for entry in &section.entries {
+            if entry.source == format!("{engine}_plugin") && !entry.path.is_empty()
+                && !sources.iter().any(|source| source.source == entry.source && source.path == entry.path)
+            {
+                sources.push(McpSourceInfo { source: entry.source.clone(), path: entry.path.clone(), exists: std::path::Path::new(&entry.path).exists() });
+            }
+        }
         McpEngineInventory {
             id: engine.to_string(),
             available: available(engine),
@@ -339,6 +410,12 @@ pub(crate) fn parse_json(text: &str, path: &str) -> Result<Value, McpError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pi_project_probe_cannot_bypass_native_trust() {
+        let error = probe_target("pi_project:server", Some("/work")).err().unwrap();
+        assert_eq!(error.code, "readonly");
+    }
 
     #[derive(Default)]
     struct ChangedEvents(std::sync::Mutex<Vec<(String, String)>>);

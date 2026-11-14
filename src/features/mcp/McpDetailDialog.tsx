@@ -76,7 +76,7 @@ export function McpDetailDialog({
         <Row label={t("mcp.detail.source")}>{t(`mcp.source.${entry.source}`)}</Row>
         <Row label={t("mcp.detail.scope")}>{t(`mcp.scope.${entry.scope}`)}</Row>
         <Row label={t("mcp.detail.state")}>
-          {entry.enabled ? t("mcp.enabled") : t("mcp.disabled")}
+          {entry.enablementKnown === false ? t("mcp.enablementUnknown") : entry.enabled ? t("mcp.enabled") : t("mcp.disabled")}
         </Row>
         {entry.transport ? <Row label={t("mcp.detail.transport")}>{entry.transport}</Row> : null}
         {entry.command ? (
@@ -115,7 +115,11 @@ export function McpDetailDialog({
           {readonlyReason}
         </p>
       ) : null}
-      <ProbeDetail entry={entry} workspacePath={workspacePath} />
+      {entry.probeAllowed === false ? (
+        <p className="text-caption-1-regular text-text-secondary">{t("mcp.probe.unavailableNativeContext")}</p>
+      ) : (
+        <ProbeDetail entry={entry} workspacePath={workspacePath} />
+      )}
       <p className="text-caption-1-regular text-text-tertiary">{t("mcp.detail.restartHint")}</p>
     </ModalShell>
   );

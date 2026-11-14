@@ -23,6 +23,7 @@ Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
 
 beforeEach(() => {
   vi.spyOn(ipc, "taskSnapshot").mockResolvedValue({ leaders: [], branches: [] });
+  vi.spyOn(ipc, "handoffFullHistorySupported").mockResolvedValue(true);
 });
 afterEach(() => {
   vi.restoreAllMocks();
@@ -50,6 +51,26 @@ function makeSession(overrides: Partial<SessionMeta> = {}): SessionMeta {
 }
 
 describe("session-cleanup & evidence-based cache window", () => {
+  it("keeps the ordinary handoff draft untouched on timeout and reports failure", async () => {
+    const raw = "Full handoff segment 1/2: codex handoff summary timed out [stage=completion; http_status=200; diagnostic_id=ordinary]";
+    const submit = vi.spyOn(ipc, "summarizeSessionHandoff").mockRejectedValue(Error(raw));
+    const applyDraft = vi.fn();
+    const onSuccess = vi.fn();
+    const onError = vi.fn();
+    const selection = { engine: "codex" as const, model: "gpt-6.1-sol", effort: "max" };
+    expect(await upgradeHandoffDraftWithGrok({
+      engine: "codex", sessionId: "session-timeout", title: "Handoff",
+      compressionSelection: selection, getCurrentDraft: () => "original draft🙂",
+      applyDraft, onSuccess, onError,
+    })).toBe(false);
+    expect(applyDraft).not.toHaveBeenCalled();
+    expect(onSuccess).not.toHaveBeenCalled();
+    expect(onError).toHaveBeenCalledWith(expect.stringContaining("[handoff-timeout]"));
+    expect(onError.mock.calls[0][0].endsWith(raw)).toBe(true);
+    expect(submit).toHaveBeenCalledTimes(1);
+    expect(submit).toHaveBeenCalledWith(expect.objectContaining({ compressionSelection: selection, historyScope: "full" }));
+  });
+
   it("does not infer cache warmth from session activity, while computing continuous 0..1 gradient ratios", () => {
     expect(getSessionCacheHeat(undefined, NOW)).toBe("unknown");
     expect(classifySessionForCleanup({ session: makeSession({ updatedAt: NOW }), streaming: true, now: NOW }).heat).toBe("unknown");
@@ -157,6 +178,24 @@ describe("session-cleanup & evidence-based cache window", () => {
     expect(leaderGroup.selectable).toBe(false);
   });
 
+  it("does not infer long idleness from an absent or invalid activity timestamp", () => {
+    for (const updatedAt of [null, 0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      const item = classifySessionForCleanup({ session: makeSession({ updatedAt }), now: NOW });
+      expect(item.category).toBe("attention");
+      expect(item.reason).toBe("unknown_activity");
+      expect(item.defaultSelected).toBe(false);
+    }
+    expect(classifySessionForCleanup({
+      session: makeSession({ updatedAt: NOW - CLEANUP_IDLE_RECOMMEND_MS }), now: NOW,
+    }).defaultSelected).toBe(true);
+  });
+
+  it("never makes a running pinned session selectable", () => {
+    const item = classifySessionForCleanup({ session: makeSession({ pinned: true }), streaming: true, now: NOW });
+    expect(item.reason).toBe("running");
+    expect(item.selectable).toBe(false);
+  });
+
   it("builds a zero-token local handoff draft with touched files, folded code fences, and nextTask", () => {
     const longCode = Array.from({ length: 12 }, (_, i) => `const line${i} = ${i};`).join("\n");
     const draft = buildSessionHandoffDraft({
@@ -251,6 +290,8 @@ describe("session-cleanup & evidence-based cache window", () => {
       },
     });
     expect(ok).toBe(true);
+    expect(spy).toHaveBeenCalledExactlyOnceWith({ engine: "claude", sessionId: "12345678-aaaa", title: "Handoff", historyScope: "full" });
+    expect(spy.mock.calls[0][0]).not.toHaveProperty("transcriptExcerpt");
     expect(currentDraft).toContain("涉及文件：`src/components/application/ai-chat/cli-menu.tsx`");
     expect(currentDraft).toContain("上一会话交接摘要（模型提炼）：");
     expect(currentDraft).toContain("> - **目标与背景**：实现 /handoff");
@@ -417,7 +458,8 @@ describe("StatusBar cacheHeat & Archive and Handoff", () => {
     expect(grokSpy).not.toHaveBeenCalled();
     const compressionSwitch = container.querySelector<HTMLInputElement>('input[role="switch"]')!;
     await act(async () => compressionSwitch.click());
-    expect(grokSpy).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ compressionModel: DEFAULT_HANDOFF_COMPRESSION_MODEL }));
+    await vi.waitFor(() => expect(grokSpy).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ compressionModel: DEFAULT_HANDOFF_COMPRESSION_MODEL, historyScope: "full" })));
+    expect(grokSpy.mock.calls[0][0]).not.toHaveProperty("transcriptExcerpt");
     expect(grokStatus?.getAttribute("data-grok-status")).toBe("running");
 
     // 4. Complete Grok 4.7 distillation in background and verify draft + status update
@@ -557,6 +599,250 @@ describe("SessionCleanupDialog batch archive & undo", () => {
 
     archiveSpy.mockRestore();
     restoreSpy.mockRestore();
+  });
+
+  it("rechecks each later session against current running state, draft, pin, and task-group membership", async () => {
+    const { useChatStore, sessionKey } = await import("./store");
+    const { useLeaderStore } = await import("@/features/leader/store");
+    const { SessionCleanupDialog } = await import("@/components/application/ai-chat/session-cleanup-dialog");
+    const lastUpdate = Date.now() - CLEANUP_IDLE_RECOMMEND_MS - 10_000;
+    const first = makeSession({ sessionId: "first", updatedAt: lastUpdate });
+    const running = makeSession({ sessionId: "later-running", updatedAt: lastUpdate - 1 });
+    const group = makeSession({ sessionId: "later-group", updatedAt: lastUpdate - 2 });
+    const draft = makeSession({ sessionId: "later-draft", updatedAt: lastUpdate - 3 });
+    const pinned = makeSession({ sessionId: "later-pinned", updatedAt: lastUpdate - 4 });
+    const previousSnapshot = useLeaderStore.getState().snapshot;
+    useLeaderStore.setState({ snapshot: { leaders: [], branches: [] } });
+    useChatStore.setState({
+      workspaces: [{ id: "ws1", name: "app", path: "/ws/app", sortOrder: 0, lastOpenedAt: 1, groupId: null }],
+      archivedWorkspaces: [], sessions: [first, running, group, draft, pinned], drafts: {}, unseen: {}, bySession: {},
+      streamingByKey: {}, archivedSessionKeys: {},
+    });
+    const archiveSpy = vi.spyOn(ipc, "archiveSession").mockImplementation(async (session) => {
+      if (session.sessionId === first.sessionId) {
+        useChatStore.setState({
+          streamingByKey: { [sessionKey(running.engine, running.sessionId, running.workspacePath)]: true },
+          drafts: { [sessionKey(draft.engine, draft.sessionId, draft.workspacePath)]: "new draft" },
+          sessions: useChatStore.getState().sessions.map((session) => session.sessionId === pinned.sessionId ? { ...session, pinned: true } : session),
+        });
+        useLeaderStore.setState({ snapshot: { leaders: [], branches: [{
+          id: "new-child", parentEngine: group.engine, parentSessionId: group.sessionId,
+          workspacePath: group.workspacePath, engine: "codex", sessionId: "child", title: "Child", task: "Work",
+          model: null, effort: null, runId: null, state: "completed", createdAt: Date.now(), updatedAt: Date.now(),
+          lastActivityAt: Date.now(), deadlineAt: Date.now(), expired: false, result: "done", resultTruncated: false, error: null,
+        }] } });
+      }
+    });
+    try {
+      await act(async () => root.render(<SessionCleanupDialog open onClose={() => {}} />));
+      await act(async () => {
+        document.body.querySelector<HTMLButtonElement>("[data-testid='cleanup-archive-selected-btn']")!.click();
+      });
+      expect(archiveSpy).toHaveBeenCalledTimes(1);
+      expect(archiveSpy).toHaveBeenCalledWith(first);
+      expect(useChatStore.getState().sessions.map((session) => session.sessionId)).toEqual([running.sessionId, group.sessionId, draft.sessionId, pinned.sessionId]);
+    } finally {
+      await act(async () => useLeaderStore.setState({ snapshot: previousSnapshot }));
+    }
+  });
+
+  it("recomputes the idle threshold when the dialog is reopened", async () => {
+    const { useChatStore } = await import("./store");
+    const { useLeaderStore } = await import("@/features/leader/store");
+    const { SessionCleanupDialog } = await import("@/components/application/ai-chat/session-cleanup-dialog");
+    const now = vi.spyOn(Date, "now").mockReturnValue(NOW);
+    const session = makeSession({ sessionId: "crosses-threshold", updatedAt: NOW - CLEANUP_IDLE_RECOMMEND_MS + 1 });
+    const previousSnapshot = useLeaderStore.getState().snapshot;
+    useLeaderStore.setState({ snapshot: { leaders: [], branches: [] } });
+    useChatStore.setState({
+      workspaces: [{ id: "ws1", name: "app", path: "/ws/app", sortOrder: 0, lastOpenedAt: 1, groupId: null }],
+      archivedWorkspaces: [], sessions: [session], drafts: {}, unseen: {}, bySession: {}, streamingByKey: {}, archivedSessionKeys: {},
+    });
+    try {
+      await act(async () => root.render(<SessionCleanupDialog open onClose={() => {}} />));
+      expect(document.body.querySelector<HTMLInputElement>("[data-testid='cleanup-session-row'] input")!.checked).toBe(false);
+      await act(async () => root.render(<SessionCleanupDialog open={false} onClose={() => {}} />));
+      now.mockReturnValue(NOW + 1);
+      await act(async () => root.render(<SessionCleanupDialog open onClose={() => {}} />));
+      expect(document.body.querySelector<HTMLInputElement>("[data-testid='cleanup-session-row'] input")!.checked).toBe(true);
+    } finally {
+      await act(async () => useLeaderStore.setState({ snapshot: previousSnapshot }));
+    }
+  });
+
+  it("still archives a draft session the user deliberately selects", async () => {
+    const { useChatStore, sessionKey } = await import("./store");
+    const { useLeaderStore } = await import("@/features/leader/store");
+    const { SessionCleanupDialog } = await import("@/components/application/ai-chat/session-cleanup-dialog");
+    const session = makeSession({ sessionId: "selected-draft", updatedAt: Date.now() - CLEANUP_IDLE_RECOMMEND_MS });
+    const draftKey = sessionKey(session.engine, session.sessionId, session.workspacePath);
+    const previousSnapshot = useLeaderStore.getState().snapshot;
+    useLeaderStore.setState({ snapshot: { leaders: [], branches: [] } });
+    useChatStore.setState({
+      workspaces: [{ id: "ws1", name: "app", path: "/ws/app", sortOrder: 0, lastOpenedAt: 1, groupId: null }],
+      archivedWorkspaces: [], sessions: [session], drafts: { [draftKey]: "keep this draft" }, unseen: {}, bySession: {}, streamingByKey: {}, archivedSessionKeys: {},
+    });
+    const archiveSpy = vi.spyOn(ipc, "archiveSession").mockResolvedValue();
+    try {
+      await act(async () => root.render(<SessionCleanupDialog open onClose={() => {}} />));
+      const checkbox = document.body.querySelector<HTMLInputElement>("[data-testid='cleanup-session-row'] input")!;
+      expect(checkbox.checked).toBe(false);
+      await act(async () => checkbox.click());
+      await act(async () => document.body.querySelector<HTMLButtonElement>("[data-testid='cleanup-archive-selected-btn']")!.click());
+      expect(archiveSpy).toHaveBeenCalledWith(session);
+      expect(useChatStore.getState().drafts[draftKey]).toBe("keep this draft");
+    } finally {
+      await act(async () => useLeaderStore.setState({ snapshot: previousSnapshot }));
+    }
+  });
+
+  it("archives an idle task group once and undoes it as a whole", async () => {
+    const { useChatStore } = await import("./store");
+    const { useLeaderStore } = await import("@/features/leader/store");
+    const { SessionCleanupDialog } = await import("@/components/application/ai-chat/session-cleanup-dialog");
+    const updatedAt = Date.now() - CLEANUP_IDLE_RECOMMEND_MS - 10_000;
+    const parent = makeSession({ sessionId: "group-root", updatedAt });
+    const child = makeSession({ sessionId: "group-child", updatedAt });
+    const rootIdentity = { engine: parent.engine, sessionId: parent.sessionId, workspacePath: parent.workspacePath };
+    const snapshot = { leaders: [], branches: [{
+      id: "branch-child", parentEngine: parent.engine, parentSessionId: parent.sessionId, workspacePath: child.workspacePath,
+      engine: child.engine, sessionId: child.sessionId, title: "Child", task: "Work", model: null, effort: null,
+      runId: null, state: "completed" as const, createdAt: updatedAt, updatedAt, lastActivityAt: updatedAt,
+      deadlineAt: updatedAt, expired: false, result: "done", resultTruncated: false, error: null,
+    }] };
+    const previousLeader = useLeaderStore.getState();
+    const groupAction = vi.fn(async (_root: Parameters<typeof previousLeader.groupAction>[0], action: Parameters<typeof previousLeader.groupAction>[1], _expected?: Parameters<typeof previousLeader.groupAction>[2]) => {
+      if (action === "archive") useChatStore.setState({ sessions: [] });
+      else useChatStore.setState({ sessions: [parent, child] });
+    });
+    const refresh = vi.fn().mockResolvedValue(undefined).mockImplementationOnce(async () => {
+      const lastActivityAt = Date.now();
+      useLeaderStore.setState({ snapshot: { ...snapshot, branches: [{ ...snapshot.branches[0], updatedAt: lastActivityAt, lastActivityAt }] } });
+    });
+    useLeaderStore.setState({ snapshot, error: null, refresh, groupAction });
+    useChatStore.setState({
+      workspaces: [{ id: "ws1", name: "app", path: "/ws/app", sortOrder: 0, lastOpenedAt: 1, groupId: null }],
+      archivedWorkspaces: [], sessions: [parent, child], drafts: {}, unseen: {}, bySession: {}, streamingByKey: {}, retryingByKey: {}, archivedSessionKeys: {},
+    });
+    const archiveSpy = vi.spyOn(ipc, "archiveSession").mockResolvedValue();
+    try {
+      await act(async () => root.render(<SessionCleanupDialog open onClose={() => {}} />));
+      const rootRow = document.body.querySelector<HTMLElement>("[data-cleanup-reason='leader_group_idle']")!;
+      const childRow = document.body.querySelector<HTMLElement>("[data-cleanup-reason='leader_child_idle']")!;
+      expect(rootRow.querySelector<HTMLInputElement>("input")!.checked).toBe(true);
+      expect(rootRow.textContent).toContain("2");
+      // The expired child is offered on its own, but the selected group covers it.
+      expect(childRow.dataset.cleanupCovered).toBe("true");
+      expect(childRow.querySelector<HTMLInputElement>("input")!.checked).toBe(true);
+      expect(childRow.querySelector<HTMLInputElement>("input")!.disabled).toBe(true);
+      expect(document.body.textContent).toContain((await import("@/lib/i18n")).default.t("chat.cleanupSelectedCount", { count: 1 }));
+      // An explicit selection must not follow a group into a new activity state.
+      await act(async () => rootRow.querySelector<HTMLInputElement>("input")!.click());
+      await act(async () => rootRow.querySelector<HTMLInputElement>("input")!.click());
+      await act(async () => document.body.querySelector<HTMLButtonElement>("[data-testid='cleanup-archive-selected-btn']")!.click());
+      expect(groupAction).not.toHaveBeenCalled();
+      const recentRow = document.body.querySelector<HTMLElement>("[data-cleanup-reason='leader_group_recent']")!;
+      expect(recentRow.querySelector<HTMLInputElement>("input")!.checked).toBe(false);
+      await act(async () => recentRow.querySelector<HTMLInputElement>("input")!.click());
+      await act(async () => document.body.querySelector<HTMLButtonElement>("[data-testid='cleanup-archive-selected-btn']")!.click());
+      expect(groupAction).toHaveBeenCalledExactlyOnceWith(rootIdentity, "archive", expect.objectContaining({
+        branchIds: ["branch-child"], members: [rootIdentity, { engine: child.engine, sessionId: child.sessionId, workspacePath: child.workspacePath }],
+        lastActivityAt: expect.any(Number),
+      }));
+      expect(archiveSpy).not.toHaveBeenCalled();
+      const banner = document.body.querySelector<HTMLElement>("[data-testid='cleanup-undo-banner']")!;
+      groupAction.mockRejectedValueOnce(new Error("Restore refused"));
+      await act(async () => banner.querySelector<HTMLButtonElement>("button")!.click());
+      expect(groupAction).toHaveBeenLastCalledWith(rootIdentity, "restore");
+      expect(banner.textContent).toContain("Restore refused");
+      expect(banner.querySelector("button")).not.toBeNull();
+      await act(async () => banner.querySelector<HTMLButtonElement>("button")!.click());
+      expect(groupAction).toHaveBeenCalledTimes(3);
+      expect(document.body.querySelector("[data-testid='cleanup-undo-banner']")).toBeNull();
+    } finally {
+      await act(async () => useLeaderStore.setState({ snapshot: previousLeader.snapshot, refresh: previousLeader.refresh, groupAction: previousLeader.groupAction, error: previousLeader.error }));
+    }
+  });
+
+  it("archives an expired child subtree alone while its recently used parent stays", async () => {
+    const { useChatStore } = await import("./store");
+    const { useLeaderStore } = await import("@/features/leader/store");
+    const { SessionCleanupDialog } = await import("@/components/application/ai-chat/session-cleanup-dialog");
+    const idleAt = Date.now() - CLEANUP_IDLE_RECOMMEND_MS - 10_000;
+    const parent = makeSession({ sessionId: "live-parent", updatedAt: Date.now() - 60_000 });
+    const child = makeSession({ sessionId: "expired-child", updatedAt: idleAt });
+    const parentIdentity = { engine: parent.engine, sessionId: parent.sessionId, workspacePath: parent.workspacePath };
+    const childIdentity = { engine: child.engine, sessionId: child.sessionId, workspacePath: child.workspacePath };
+    const snapshot = { leaders: [], branches: [{
+      id: "branch-expired", parentEngine: parent.engine, parentSessionId: parent.sessionId, workspacePath: child.workspacePath,
+      engine: child.engine, sessionId: child.sessionId, title: "Child", task: "Work", model: null, effort: null,
+      runId: null, state: "failed" as const, createdAt: idleAt, updatedAt: idleAt, lastActivityAt: idleAt,
+      deadlineAt: idleAt, expired: true, result: "", resultTruncated: false, error: "quota reached",
+    }] };
+    const previousLeader = useLeaderStore.getState();
+    const archiveSubtree = vi.fn(async () => { useChatStore.setState({ sessions: [parent] }); });
+    const groupAction = vi.fn(async () => { useChatStore.setState({ sessions: [parent, child] }); });
+    useLeaderStore.setState({ snapshot, error: null, refresh: vi.fn().mockResolvedValue(undefined), archiveSubtree, groupAction });
+    useChatStore.setState({
+      workspaces: [{ id: "ws1", name: "app", path: "/ws/app", sortOrder: 0, lastOpenedAt: 1, groupId: null }],
+      archivedWorkspaces: [], sessions: [parent, child], drafts: {}, unseen: {}, bySession: {}, streamingByKey: {}, retryingByKey: {}, archivedSessionKeys: {},
+    });
+    try {
+      await act(async () => root.render(<SessionCleanupDialog open onClose={() => {}} />));
+      const parentRow = document.body.querySelector<HTMLElement>("[data-cleanup-reason='leader_group_recent']")!;
+      const childRow = document.body.querySelector<HTMLElement>("[data-cleanup-reason='leader_child_idle']")!;
+      expect(parentRow.querySelector<HTMLInputElement>("input")!.checked).toBe(false);
+      expect(childRow.querySelector<HTMLInputElement>("input")!.checked).toBe(true);
+      expect(childRow.dataset.cleanupCovered).toBeUndefined();
+      await act(async () => document.body.querySelector<HTMLButtonElement>("[data-testid='cleanup-archive-selected-btn']")!.click());
+      expect(archiveSubtree).toHaveBeenCalledExactlyOnceWith(parentIdentity, "branch-expired", {
+        branchIds: ["branch-expired"], members: [childIdentity], lastActivityAt: idleAt,
+      });
+      expect(groupAction).not.toHaveBeenCalled();
+      const banner = document.body.querySelector<HTMLElement>("[data-testid='cleanup-undo-banner']")!;
+      await act(async () => banner.querySelector<HTMLButtonElement>("button")!.click());
+      expect(groupAction).toHaveBeenCalledExactlyOnceWith(childIdentity, "restore");
+    } finally {
+      await act(async () => useLeaderStore.setState({ snapshot: previousLeader.snapshot, refresh: previousLeader.refresh,
+        groupAction: previousLeader.groupAction, archiveSubtree: previousLeader.archiveSubtree, error: previousLeader.error }));
+    }
+  });
+
+  it.each([
+    ["Native group refused", null],
+    ["CLEANUP_GROUP_CHANGED: activity changed", "chat.cleanupGroupChanged"],
+    ["Leader group must be idle. Stop active chats", "chat.cleanupGroupChanged"],
+    ["Command task_group_archive_checked not found", "chat.cleanupGroupHostUpdateRequired"],
+  ])("reports task group archive failure %s without claiming an undoable success", async (message, key) => {
+    const { useChatStore } = await import("./store");
+    const { useLeaderStore } = await import("@/features/leader/store");
+    const { SessionCleanupDialog } = await import("@/components/application/ai-chat/session-cleanup-dialog");
+    const updatedAt = Date.now() - CLEANUP_IDLE_RECOMMEND_MS - 10_000;
+    const parent = makeSession({ sessionId: "failed-group-root", updatedAt });
+    const child = makeSession({ sessionId: "failed-group-child", updatedAt });
+    const snapshot = { leaders: [], branches: [{
+      id: "branch-failed-child", parentEngine: parent.engine, parentSessionId: parent.sessionId, workspacePath: child.workspacePath,
+      engine: child.engine, sessionId: child.sessionId, title: "Child", task: "Work", model: null, effort: null,
+      runId: null, state: "completed" as const, createdAt: updatedAt, updatedAt, lastActivityAt: updatedAt,
+      deadlineAt: updatedAt, expired: false, result: "done", resultTruncated: false, error: null,
+    }] };
+    const previousLeader = useLeaderStore.getState();
+    useLeaderStore.setState({ snapshot, error: null, refresh: vi.fn().mockResolvedValue(undefined), groupAction: vi.fn().mockRejectedValue(new Error(message)) });
+    useChatStore.setState({
+      workspaces: [{ id: "ws1", name: "app", path: "/ws/app", sortOrder: 0, lastOpenedAt: 1, groupId: null }],
+      archivedWorkspaces: [], sessions: [parent, child], drafts: {}, unseen: {}, bySession: {}, streamingByKey: {}, retryingByKey: {}, archivedSessionKeys: {},
+    });
+    try {
+      await act(async () => root.render(<SessionCleanupDialog open onClose={() => {}} />));
+      await act(async () => document.body.querySelector<HTMLButtonElement>("[data-testid='cleanup-archive-selected-btn']")!.click());
+      const banner = document.body.querySelector<HTMLElement>("[data-testid='cleanup-undo-banner']")!;
+      const { default: i18n } = await import("@/lib/i18n");
+      expect(banner.textContent).toContain(key ? i18n.t(key) : message);
+      expect(banner.querySelector("button")).toBeNull();
+      expect(useChatStore.getState().sessions).toEqual([parent, child]);
+    } finally {
+      await act(async () => useLeaderStore.setState({ snapshot: previousLeader.snapshot, refresh: previousLeader.refresh, groupAction: previousLeader.groupAction, error: previousLeader.error }));
+    }
   });
 
   it("displays reclaimable local cache in SessionCleanupDialog and prunes on click", async () => {

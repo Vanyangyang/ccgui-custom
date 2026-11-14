@@ -208,9 +208,9 @@ fn resolve(rows: &[(String, String, Value)], scope: &Scope<'_>) -> Result<Option
         return Err("Ambiguous plugin fixed-instruction owners".into());
     }
     let result = candidates.pop().flatten();
-    if result.is_some() && !matches!(scope.engine, "claude" | "codex") {
+    if result.is_some() && !crate::plugin_caps::FIXED_INSTRUCTIONS_ENGINES.contains(&scope.engine) {
         return Err(
-            "Plugin fixed instructions are supported only by local Claude and Codex".into(),
+            "Plugin fixed instructions are supported only by local Claude, Codex and AGY".into(),
         );
     }
     Ok(result)
@@ -263,6 +263,115 @@ mod tests {
                 "inputs":[{"receipt":{"runId":"next","delivery":"turn","status":"starting","sessionRef":session()},"fixedInstructions":fixed("old")}]
             }]}),
         )
+    }
+
+    // Change only native engine identity fields in these synthetic ledgers.
+    fn for_engine(mut row: (String, String, Value), engine: &str) -> (String, String, Value) {
+        fn visit(value: &mut Value, engine: &str) {
+            match value {
+                Value::Object(fields) => for (key, value) in fields {
+                    if matches!(key.as_str(), "engine" | "newEngine" | "execEngine") {
+                        *value = json!(engine);
+                    } else {
+                        visit(value, engine);
+                    }
+                },
+                Value::Array(values) => for value in values { visit(value, engine); },
+                _ => {}
+            }
+        }
+        visit(&mut row.2, engine);
+        row
+    }
+
+    #[test]
+    fn advertised_engines_resolve_initial_turn_and_native_restore_from_current_ledger() {
+        for engine in crate::plugin_caps::FIXED_INSTRUCTIONS_ENGINES {
+            let mut s = scope("initial", None);
+            s.engine = engine;
+            let first = for_engine(index(entry()), engine);
+            assert!(resolve(&[first.clone()], &s).unwrap().unwrap().contains("policy-v1"));
+            s.run = "other-run";
+            assert!(resolve(&[first], &s).unwrap().is_none());
+            let rows = vec![for_engine(index(owned()), engine), for_engine(conversation(), engine)];
+            s.session = Some("session");
+            for run in ["initial", "next", "cold"] {
+                s.run = run;
+                let text = resolve(&rows, &s).unwrap().unwrap();
+                assert_eq!(text.matches("policy-v2").count(), 1);
+                assert!(!text.contains("policy-v1") && !text.contains("policy-old"));
+            }
+        }
+    }
+
+    #[test]
+    fn agy_ledger_retains_plugin_session_workspace_and_ownership_isolation() {
+        let base = for_engine(index(owned()), "agy");
+        let current = for_engine(conversation(), "agy");
+        let mut s = scope("cold", Some("session"));
+        s.engine = "agy";
+        for field in ["conversationOwner", "sessionProven"] {
+            let mut row = base.clone();
+            row.2["entries"][0][field] = json!(false);
+            assert!(resolve(&[row, current.clone()], &s).unwrap().is_none());
+        }
+        let mut mismatch = base.clone();
+        mismatch.2["entries"][0]["identityMismatch"] = json!(true);
+        assert!(resolve(&[mismatch, current.clone()], &s).unwrap().is_none());
+        for (field, value) in [("sessionId", "alien"), ("workspacePath", "G:/elsewhere"), ("engine", "codex")] {
+            let mut alien = current.clone();
+            alien.2["records"][0]["sessionRef"][field] = json!(value);
+            assert!(resolve(&[base.clone(), alien], &s).unwrap().unwrap().contains("policy-v1"));
+        }
+        let mut alien = current.clone();
+        alien.0 = "other-plugin".into();
+        assert!(resolve(&[base.clone(), alien], &s).unwrap().unwrap().contains("policy-v1"));
+        s.workspace = "G:/elsewhere";
+        assert!(resolve(&[base.clone(), current.clone()], &s).unwrap().is_none());
+        s.workspace = "G:/work";
+        s.session = Some("alien");
+        assert!(resolve(&[base.clone(), current.clone()], &s).unwrap().is_none());
+        s.session = Some("session");
+        let mut future = current.clone();
+        future.2["version"] = json!(2);
+        assert!(resolve(&[base.clone(), future], &s).is_err());
+        let mut malformed = current.clone();
+        malformed.2["records"][0]["fixedInstructions"]["version"] = json!("invalid version");
+        assert!(resolve(&[base.clone(), malformed], &s).is_err());
+        let mut other_owner = base.clone();
+        other_owner.0 = "other-plugin".into();
+        assert!(resolve(&[base, other_owner, current], &s).is_err());
+    }
+
+    #[test]
+    fn agy_discussion_initial_and_native_resume_require_exact_scope() {
+        let mut row = (
+            "plugin".into(), format!("{DISCUSSION}thread"),
+            json!({"snapshot":{"threadId":"thread","workspacePath":"G:/work","selection":{"engine":"agy"},"sessionRef":null},
+                "runId":"initial","fixedInstructions":fixed("v1")}),
+        );
+        let mut s = scope("initial", None);
+        s.engine = "agy";
+        assert!(resolve(&[row.clone()], &s).unwrap().is_some());
+        s.run = "other-run";
+        assert!(resolve(&[row.clone()], &s).unwrap().is_none());
+        row.2["snapshot"]["sessionRef"] = json!({"engine":"agy","sessionId":"session","workspacePath":"G:/work"});
+        s.session = Some("session");
+        assert!(resolve(&[row.clone()], &s).unwrap().is_some());
+        s.session = Some("alien");
+        assert!(resolve(&[row.clone()], &s).unwrap().is_none());
+        s.session = Some("session");
+        row.2["snapshot"]["threadId"] = json!("alien");
+        assert!(resolve(&[row], &s).unwrap().is_none());
+    }
+
+    #[test]
+    fn unadvertised_engines_still_reject_matched_fixed_instructions() {
+        for engine in ["cursor", "gemini", "grok", "pi", "unknown"] {
+            let mut s = scope("initial", None);
+            s.engine = engine;
+            assert!(resolve(&[for_engine(index(entry()), engine)], &s).is_err());
+        }
     }
 
     #[test]
@@ -407,17 +516,16 @@ mod tests {
         let root = std::env::temp_dir().join(format!("plugin-policy-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let db = crate::db::Db::open_at(&root.join("app.db")).unwrap();
-        db.plugin_kv_set("plugin", INDEX, &index(owned()).2)
-            .unwrap();
-        let read = || {
-            lookup(&db, "next", "codex", "G:/work", Some("session"))
-                .unwrap()
-                .unwrap()
-        };
-        assert!(read().contains("policy-v1"));
-        db.plugin_kv_set("plugin", CONVERSATIONS, &conversation().2)
-            .unwrap();
-        assert!(read().contains("policy-v2"));
+        for engine in crate::plugin_caps::FIXED_INSTRUCTIONS_ENGINES {
+            db.plugin_kv_set("plugin", INDEX, &for_engine(index(entry()), engine).2).unwrap();
+            assert!(lookup(&db, "initial", engine, "G:/work", None).unwrap().unwrap().contains("policy-v1"));
+            db.plugin_kv_set("plugin", INDEX, &for_engine(index(owned()), engine).2).unwrap();
+            let read = |run| lookup(&db, run, engine, "G:/work", Some("session")).unwrap().unwrap();
+            assert!(read("next").contains("policy-v1"));
+            db.plugin_kv_set("plugin", CONVERSATIONS, &for_engine(conversation(), engine).2).unwrap();
+            assert!(read("next").contains("policy-v2"));
+            assert!(read("cold").contains("policy-v2"));
+        }
         drop(db);
         std::fs::remove_dir_all(root).unwrap();
     }

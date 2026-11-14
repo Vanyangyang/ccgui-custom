@@ -13,14 +13,18 @@ use super::{ProcessGuard, SideCallError, SideCallOutput, StructuredCall, MAX_OUT
 use crate::engine::{command_for_binary, SendRequest};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 
 const OPENAI_BASE: &str = "https://api.openai.com/v1";
 const CHATGPT_BASE: &str = "https://chatgpt.com/backend-api/codex";
 const MAX_CONFIG: usize = 1024 * 1024;
+const PREPARED_ROUTE_TTL: Duration = Duration::from_secs(90);
 // Reasoning and token events repeat metadata/text on the wire. The transport
 // budget must not use the much smaller final structured-answer budget.
 const MAX_STREAM_BYTES: usize = 8 * 1024 * 1024;
@@ -41,6 +45,154 @@ struct AuthSnapshot {
     workspace_routing: Option<Value>,
 }
 
+struct CachedPreparedRoute {
+    pre_key: [u8; 32],
+    auth_hash: Option<[u8; 32]>,
+    verified_at: Instant,
+    base: String,
+    headers: HeaderMap,
+}
+
+static PREPARED_ROUTE_CACHE: LazyLock<Mutex<Option<CachedPreparedRoute>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(bytes);
+    hash.finalize().into()
+}
+
+fn hash_len_bytes(hash: &mut Sha256, bytes: &[u8]) {
+    hash.update((bytes.len() as u64).to_le_bytes());
+    hash.update(bytes);
+}
+
+fn preparation_pre_key(
+    home: &Path,
+    bin: &str,
+    native_text: &str,
+    config: &toml::Table,
+    explicit_env: &HashMap<String, String>,
+    needs_auth: bool,
+    env_lookup: impl Fn(&str) -> Option<String>,
+) -> Result<[u8; 32], SideCallError> {
+    let mut hash = Sha256::new();
+    hash_len_bytes(&mut hash, b"codex-prepared-route-v1");
+    hash_len_bytes(&mut hash, home.as_os_str().as_encoded_bytes());
+    hash_len_bytes(&mut hash, bin.as_bytes());
+    hash_len_bytes(&mut hash, native_text.as_bytes());
+    let config_bytes = serde_json::to_vec(config).map_err(|_| SideCallError::Unavailable)?;
+    hash_len_bytes(&mut hash, &config_bytes);
+    let mut sorted_env: Vec<_> = explicit_env.iter().collect();
+    sorted_env.sort_by(|a, b| a.0.cmp(b.0));
+    hash.update((sorted_env.len() as u64).to_le_bytes());
+    for (key, value) in sorted_env {
+        hash_len_bytes(&mut hash, key.as_bytes());
+        hash_len_bytes(&mut hash, value.as_bytes());
+    }
+    let mut route_env_keys = vec![
+        "OPENAI_API_KEY".to_owned(),
+        "OPENAI_BASE_URL".to_owned(),
+        "OPENAI_ORGANIZATION".to_owned(),
+        "OPENAI_PROJECT".to_owned(),
+    ];
+    if let Ok((_, Some(provider))) = selected_provider(config) {
+        if let Some(env_key) = optional_str(provider, "env_key")? {
+            route_env_keys.push(env_key.to_owned());
+        }
+        if let Some(env_headers) = provider
+            .get("env_http_headers")
+            .and_then(toml::Value::as_table)
+        {
+            for value in env_headers.values() {
+                if let Some(name) = value.as_str() {
+                    route_env_keys.push(name.to_owned());
+                }
+            }
+        }
+    }
+    route_env_keys.sort();
+    route_env_keys.dedup();
+    hash.update((route_env_keys.len() as u64).to_le_bytes());
+    for key in route_env_keys {
+        hash_len_bytes(&mut hash, key.as_bytes());
+        match env_lookup(&key) {
+            Some(value) => {
+                hash.update([1]);
+                hash_len_bytes(&mut hash, value.as_bytes());
+            }
+            None => hash.update([0]),
+        }
+    }
+    hash.update([u8::from(needs_auth)]);
+    Ok(hash.finalize().into())
+}
+
+fn lookup_prepared_route_in(
+    cache: &Mutex<Option<CachedPreparedRoute>>,
+    pre_key: &[u8; 32],
+    auth_hash: Option<[u8; 32]>,
+    now: Instant,
+) -> Option<(String, HeaderMap)> {
+    let mut guard = cache.lock().ok()?;
+    let entry = guard.as_ref()?;
+    if now.saturating_duration_since(entry.verified_at) >= PREPARED_ROUTE_TTL {
+        *guard = None;
+        return None;
+    }
+    if &entry.pre_key != pre_key || entry.auth_hash != auth_hash {
+        return None;
+    }
+    Some((entry.base.clone(), entry.headers.clone()))
+}
+
+fn store_prepared_route_in(
+    cache: &Mutex<Option<CachedPreparedRoute>>,
+    pre_key: [u8; 32],
+    auth_hash: Option<[u8; 32]>,
+    now: Instant,
+    base: &str,
+    headers: &HeaderMap,
+) {
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some(CachedPreparedRoute {
+            pre_key,
+            auth_hash,
+            verified_at: now,
+            base: base.to_owned(),
+            headers: headers.clone(),
+        });
+    }
+}
+
+fn invalidate_prepared_route_in(cache: &Mutex<Option<CachedPreparedRoute>>) {
+    if let Ok(mut guard) = cache.lock() {
+        *guard = None;
+    }
+}
+
+fn lookup_prepared_route(
+    pre_key: &[u8; 32],
+    auth_hash: Option<[u8; 32]>,
+    now: Instant,
+) -> Option<(String, HeaderMap)> {
+    lookup_prepared_route_in(&PREPARED_ROUTE_CACHE, pre_key, auth_hash, now)
+}
+
+fn store_prepared_route(
+    pre_key: [u8; 32],
+    auth_hash: Option<[u8; 32]>,
+    now: Instant,
+    base: &str,
+    headers: &HeaderMap,
+) {
+    store_prepared_route_in(&PREPARED_ROUTE_CACHE, pre_key, auth_hash, now, base, headers);
+}
+
+fn invalidate_prepared_route() {
+    invalidate_prepared_route_in(&PREPARED_ROUTE_CACHE);
+}
+
 fn traced<T>(stage: &'static str, result: Result<T, SideCallError>) -> Result<T, SideCallError> {
     if let Err(error) = &result {
         super::diagnostics::record(stage);
@@ -55,15 +207,61 @@ fn bad_output(stage: &'static str) -> SideCallError {
 }
 
 pub(super) async fn structured(call: StructuredCall<'_>) -> Result<SideCallOutput, SideCallError> {
-    traced(
-        "completion",
-        tokio::time::timeout(call.timeout, structured_inner(&call))
-            .await
-            .unwrap_or(Err(SideCallError::Timeout)),
-    )
+    completion_deadline(call.timeout, structured_inner(&call)).await
+}
+
+async fn completion_deadline<T>(
+    timeout: std::time::Duration,
+    operation: impl std::future::Future<Output = Result<T, SideCallError>>,
+) -> Result<T, SideCallError> {
+    super::diagnostics::deadline(timeout);
+    let result = match tokio::time::timeout(timeout, operation).await {
+        Ok(result) => result,
+        Err(_) => {
+            super::diagnostics::timed_out();
+            Err(SideCallError::Timeout)
+        }
+    };
+    traced("completion", result)
 }
 
 async fn structured_inner(call: &StructuredCall<'_>) -> Result<SideCallOutput, SideCallError> {
+    let (base, headers) = serialized_preparation(&PREPARATION_GATE, prepare(call)).await?;
+    complete_http(call, &base, headers).await
+}
+
+// Stock auth refresh and the subsequent file snapshot share CODEX_HOME across
+// side calls. Keep that whole preparation atomic within this process, while
+// allowing independent HTTP completions to overlap after headers are owned.
+static PREPARATION_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct GuardedPreparation<'a, F> {
+    // Field order ensures cancellation drops the operation (including its
+    // process guard) before unlocking preparation for the next side call.
+    operation: std::pin::Pin<Box<F>>,
+    _guard: tokio::sync::MutexGuard<'a, ()>,
+}
+
+fn serialized_preparation<'a, T: 'a>(
+    gate: &'a tokio::sync::Mutex<()>,
+    preparation: impl std::future::Future<Output = Result<T, SideCallError>> + 'a,
+) -> impl std::future::Future<Output = Result<T, SideCallError>> + 'a {
+    // Box before constructing the waiting future: do not carry the large
+    // preparation future inline through the Windows 1 MiB IPC stack.
+    let preparation = Box::pin(preparation);
+    async move {
+        super::diagnostics::active_phase("preparation_wait");
+        let guard = gate.lock().await;
+        let mut guarded = GuardedPreparation {
+            operation: preparation,
+            _guard: guard,
+        };
+        guarded.operation.as_mut().await
+    }
+}
+
+async fn prepare(call: &StructuredCall<'_>) -> Result<(String, HeaderMap), SideCallError> {
+    super::diagnostics::active_phase("configuration");
     crate::config::ensure_engine_enabled("codex").map_err(|_| SideCallError::Unavailable)?;
     let provider = crate::config::resolve_provider("codex", call.provider_id)
         .map_err(|_| SideCallError::Unavailable)?;
@@ -125,19 +323,45 @@ async fn structured_inner(call: &StructuredCall<'_>) -> Result<SideCallOutput, S
             .cloned()
             .or_else(|| std::env::var(key).ok())
     })?;
+    let needs_auth = route.key.is_none() && route.requires_auth;
+    if needs_auth
+        && config
+            .get("cli_auth_credentials_store")
+            .and_then(toml::Value::as_str)
+            .is_some_and(|store| store != "file")
+    {
+        return Err(SideCallError::Unavailable);
+    }
+    let pre_key = preparation_pre_key(
+        &home,
+        &bin,
+        &native_text,
+        &config,
+        &explicit_env,
+        needs_auth,
+        |key| std::env::var(key).ok(),
+    )?;
+    let pre_auth_hash = if needs_auth {
+        read_optional(&home.join("auth.json"))
+            .await?
+            .map(|text| sha256_bytes(text.as_bytes()))
+    } else {
+        None
+    };
+    if !needs_auth || pre_auth_hash.is_some() {
+        if let Some(cached) = lookup_prepared_route(&pre_key, pre_auth_hash, Instant::now()) {
+            return Ok(cached);
+        }
+    }
     // Every path, including explicit channel keys, checks the stock CLI's
     // managed effective config before a credential can reach HTTP.
+    super::diagnostics::active_phase("auth_snapshot");
     let auth = traced(
         "auth_snapshot",
-        stock_snapshot(
-            command,
-            &home,
-            &config,
-            &explicit_env,
-            route.key.is_none() && route.requires_auth,
-        )
-        .await,
+        stock_snapshot(command, &home, &config, &explicit_env, needs_auth).await,
     )?;
+    super::diagnostics::active_phase("configuration");
+    let mut cache_auth_hash = None;
     let (base, headers) = if let Some(key) = route.key {
         let mut headers = route.headers;
         set_bearer(&mut headers, &key)?;
@@ -167,11 +391,15 @@ async fn structured_inner(call: &StructuredCall<'_>) -> Result<SideCallOutput, S
         }
         if auth.mode == "apikey" {
             set_bearer(&mut headers, &auth.token)?;
+            cache_auth_hash = read_optional(&home.join("auth.json"))
+                .await?
+                .map(|text| sha256_bytes(text.as_bytes()));
             (route.base.unwrap_or_else(|| OPENAI_BASE.into()), headers)
         } else {
             let latest = read_optional(&home.join("auth.json"))
                 .await?
                 .ok_or(SideCallError::Unavailable)?;
+            let post_auth_hash = sha256_bytes(latest.as_bytes());
             let latest: Value =
                 serde_json::from_str(&latest).map_err(|_| SideCallError::Unavailable)?;
             ensure_file_oauth(&config, &latest)?;
@@ -192,11 +420,19 @@ async fn structured_inner(call: &StructuredCall<'_>) -> Result<SideCallOutput, S
                 account,
                 &mut headers,
             )?;
+            cache_auth_hash = Some(post_auth_hash);
             (base, headers)
         }
     };
-    complete_http(call, &base, headers).await
+    if !needs_auth || cache_auth_hash.is_some() {
+        store_prepared_route(pre_key, cache_auth_hash, Instant::now(), &base, &headers);
+    }
+    Ok((base, headers))
 }
+
+#[cfg(test)]
+#[path = "codex_concurrency_tests.rs"]
+mod concurrency_tests;
 
 fn routing_snapshot(
     command: &tokio::process::Command,
@@ -839,6 +1075,7 @@ async fn complete_http(
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|_| SideCallError::Unavailable)?;
+    super::diagnostics::active_phase("http_headers");
     let mut response = traced(
         "http_send",
         client
@@ -851,10 +1088,14 @@ async fn complete_http(
     )?;
     super::diagnostics::record_http_status(response.status().as_u16());
     if !response.status().is_success() {
+        let status_code = response.status().as_u16();
+        if matches!(status_code, 401 | 403) {
+            invalidate_prepared_route();
+        }
         super::diagnostics::record("http_status");
         eprintln!(
             "[side-call] codex stage=http_status error=Failed status={}",
-            response.status().as_u16()
+            status_code
         );
         return Err(SideCallError::Failed);
     }
@@ -894,10 +1135,14 @@ async fn complete_http(
     let mut state = SseState::default();
     let mut total = 0usize;
     let mut prefix_checked = false;
-    while let Some(chunk) = traced(
-        "http_stream_read",
-        response.chunk().await.map_err(|_| SideCallError::Failed),
-    )? {
+    super::diagnostics::body_started();
+    loop {
+        super::diagnostics::active_phase(if sse { "http_stream_wait" } else { "http_json_body_wait" });
+        let Some(chunk) = traced(
+            "http_stream_read",
+            response.chunk().await.map_err(|_| SideCallError::Failed),
+        )? else { break; };
+        super::diagnostics::received_bytes(chunk.len());
         total = total
             .checked_add(chunk.len())
             .ok_or_else(|| bad_output("http_stream_limit"))?;
@@ -1049,6 +1294,7 @@ impl SseState {
             "sse_json",
             serde_json::from_str(&data).map_err(|_| SideCallError::BadOutput),
         )?;
+        super::diagnostics::sse_event(event.get("type").and_then(Value::as_str).unwrap_or(""));
         let kind = traced(
             "sse_event_type",
             event
@@ -1275,6 +1521,94 @@ mod tests {
     }
     fn completed(text: &str) -> Value {
         json!({"status":"completed","output":[message(text)],"usage":{"input_tokens":8,"output_tokens":4}})
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn handoff_deadline_allows_completion_after_the_old_sixty_second_cutoff() {
+        let schema = json!({"type":"object"});
+        let mut selected = call(&schema);
+        selected.effort = "max";
+        selected.timeout = crate::app_cache::HANDOFF_TIMEOUT;
+        let started = tokio::time::Instant::now();
+        let output = completion_deadline(selected.timeout, async {
+            let body = request_body(&selected)?;
+            assert_eq!(body["model"], "gpt-6.1-sol");
+            assert_eq!(body["reasoning"]["effort"], "max");
+            tokio::time::sleep(Duration::from_secs(61)).await;
+            let terminal = json!({"type":"response.completed", "response":completed(r#"{"summary":"保留完整摘要和待验证事项。"}"#)});
+            SseState::default().frame(&format!("data: {terminal}"))?.ok_or(SideCallError::BadOutput)
+        }).await.unwrap();
+        assert_eq!(started.elapsed(), Duration::from_secs(61));
+        assert_eq!(output.structured["summary"], "保留完整摘要和待验证事项。");
+    }
+
+    // A real loopback body remains open until the client drops it. No account,
+    // engine startup or external endpoint is involved, and extra requests fail.
+    async fn stalled_stream(prefix: String, heartbeat: bool) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 2048];
+            loop {
+                let count = stream.read(&mut buffer).await.unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&buffer[..count]);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = std::str::from_utf8(&request[..end]).unwrap();
+                    let length: usize = head.lines().find_map(|line| line.to_ascii_lowercase()
+                        .strip_prefix("content-length:").map(|value| value.trim().parse().unwrap())).unwrap();
+                    if request.len() >= end + 4 + length { break; }
+                }
+            }
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").await.unwrap();
+            stream.write_all(prefix.as_bytes()).await.unwrap();
+            loop {
+                tokio::select! {
+                    _ = listener.accept() => panic!("completion must not issue a duplicate request"),
+                    result = stream.read(&mut buffer) => {
+                        match result {
+                            Ok(0) => {},
+                            Err(error) if matches!(error.kind(), std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::BrokenPipe) => {},
+                            other => panic!("client must drop its stalled response: {other:?}"),
+                        }
+                        break;
+                    },
+                    _ = tokio::time::sleep(Duration::from_millis(10)), if heartbeat => {
+                        if stream.write_all(b": heartbeat\n\n").await.is_err() { break; }
+                    },
+                }
+            }
+        });
+        (url, task)
+    }
+
+    #[tokio::test]
+    async fn stalled_http_200_and_heartbeat_only_streams_keep_deadline_diagnostics() {
+        let schema = json!({"type":"object"});
+        for (prefix, events, last_event, heartbeat) in [
+            (": heartbeat\n\n".to_owned(), 0, None, true),
+            // A valid unknown event and an unfinished terminal frame must not
+            // be accepted as completion, even while the connection stays open.
+            ("data: {\"type\":\"private-unknown-event\"}\n\ndata: {\"type\":\"response.completed\"".to_owned(), 1, Some("other"), false),
+        ] {
+            let (base, server) = stalled_stream(prefix.clone(), heartbeat).await;
+            let deadline = Duration::from_millis(200);
+            let failure = super::super::diagnostics::capture(completion_deadline(deadline,
+                complete_http(&call(&schema), &base, HeaderMap::new()),
+            )).await.unwrap_err();
+            assert_eq!(failure.kind, SideCallError::Timeout);
+            assert_eq!(failure.stage, Some("http_stream_wait"));
+            assert_eq!(failure.http_status, Some(200));
+            assert_eq!(failure.timeout_ms, Some(200));
+            assert!(failure.received_bytes.unwrap() >= prefix.len() as u64);
+            assert_eq!(failure.sse_events, Some(events));
+            assert_eq!(failure.last_event, last_event);
+            assert!(!format!("{failure:?}").contains("private-unknown-event"));
+            tokio::time::timeout(Duration::from_secs(2), server).await.unwrap().unwrap();
+        }
     }
 
     async fn fixture(
@@ -2064,6 +2398,94 @@ mod tests {
         assert_eq!(
             validate_effective_routing(&candidate, &json!({"config":null}), |_| None),
             Err(SideCallError::Unavailable)
+        );
+    }
+
+    #[test]
+    fn prepared_route_cache_reuses_identical_inputs_and_invalidates_on_change_expiry_or_401() {
+        let cache = Mutex::new(None);
+        let config: toml::Table = toml::from_str(
+            "model_provider='relay'\n[model_providers.relay]\nname='Fixture'\nbase_url='https://fixture.example/v1'\nenv_key='FIXTURE_KEY'\nwire_api='responses'",
+        )
+        .unwrap();
+        let explicit_env = HashMap::from([("CODEX_HOME".to_owned(), "/tmp/codex-a".to_owned())]);
+        let pre_key = preparation_pre_key(
+            Path::new("/tmp/codex-a"),
+            "codex",
+            "",
+            &config,
+            &explicit_env,
+            true,
+            |key| match key {
+                "FIXTURE_KEY" => Some("secret-1".to_owned()),
+                _ => None,
+            },
+        )
+        .unwrap();
+        let auth_a = Some(sha256_bytes(br#"{"tokens":{"access_token":"a"}}"#));
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static("Bearer test"));
+        let t0 = Instant::now();
+
+        store_prepared_route_in(
+            &cache,
+            pre_key,
+            auth_a,
+            t0,
+            "https://fixture.example/v1",
+            &headers,
+        );
+        assert!(
+            lookup_prepared_route_in(&cache, &pre_key, auth_a, t0 + Duration::from_secs(30))
+                .is_some()
+        );
+
+        let auth_b = Some(sha256_bytes(br#"{"tokens":{"access_token":"b"}}"#));
+        assert!(
+            lookup_prepared_route_in(&cache, &pre_key, auth_b, t0 + Duration::from_secs(30))
+                .is_none()
+        );
+
+        let changed_env_key = preparation_pre_key(
+            Path::new("/tmp/codex-a"),
+            "codex",
+            "",
+            &config,
+            &explicit_env,
+            true,
+            |key| match key {
+                "FIXTURE_KEY" => Some("secret-2".to_owned()),
+                _ => None,
+            },
+        )
+        .unwrap();
+        assert_ne!(changed_env_key, pre_key);
+        assert!(
+            lookup_prepared_route_in(
+                &cache,
+                &changed_env_key,
+                auth_a,
+                t0 + Duration::from_secs(30)
+            )
+            .is_none()
+        );
+
+        assert!(
+            lookup_prepared_route_in(&cache, &pre_key, auth_a, t0 + PREPARED_ROUTE_TTL).is_none()
+        );
+
+        store_prepared_route_in(
+            &cache,
+            pre_key,
+            auth_a,
+            t0,
+            "https://fixture.example/v1",
+            &headers,
+        );
+        invalidate_prepared_route_in(&cache);
+        assert!(
+            lookup_prepared_route_in(&cache, &pre_key, auth_a, t0 + Duration::from_secs(1))
+                .is_none()
         );
     }
 }

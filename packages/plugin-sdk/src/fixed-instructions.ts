@@ -1,6 +1,7 @@
 /** Supplementary plugin guidance, separate from user turns. It does not grant
- * tools or permissions. Supported local Claude/Codex launches restore it through
- * their native system/developer instruction channel, including resumed sessions.
+ * tools or permissions. Supported local Claude/Codex/AGY launches restore it through
+ * their native instruction channel, including resumed sessions. Check the exact
+ * engine catalog capability; older hosts do not support AGY profiles.
  * Omission on a continuation retains the previous profile. Changing a profile
  * waits for a full native turn; it cannot replace instructions in a live turn. */
 export interface HostFixedInstructions {

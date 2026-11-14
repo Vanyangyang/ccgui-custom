@@ -99,9 +99,8 @@ describe("worker transport integration", () => {
     second.close();
     await rejected;
     await vi.advanceTimersByTimeAsync(1000);
-    const third = FakeSocket.all[2];
-    third.open(); third.hello();
-    expect(third.sent).toEqual([]);
+    expect(FakeSocket.all).toHaveLength(2);
+    expect(FakeSocket.all.flatMap(socket => socket.sent).filter(frame => frame.cmd === "send_follow_up")).toHaveLength(1);
   });
 
   it("reports bounded uncertainty without turning a timed-out mutation into success", async () => {
@@ -328,7 +327,7 @@ describe("worker transport integration", () => {
     const delivered = vi.fn();
     let listening = false;
     const ready = transport.listen("engine://event", delivered).then(() => { listening = true; });
-    const sent = transport.invoke("send_message", { runId: "requested-run", prompt: "hello" });
+    const sent = transport.invoke("send_message", { runId: "requested-run", prompt: "hello", codexServiceTierOverride: "priority" });
     await flush();
     expect(listening).toBe(false);
     expect(native.invoke.mock.calls.map((call: unknown[]) => call[0])).not.toContain("runtime_worker_start");
@@ -341,6 +340,9 @@ describe("worker transport integration", () => {
     expect(delivered.mock.calls).toEqual([[{ payload: "delta-1" }], [{ payload: "delta-2" }]]);
     expect(transport.getWorkerEventCursors()).toEqual({ "worker-accepted": 2 });
     expect(native.invoke.mock.calls.filter((call: unknown[]) => call[0] === "runtime_worker_start")).toHaveLength(1);
+    expect(native.invoke).toHaveBeenCalledWith("runtime_worker_start", expect.objectContaining({
+      args: expect.objectContaining({ codexServiceTierOverride: "priority" }),
+    }));
   });
 
   it("preserves an accepted start when view attachment fails and retries attachment without resending", async () => {
@@ -410,8 +412,7 @@ describe("worker transport integration", () => {
     expect(first.sent[2]).toMatchObject({ cmd: "respond_plan_review", args });
     const rejected = expect(request).rejects.toMatchObject({ code: "request-uncertain", command: "respond_plan_review" });
     first.close(); await rejected; await vi.advanceTimersByTimeAsync(1000);
-    const second = FakeSocket.all[1]; second.open(); second.hello(); await flush();
-    expect(second.sent).toEqual([]);
+    expect(FakeSocket.all).toHaveLength(1);
     expect(FakeSocket.all.flatMap(socket => socket.sent).filter(frame => frame.cmd === "respond_plan_review")).toHaveLength(1);
   });
 

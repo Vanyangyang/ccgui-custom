@@ -1,10 +1,11 @@
 //! Antigravity (`agy`) conversations are sqlite + protobuf, not NDJSON.
 //!
-//! User text is taken from `~/.gemini/antigravity-cli/history.jsonl` (the
-//! CLI's own prompt log). Assistant / tool text is pulled out of
+//! User text and native images come from user steps, with the CLI's optional
+//! `history.jsonl` prompt log as a fallback. Assistant / tool text is pulled out of
 //! length-delimited UTF-8 strings in each `steps.step_payload` blob.
 
 use super::{Message, ParsedSession, ScanSummary};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::Deserialize;
 use std::path::Path;
 
@@ -34,53 +35,82 @@ pub(super) fn parse_agy_session(path: &Path) -> ParsedSession {
 
 fn parse_agy_session_inner(path: &Path, with_usage: bool) -> ParsedSession {
     let id = conversation_id(path);
-    let mut users = load_user_turns(path, id.as_deref());
-    let mut user_iter = users.drain(..);
+    let users = load_user_turns(path, id.as_deref());
+    parse_agy_steps(path, with_usage, users, load_steps(path).unwrap_or_default())
+}
+
+/// Complete saved-visible-history reads must not treat a failed SQLite read as
+/// an empty database and then return only the prompt-log compensation rows.
+pub(crate) fn parse_agy_session_strict(path: &Path) -> Result<ParsedSession, String> {
+    parse_agy_session_strict_inner(path, false)
+}
+
+/// Timeline replacement must fail atomically when saved message reads fail.
+pub(super) fn parse_agy_session_timeline_strict(path: &Path) -> Result<ParsedSession, String> {
+    parse_agy_session_strict_inner(path, true)
+}
+
+fn parse_agy_session_strict_inner(path: &Path, with_usage: bool) -> Result<ParsedSession, String> {
+    let steps = load_steps_strict(path)?;
+    let id = conversation_id(path).ok_or("full AGY history has no conversation ID")?;
+    let users = load_user_turns_strict(path, &id)?;
+    // Usage queries are unrelated to visible handoff text and remain best-effort
+    // only in the timeline path. No thinking or raw protobuf is exposed here.
+    Ok(parse_agy_steps(path, with_usage, users, steps))
+}
+
+fn parse_agy_steps(path: &Path, with_usage: bool, users: Vec<UserTurn>, steps: Vec<(i64, Vec<u8>)>) -> ParsedSession {
+    let mut user_iter = users.into_iter();
     let mut messages = Vec::new();
     let mut seq = 0i64;
     let mut turn_usage = TurnUsage::default();
 
-    if let Some(steps) = load_steps(path) {
-        for (step_type, payload) in steps {
-            match step_type {
-                STEP_USER => {
-                    if with_usage { turn_usage.finish(&mut messages); }
-                    turn_usage = TurnUsage::new();
-                    let hist_turn = user_iter.next();
-                    let turn = match (extract_user_step_turn(&payload), hist_turn) {
-                        (Some(mut step_turn), Some(hist)) => {
-                            if step_turn.ts_ms.is_none() {
-                                step_turn.ts_ms = hist.ts_ms;
-                            }
-                            if step_turn.images.is_empty() && !hist.images.is_empty() {
-                                step_turn.images = hist.images;
-                            }
-                            Some(step_turn)
+    for (step_type, payload) in steps {
+        match step_type {
+            STEP_USER => {
+                if with_usage { turn_usage.finish(&mut messages); }
+                turn_usage = TurnUsage::new();
+                let step_turn = extract_user_step_turn(&payload);
+                if step_turn.as_ref().is_some_and(|turn| {
+                    crate::engine::agy_acp::is_internal_wakeup_prompt(&turn.text)
+                        && turn.images.is_empty()
+                }) {
+                    continue;
+                }
+                let hist_turn = user_iter.next();
+                let turn = match (step_turn, hist_turn) {
+                    (Some(mut step_turn), Some(hist)) => {
+                        if step_turn.ts_ms.is_none() {
+                            step_turn.ts_ms = hist.ts_ms;
                         }
-                        (Some(step_turn), None) => Some(step_turn),
-                        (None, Some(hist)) => Some(hist),
-                        (None, None) => None,
-                    };
-                    if let Some(turn) = turn {
-                        seq += 1;
-                        messages.push(user_message(seq, turn));
+                        if step_turn.images.is_empty() && !hist.images.is_empty() {
+                            step_turn.images = hist.images;
+                        }
+                        Some(step_turn)
                     }
+                    (Some(step_turn), None) => Some(step_turn),
+                    (None, Some(hist)) => Some(hist),
+                    (None, None) => None,
+                };
+                if let Some(turn) = turn {
+                    seq += 1;
+                    messages.push(user_message(seq, turn));
                 }
-                STEP_ASSISTANT => {
-                    if with_usage { turn_usage.add(&payload); }
-                    // Tool payloads live in the same sqlite blobs as replies;
-                    // reconstructing them yields protobuf/JSON fragments
-                    // ("ommandLine", "WaitMsBeforeAsync"). History only keeps
-                    // the visible assistant reply.
-                    if let Some(text) = pick_assistant(&proto_strings(&payload)) {
-                        seq += 1;
-                        let ts_ms = extract_step_timestamp_ms(&payload);
-                        messages.push(plain_message(seq, "assistant", text, ts_ms));
-                        turn_usage.last_assistant = Some(messages.len() - 1);
-                    }
-                }
-                _ => {}
             }
+            STEP_ASSISTANT => {
+                if with_usage { turn_usage.add(&payload); }
+                // Tool payloads live in the same sqlite blobs as replies;
+                // reconstructing them yields protobuf/JSON fragments
+                // ("ommandLine", "WaitMsBeforeAsync"). History only keeps
+                // the visible assistant reply.
+                if let Some(text) = pick_assistant(&proto_strings(&payload)) {
+                    seq += 1;
+                    let ts_ms = extract_step_timestamp_ms(&payload);
+                    messages.push(plain_message(seq, "assistant", text, ts_ms));
+                    turn_usage.last_assistant = Some(messages.len() - 1);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -549,7 +579,7 @@ fn extract_step_timestamp_ms(buf: &[u8]) -> Option<i64> {
 
 /// Extract a user prompt from a `STEP_USER` (`step_type = 14`) protobuf payload.
 /// `field 19` (`UserStep`) stores the user text in `field 2` (or `field 3 -> field 1`
-/// for structured/task prompts).
+/// for structured/task prompts); repeated `field 9` contains native ACP images.
 fn extract_user_step_turn(buf: &[u8]) -> Option<UserTurn> {
     let user_step = find_length_delimited_field(buf, 19)?;
     let raw_bytes = find_length_delimited_field(user_step, 2)
@@ -557,12 +587,19 @@ fn extract_user_step_turn(buf: &[u8]) -> Option<UserTurn> {
         .or_else(|| {
             let sub = find_length_delimited_field(user_step, 3)?;
             find_length_delimited_field(sub, 1).filter(|b| !b.is_empty())
-        })?;
-    let raw_str = std::str::from_utf8(raw_bytes).ok()?;
-    if !is_clean_text(raw_str) {
-        return None;
-    }
-    let (clean_text, images) = strip_agy_images(raw_str);
+        });
+    let raw_str = raw_bytes
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .filter(|text| is_clean_text(text))
+        .unwrap_or("");
+    let (clean_text, mut images) = strip_agy_images(raw_str);
+    images.extend(
+        length_delimited_fields(user_step)
+            .filter(|(field, _)| *field == 9)
+            .filter_map(|(_, image)| native_user_image(image)),
+    );
+    let mut seen = std::collections::HashSet::new();
+    images.retain(|image| seen.insert(image.clone()));
     if clean_text.is_empty() && images.is_empty() {
         return None;
     }
@@ -573,38 +610,132 @@ fn extract_user_step_turn(buf: &[u8]) -> Option<UserTurn> {
     })
 }
 
-fn find_length_delimited_field(buf: &[u8], target_field: u64) -> Option<&[u8]> {
-    let mut i = 0;
-    while i < buf.len() {
-        let (tag, i2) = read_varint(buf, i)?;
-        let field = tag >> 3;
-        match (tag & 7) as u32 {
-            0 => {
-                let (_, n) = read_varint(buf, i2)?;
-                i = n;
-            }
-            1 if i2 + 8 <= buf.len() => i = i2 + 8,
-            5 if i2 + 4 <= buf.len() => i = i2 + 4,
-            2 => {
-                let (len, i3) = read_varint(buf, i2)?;
-                let end = i3.checked_add(len as usize)?;
-                if end > buf.len() {
-                    return None;
-                }
-                if field == target_field {
-                    return Some(&buf[i3..end]);
-                }
-                i = end;
-            }
-            _ => return None,
-        }
+const MAX_NATIVE_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+
+fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        Some("image/webp")
+    } else {
+        None
     }
-    None
+}
+
+/// ACP UserStep.field9 stores MIME, raw bytes and an optional local source path.
+fn native_user_image(image: &[u8]) -> Option<String> {
+    let bytes = find_length_delimited_field(image, 2).unwrap_or_default();
+    let declared = std::str::from_utf8(find_length_delimited_field(image, 1).unwrap_or_default())
+        .ok()?
+        .trim();
+    let mime = if declared.is_empty() {
+        sniff_image_mime(bytes)
+    } else {
+        let subtype = declared.strip_prefix("image/")?;
+        if subtype.is_empty()
+            || !subtype.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$&^_.+-".contains(&b))
+        {
+            return None;
+        }
+        Some(declared)
+    };
+    if !bytes.is_empty() {
+        if bytes.len() > MAX_NATIVE_IMAGE_BYTES {
+            return None;
+        }
+        return Some(format!("data:{};base64,{}", mime?, STANDARD.encode(bytes)));
+    }
+    let raw_path = std::str::from_utf8(find_length_delimited_field(image, 5)?)
+        .ok()?
+        .trim();
+    if raw_path.is_empty() {
+        return None;
+    }
+    let path = if raw_path.starts_with("file://") {
+        super::discovery::file_uri_path(raw_path)?
+    } else {
+        if raw_path.contains("://") {
+            return None;
+        }
+        std::path::PathBuf::from(raw_path)
+    };
+    let image_extension = path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| {
+        matches!(ext.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "avif" | "svg")
+    });
+    (mime.is_some() || image_extension).then(|| path.to_string_lossy().into_owned())
+}
+
+fn find_length_delimited_field(buf: &[u8], target_field: u64) -> Option<&[u8]> {
+    length_delimited_fields(buf).find_map(|(field, bytes)| (field == target_field).then_some(bytes))
+}
+
+fn length_delimited_fields(buf: &[u8]) -> impl Iterator<Item = (u64, &[u8])> {
+    let mut i = 0;
+    std::iter::from_fn(move || {
+        while i < buf.len() {
+            let (tag, i2) = read_varint(buf, i)?;
+            let field = tag >> 3;
+            match (tag & 7) as u32 {
+                0 => {
+                    let (_, n) = read_varint(buf, i2)?;
+                    i = n;
+                }
+                1 if i2 + 8 <= buf.len() => i = i2 + 8,
+                5 if i2 + 4 <= buf.len() => i = i2 + 4,
+                2 => {
+                    let (len, i3) = read_varint(buf, i2)?;
+                    let end = i3.checked_add(len as usize)?;
+                    if end > buf.len() {
+                        return None;
+                    }
+                    i = end;
+                    return Some((field, &buf[i3..end]));
+                }
+                _ => return None,
+            }
+        }
+        None
+    })
 }
 
 fn session_home(path: &Path) -> Option<&Path> {
     let conversations = path.parent()?;
     (conversations.file_name()?.to_str()? == "conversations").then(|| conversations.parent()).flatten()
+}
+
+pub(crate) fn user_history_path(session: &Path) -> Option<std::path::PathBuf> {
+    session_home(session).map(|home| home.join("history.jsonl"))
+}
+
+fn load_user_turns_strict(session: &Path, id: &str) -> Result<Vec<UserTurn>, String> {
+    use std::io::BufRead;
+    let Some(path) = user_history_path(session) else { return Ok(Vec::new()); };
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("full AGY prompt history open failed: {error}")),
+    };
+    let mut users = Vec::new();
+    for (index, line) in std::io::BufReader::new(file).lines().enumerate() {
+        let line = line.map_err(|error| format!("full AGY prompt history read failed at line {}: {error}", index + 1))?;
+        if line.trim().is_empty() { continue; }
+        let row = serde_json::from_str::<HistoryLine>(&line)
+            .map_err(|error| format!("full AGY prompt history is malformed at line {}: {error}", index + 1))?;
+        if row.conversation_id.as_deref() != Some(id) { continue; }
+        let Some(display) = row.display else { continue; };
+        let (text, images) = strip_agy_images(&display);
+        if crate::engine::agy_acp::is_internal_wakeup_prompt(&text) && images.is_empty() {
+            continue;
+        }
+        if !text.is_empty() || !images.is_empty() {
+            users.push(UserTurn { text, images, ts_ms: row.timestamp });
+        }
+    }
+    Ok(users)
 }
 
 fn load_user_turns(session: &Path, conversation_id: Option<&str>) -> Vec<UserTurn> {
@@ -628,6 +759,9 @@ fn load_user_turns(session: &Path, conversation_id: Option<&str>) -> Vec<UserTur
             continue;
         };
         let (clean_text, images) = strip_agy_images(raw_display);
+        if crate::engine::agy_acp::is_internal_wakeup_prompt(&clean_text) && images.is_empty() {
+            continue;
+        }
         if clean_text.is_empty() && images.is_empty() {
             continue;
         }
@@ -671,6 +805,65 @@ fn load_steps(path: &Path) -> Option<Vec<(i64, Vec<u8>)>> {
         .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))
         .ok()?;
     Some(rows.flatten().collect())
+}
+
+const FULL_HISTORY_BUSY_WAIT: std::time::Duration = std::time::Duration::from_millis(150);
+const FULL_HISTORY_LOCK_BACKOFF_MS: [u64; 3] = [25, 50, 100];
+
+struct HistorySqliteReadError {
+    stage: &'static str,
+    source: rusqlite::Error,
+}
+
+impl HistorySqliteReadError {
+    fn new(stage: &'static str, source: rusqlite::Error) -> Self { Self { stage, source } }
+    fn is_lock_conflict(&self) -> bool {
+        matches!(&self.source, rusqlite::Error::SqliteFailure(error, _) if matches!(error.code,
+            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
+    }
+    fn message(&self) -> String { format!("full AGY database {} failed: {}", self.stage, self.source) }
+}
+
+fn retry_history_sqlite_read<T>(
+    mut read: impl FnMut() -> Result<T, HistorySqliteReadError>,
+    mut wait: impl FnMut(std::time::Duration),
+) -> Result<T, String> {
+    for attempt in 0..=FULL_HISTORY_LOCK_BACKOFF_MS.len() {
+        match read() {
+            Ok(value) => return Ok(value),
+            Err(error) if error.is_lock_conflict() => {
+                if let Some(delay) = FULL_HISTORY_LOCK_BACKOFF_MS.get(attempt) {
+                    wait(std::time::Duration::from_millis(*delay));
+                } else {
+                    return Err(format!("full AGY history is temporarily busy/locked after {} read attempts; retry after the client finishes writing. {}",
+                        attempt + 1, error.message()));
+                }
+            }
+            Err(error) => return Err(error.message()),
+        }
+    }
+    unreachable!("bounded SQLite read attempts always return")
+}
+
+fn load_steps_strict(path: &Path) -> Result<Vec<(i64, Vec<u8>)>, String> {
+    retry_history_sqlite_read(|| load_steps_strict_once(path), std::thread::sleep)
+}
+
+fn load_steps_strict_once(path: &Path) -> Result<Vec<(i64, Vec<u8>)>, HistorySqliteReadError> {
+    let conn = rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| HistorySqliteReadError::new("open", error))?;
+    // A single SELECT keeps one consistent read snapshot. Each failed attempt
+    // drops its connection and every partial row before bounded lock-only retry.
+    // SQLite bounds each lock wait to 150ms; the outer policy bounds attempts
+    // and backoff separately. Actual query and scheduling time are not capped.
+    conn.busy_timeout(FULL_HISTORY_BUSY_WAIT)
+        .map_err(|error| HistorySqliteReadError::new("lock policy", error))?;
+    let mut stmt = conn.prepare("SELECT step_type, step_payload FROM steps ORDER BY idx")
+        .map_err(|error| HistorySqliteReadError::new("prepare", error))?;
+    let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)))
+        .map_err(|error| HistorySqliteReadError::new("query", error))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| HistorySqliteReadError::new("row read", error))
 }
 
 fn user_message(seq: i64, turn: UserTurn) -> Message {
@@ -968,6 +1161,294 @@ fn read_varint(buf: &[u8], mut i: usize) -> Option<(u64, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FullHistoryFixture { root: std::path::PathBuf, session: std::path::PathBuf }
+    impl FullHistoryFixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("ccgui-agy-full-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(root.join("conversations")).unwrap();
+            let session = root.join("conversations/synthetic.db");
+            let conn = rusqlite::Connection::open(&session).unwrap();
+            conn.execute_batch("CREATE TABLE steps(idx INTEGER, step_type INTEGER, step_payload BLOB)").unwrap();
+            Self { root, session }
+        }
+        fn history(&self, text: &str) {
+            std::fs::write(self.root.join("history.jsonl"), serde_json::json!({"conversationId":"synthetic", "display":text}).to_string()).unwrap();
+        }
+    }
+    impl Drop for FullHistoryFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.session);
+            let _ = std::fs::remove_file(self.root.join("history.jsonl"));
+            let _ = std::fs::remove_dir(self.root.join("history.jsonl"));
+            let _ = std::fs::remove_dir(self.root.join("conversations"));
+            let _ = std::fs::remove_dir(&self.root);
+        }
+    }
+
+    fn timeline(path: &Path) -> Result<ParsedSession, String> {
+        super::super::extract::parse_session_file_with_handoffs("agy", path, Default::default())
+    }
+
+    #[test]
+    fn timeline_agy_rejects_corrupt_database_without_changing_soft_scan() {
+        let fixture = FullHistoryFixture::new();
+        fixture.history("available user text");
+        std::fs::write(&fixture.session, "not a sqlite database").unwrap();
+        assert_eq!(super::super::extract::parse_session_file("agy", &fixture.session).unwrap().messages.len(), 1);
+        assert_eq!(scan_agy_summary(&fixture.session).message_count, 1);
+        assert!(timeline(&fixture.session).err().unwrap().contains("prepare failed"));
+    }
+
+    fn native_image_field(mime: &str, bytes: &[u8], path: &str) -> Vec<u8> {
+        let mut image = encode_string_field(1, mime);
+        image.extend(encode_bytes_field(2, bytes));
+        image.extend(encode_string_field(5, path));
+        encode_bytes_field(9, &image)
+    }
+
+    fn assert_native_png_timeline(text: Option<&str>) {
+        let fixture = FullHistoryFixture::new();
+        let png = b"\x89PNG\r\n\x1a\nfixture";
+        let mut user = text.map(|s| encode_string_field(2, s)).unwrap_or_default();
+        user.extend(native_image_field("image/png", png, "/missing/upload.png"));
+        let conn = rusqlite::Connection::open(&fixture.session).unwrap();
+        conn.execute("INSERT INTO steps VALUES(0, ?1, ?2)",
+            rusqlite::params![STEP_USER, encode_bytes_field(19, &user)]).unwrap();
+        let parsed = timeline(&fixture.session).unwrap();
+        assert_eq!(parsed.messages.len(), 1);
+        assert_eq!(parsed.messages[0].text, text.unwrap_or_default());
+        assert_eq!(parsed.messages[0].images, [format!("data:image/png;base64,{}", STANDARD.encode(png))]);
+    }
+
+    #[test]
+    fn timeline_agy_native_png_with_text() { assert_native_png_timeline(Some("看看这张图😀")); }
+
+    #[test]
+    fn timeline_agy_native_png_with_empty_text() { assert_native_png_timeline(Some("")); }
+
+    #[test]
+    fn timeline_agy_native_png_without_text_field() { assert_native_png_timeline(None); }
+
+    #[test]
+    fn native_images_sniff_magic_validate_mime_and_bound_payloads() {
+        for (bytes, mime) in [
+            (b"\x89PNG\r\n\x1a\n".as_slice(), "image/png"),
+            (b"\xff\xd8\xff".as_slice(), "image/jpeg"),
+            (b"GIF89a".as_slice(), "image/gif"),
+            (b"RIFF1234WEBP".as_slice(), "image/webp"),
+        ] {
+            let image = native_image_field("", bytes, "");
+            let turn = extract_user_step_turn(&encode_bytes_field(19, &image)).unwrap();
+            assert_eq!(turn.images, [format!("data:{mime};base64,{}", STANDARD.encode(bytes))]);
+        }
+        for mime in ["text/plain", "image/", "image/png;base64,bad", "image/p\nng"] {
+            assert!(extract_user_step_turn(&encode_bytes_field(19, &native_image_field(mime, b"not an image", ""))).is_none());
+        }
+        assert!(extract_user_step_turn(&encode_bytes_field(19, &native_image_field("", b"unknown", ""))).is_none());
+        let too_large = vec![0; MAX_NATIVE_IMAGE_BYTES + 1];
+        assert!(extract_user_step_turn(&encode_bytes_field(19, &native_image_field("image/png", &too_large, "/fallback.png"))).is_none());
+    }
+
+    #[test]
+    fn native_images_merge_marker_paths_in_order_and_decode_file_uri() {
+        let path = "C:/Projects/image one.png";
+        let prompt = crate::engine::images::agy_prompt_with_images("look", &[path.into()], Path::new("C:/Projects"));
+        let mut user = encode_string_field(2, &prompt);
+        user.extend(native_image_field("image/png", &[], "file:///C:/Projects/image%20one.png"));
+        user.extend(native_image_field("", b"GIF87a", ""));
+        user.extend(native_image_field("", b"GIF87a", ""));
+        user.extend(native_image_field("", &[], "C:/Projects/not-image.txt"));
+        let turn = extract_user_step_turn(&encode_bytes_field(19, &user)).unwrap();
+        assert_eq!(turn.text, "look");
+        assert_eq!(turn.images, [path.to_string(), format!("data:image/gif;base64,{}", STANDARD.encode(b"GIF87a"))]);
+    }
+
+    #[test]
+    fn timeline_agy_rejects_missing_schema_without_empty_success() {
+        let fixture = FullHistoryFixture::new();
+        let conn = rusqlite::Connection::open(&fixture.session).unwrap();
+        conn.execute_batch("DROP TABLE steps").unwrap();
+        assert!(timeline(&fixture.session).err().unwrap().contains("prepare failed"));
+    }
+
+    #[test]
+    fn timeline_agy_rejects_bad_rows_without_partial_success() {
+        let fixture = FullHistoryFixture::new();
+        fixture.history("available user text");
+        let conn = rusqlite::Connection::open(&fixture.session).unwrap();
+        conn.execute("INSERT INTO steps VALUES(0, 15, ?1)", [assistant_with_usage("valid prefix", 10, 2, Some(3))]).unwrap();
+        conn.execute_batch("INSERT INTO steps VALUES(1, 15, 'not a blob')").unwrap();
+        assert!(timeline(&fixture.session).err().unwrap().contains("row read failed"));
+    }
+
+    #[test]
+    fn timeline_agy_preserves_native_text_images_and_usage_without_prompt_log() {
+        let fixture = FullHistoryFixture::new();
+        let images = vec!["/tmp/synthetic-image.png".to_string()];
+        let prompt = crate::engine::images::agy_prompt_with_images("原生提问😀", &images, Path::new("/tmp"));
+        let conn = rusqlite::Connection::open(&fixture.session).unwrap();
+        conn.execute("INSERT INTO steps VALUES(0, ?1, ?2)", rusqlite::params![STEP_USER, encode_bytes_field(19, &encode_string_field(2, &prompt))]).unwrap();
+        conn.execute("INSERT INTO steps VALUES(1, ?1, ?2)", rusqlite::params![STEP_ASSISTANT, assistant_with_usage("原生回答😀", 10, 2, Some(3))]).unwrap();
+        let parsed = timeline(&fixture.session).unwrap();
+        assert_eq!(parsed.messages.len(), 2);
+        assert_eq!(parsed.messages[0].text, "原生提问😀");
+        assert_eq!(parsed.messages[0].images, images);
+        assert_eq!(parsed.messages[1].text, "原生回答😀");
+        let usage = parsed.messages[1].usage.as_ref().unwrap();
+        assert_eq!(usage["input_tokens"], 10);
+        assert_eq!(usage["output_tokens"], 2);
+        assert_eq!(usage["cache_read_input_tokens"], 3);
+        assert!(parse_agy_session_strict(&fixture.session).unwrap().messages[1].usage.is_none());
+    }
+
+    #[test]
+    fn timeline_agy_rejects_malformed_optional_prompt_log() {
+        let fixture = FullHistoryFixture::new();
+        std::fs::write(fixture.root.join("history.jsonl"), "{broken").unwrap();
+        assert!(timeline(&fixture.session).err().unwrap().contains("malformed at line 1"));
+    }
+
+    #[test]
+    fn full_handoff_agy_rejects_corrupt_database_instead_of_prompt_only_fallback() {
+        let fixture = FullHistoryFixture::new();
+        fixture.history("prompt-only fallback must not be a complete handoff");
+        std::fs::write(&fixture.session, "not a sqlite database").unwrap();
+        assert_eq!(parse_agy_session_inner(&fixture.session, false).messages.len(), 1);
+        assert!(parse_agy_session_strict(&fixture.session).err().unwrap().contains("database prepare failed"));
+    }
+
+    #[test]
+    fn full_handoff_agy_retries_only_busy_and_locked_with_bounded_backoff() {
+        for code in [rusqlite::ffi::SQLITE_BUSY, rusqlite::ffi::SQLITE_LOCKED | (1 << 8)] {
+            let mut attempts = 0;
+            let mut waits = Vec::new();
+            let text = retry_history_sqlite_read(|| {
+                attempts += 1;
+                if attempts == 1 {
+                    Err(HistorySqliteReadError::new("query", rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None)))
+                } else { Ok("complete snapshot, not a partial read") }
+            }, |wait| waits.push(wait)).unwrap();
+            assert_eq!(text, "complete snapshot, not a partial read");
+            assert_eq!(attempts, 2);
+            assert_eq!(waits, [std::time::Duration::from_millis(25)]);
+
+            attempts = 0; waits.clear();
+            let error = retry_history_sqlite_read::<()>(|| {
+                attempts += 1;
+                Err(HistorySqliteReadError::new("query", rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None)))
+            }, |wait| waits.push(wait)).unwrap_err();
+            assert_eq!(attempts, 4);
+            assert_eq!(waits, [25, 50, 100].map(std::time::Duration::from_millis));
+            assert!(error.contains("temporarily busy/locked"), "{error}");
+        }
+        for code in [rusqlite::ffi::SQLITE_CORRUPT, rusqlite::ffi::SQLITE_NOTADB, rusqlite::ffi::SQLITE_CANTOPEN] {
+            let mut attempts = 0;
+            let error = retry_history_sqlite_read::<()>(|| {
+                attempts += 1;
+                Err(HistorySqliteReadError::new("prepare", rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None)))
+            }, |_| panic!("non-lock errors must not be retried")).unwrap_err();
+            assert_eq!(attempts, 1);
+            assert!(error.contains("database prepare failed"), "{error}");
+            assert!(!error.contains("temporarily busy/locked"));
+        }
+    }
+
+    #[test]
+    fn full_handoff_agy_read_only_does_not_create_missing_databases() {
+        let fixture = FullHistoryFixture::new();
+        let missing = fixture.root.join("conversations/missing.db");
+        assert!(load_steps_strict(&missing).is_err());
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn full_handoff_agy_reads_committed_wal_history_during_an_active_write() {
+        let fixture = FullHistoryFixture::new();
+        let writer = rusqlite::Connection::open(&fixture.session).unwrap();
+        writer.pragma_update(None, "journal_mode", "WAL").unwrap();
+        let payload = |text| encode_bytes_field(20, &encode_string_field(1, text));
+        writer.execute("INSERT INTO steps VALUES(0, 15, ?1)", [payload("Saved committed reply")]).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        writer.execute("INSERT INTO steps VALUES(1, 15, ?1)", [payload("Uncommitted reply must stay hidden")]).unwrap();
+        let parsed = parse_agy_session_strict(&fixture.session).unwrap();
+        assert_eq!(parsed.messages.len(), 1);
+        assert_eq!(parsed.messages[0].text, "Saved committed reply");
+        writer.execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn full_handoff_agy_recovers_after_a_transient_writer_releases_its_lock() {
+        let fixture = FullHistoryFixture::new();
+        let mut contents = encode_string_field(1, "Complete saved assistant history after the lock");
+        contents.extend(encode_string_field(3, "THINKING_MUST_STAY_HIDDEN"));
+        let payload = encode_bytes_field(20, &contents);
+        let writer = rusqlite::Connection::open(&fixture.session).unwrap();
+        writer.execute("INSERT INTO steps VALUES(0, 15, ?1)", [payload]).unwrap();
+        writer.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            writer.execute_batch("ROLLBACK").unwrap();
+        });
+        let parsed = parse_agy_session_strict(&fixture.session);
+        release.join().unwrap();
+        let parsed = parsed.expect("transient lock must not look like corrupt or missing history");
+        assert_eq!(parsed.messages.len(), 1);
+        assert_eq!(parsed.messages[0].text, "Complete saved assistant history after the lock");
+    }
+
+    #[test]
+    fn full_handoff_agy_reports_persistent_lock_without_prompt_fallback() {
+        let fixture = FullHistoryFixture::new();
+        fixture.history("prompt-only fallback must not be a complete handoff");
+        let connection = rusqlite::Connection::open(&fixture.session).unwrap();
+        connection.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let error = parse_agy_session_strict(&fixture.session).err().unwrap();
+        assert!(error.contains("locked"), "{error}");
+        assert!(error.contains("temporarily busy/locked after 4 read attempts"), "{error}");
+        connection.execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn full_handoff_agy_propagates_bad_sqlite_rows_and_missing_schema() {
+        let fixture = FullHistoryFixture::new();
+        fixture.history("available user text");
+        let conn = rusqlite::Connection::open(&fixture.session).unwrap();
+        conn.execute_batch("INSERT INTO steps VALUES(0, 15, 'not a blob')").unwrap();
+        assert!(parse_agy_session_strict(&fixture.session).err().unwrap().contains("row read failed"));
+        conn.execute_batch("DROP TABLE steps").unwrap();
+        assert!(parse_agy_session_strict(&fixture.session).err().unwrap().contains("prepare failed"));
+    }
+
+    #[test]
+    fn full_handoff_agy_requires_readable_well_formed_optional_history_log() {
+        let fixture = FullHistoryFixture::new();
+        assert!(parse_agy_session_strict(&fixture.session).unwrap().messages.is_empty());
+        fixture.history("readable visible prompt");
+        assert_eq!(parse_agy_session_strict(&fixture.session).unwrap().messages[0].text, "readable visible prompt");
+        let log = fixture.root.join("history.jsonl");
+        std::fs::write(&log, "{broken").unwrap();
+        assert!(parse_agy_session_strict(&fixture.session).err().unwrap().contains("malformed at line 1"));
+        std::fs::write(&log, [0xff, 0xfe]).unwrap();
+        assert!(parse_agy_session_strict(&fixture.session).err().unwrap().contains("read failed at line 1"));
+        std::fs::remove_file(&log).unwrap();
+        std::fs::create_dir(&log).unwrap();
+        assert!(parse_agy_session_strict(&fixture.session).is_err());
+    }
+
+    #[test]
+    fn full_handoff_agy_strict_parse_preserves_visible_reply_without_thinking() {
+        let fixture = FullHistoryFixture::new();
+        let mut contents = encode_string_field(1, "Visible saved assistant reply");
+        contents.extend(encode_string_field(3, "SECRET_THINKING_MUST_NOT_APPEAR"));
+        let payload = encode_bytes_field(20, &contents);
+        let conn = rusqlite::Connection::open(&fixture.session).unwrap();
+        conn.execute("INSERT INTO steps VALUES(0, 15, ?1)", [payload]).unwrap();
+        let parsed = parse_agy_session_strict(&fixture.session).unwrap();
+        assert_eq!(parsed.messages.len(), 1);
+        assert_eq!(parsed.messages[0].text, "Visible saved assistant reply");
+        assert!(parsed.messages[0].usage.is_none());
+    }
 
     #[test]
     fn history_and_summary_are_loaded_from_the_session_own_home() {
@@ -1525,6 +2006,76 @@ mod tests {
         assert_eq!(after_next.estimated_tokens, Some(169_227));
 
         drop(conn);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn filters_internal_acp_background_wakeup_prompts_from_sqlite_and_history_jsonl() {
+        let root = std::env::temp_dir().join(format!("agy-wakeup-filter-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("conversations")).unwrap();
+        let sid = "wakeup-conv";
+        let db_path = root.join(format!("conversations/{sid}.db"));
+        std::fs::write(
+            root.join("history.jsonl"),
+            format!(
+                "{{\"display\":\"run build\",\"timestamp\":1000,\"conversationId\":\"{sid}\"}}\n\
+                 {{\"display\":\"{}\",\"timestamp\":2000,\"conversationId\":\"{sid}\"}}\n\
+                 {{\"display\":\"check output\",\"timestamp\":3000,\"conversationId\":\"{sid}\"}}\n",
+                crate::engine::agy_acp::AGY_BG_TASK_WAKEUP_PROMPT
+            ),
+        )
+        .unwrap();
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE steps(idx INTEGER PRIMARY KEY, step_type INTEGER, step_payload BLOB);",
+        )
+        .unwrap();
+        let user_blob = |text: &str| encode_bytes_field(19, &encode_string_field(2, text));
+        let rows: Vec<(i64, Vec<u8>)> = vec![
+            (STEP_USER, user_blob("run build")),
+            (STEP_ASSISTANT, assistant_with_usage("Build started in background.", 40, 10, Some(5))),
+            (STEP_USER, user_blob(crate::engine::agy_acp::AGY_BG_TASK_WAKEUP_PROMPT)),
+            (STEP_ASSISTANT, assistant_with_usage("Build finished cleanly.", 60, 15, Some(20))),
+            (STEP_USER, user_blob("check output")),
+            (STEP_ASSISTANT, assistant_with_usage("Artifacts verified.", 80, 12, Some(30))),
+        ];
+        for (idx, (ty, blob)) in rows.into_iter().enumerate() {
+            conn.execute(
+                "INSERT INTO steps VALUES (?1, ?2, ?3)",
+                rusqlite::params![idx as i64, ty, blob],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        for parsed in [
+            parse_agy_session(&db_path),
+            parse_agy_session_timeline_strict(&db_path).unwrap(),
+        ] {
+            let pairs: Vec<(&str, &str)> = parsed
+                .messages
+                .iter()
+                .map(|m| (m.role.as_str(), m.text.as_str()))
+                .collect();
+            assert_eq!(
+                pairs,
+                vec![
+                    ("user", "run build"),
+                    ("assistant", "Build started in background."),
+                    ("assistant", "Build finished cleanly."),
+                    ("user", "check output"),
+                    ("assistant", "Artifacts verified."),
+                ]
+            );
+            assert_eq!(parsed.messages[0].ts.as_deref(), Some("1000"));
+            assert_eq!(parsed.messages[3].ts.as_deref(), Some("3000"));
+        }
+        let strict = parse_agy_session_timeline_strict(&db_path).unwrap();
+        assert_eq!(strict.messages[1].usage.as_ref().unwrap()["output_tokens"], 10);
+        assert_eq!(strict.messages[2].usage.as_ref().unwrap()["output_tokens"], 15);
+        assert_eq!(strict.messages[4].usage.as_ref().unwrap()["output_tokens"], 12);
+
         std::fs::remove_dir_all(root).unwrap();
     }
 

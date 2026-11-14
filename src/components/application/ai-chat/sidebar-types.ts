@@ -27,6 +27,8 @@ export interface AiChatThread {
   /** Pending tab: first message not sent, so pin/rename/copy-id do not apply. */
   isDraft?: boolean;
   children?: AiChatThread[];
+  /** Display-only disclosure containing retired handoff sessions. */
+  handoffHistory?: boolean;
   /** Has created child tasks; derived from branch relationships, not a mode. */
   isLeader?: boolean;
   leaderBranch?: import("@/features/leader/types").LeaderBranch;

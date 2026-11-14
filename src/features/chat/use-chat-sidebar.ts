@@ -138,6 +138,14 @@ export function useChatSidebar({
       unseen: unseen[`${s.engine}/${s.sessionId}`] ?? false,
       protectedFromDeletion: isLeaderGroupMember(leaderSnapshot, s) || isManagedLeaderSession(`${s.engine}/${s.sessionId}`),
     }));
+    // Include nested worktrees: project organization only relabels top-level
+    // members, but every registered directory needs the same launch guard.
+    const unavailablePaths = new Map<string, "missing" | "changed">();
+    for (const project of projects) {
+      for (const member of project.members) {
+        if (member.status !== "available") unavailablePaths.set(normalizeProjectPath(member.path), member.status);
+      }
+    }
     const buildRepo = (w: Workspace, defaultOpen: boolean): AiChatRepo => {
       // Sidebar alias: a user-set name replaces the folder name in the
       // sidebar only; the original stays on the row tooltip.
@@ -148,6 +156,7 @@ export function useChatSidebar({
       return {
         id: w.id,
         path: w.path,
+        unavailable: unavailablePaths.get(normalizeProjectPath(w.path)),
         // Worktree 子行的主名是分支名（mockup 场景 1），目录名进 tooltip。
         label: alias || (meta?.branch ?? w.name),
         originalLabel: alias || meta ? w.name : undefined,
@@ -165,6 +174,7 @@ export function useChatSidebar({
                 id: sessionKey(tab.engine, null, tab.workspacePath),
                 label: t("chat.newChat"),
                 engine: tab.engine,
+                workspacePath: tab.workspacePath,
                 time: "",
                 isDraft: true,
               },
@@ -175,7 +185,7 @@ export function useChatSidebar({
       };
     };
     return parentWorkspaces.map((w, index) => buildRepo(w, index === 0));
-  }, [parentWorkspaces, childrenByParent, workspaceAliases, sessions, openTabs, threadLimit, threadStreaming, threadRetrying, unseen, i18n.language, uiHooks, t, leaderSnapshot, selfDevWorkspaceId]);
+  }, [parentWorkspaces, childrenByParent, workspaceAliases, sessions, openTabs, threadLimit, threadStreaming, threadRetrying, unseen, i18n.language, uiHooks, t, leaderSnapshot, selfDevWorkspaceId, projects]);
   // 工作区二级分类: bucket repos by their workspace's group assignment.
   // Ungrouped repos come first (no header), then groups in settings order.
   // Empty groups stay in the tree — the sidebar renders them like populated
@@ -377,25 +387,6 @@ export function useChatSidebar({
     [setDialog],
   );
 
-  // Sidebar 新建会话 nav entry: new chat in the active workspace (fallback:
-  // first visible workspace; archived ones never pick up new chats, and no
-  // workspace yet → add one first).
-  const handleNewSession = useCallback(() => {
-    const workspace =
-      workspaces.find((w) => w.path === active?.workspacePath && !archivedIds.has(w.id)) ??
-      visibleWorkspaces[0];
-    if (!workspace) {
-      handleAddWorkspace();
-      return;
-    }
-    dismissCenterSurfaces();
-    startNewChat(workspace.path);
-    // 中心面可能刚从别处（插件中心/浏览器）切回来，那时直接 focus() 会被
-    // 浏览器忽略（隐藏元素），交给等可见的助手。
-    focusComposerWhenVisible(composerInputRef);
-    collapseSidebarOnMobile();
-  }, [workspaces, visibleWorkspaces, archivedIds, active?.workspacePath, startNewChat, handleAddWorkspace, collapseSidebarOnMobile, composerInputRef]);
-
   // Workspace row + button: start (or re-focus) the pending new chat in that
   // workspace.
   const handleNewSessionInWorkspace = useCallback(
@@ -416,7 +407,7 @@ export function useChatSidebar({
         return;
       }
       const workspace = workspaces.find((w) => w.id === workspaceId);
-      if (!workspace) return;
+      if (!workspace || archivedIds.has(workspace.id)) return;
       const member = projects.flatMap((p) => p.members).find((m) => normalizeProjectPath(m.path) === normalizeProjectPath(workspace.path) && m.status !== "available");
       if (member) {
         useChatStore.setState({ actionError: t("projects.unavailable") });
@@ -427,8 +418,24 @@ export function useChatSidebar({
       focusComposerWhenVisible(composerInputRef);
       collapseSidebarOnMobile();
     },
-    [workspaces, startNewChat, collapseSidebarOnMobile, composerInputRef, projects, t],
+    [workspaces, archivedIds, startNewChat, collapseSidebarOnMobile, composerInputRef, projects, t],
   );
+  // Sidebar, tab-strip + and shortcut share this entry. Multiple workspaces
+  // require an explicit choice before creating/focusing a draft.
+  const handleNewSession = useCallback(() => {
+    const workspace =
+      visibleWorkspaces.find((w) => active && workspaceCatalogPathKey(w.path) === workspaceCatalogPathKey(active.workspacePath)) ??
+      visibleWorkspaces[0];
+    if (!workspace) {
+      handleAddWorkspace();
+      return;
+    }
+    if (visibleWorkspaces.length > 1) {
+      setDialog({ kind: "newSession", workspaceId: workspace.id });
+      return;
+    }
+    handleNewSessionInWorkspace(workspace.id);
+  }, [visibleWorkspaces, active?.workspacePath, handleNewSessionInWorkspace, handleAddWorkspace, setDialog]);
   // Sidebar 新建浏览器 nav entry: open a fresh browser tab in the center
   // strip. Other center surfaces step aside (same mutual exclusion as
   // handleTabSelect) — otherwise an active plugin hub/workbench keeps the

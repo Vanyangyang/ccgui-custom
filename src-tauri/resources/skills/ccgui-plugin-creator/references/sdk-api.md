@@ -1,7 +1,7 @@
 <!-- 由 src/features/plugins/skill/creator-skill-docs.ts 从源码生成，请勿手改。 -->
 <!-- 重新生成：pnpm plugin-skill:docs（测试 creator-skill-docs.test.ts 会断言本文件与源码一致）。 -->
 
-# CC GUI 插件 SDK 参考（SDK 0.3.28）
+# CC GUI 插件 SDK 参考（SDK 0.3.56）
 
 本文件由脚本从 `packages/plugin-sdk`（公共契约）与宿主运行时（权限门禁）派生，属于 `ccgui-plugin-creator` skill。
 字段、方法、权限以本文件为准：**文中没有的 API 一律视为不存在**，不要凭记忆猜测方法名或权限名。
@@ -61,7 +61,7 @@ export default function activate(ctx: PluginContext): void | (() => void) {
 | `ctx.ui.registerPage` | `ui:page` | Overlay page at `#/p/<id>` (plan §4.2 #10). |
 | `ctx.ui.registerTimelineRowRenderer` | `ui:timeline-row` | Renderer for a plugin-defined chat timeline row kind (plan §4.2 #5). The row payload is plugin-defined and typed loosely — blob bundles can't share the host's TimelineRow type identity. |
 | `ctx.ui.registerSidebarNav` | `ui:sidebar-entry` | Home sidebar nav entry under the builtin 自动化 row (permission `ui:sidebar-entry`, 0.3.12). `onOpen` usually opens the plugin's center tab via openCenterTab. |
-| `ctx.ui.registerCenterTab` | `ui:center-tab`（`ui:detached-window` 按需） | Center-area tab definition (permission `ui:center-tab`, 0.3.12): renders in the center tab strip like session/file/browser tabs. Opening goes through openCenterTab; multiple keys = multiple tabs. |
+| `ctx.ui.registerCenterTab` | `ui:center-tab`（`ui:detached-window`、`host:tasks` 按需） | Center-area tab definition (permission `ui:center-tab`, 0.3.12): renders in the center tab strip like session/file/browser tabs. Opening goes through openCenterTab; multiple keys = multiple tabs. |
 | `ctx.ui.openCenterTab` | `ui:center-tab` | Open (or focus) one of this plugin's registered center tabs (permission `ui:center-tab`, 0.3.12). Throws when the tab was never registered — open failures must be visible, not silent. |
 | `ctx.theme.injectCss` | `theme` | Inject a stylesheet scoped to this plugin; removed on unload. Rejects remote references (`@import`, `url(http…)`): plugins must be self-contained (plan §8 gate rules). |
 | `ctx.theme.setTokens` | `theme` | Shorthand for BoardUI token overrides: keys must be `--*` custom properties; emits `:root {…}` and `.dark {…}` blocks. |
@@ -83,12 +83,15 @@ export default function activate(ctx: PluginContext): void | (() => void) {
 | `ctx.chat.submit` | `host:chat` | — |
 | `ctx.chat.receipt` | `host:chat` | This plugin/document's ledger only; a new document returns null for an old document's request ID. Null can mean old/unknown/unreachable, never permission to replay or resubmit to a new ID/target. |
 | `ctx.chat.onEvent` | `host:chat` | This plugin's receipts only; automatically disposed on unload. |
-| `ctx.tasks.conversation` | `host:tasks` | Attach only this plugin's initial owned task request to its proven native coordinator (0.3.24). |
+| `ctx.tasks.conversation` | `host:tasks` | Project this plugin's proven native coordinator from submit or attachConversation. |
 | `ctx.tasks.sendMessage` | `host:tasks` | Durable exact-session input CAS; received means native accepted, never applied. |
 | `ctx.tasks.messageReceipt` | `host:tasks` | — |
 | `ctx.tasks.cancelMessage` | `host:tasks` | — |
+| `ctx.tasks.sendMessageNow` | `host:tasks` | 0.3.30, capability immediateMessages: prioritize the original queued input. Uses the selected receipt's inputRevision; queued is not delivery proof. May yield the current reply, without stopping managed descendants. |
 | `ctx.tasks.stopConversation` | `host:tasks` | Cancels pending inputs and requests stop of the exact coordinator and its real managed descendants. |
 | `ctx.tasks.conversationAction` | `host:tasks` | — |
+| `ctx.tasks.previewCostHandoff` | `host:tasks` | Read-only exact-source preview; never approves, cancels or sends the held request. |
+| `ctx.tasks.handoffManagedChild` | `host:tasks` | — |
 | `ctx.tasks.onConversationEvent` | `host:tasks` | — |
 | `ctx.tasks.catalog` | `host:tasks` | Engines (with the user's defaults), registered workspaces and project organization. No credentials or settings. |
 | `ctx.tasks.history` | `host:tasks` | Saved chats of exactly one registered local workspace, newest first, paged (≤100). Metadata only. |
@@ -96,11 +99,12 @@ export default function activate(ctx: PluginContext): void | (() => void) {
 | `ctx.tasks.plan` | `host:tasks` | Isolated, tool-less routing call. Rejects with Error whose `code` is a HostTaskPlanErrorCode. |
 | `ctx.tasks.getPlan` | `host:tasks` | This plugin's plan record (running/ready/needs_clarification/failed/cancelled). |
 | `ctx.tasks.cancelPlan` | `host:tasks` | Stops a running planner call; true when one was running. |
-| `ctx.tasks.submit` | `host:tasks` | Durable acceptance before resolving; delivery continues in the background. |
+| `ctx.tasks.submit` | `host:tasks` | Durable acceptance before resolving; delivery continues in the background. New native chats use private first-turn state on current hosts, preserving user draft text/images, per-tab choices, sidechats, modes and focus. A real conversation tab appears only after exact native identity is confirmed. Existing-session sends retain their original busy/approval guards. |
+| `ctx.tasks.attachConversation` | `host:tasks` | Exclusively associate an existing native coordinator; never sends an initial turn. |
 | `ctx.tasks.receipt` | `host:tasks` | This plugin's receipt; null for an unknown id, never permission to resubmit under a new id. |
 | `ctx.tasks.list` | `host:tasks` | This plugin's receipts in acceptance order. |
-| `ctx.tasks.cancel` | `host:tasks` | Queued requests are withdrawn; a running turn of this request is interrupted. |
-| `ctx.tasks.open` | `host:tasks` | Focus the request's conversation (user-initiated). |
+| `ctx.tasks.cancel` | `host:tasks` | Queued requests are withdrawn; a running turn of this request is interrupted. An attached receipt has no initial turn; use stopConversation for its native coordinator. |
+| `ctx.tasks.open` | `host:tasks` | User-initiated focus of the request's conversation. For a legacy shared pending-slot request, hosts may also reveal the exact native draft blocked by unsent text/images, reopening its tab without changing the draft. This does not send, cancel, clear content or bypass launch protection; hosts that cannot locate or reveal the target reject the operation. |
 | `ctx.tasks.forget` | `host:tasks` | Prune large assistant output from a settled receipt while retaining its non-replayable tombstone and identity. |
 | `ctx.tasks.slots` | `host:tasks` | Current chat per logical slot; moves only on native session evidence. |
 | `ctx.tasks.onEvent` | `host:tasks` | This plugin's receipts only; disposed on unload. |
@@ -146,7 +150,7 @@ ui: {
   registerTimelineRowRenderer(def: { kind: string; key?: string; component: ComponentType<{ row: { kind: string } }> }): Disposer;
   /** 权限：ui:sidebar-entry */
   registerSidebarNav(def: { key?: string; label(): string; icon?: ComponentType<{ className?: string }>; order?: number; onOpen(): void }): Disposer;
-  /** 权限：ui:center-tab、ui:detached-window */
+  /** 权限：ui:center-tab、ui:detached-window、host:tasks */
   registerCenterTab(def: { key?: string; title(): string; icon?: ComponentType<{ className?: string }>; component: ComponentType; order?: number; detached?: PluginDetachedSurfaceDefinition }): Disposer;
   /** 权限：ui:center-tab */
   openCenterTab(key?: string): void;
@@ -273,9 +277,15 @@ tasks: {
   /** 权限：host:tasks */
   cancelMessage(conversationRequestId: string, requestId: string): Promise<import("./task-conversations").HostTaskMessageReceipt | null>;
   /** 权限：host:tasks */
+  sendMessageNow(conversationRequestId: string, requestId: string, expectedInputRevision: number): Promise<import("./task-conversations").HostTaskMessageReceipt | null>;
+  /** 权限：host:tasks */
   stopConversation(requestId: string): Promise<import("./task-conversations").HostTaskConversationSnapshot>;
   /** 权限：host:tasks */
   conversationAction(requestId: string, action: import("./task-conversations").HostTaskConversationAction): Promise<import("./task-conversations").HostTaskConversationSnapshot | void>;
+  /** 权限：host:tasks */
+  previewCostHandoff?(request: import("./task-conversations").HostTaskCostHandoffRequest): Promise<import("./task-conversations").HostTaskCostHandoffPreview>;
+  /** 权限：host:tasks */
+  handoffManagedChild?(request: import("./task-conversations").HostTaskManagedHandoffRequest): Promise<import("./task-conversations").HostTaskManagedHandoffResult>;
   /** 权限：host:tasks */
   onConversationEvent(callback: (snapshot: import("./task-conversations").HostTaskConversationSnapshot) => void): Disposer;
   /** 权限：host:tasks */
@@ -292,6 +302,8 @@ tasks: {
   cancelPlan(requestId: string): Promise<boolean>;
   /** 权限：host:tasks */
   submit(request: import("./tasks").HostTaskSubmission): Promise<import("./tasks").HostTaskReceipt>;
+  /** 权限：host:tasks */
+  attachConversation(request: import("./tasks").HostTaskAttachmentRequest): Promise<import("./tasks").HostTaskReceipt>;
   /** 权限：host:tasks */
   receipt(requestId: string): Promise<import("./tasks").HostTaskReceipt | null>;
   /** 权限：host:tasks */
@@ -338,6 +350,7 @@ bridge: {
 
 ```ts
 host: {
+  memoryReview: import("./memory-review").HostMemoryReviewApi;
   whenReady(signal?: AbortSignal): Promise<void>;
   appVersion: string;
   sdkVersion: string;
@@ -349,6 +362,7 @@ host: {
 ### 标量属性
 
 ```ts
+ctx.handoff: HostHandoffApi; // Host /handoff compression of supplied excerpts; desktop owner, host:chat (0.3.29).
 ctx.conversations: HostConversationsApi & { View: ConversationViewComponent }; // Persistent read-only native discussions; requires host:chat.
 ctx.images: HostImagesApi; // Durable host-managed plugin image attachments; requires host:chat or host:tasks (0.3.23).
 ctx.pluginId: string;
@@ -366,7 +380,7 @@ import type { Disposer } from "./manifest";
 import type { ComponentType } from "react";
 import type { HostFixedInstructions } from "./fixed-instructions";
 
-export type ConversationEngine = "claude" | "codex";
+export type ConversationEngine = "claude" | "codex" | "agy";
 export interface ConversationSelection {
   engine: ConversationEngine;
   model?: string;
@@ -417,6 +431,8 @@ export interface ConversationCatalog {
     label: string;
     available: boolean;
     supportsImages?: boolean;
+    /** Exact native engine capability; do not infer from the global flag. */
+    supportsFixedInstructions?: boolean;
     models: Array<{ id: string; label: string }>;
     providers: Array<{ id: string; label: string }>;
     efforts?: Array<{ id: string; label: string }>;
@@ -428,12 +444,13 @@ export interface ConversationCatalog {
 }
 /** Desktop-owner-only host:chat capability. Runs persistent read-only native
  * Sidechat branches (Claude: Read/Grep/Glob, no MCP; Codex: verified read-only
- * sandbox, no network). It can read files in the registered local workspace and
+ * sandbox, no network; AGY: native plan mode). It can read files in the registered local workspace and
  * sends prompts and inspected context to the selected provider. It consumes
  * provider quota. No execution, promotion, task ledger, or global settings edits
  * are exposed. Closing UI / disposing listeners does not cancel work.
  * A thread's workspace and selection are immutable. Rotate threadId to change
- * either. Missing model/effort resolve once from host defaults; if a default
+ * either. AGY effort is encoded in the selected model ID; omit separate effort.
+ * Missing model/effort resolve once from host defaults; if a default
  * cannot be resolved, open requires an explicit choice instead of relying on
  * mutable CLI defaults. Persisted in-flight work without native proof restores as unknown;
  * it is never silently replayed. Only the latest request is retained per thread;
@@ -470,8 +487,9 @@ SDK 0.3.27：先检查 catalog().capabilities.fixedInstructions；tasks 还必�
 
 ```ts
 /** Supplementary plugin guidance, separate from user turns. It does not grant
- * tools or permissions. Supported local Claude/Codex launches restore it through
- * their native system/developer instruction channel, including resumed sessions.
+ * tools or permissions. Supported local Claude/Codex/AGY launches restore it through
+ * their native instruction channel, including resumed sessions. Check the exact
+ * engine catalog capability; older hosts do not support AGY profiles.
  * Omission on a continuation retains the previous profile. Changing a profile
  * waits for a full native turn; it cannot replace instructions in a live turn. */
 export interface HostFixedInstructions {
@@ -485,13 +503,17 @@ export interface HostFixedInstructions {
 ## 宿主持续协调契约
 
 `ctx.tasks.catalog().capabilities.continuousCoordination` 为真时，可用初始插件自有任务 requestId 绑定协调会话。后续输入使用 sendMessage 的 inputRevision CAS，同一原生 session 的 steer/live 或宿主持久队列；received 仅表示 native 接收，不表示要求已应用，completed 仅表示关联 turn 结束。unknown 不自动重放。真实消息投影仅供展示，不写插件存储。stopConversation 包含待送输入和实际归属 children；子任务控制与历史保留。
+0.3.30：同时检查 capabilities.immediateMessages 与 sendMessageNow 方法后，可优先发送原排队输入，参数 revision 是所选回执的 inputRevision，不是会话投影 revision。保留原 ID/正文；Claude 可请求仅让出当前回复，Codex 只走合法 steer，不停止子任务、不取消重建。sendNowRequested 仍是 queued 意图，不能视为收到；权限、未知结果、停止、暂停与归属检查继续生效。旧宿主禁用此按钮并提示更新，原队列功能照常。
+0.3.51：capabilities.coordinatorMessageQueue 为真时可显式 sendMessage({ deliveryMode: 'queue', ... })，等待主对话本次回复结束；Claude 仅等后台任务的 live 空闲点可继续接收，不必等子任务结束。省略模式仍按既有 steer/live/turn 自动接收；不能把初始 queued 回执当作严格等待的承诺。策略随原请求持久化并参与幂等校验，显式 sendMessageNow 可提升同一回执的优先级。nativeReplyIdle 表示回复空闲点，nativeStatus 仍可能因活进程而为 busy；所有发送仍以 canSend 和审批门禁为准。
 
 ```ts
 import type { Disposer } from "./manifest";
-import type { HostTaskSelection, HostTaskSessionRef } from "./tasks";
+import type { HostTaskExcerpt, HostTaskSelection, HostTaskSessionRef } from "./tasks";
 import type { HostFixedInstructions } from "./fixed-instructions";
 
 export interface HostTaskMessageReceipt {
+  /** Original requested policy, retained even after explicit sendMessageNow. */
+  deliveryMode?: "queue";
   conversationRequestId: string;
   requestId: string;
   /** Bounded (280 UTF-16 units, no split surrogate) displayText preview; empty
@@ -505,6 +527,15 @@ export interface HostTaskMessageReceipt {
   acceptedAt: number;
   updatedAt: number;
   error?: string;
+  /** The host fenced this unknown input on an explicit stop and verified its
+   * exact native run ended (0.3.49). Delivery remains unknown and is never
+   * replayed. Use the conversation's canSend for any new explicit input. */
+  stopResolved?: true;
+  /** The exact dedicated native turn ended, but delivery of this input remains
+   * unknown. The original request must not be replayed. */
+  terminalOutcome?: "completed" | "failed" | "cancelled";
+  /** Priority requested, but still queued; not native delivery acknowledgement. */
+  sendNowRequested?: boolean;
 }
 export interface HostTaskConversationChild {
   id: string;
@@ -512,6 +543,72 @@ export interface HostTaskConversationChild {
   state: string;
   sessionRef: HostTaskSessionRef | null;
   delegation?: { requestId?: string; state: string; result?: string | null };
+  /** Native successor/predecessor links for durable operation reconciliation (0.3.37).
+   * handed_off is terminal for this child, not completion of its successor. */
+  handoffFrom?: { branchId: string; requestId: string; operationId: string };
+  handoffTo?: { branchId: string; requestId: string; operationId: string };
+}
+/** Local planning evidence for an exact pending prompt (0.3.38).
+ * Token ranges are heuristic, API prices are references, and historical context
+ * is conditional. None of these fields is a bill or a guaranteed upper bound. */
+export interface HostTaskRequestCostEstimate {
+  method: "utf8-quarter-to-byte-v1";
+  textCharacters: number;
+  textUtf8Bytes: number;
+  textTokens: { lower: number; upper: number };
+  /** Omitted when the request's attachments cannot be established. */
+  imageCount?: number;
+  contextBasis: "current_context" | "last_request" | "unknown" | "model_mismatch";
+  contextTokens?: number;
+  inputTokens?: { lower: number; upper: number };
+  pricing?: {
+    basis: "api_standard_reference";
+    model: string;
+    sourceUrl: string;
+    checkedAt: string;
+    effectiveFrom: number;
+    effectiveUntil: number;
+    inputUsdPerMillion: number;
+    cacheReadUsdPerMillion: number;
+    outputUsdPerMillion: number;
+  };
+  inputUsd?: { lower: number; upper: number };
+  unavailableReason?: "model_price_unverified" | "price_outdated";
+  /** Host-localized plain text, shared by the native card, dialog and plugins.
+   * Display verbatim as text; never execute, persist, or treat as approval. */
+  displayLines?: string[];
+}
+/** A bounded, read-only projection of a human cost decision belonging to this
+ * coordinator or one of its proven descendants. */
+export interface HostTaskCostApproval {
+  /** Coordinator input, cross-session message, or managed child task. Older hosts may omit the kind. */
+  kind?: "coordinatorInput" | "crossSession" | "leader";
+  id: string;
+  requestId: string;
+  sender: HostTaskSessionRef & { title?: string };
+  target: HostTaskSessionRef & { title?: string };
+  message: string;
+  /** Ordered host-managed task-image:<sha256> identities; read-only, never plugin image API IDs or paths. */
+  imageRefs?: string[];
+  truncated: boolean;
+  model: string | null;
+  cacheHeat: "hot" | "cold" | "unknown";
+  used?: number;
+  max?: number;
+  usageKind: "current_context" | "last_request" | "unknown";
+  /** Historical telemetry only; never an estimate of this request's cost. Older hosts may omit these fields. */
+  contextReference?: boolean;
+  modelMismatch?: boolean;
+  usageModel?: string;
+  cacheExpiryDisabled?: boolean;
+  cacheReference?: { promptTokens: number; cacheReadTokens: number; observedAt: number; ttlSeconds: number; maxTtlSeconds: number };
+  requestEstimate?: HostTaskRequestCostEstimate;
+  /** Next cache-window boundary to refresh in the host, not a hit guarantee. */
+  costEvidenceRefreshAt?: number;
+  capturedAt: number;
+  canHandoff: boolean;
+  /** Read-only workbench preview is available; it does not execute or cancel. */
+  canPreviewHandoff?: boolean;
 }
 export interface HostTaskConversationSnapshot {
   requestId: string;
@@ -519,13 +616,26 @@ export interface HostTaskConversationSnapshot {
   inputRevision: number;
   workspacePath: string;
   sessionRef: HostTaskSessionRef | null;
+  /** Current native choices when fully resolvable; initial task choices before
+   * native attachment. Incomplete current choices are omitted, not replaced
+   * by a stale initial receipt. These are not upstream model telemetry. */
   selection?: HostTaskSelection;
   effectiveSelection?: HostTaskSelection;
   status: "starting" | "running" | "waiting" | "idle" | "stopping" | "cancelled" | "failed" | "unknown";
+  /** Actual native coordinator activity (0.3.44), independent of queued inputs
+   * and managed children counted by status. Older hosts may omit this field. */
+  nativeStatus?: "idle" | "busy" | "awaiting_permission";
+  /** True at an idle reply boundary, including a live Claude process waiting
+   * for background tasks. Does not bypass canSend or delivery approval gates. */
+  nativeReplyIdle?: boolean;
   /** Transient real host rows, including native sequence, timestamps and pending cards. Never persist these projections. */
   messages: unknown[];
   deliveries: HostTaskMessageReceipt[];
   children: HostTaskConversationChild[];
+  costApprovals?: HostTaskCostApproval[];
+  costApprovalsTruncated?: boolean;
+  /** Existing host prediction for this exact idle coordinator, transient only. */
+  composerPrediction?: { id: number; text: string } | null;
   canSend: boolean;
   /** Sticky stop watch, including when all currently observed runs are cancelled.
    * Cleared only after an explicit new input is natively accepted. */
@@ -534,6 +644,10 @@ export interface HostTaskConversationSnapshot {
   error?: string;
 }
 export interface HostTaskMessageRequest {
+  /** Requires coordinatorMessageQueue. Wait for the current reply to end;
+   * Claude may accept live input while background tasks remain. Omitted retains automatic
+   * turn/steer/live delivery. Explicit sendMessageNow may release this wait. */
+  deliveryMode?: "queue";
   conversationRequestId: string;
   requestId: string;
   expectedInputRevision: number;
@@ -542,8 +656,69 @@ export interface HostTaskMessageRequest {
   fixedInstructions?: HostFixedInstructions;
   /** User-authored display text; native prompt and transcript text are untouched. */
   displayText?: string;
+  /** Coordinator-only Codex service tier for this input; omitted follows the app setting. Changed tiers wait for a fresh native turn. */
+  codexServiceTier?: "default" | "priority";
   images?: string[];
 }
+/** Read-only, bounded source context for an owned pending cost decision. The
+ * original message is exact; no request is approved, cancelled or sent. */
+export interface HostTaskCostHandoffPreview {
+  conversationRequestId: string;
+  approvalId: string;
+  approvalRequestId: string;
+  kind: "coordinatorInput" | "crossSession" | "leader";
+  source: HostTaskSessionRef;
+  model: string | null;
+  message: string;
+  /** Exact native continuation prompt when different from displayed text. */
+  originalPrompt?: string;
+  /** Coordinator inputs retain plugin-owned image IDs. Leader previews contain only
+   * host-managed task-image:<sha256> references for identity/counting; these cannot
+   * be resolved with plugin image APIs. Cross-session previews have no images. */
+  images: string[];
+  excerpt: HostTaskExcerpt;
+  /** SHA-256 of the immutable request identity and complete message. */
+  sourceStamp: string;
+}
+export interface HostTaskCostHandoffRequest {
+  conversationRequestId: string;
+  expectedRevision: number;
+  approvalId: string;
+  approvalRequestId: string;
+}
+/** 0.3.37, capability managedChildCostHandoff. Only an owned pending leader
+ * cost review is eligible. The host displays a native human confirmation and
+ * revalidates the full source afterwards; plugin booleans cannot approve it.
+ * Persist operationId before calling. Never automatically retry an uncertain
+ * result: inspect child handoff links to reconcile the native ledger instead. */
+export interface HostTaskManagedHandoffRequest extends HostTaskCostHandoffRequest {
+  /** Exact sourceStamp returned by previewCostHandoff for this source. */
+  sourceStamp: string;
+  /** Stable [A-Za-z0-9._:-]{1,128} identity for this exact summary/request. */
+  operationId: string;
+  /** Nonempty, at most 8000 UTF-16 units, no NUL. Sent exactly as confirmed. */
+  summary: string;
+  /** Requires managedChildHandoffSelection. Independent successor configuration;
+   * omitted preserves the source child's configuration. The host resolves and
+   * confirms the exact target before submission. Freeze with operationId. */
+  targetSelection?: HostTaskSelection;
+}
+export type HostTaskManagedHandoffResult = {
+  /** accepted proves a native successor link, not completion of its task.
+   * Cancellation leaves the ledger unchanged. Unknown outcomes reject; inspect
+   * children using the persisted operationId, never automatically resubmit. */
+  status: "accepted" | "cancelled";
+  snapshot: HostTaskConversationSnapshot;
+} | {
+  /** Only proves THIS invocation did not cross the host submission boundary.
+   * It does not prove this operationId was never submitted by an earlier call
+   * or host process. Never retry an unknown operation: reconcile its links.
+   * Callers should invoke once per fresh, durably frozen operationId. */
+  status: "not_submitted";
+  operationId: string;
+  /** Host-authored safe display text, without source content or raw exceptions. */
+  reason: string;
+};
 /** Displayed pending identity is mandatory for mutating native actions. sourceId
  * is a renderer routing hint; the owning request and current native record are
  * independently validated by the host. */
@@ -558,14 +733,24 @@ export type HostTaskConversationAction = {
   | { type: "answerQuestion"; seq: number; runId: string; requestId: string; answers: Record<string, string | string[]> | null }
   | { type: "answerGrant"; seq: number; accept: boolean }
   | { type: "answerPlan"; planId: string; planRevision: number; runId: string | null; decision: "approve" | "request_changes" | "defer"; feedback?: string }
+  /** Requests a native human confirmation; plugin and model cannot approve directly. */
+  | { type: "requestCostReview"; approvalId: string; approvalRequestId: string; decision: "approve" | "cancel" | "handoff" }
+  /** Dismiss the exact displayed prediction generation, never a newer one. */
+  | { type: "dismissPrediction"; predictionId: number }
 );
 export interface HostTaskConversationsApi {
   conversation(requestId: string): Promise<HostTaskConversationSnapshot>;
   sendMessage(request: HostTaskMessageRequest): Promise<HostTaskMessageReceipt>;
   messageReceipt(conversationRequestId: string, requestId: string): Promise<HostTaskMessageReceipt | null>;
   cancelMessage(conversationRequestId: string, requestId: string): Promise<HostTaskMessageReceipt | null>;
+  /** 0.3.30, capability immediateMessages. Prioritize this original queued input.
+   * expectedInputRevision is the selected receipt's inputRevision. May request
+   * reply-only yield; never stops descendants or replays an ambiguous delivery. */
+  sendMessageNow(conversationRequestId: string, requestId: string, expectedInputRevision: number): Promise<HostTaskMessageReceipt | null>;
   stopConversation(requestId: string): Promise<HostTaskConversationSnapshot>;
   conversationAction(requestId: string, action: HostTaskConversationAction): Promise<HostTaskConversationSnapshot | void>;
+  previewCostHandoff?(request: HostTaskCostHandoffRequest): Promise<HostTaskCostHandoffPreview>;
+  handoffManagedChild?(request: HostTaskManagedHandoffRequest): Promise<HostTaskManagedHandoffResult>;
   onConversationEvent(callback: (snapshot: HostTaskConversationSnapshot) => void): Disposer;
 }
 ```
@@ -660,6 +845,12 @@ export interface MemoryExtractionStatus {
   busy: boolean;
   retryAfterMs: number;
   reason?: string;
+  /** Native durable request receipts and shared token/failure limits are active.
+   * Automatic consumers must require this capability before enabling work. */
+  automationVersion?: 1;
+  /** Local source/receipt reads are currently permitted even if paid inference
+   * is waiting for its token budget or provider recovery. Never permits a call. */
+  canReconcile?: boolean;
 }
 export interface MemoryExtractionSourceRequest {
   projectId: string;
@@ -671,6 +862,9 @@ export interface MemoryExtractionRequest extends MemoryExtractionSourceRequest {
   context?: MemoryExtractionContext[];
   formatVersion?: 2;
   expectedSourceDigest?: string;
+  /** Look up this exact request's durable outcome. Never starts inference,
+   * including when the host has no receipt for the supplied requestId. */
+  reconcileOnly?: boolean;
 }
 export interface MemoryExtractionPrepareRequest extends MemoryExtractionSourceRequest {
   cursor?: MemoryExtractionCursor | null;
@@ -690,9 +884,11 @@ export type MemoryExtractionPreparation = {
  * selected source. Fixed tool-less Gemini4/Vertex extraction consumes provider
  * quota. The native host verifies source ownership, project and successful
  * completion; policies, carried references and tool/thinking output are excluded.
- * It waits for global foreground idle and cancels on new foreground input or
- * maintenance. Cancellation cannot guarantee upstream quota or billing refunds.
- * No queue, persistence or main-chat injection is performed by this API.
+ * It waits for foreground idle before dispatch. With automationVersion 1, a
+ * bounded request already sent may finish when foreground work starts; explicit
+ * cancellation, permissions and maintenance still fence its application.
+ * Native receipts and shared token limits are durable. The plugin owns its
+ * work queue and records. Cancellation cannot guarantee billing refunds.
  * Persist source/cursor metadata and validated notes with their evidence only;
  * generated notes never acquire user-confirmed authority automatically. */
 export interface HostMemoryExtractionApi {
@@ -705,6 +901,139 @@ export interface HostMemoryExtractionApi {
   /** One bounded request; a completed empty notes array is a successful batch. */
   extract(request: MemoryExtractionRequest): Promise<MemoryExtractionResult>;
   cancel(requestId: string): Promise<void>;
+}
+```
+
+## 宿主交接摘要契约
+
+`ctx.handoff`（0.3.29，`host:chat`）仅桌面 owner 可用，浮窗经 owner action 调用。提供有界 text（最多 48000 UTF-16 单元）、title（512）、childContext（6000），不提供任何源 session ID，也不创建新聊天。复用宿主 /handoff 的摘要核心；preferences 返回宿主压缩偏好，enabled 只是自动压缩默认值，显式 summarize 仍可调用。接受时冻结宿主 selection，不使用插件聊天模型。
+
+summarize 先持久化 requestId、输入哈希和 baseRevision，再调用原生并返回 running。插件应先保存请求身份，再通过 onEvent/inspect 收敛，不能在 unknown 时自动重发；相同 ID 和完全相同输入只返回既有状态。每个 handoffId 仅保存最新请求，expectedRevision 使用已有 snapshot.revision（首次 0；重试保持原 expectedRevision）。discard 只是放弃结果，不是终止推理或退还额度；晚到结果被忽略，宿主仍阻塞更新直到原生调用结束。插件自行保留可编辑草稿，不以返回结果覆盖调用期间的手工修改。
+
+```ts
+import type { Disposer } from "./manifest";
+
+/** Routing from the host's /handoff preferences, independent of plugin chats. */
+export interface HostHandoffSelection {
+  engine: "claude" | "codex" | "pi" | "cursor";
+  model: string;
+  providerId?: string;
+  effort?: string;
+}
+export interface HostHandoffPreferences {
+  /** Default automatic compression preference; explicit summarize is allowed when false. */
+  enabled: boolean;
+  selection: HostHandoffSelection;
+}
+/** Safe projection of the shared /handoff picker. Contains labels and IDs only,
+ * never provider credentials or raw local configuration. */
+export interface HostHandoffCatalog {
+  selection: HostHandoffSelection;
+  engines: Array<{
+    id: HostHandoffSelection["engine"];
+    label: string;
+    available: boolean;
+    models: Array<{ id: string; label: string }>;
+    providers: Array<{ id: string; label: string }>;
+    efforts: Array<{ id: string; label: string }>;
+    defaultSelection: HostHandoffSelection;
+  }>;
+}
+export interface HostHandoffRequest {
+  handoffId: string;
+  requestId: string;
+  /** Latest snapshot revision, or 0 for a new handoff. Retry with the original revision. */
+  expectedRevision: number;
+  /** Explicit plugin-owned text. Omit when source is supplied. */
+  text?: string;
+  title?: string;
+  childContext?: string;
+  /** Explicit selection for this operation; omitted follows /handoff preferences. */
+  selection?: HostHandoffSelection;
+  /** 0.3.39: host resolves the owned pending child and reads all saved visible
+   * history. Requires host:tasks as well as host:chat; never accepts a raw session ID. */
+  source?: HostHandoffManagedChildSource | HostHandoffCoordinatorSource;
+}
+/** Owned coordinator's complete saved history; requires host:tasks and
+ * coordinatorFullHistoryHandoff. Generates a summary only, without sending or transferring tasks. */
+export interface HostHandoffCoordinatorSource {
+  kind: "coordinator";
+  conversationRequestId: string;
+  expectedRevision: number;
+}
+export interface HostHandoffManagedChildSource {
+  kind: "managedChild";
+  conversationRequestId: string;
+  expectedRevision: number;
+  approvalId: string;
+  approvalRequestId: string;
+  sourceStamp: string;
+}
+/** Native metadata only. Durations are nonnegative safe integer milliseconds;
+ * call counts are at most 1024 and completed + active = started. */
+export interface HostHandoffTiming {
+  elapsedMs: number;
+  readingMs: number;
+  segmentsMs: number;
+  mergingMs: number;
+  verifyingMs: number;
+  modelCalls: number;
+  completedModelCalls: number;
+  activeModelCalls: number;
+  /** Sum of ended calls (including failures); overlapping calls are not wall time. */
+  modelElapsedMs: number;
+  lastModelCallMs?: number;
+  longestModelCallMs?: number;
+}
+/** Native phase counts only; merge rounds can add work, so these are not a total percentage. */
+export interface HostHandoffProgress {
+  phase: "reading" | "segments" | "merging" | "verifying";
+  completed?: number;
+  total?: number;
+  round?: number;
+  /** Host observation time, not a provider token/response timestamp. */
+  updatedAt: number;
+  /** Optional on older hosts/snapshots. Final statistics remain after completion. */
+  timing?: HostHandoffTiming;
+}
+export interface HostHandoffSnapshot {
+  readonly handoffId: string;
+  readonly requestId: string;
+  readonly revision: number;
+  readonly status: "running" | "completed" | "failed" | "unknown" | "discarded";
+  readonly selection: HostHandoffSelection;
+  /** 0.3.47: fixed when accepted. Old persisted requests may omit it. */
+  readonly startedAt?: number;
+  /** Optional transient progress; absence does not imply the request has stopped. */
+  readonly progress?: HostHandoffProgress;
+  readonly summary?: string;
+  readonly error?: string;
+}
+/** Desktop owner only, requires host:chat (0.3.29). Floating views dispatch to
+ * their owner. Explicit text never resolves session IDs. An owned managed-child
+ * source additionally requires host:tasks and fullHistoryHandoff (0.3.39).
+ * This uses the host /handoff compressor without opening a chat.
+ * Input identity is durable before native submission;
+ * source text is not persisted. One latest request is retained per handoffId. */
+export interface HostHandoffApi {
+  preferences(): Promise<HostHandoffPreferences>;
+  /** 0.3.40: free local discovery for an in-place plugin picker. The selection
+   * controls channel-specific models; no dialog, inference or settings write.
+   * Floating views dispatch to their owner and display only this safe catalog. */
+  catalog?(options?: { selection?: HostHandoffSelection }): Promise<HostHandoffCatalog>;
+  /** 0.3.39: same native model/channel/effort picker as /handoff. Does not
+   * invoke a model, mutate a destination chat, or change global preferences. */
+  chooseModel?(options?: { workspacePath?: string; selection?: HostHandoffSelection }): Promise<HostHandoffSelection | null>;
+  /** Freezes host preferences at acceptance and returns running after durable
+   * submission. Observe onEvent/inspect for completion. Identical request-ID
+   * retries return its current snapshot without invoking the model again.
+   * Unknown requests must be inspected/discarded, never automatically replayed. */
+  summarize(request: HostHandoffRequest): Promise<HostHandoffSnapshot>;
+  inspect(handoffId: string): Promise<HostHandoffSnapshot | null>;
+  /** Abandons results only, not the native inference or upstream cost. Late
+   * output is ignored; runtime updates stay blocked until native work settles. */
+  discard(handoffId: string, requestId: string): Promise<HostHandoffSnapshot | null>;
+  onEvent(callback: (snapshot: HostHandoffSnapshot) => void): Disposer;
 }
 ```
 
@@ -801,6 +1130,14 @@ export interface PluginDetachedSurfaceDefinition {
   getSnapshot(): unknown;
   subscribe(listener: () => void): Disposer;
   dispatch(action: PluginDetachedAction): unknown | Promise<unknown>;
+  /** Route a human-selected assistant notice to an exact plugin-owned
+   * coordinator. The host verifies the returned request against its native
+   * session before calling deliver. A draft must be appended, not sent. */
+  noticeTarget?: {
+    resolve(source: { engine: string; sessionId: string; workspacePath: string }): string | null;
+    deliver(request: { source: { engine: string; sessionId: string; workspacePath: string }; requestId: string; noticeId: string;
+      action: "open" | "draft"; text?: string; signal: AbortSignal }): Promise<boolean>;
+  };
 }
 ```
 
@@ -832,9 +1169,9 @@ export interface PluginDetachedSurfaceDefinition {
 | `network:none` | — |
 | `composer:draft` | `ctx.composer.setDraft` |
 | `host:session` | `ctx.sessions.selectSession`、`ctx.sessions.refresh`、`ctx.sessions.setEffort`、`ctx.sessions.registerSource` |
-| `host:chat` | `ctx.conversations.catalog`、`ctx.conversations.open`、`ctx.conversations.inspect`、`ctx.conversations.send`、`ctx.conversations.stop`、`ctx.conversations.openFile`、`ctx.conversations.onEvent`、`ctx.images.importImage`、`ctx.images.readPreview`、`ctx.chat.identity`、`ctx.chat.current`、`ctx.chat.inspect`、`ctx.chat.submit`、`ctx.chat.receipt`、`ctx.chat.onEvent` |
-| `host:tasks` | `ctx.images.importImage`、`ctx.images.readPreview`、`ctx.tasks.conversation`、`ctx.tasks.sendMessage`、`ctx.tasks.messageReceipt`、`ctx.tasks.cancelMessage`、`ctx.tasks.stopConversation`、`ctx.tasks.conversationAction`、`ctx.tasks.onConversationEvent`、`ctx.tasks.catalog`、`ctx.tasks.history`、`ctx.tasks.excerpt`、`ctx.tasks.plan`、`ctx.tasks.getPlan`、`ctx.tasks.cancelPlan`、`ctx.tasks.submit`、`ctx.tasks.receipt`、`ctx.tasks.list`、`ctx.tasks.cancel`、`ctx.tasks.open`、`ctx.tasks.forget`、`ctx.tasks.slots`、`ctx.tasks.onEvent` |
-| `host:memory` | `ctx.memoryExtraction.status`、`ctx.memoryExtraction.checkpoint`、`ctx.memoryExtraction.prepare`、`ctx.memoryExtraction.extract`、`ctx.memoryExtraction.cancel` |
+| `host:chat` | `ctx.handoff.catalog`、`ctx.handoff.chooseModel`、`ctx.handoff.preferences`、`ctx.handoff.summarize`、`ctx.handoff.inspect`、`ctx.handoff.discard`、`ctx.handoff.onEvent`、`ctx.conversations.catalog`、`ctx.conversations.open`、`ctx.conversations.inspect`、`ctx.conversations.send`、`ctx.conversations.stop`、`ctx.conversations.openFile`、`ctx.conversations.onEvent`、`ctx.images.importImage`、`ctx.images.readPreview`、`ctx.chat.identity`、`ctx.chat.current`、`ctx.chat.inspect`、`ctx.chat.submit`、`ctx.chat.receipt`、`ctx.chat.onEvent` |
+| `host:tasks` | `ctx.ui.registerCenterTab`、`ctx.handoff.summarize`、`ctx.images.importImage`、`ctx.images.readPreview`、`ctx.tasks.conversation`、`ctx.tasks.sendMessage`、`ctx.tasks.messageReceipt`、`ctx.tasks.cancelMessage`、`ctx.tasks.sendMessageNow`、`ctx.tasks.stopConversation`、`ctx.tasks.conversationAction`、`ctx.tasks.previewCostHandoff`、`ctx.tasks.handoffManagedChild`、`ctx.tasks.onConversationEvent`、`ctx.tasks.catalog`、`ctx.tasks.history`、`ctx.tasks.excerpt`、`ctx.tasks.plan`、`ctx.tasks.getPlan`、`ctx.tasks.cancelPlan`、`ctx.tasks.submit`、`ctx.tasks.attachConversation`、`ctx.tasks.receipt`、`ctx.tasks.list`、`ctx.tasks.cancel`、`ctx.tasks.open`、`ctx.tasks.forget`、`ctx.tasks.slots`、`ctx.tasks.onEvent` |
+| `host:memory` | `ctx.memoryExtraction.status`、`ctx.memoryExtraction.checkpoint`、`ctx.memoryExtraction.prepare`、`ctx.memoryExtraction.extract`、`ctx.memoryExtraction.cancel`、`ctx.host.memoryReview.status`、`ctx.host.memoryReview.review` |
 | `host:workspace` | `ctx.workspaces.publishProject`、`ctx.workspaces.add` |
 | `host:workspace:remote` | `ctx.workspaces.add` |
 

@@ -12,10 +12,18 @@ import type { ChatStore } from "../store/types";
 import type { SessionMeta } from "@/lib/ipc";
 import { EMPTY_SESSION } from "../store/stream";
 import { sessionKey } from "../store/persistence";
+import { webcrypto } from "node:crypto";
+import type { ManagedChildTargetPickerProps } from "./ManagedChildTargetPicker";
 
 const actions = vi.hoisted(() => ({ approve: vi.fn(), cancel: vi.fn(), send: vi.fn() }));
 const native = vi.hoisted(() => ({ invoke: vi.fn(), refresh: vi.fn() }));
 vi.mock("@/lib/transport", () => ({ invoke: native.invoke, isWeb: false, listen: vi.fn(async () => () => {}) }));
+vi.mock("@tauri-apps/plugin-dialog", () => ({ confirm: vi.fn(async () => true) }));
+// Model catalog and menu rendering have dedicated component/browser coverage.
+// This integration retains the actual summary service and native cost actions.
+vi.mock("./HandoffCompressionControls", () => ({ HandoffModelPicker: () => null }));
+vi.mock("./ManagedChildTargetPicker", () => ({ ManagedChildTargetPicker: ({ onChange, disabled, supported }: ManagedChildTargetPickerProps) =>
+  <button data-testid="target-picker" disabled={disabled || !supported} onClick={() => onChange({ engine: "codex", model: "gpt-6-astra", providerId: "__local__", effort: "high" })}>target</button> }));
 vi.mock("@/features/leader/store", () => ({ useLeaderStore: { getState: () => ({ refresh: native.refresh }) } }));
 vi.mock("../cross-session", async (original) => ({
   ...await original<typeof import("../cross-session")>(),
@@ -24,7 +32,7 @@ vi.mock("../cross-session", async (original) => ({
   sendCrossSessionMessageNow: actions.send,
 }));
 const chat = vi.hoisted(() => ({ sessions: [] as SessionMeta[], setSessionError: vi.fn(), setDraft: vi.fn(), removeQueued: vi.fn(), sendQueuedNow: vi.fn(),
-  bySession: {} as ChatStore["bySession"], openTabs: [] as ActiveSession[], models: {} }));
+  bySession: {} as ChatStore["bySession"], openTabs: [] as ActiveSession[], models: {}, archivedSessionKeys: {} as Record<string, boolean> }));
 vi.mock("../store", async () => ({
   useChatStore: Object.assign((selector: (state: typeof chat) => unknown) => selector(chat), { getState: () => chat }),
   sessionKey: (await import("../store/persistence")).sessionKey,
@@ -46,7 +54,7 @@ beforeEach(async () => {
   chat.sessions = []; chat.bySession = {}; chat.openTabs = [];
   actions.approve.mockResolvedValue(undefined);
   actions.cancel.mockResolvedValue(undefined);
-  native.invoke.mockResolvedValue({ leaders: [], branches: [] });
+  native.invoke.mockImplementation(async command => command === "host_confirmation_open" ? true : { leaders: [], branches: [] });
   native.refresh.mockResolvedValue(undefined);
   useCrossSessionActivityStore.getState().reset();
   await i18n.changeLanguage("en");
@@ -55,6 +63,114 @@ beforeEach(async () => {
 afterEach(async () => { await act(async () => root.unmount()); node.remove(); vi.useRealTimers(); });
 
 describe("cost approval", () => {
+  it.each([false, true])("prepares and hands the original child to a successor only after confirmation (explicit target: %s)", async explicitTarget => {
+    vi.stubGlobal("crypto", webcrypto);
+    try {
+      const source = { engine: "agy", sessionId: `auto-summary-child-${explicitTarget}`, workspacePath: "/auto-summary" };
+      const held = { ...record(), scopedId: `leader:auto-summary-${explicitTarget}`, target: source, message: "原样保留的新任务🙂".repeat(200),
+        leaderCostApproval: { branchId: "auto-summary", requestId: `auto-held-${explicitTarget}`, model: "gemini-4-argon" } };
+      chat.sessions = [{ ...source, filePath: "/synthetic-history", fileSize: 100, fileMtimeMs: 1, updatedAt: 1 } as SessionMeta];
+      useCrossSessionActivityStore.getState().upsertRecord(held);
+      const summary = "自动摘要：已核对原子会话约束，接班后继续原任务并回传主会话。";
+      native.invoke.mockImplementation(async (command: string, args?: { selection?: unknown }) => ["task_managed_child_handoff_selection_supported", "host_confirmation_open"].includes(command) ? true
+        : command === "task_resolve_handoff_selection" ? args?.selection : command === "load_session_page"
+        ? { messages: [{ seq: 1, role: "assistant", text: "旧子会话的已确认约束与待办。" }], nextBefore: null }
+        : command === "handoff_full_history_supported" ? true : command === "summarize_session_handoff" ? summary : { leaders: [], branches: [] });
+      await act(async () => root.render(<CrossSessionCostApproval record={held} />));
+      await act(async () => button("managedHandoffOpen").click());
+      expect(native.invoke.mock.calls.filter(([name]) => name === "summarize_session_handoff")).toHaveLength(0);
+      await vi.waitFor(() => expect(button("managedHandoffGenerate")?.disabled).toBe(false));
+      await act(async () => button("managedHandoffGenerate").click());
+      await vi.waitFor(async () => {
+        await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)); });
+        expect(node.querySelector("textarea")?.value).toBe(summary);
+      });
+      expect(native.invoke.mock.calls.filter(([name]) => name === "summarize_session_handoff")).toHaveLength(1);
+      const summaryArgs = native.invoke.mock.calls.find(([name]) => name === "summarize_session_handoff")![1];
+      expect(summaryArgs).toMatchObject({ engine: source.engine, sessionId: source.sessionId, historyScope: "full" });
+      expect(summaryArgs).not.toHaveProperty("transcriptExcerpt");
+      expect(native.invoke.mock.calls.filter(([name]) => name === "task_handoff_child")).toHaveLength(0);
+      expect(node.querySelector("pre")?.textContent).toBe(held.message);
+      if (explicitTarget) await act(async () => (node.querySelector('[data-testid="target-picker"]') as HTMLButtonElement).click());
+      expect(node.querySelector("textarea")?.value).toBe(summary);
+      await act(async () => button("managedHandoffSubmit").click());
+      const handoffs = native.invoke.mock.calls.filter(([name]) => name === "task_handoff_child");
+      expect(handoffs).toHaveLength(1);
+      expect(handoffs[0][1]).toMatchObject({ parentEngine: sender.engine, parentSessionId: sender.sessionId,
+        workspacePath: sender.workspacePath, branchId: "auto-summary", requestId: `auto-held-${explicitTarget}`, sourceSessionId: source.sessionId,
+        reviewedModel: "gemini-4-argon", summary });
+      if (explicitTarget) expect(handoffs[0][1]).toHaveProperty("targetSelection", { engine: "codex", model: "gpt-6-astra", providerId: "__local__", effort: "high" });
+      else expect(handoffs[0][1]).not.toHaveProperty("targetSelection");
+      expect(actions.approve).not.toHaveBeenCalled(); expect(actions.cancel).not.toHaveBeenCalled();
+      expect(native.invoke.mock.calls.some(([name]) => name === "start_new_chat" || name === "send_message")).toBe(false);
+    } finally { vi.unstubAllGlobals(); }
+  });
+  it.each(["G:/project", ""])("preserves each approval card's ownership policy for metadata path %s", async workspacePath => {
+    const active = { ...target, engine: "codex", workspacePath: "G:\\project", model: "gpt-6-astra" };
+    const key = sessionKey(active.engine, active.sessionId, active.workspacePath);
+    const meta = { ...active, workspacePath, model: "old-model" } as SessionMeta;
+    chat.sessions = [meta]; chat.openTabs = [active];
+    chat.bySession[key] = { ...EMPTY_SESSION, usage: { input_tokens: 50_000 },
+      messages: [{ model: "old-model", usage: { input_tokens: 50_000 } }] as never };
+    const held = { ...record(), target: active };
+    await act(async () => root.render(<CrossSessionCostApproval record={held} />));
+    if (workspacePath) {
+      expect(node.textContent).toContain("gpt-6-astra");
+      expect(node.textContent).toContain(i18n.t("crossSession.costModelChanged", { model: "old-model" }));
+    } else {
+      expect(node.textContent).not.toContain("gpt-6-astra");
+      expect(node.textContent).toContain("model-a");
+    }
+    useSessionSendCostGuardStore.getState().hold({ sessionKey: key, engine: active.engine,
+      sessionId: active.sessionId, workspacePath: active.workspacePath, prompt: "continue", images: [], mode: "send", review: held.costReview! });
+    await act(async () => root.render(<SessionSendCostApproval active={active} />));
+    expect(node.textContent).toContain("gpt-6-astra");
+    expect(node.textContent).toContain(i18n.t("crossSession.costModelChanged", { model: "old-model" }));
+    expect(meta.workspacePath).toBe(workspacePath);
+  });
+  it("prepares a handoff for the held target without approving or cancelling the original request", async () => {
+    const held = record();
+    useCrossSessionActivityStore.getState().upsertRecord(held);
+    useHandoffStore.setState({ byWorkspace: {} });
+    const prepare = vi.spyOn(useHandoffStore.getState(), "startHandoff").mockImplementation(() => {});
+    await act(async () => root.render(<CrossSessionCostApproval record={held} />));
+    await act(async () => button("costHandoff").click());
+    expect(prepare).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      workspacePath: target.workspacePath, sourceEngine: target.engine, sourceSessionId: target.sessionId,
+      nextTask: held.message, archiveSourceOnSend: false, initialMode: "local",
+    }));
+    expect(actions.approve).not.toHaveBeenCalled();
+    expect(actions.cancel).not.toHaveBeenCalled();
+    expect(useCrossSessionActivityStore.getState().records[0].status).toBe("awaiting_cost_approval");
+  });
+  it("offers managed child Handoff for advisory cache and submits only after explicit confirmation", async () => {
+    const held = { ...record(), kind: "subtask" as const, target: { ...target, engine: "agy" },
+      leaderCostApproval: { branchId: "branch-1", requestId: "held-1", model: "gemini-4-argon" } };
+    held.costReview!.cacheHeat = "unknown";
+    held.costReview!.cache = { startedAt: 1000, observedAt: 1000, ttlSeconds: 900, source: "agy-vertex-reference",
+      reference: { maxTtlSeconds: 1200, cacheReadTokens: 0, promptTokens: 353093 } };
+    useCrossSessionActivityStore.getState().upsertRecord(held);
+    useHandoffStore.setState({ byWorkspace: {} });
+    const prepare = vi.spyOn(useHandoffStore.getState(), "startHandoff").mockImplementation(() => {});
+    await act(async () => root.render(<CrossSessionCostApproval record={held} />));
+    expect(node.textContent).toContain(i18n.t("crossSession.costCacheUnknown"));
+    expect(button("managedHandoffOpen")).toBeDefined();
+    await act(async () => button("managedHandoffOpen").click());
+    expect(node.querySelector('[aria-label="' + i18n.t("crossSession.managedHandoffTitle") + '"]')).not.toBeNull();
+    expect(prepare).not.toHaveBeenCalled();
+    expect(actions.approve).not.toHaveBeenCalled();
+    expect(actions.cancel).not.toHaveBeenCalled();
+    expect(native.invoke).toHaveBeenCalledExactlyOnceWith("task_managed_child_handoff_selection_supported");
+    expect(useCrossSessionActivityStore.getState().records[0].status).toBe("awaiting_cost_approval");
+    const textarea = node.querySelector("textarea")!;
+    await act(async () => { Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(textarea, "交接摘要🙂"); textarea.dispatchEvent(new Event("input", { bubbles: true })); });
+    await act(async () => button("managedHandoffSubmit").click());
+    expect(native.invoke.mock.calls.filter(([name]) => name === "task_handoff_child")).toEqual([["task_handoff_child", expect.objectContaining({
+      parentEngine: sender.engine, parentSessionId: sender.sessionId, branchId: "branch-1", requestId: "held-1",
+      sourceSessionId: target.sessionId, reviewedModel: "gemini-4-argon", summary: "交接摘要🙂", operationId: expect.any(String),
+    })]]);
+    expect(prepare).not.toHaveBeenCalled();
+  });
   it.each(["consultation", "subtask"] as const)("keeps legacy unloaded Codex %s approval manual without cache expiry claims", async (kind) => {
     const value = { ...record(), target: { ...target, engine: "codex" }, kind,
       leaderCostApproval: kind === "subtask" ? { branchId: "branch-1", requestId: "held-1", model: "gpt-6-astra" } : undefined };
@@ -164,6 +280,25 @@ describe("cost approval", () => {
     expect(node.textContent).toContain("2,400");
     expect(node.textContent).toContain("claude-opus-4-5");
     expect(actions.approve).not.toHaveBeenCalled();
+  });
+
+  it("keeps the original review when an identically keyed tab belongs to another workspace", async () => {
+    const key = sessionKey(target.engine, target.sessionId, target.workspacePath);
+    chat.sessions = [{ ...target, model: "model-a" } as SessionMeta];
+    chat.openTabs = [{ ...target, workspacePath: "/different" } as ActiveSession];
+    chat.bySession[key] = { ...EMPTY_SESSION, usage: { input_tokens: 75000 },
+      messages: [{ seq: 1, role: "assistant", text: "", ts: null, model: "model-a", usage: { input_tokens: 75000 } }] };
+    const held = record();
+    await act(async () => root.render(<CrossSessionCostApproval record={held} />));
+    expect(node.textContent).toContain("50,000");
+    expect(node.textContent).not.toContain("75,000");
+    useSessionSendCostGuardStore.getState().hold({ sessionKey: key, engine: target.engine, sessionId: target.sessionId,
+      workspacePath: target.workspacePath, prompt: "resume", images: [], mode: "send", review: held.costReview! });
+    await act(async () => root.render(<SessionSendCostApproval active={target as ActiveSession} />));
+    expect(node.textContent).toContain("50,000");
+    expect(node.textContent).not.toContain("75,000");
+    expect(useSessionSendCostGuardStore.getState().bySessionKey[key]).toBeDefined();
+    await act(async () => useSessionSendCostGuardStore.getState().dismiss(key));
   });
 
   it("shows the captured window and never approves on mount", async () => {

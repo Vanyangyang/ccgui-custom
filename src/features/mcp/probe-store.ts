@@ -47,9 +47,9 @@ export function probeStateFor(
   return state;
 }
 
-/** 可以检测的条件：配置里真有命令或地址。 */
+/** Only probe entries whose launch context can be reproduced by the host. */
 export function probeable(entry: McpConfigEntry): boolean {
-  return Boolean(entry.command || entry.url);
+  return entry.probeAllowed !== false && Boolean(entry.command || entry.url);
 }
 
 /** 需要（重新）检测吗：停用的、没命令/地址的、还有新鲜结果的都跳过。 */

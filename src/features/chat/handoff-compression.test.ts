@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ipc } from "@/lib/ipc";
+import { runtimeCheckpoint } from "@/lib/runtime-checkpoint";
 import { useChatStore, sessionKey } from "./store";
 import { EMPTY_SESSION } from "./store/stream";
 import { replaceHandoffDraftSummary, useHandoffStore } from "./session-cleanup";
@@ -19,21 +20,29 @@ const args = {
 };
 const entry = () => useHandoffStore.getState().byWorkspace[workspacePath];
 const draft = () => useChatStore.getState().drafts[key];
+const nativeStarted = (count = 1) => vi.waitFor(() => expect(ipc.summarizeSessionHandoff).toHaveBeenCalledTimes(count));
+const settled = () => vi.waitFor(() => expect(entry()?.compressionRunning ?? false).toBe(false));
+const pending: Array<() => void> = [];
 function deferred() {
   let resolve!: (value: string) => void;
   let reject!: (error: Error) => void;
   const promise = new Promise<string>((yes, no) => { resolve = yes; reject = no; });
+  pending.push(() => resolve("test cleanup"));
   return { promise, resolve, reject };
 }
 
 beforeEach(() => {
   vi.spyOn(ipc, "taskSnapshot").mockResolvedValue({ leaders: [], branches: [] });
+  vi.spyOn(ipc, "handoffFullHistorySupported").mockResolvedValue(true);
   localStorage.removeItem(HANDOFF_PREFERENCES_KEY);
   localStorage.removeItem(LEGACY_HANDOFF_PREFERENCES_KEY);
   useHandoffStore.setState({ byWorkspace: {} });
   useChatStore.setState({ ...original, activeEngine: "codex", active: null, openTabs: [], drafts: {}, sessions: [], archivedSessionKeys: {}, streamingByKey: {} });
 });
-afterEach(() => {
+afterEach(async () => {
+  runtimeCheckpoint.abort();
+  for (const finish of pending.splice(0)) finish();
+  await settled();
   vi.restoreAllMocks();
   localStorage.removeItem(HANDOFF_PREFERENCES_KEY);
   localStorage.removeItem(LEGACY_HANDOFF_PREFERENCES_KEY);
@@ -64,9 +73,11 @@ describe("optional handoff model compression", () => {
     expect(summarize).not.toHaveBeenCalled();
     useHandoffStore.getState().setCompressionMode(workspacePath, "grok");
     expect(summarize).not.toHaveBeenCalled();
-    await Promise.resolve(); // Complete the child snapshot before model inference.
+    await nativeStarted(); // Wait for child discovery and the capability probe.
     expect(summarize).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ compressionModel: "gemini-3.1-pro", engine: "codex", sessionId: "source" }));
-    summary.resolve("Selected model summary"); await summary.promise;
+    expect(summarize.mock.calls[0][0]).toMatchObject({ historyScope: "full" });
+    expect(summarize.mock.calls[0][0]).not.toHaveProperty("transcriptExcerpt");
+    summary.resolve("Selected model summary"); await settled();
     expect(draft()).toContain("上一会话交接摘要（模型提炼）：");
     expect(draft()).not.toContain("Grok 4.7");
     expect(useChatStore.getState().active).toEqual(active);
@@ -78,9 +89,9 @@ describe("optional handoff model compression", () => {
     useHandoffStore.getState().startHandoff(args);
     useHandoffStore.getState().setCompressionModel(workspacePath, "opus-4.6");
     useHandoffStore.getState().setCompressionMode(workspacePath, "grok");
-    await Promise.resolve();
+    await nativeStarted(); await settled();
     useHandoffStore.getState().startHandoff({ ...args, sourceSessionId: "second" });
-    await Promise.resolve();
+    await nativeStarted(2); await settled();
     expect(summarize).toHaveBeenCalledTimes(2);
     expect(summarize).toHaveBeenLastCalledWith(expect.objectContaining({ compressionModel: "opus-4.6" }));
     useHandoffStore.getState().setCompressionMode(workspacePath, "local");
@@ -94,42 +105,103 @@ describe("optional handoff model compression", () => {
     const summary = deferred();
     vi.spyOn(ipc, "summarizeSessionHandoff").mockReturnValue(summary.promise);
     useHandoffStore.getState().startHandoff({ ...args, initialMode: "grok" });
-    await Promise.resolve();
+    await nativeStarted();
     useHandoffStore.getState().setCompressionMode(workspacePath, "local");
     const local = draft();
-    summary.resolve("Old request must not appear"); await summary.promise;
+    summary.resolve("Old request must not appear"); await settled();
     expect(draft()).toBe(local);
     expect(entry()).toMatchObject({ mode: "local", grokStatus: "idle", grokSummary: null });
+  });
+
+  it.each(["disabled", "dismissed"] as const)("does not start another generation while the %s call is still alive", async abandoned => {
+    const first = deferred(), second = deferred();
+    const summarize = vi.spyOn(ipc, "summarizeSessionHandoff").mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
+    useHandoffStore.getState().startHandoff({ ...args, initialMode: "grok" }); await nativeStarted();
+    if (abandoned === "disabled") useHandoffStore.getState().setCompressionMode(workspacePath, "local");
+    else {
+      useHandoffStore.getState().dismissHandoff(workspacePath);
+      useHandoffStore.getState().startHandoff({ ...args, initialMode: "grok" });
+      await vi.waitFor(() => expect(entry().childrenStatus).toBe("ready"));
+    }
+    expect(entry().compressionRunning).toBe(true);
+    useHandoffStore.getState().setCompressionModel(workspacePath, "opus-4.6");
+    useHandoffStore.getState().setCompressionMode(workspacePath, "grok");
+    useHandoffStore.getState().retryGrok(workspacePath);
+    expect(summarize).toHaveBeenCalledTimes(1);
+    expect(entry().compressionModel).toBe(DEFAULT_HANDOFF_COMPRESSION_MODEL);
+    const untouched = draft();
+    first.resolve("abandoned late summary"); await settled();
+    expect(draft()).toBe(untouched); expect(entry().grokSummary).toBeNull();
+    expect(summarize).toHaveBeenCalledTimes(1);
+    if (entry().mode !== "grok") useHandoffStore.getState().setCompressionMode(workspacePath, "grok");
+    else useHandoffStore.getState().retryGrok(workspacePath);
+    await nativeStarted(2);
+    second.resolve("explicit replacement summary"); await settled();
+    expect(draft()).toContain("explicit replacement summary");
+  });
+
+  it.each([false, "error"] as const)("keeps the local draft and never falls back to excerpt compression when full-history probe returns %s", async probe => {
+    if (probe === false) vi.mocked(ipc.handoffFullHistorySupported).mockResolvedValue(false);
+    else vi.mocked(ipc.handoffFullHistorySupported).mockRejectedValue(new Error("old native"));
+    const summarize = vi.spyOn(ipc, "summarizeSessionHandoff");
+    useHandoffStore.getState().startHandoff({ ...args, initialMode: "grok" });
+    const local = draft();
+    await vi.waitFor(() => expect(entry().grokStatus).toBe("error")); await settled();
+    expect(entry().grokError).toContain("Full-history");
+    expect(draft()).toBe(local); expect(summarize).not.toHaveBeenCalled();
+  });
+
+  it.each(["disabled", "dismissed"] as const)("blocks runtime checkpoints until native settles even when the draft is %s", async abandoned => {
+    const summary = deferred();
+    vi.spyOn(ipc, "summarizeSessionHandoff").mockReturnValue(summary.promise);
+    const blocker = { participant: "session-handoff-compression", reason: "handoff-native-submission" };
+    expect(runtimeCheckpoint.readiness()).not.toContainEqual(blocker);
+    useHandoffStore.getState().startHandoff({ ...args, initialMode: "grok" }); await nativeStarted();
+    expect(runtimeCheckpoint.readiness()).toContainEqual(blocker);
+    if (abandoned === "disabled") useHandoffStore.getState().setCompressionMode(workspacePath, "local");
+    else useHandoffStore.getState().dismissHandoff(workspacePath);
+    expect(runtimeCheckpoint.readiness()).toContainEqual(blocker);
+    await expect(runtimeCheckpoint.prepare()).rejects.toThrow("session-handoff-compression:handoff-native-submission");
+    runtimeCheckpoint.abort();
+    summary.resolve("late discarded result");
+    await vi.waitFor(() => expect(runtimeCheckpoint.readiness()).not.toContainEqual(blocker));
   });
 
   it("keeps native failure diagnostics and the editable local draft until an explicit retry succeeds", async () => {
     const first = deferred(); const retry = deferred();
     vi.spyOn(ipc, "summarizeSessionHandoff").mockReturnValueOnce(first.promise).mockReturnValueOnce(retry.promise);
     useHandoffStore.getState().startHandoff({ ...args, initialMode: "grok" });
-    await Promise.resolve();
+    await nativeStarted();
     useChatStore.getState().setDraft(key, draft() + "保留下一步任务 😀");
     const local = draft();
     const diagnostic = "codex returned invalid summary [stage=final_json; http_status=200; diagnostic_id=fixture-call]";
-    first.reject(new Error(diagnostic)); await first.promise.catch(() => {});
+    first.reject(new Error(diagnostic)); await settled();
     expect(entry()).toMatchObject({ grokStatus: "error", grokError: diagnostic, grokSummary: null });
     expect(draft()).toBe(local);
     useHandoffStore.getState().retryGrok(workspacePath);
-    retry.resolve("有效的模型提炼摘要，保留所有待办。"); await retry.promise;
+    await nativeStarted(2);
+    retry.resolve("有效的模型提炼摘要，保留所有待办。"); await settled();
     expect(entry()).toMatchObject({ grokStatus: "done", grokError: null });
     expect(draft()).toContain("有效的模型提炼摘要，保留所有待办。");
     expect(draft()).toContain("保留下一步任务 😀");
   });
 
-  it("binds each completion to its selected model and preserves text after the summary", async () => {
+  it("locks model changes and retries until the active call settles, preserving text after the summary", async () => {
     const first = deferred(); const second = deferred();
     const summarize = vi.spyOn(ipc, "summarizeSessionHandoff").mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
     useHandoffStore.getState().startHandoff({ ...args, initialMode: "grok" });
-    await Promise.resolve();
+    await nativeStarted();
     useChatStore.getState().setDraft(key, draft() + "保留后续任务 😀");
     useHandoffStore.getState().setCompressionModel(workspacePath, "gemini-3.1-pro");
+    useHandoffStore.getState().retryGrok(workspacePath);
+    expect(summarize).toHaveBeenCalledTimes(1);
+    expect(entry().compressionModel).toBe(DEFAULT_HANDOFF_COMPRESSION_MODEL);
+    first.resolve("Old model summary"); await settled();
+    useHandoffStore.getState().setCompressionModel(workspacePath, "gemini-3.1-pro");
+    expect(summarize).toHaveBeenCalledTimes(1);
+    useHandoffStore.getState().retryGrok(workspacePath); await nativeStarted(2);
     expect(summarize).toHaveBeenLastCalledWith(expect.objectContaining({ compressionModel: "gemini-3.1-pro" }));
-    second.resolve("New selected-model summary"); await second.promise;
-    first.resolve("Old model summary"); await first.promise;
+    second.resolve("New selected-model summary"); await settled();
     expect(draft()).toContain("New selected-model summary");
     expect(draft()).not.toContain("Old model summary");
     expect(draft()).toContain("接下来请继续：保留后续任务 😀");
@@ -139,18 +211,24 @@ describe("optional handoff model compression", () => {
     const first = deferred(); const second = deferred();
     vi.spyOn(ipc, "summarizeSessionHandoff").mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
     useHandoffStore.getState().startHandoff({ ...args, initialMode: "grok" });
-    await Promise.resolve();
+    await nativeStarted();
     const edited = draft().replace("Local conclusion 中文 😀", "人工核实：保留这个结论 😀");
     useChatStore.getState().setDraft(key, edited);
     if (change === "toggle") {
       useHandoffStore.getState().setCompressionMode(workspacePath, "local");
       expect(draft()).toBe(edited);
       useHandoffStore.getState().setCompressionMode(workspacePath, "grok");
+      expect(entry().mode).toBe("local");
     } else {
       useHandoffStore.getState().setCompressionModel(workspacePath, "opus-4.6");
     }
-    second.resolve("New background summary"); await second.promise;
-    first.reject(new Error("old error")); await first.promise.catch(() => {});
+    first.reject(new Error("old error")); await settled();
+    // Model/toggle changes preserve manual ownership; explicit retry is tested
+    // separately because it intentionally authorizes replacing the summary.
+    useHandoffStore.getState().setCompressionMode(workspacePath, "local");
+    if (change === "model") useHandoffStore.getState().setCompressionModel(workspacePath, "opus-4.6");
+    useHandoffStore.getState().setCompressionMode(workspacePath, "grok"); await nativeStarted(2);
+    second.resolve("New background summary"); await settled();
     expect(entry().grokStatus).toBe("done");
     expect(draft()).toBe(edited);
   });
@@ -207,11 +285,11 @@ describe("optional handoff model compression", () => {
     expect(summarize).not.toHaveBeenCalled();
     useHandoffStore.getState().setCompressionMode(workspacePath, "grok");
     expect(summarize).not.toHaveBeenCalled();
-    await Promise.resolve();
+    await nativeStarted();
     expect(summarize).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ compressionSelection: selection, engine: "codex" }));
-    await Promise.resolve();
+    await settled();
     useHandoffStore.getState().startHandoff({ ...args, sourceSessionId: "second" });
-    await Promise.resolve();
+    await nativeStarted(2); await settled();
     expect(summarize).toHaveBeenLastCalledWith(expect.objectContaining({ compressionSelection: selection }));
     expect(entry().compressionSelection).toEqual(selection);
     expect(useChatStore.getState().models).toBe(chat.models);
@@ -220,20 +298,24 @@ describe("optional handoff model compression", () => {
     expect(useChatStore.getState().activeEngine).toBe(chat.activeEngine);
   });
 
-  it.each(["providerId", "engine", "effort"] as const)("invalidates old results when only %s changes", async (field) => {
+  it.each(["providerId", "engine", "effort"] as const)("locks %s during a call and freezes the new route on explicit retry", async (field) => {
     const first = deferred(); const second = deferred();
     const summarize = vi.spyOn(ipc, "summarizeSessionHandoff").mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
     const selection = { engine: "claude" as const, model: "same-model", providerId: "one", effort: "medium" };
     useHandoffStore.getState().startHandoff(args);
     useHandoffStore.getState().setCompressionSelection(workspacePath, selection);
     useHandoffStore.getState().setCompressionMode(workspacePath, "grok");
-    await Promise.resolve();
+    await nativeStarted();
     const next = { ...selection, [field]: field === "engine" ? "codex" : field === "providerId" ? "two" : "high" };
     useHandoffStore.getState().setCompressionSelection(workspacePath, next);
-    expect(summarize).toHaveBeenCalledTimes(2);
+    expect(summarize).toHaveBeenCalledTimes(1);
+    expect(entry().compressionSelection).toEqual(selection);
+    first.resolve("Old route summary"); await settled();
+    useHandoffStore.getState().setCompressionSelection(workspacePath, next);
+    expect(summarize).toHaveBeenCalledTimes(1);
+    useHandoffStore.getState().retryGrok(workspacePath); await nativeStarted(2);
     expect(summarize).toHaveBeenLastCalledWith(expect.objectContaining({ compressionSelection: next }));
-    second.resolve("New route summary"); await second.promise;
-    first.resolve("Old route summary"); await first.promise;
+    second.resolve("New route summary"); await settled();
     expect(draft()).toContain("New route summary");
     expect(draft()).not.toContain("Old route summary");
     useHandoffStore.getState().setSending(workspacePath, entry().id, true);

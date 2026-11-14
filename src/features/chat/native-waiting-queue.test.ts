@@ -190,6 +190,7 @@ describe("native run waiting for background tasks", () => {
         } as never,
       ],
       permission: "auto",
+      archivedSessionKeys: {},
       streamingByKey: {},
       bySession: {
         [KEY]: {
@@ -197,6 +198,231 @@ describe("native run waiting for background tasks", () => {
           messages: [{ seq: 1, role: "user", text: "earlier", ts: null }],
         },
       },
+    });
+  });
+
+  describe("prepare an immediate durable inbox follow-up", () => {
+    it("requests only native Esc on a background running Claude turn and waits for real idle events", async () => {
+      await launch(); generating();
+      const other = { ...TAB, sessionId: "user-active", workspacePath: "/tmp/other" };
+      useChatStore.setState({ active: other, openTabs: [TAB, other] });
+      const originalQueue = session().queue;
+      const originalUsers = userTexts();
+      await state().prepareImmediateFollowUp(TAB, RUN);
+      expect(ipc.interruptTurn).toHaveBeenCalledExactlyOnceWith(RUN);
+      expect(ipc.interruptSession).not.toHaveBeenCalled();
+      expect(ipc.sendFollowUp).not.toHaveBeenCalled();
+      expect(ipc.sendMessage).not.toHaveBeenCalled();
+      expect(state().active).toEqual(other);
+      expect(session()).toMatchObject({ streaming: true, nativeActivity: "running", nativeTaskRunId: RUN, queueParked: false });
+      expect(session().queue).toBe(originalQueue);
+      expect(userTexts()).toEqual(originalUsers);
+      emit(event("turn_complete", { usage: null }), event("activity", { state: "waiting" }));
+      await flush();
+      expect(session()).toMatchObject({ streaming: true, nativeActivity: "waiting", queueParked: false });
+      expect(ipc.sendFollowUp).not.toHaveBeenCalled();
+      expect(ipc.sendMessage).not.toHaveBeenCalled();
+    });
+
+    it("leaves Claude waiting with children ready without interrupting or sending", async () => {
+      await launch(); enterWaiting();
+      await state().prepareImmediateFollowUp(TAB, RUN);
+      expect(session()).toMatchObject({ streaming: true, nativeActivity: "waiting", queueParked: false });
+      expect(ipc.interruptTurn).not.toHaveBeenCalled();
+      expect(ipc.interruptSession).not.toHaveBeenCalled();
+      expect(ipc.sendFollowUp).not.toHaveBeenCalled();
+      expect(ipc.sendMessage).not.toHaveBeenCalled();
+    });
+
+    it.each([null, "an-older-run"])("rejects stale expected run %s before interrupt", async expected => {
+      await launch(); generating();
+      await expect(state().prepareImmediateFollowUp(TAB, expected)).rejects.toThrow();
+      expect(ipc.interruptTurn).not.toHaveBeenCalled();
+      expect(ipc.interruptSession).not.toHaveBeenCalled();
+      expect(session().queue).toEqual([]);
+    });
+
+    it.each(["question", "grant", "plan", "queue", "loading", "archived", "closed", "workspace", "settings"])("rejects the %s blocker without changing native input", async blocker => {
+      await launch(); generating();
+      let target = TAB;
+      if (blocker === "question") setSession({ messages: [...session().messages, { seq: 100, role: "question", text: "", ts: null, question: { status: "pending" } } as never] });
+      if (blocker === "grant") setSession({ messages: [...session().messages, grantCard()] });
+      if (blocker === "plan") setSession({ messages: [...session().messages, { seq: 100, role: "assistant", text: "", ts: null, planReview: { status: "awaiting_review" } } as never] });
+      if (blocker === "queue") state().queueMessage("existing native queued input", [], undefined, TAB);
+      if (blocker === "loading") setSession({ loading: true });
+      if (blocker === "archived") useChatStore.setState({ archivedSessionKeys: { [KEY]: true } });
+      if (blocker === "closed") useChatStore.setState({ openTabs: [] });
+      if (blocker === "workspace") target = { ...TAB, workspacePath: "/wrong-workspace" };
+      if (blocker === "settings") useChatStore.setState({ permission: "manual" });
+      const before = session();
+      await expect(state().prepareImmediateFollowUp(target, RUN)).rejects.toThrow();
+      expect(session()).toBe(before);
+      expect(ipc.interruptTurn).not.toHaveBeenCalled();
+      expect(ipc.interruptSession).not.toHaveBeenCalled();
+      expect(ipc.sendFollowUp).not.toHaveBeenCalled();
+      expect(ipc.sendMessage).not.toHaveBeenCalled();
+    });
+
+    it("propagates failed Esc and allows retry on the same run without a new prompt", async () => {
+      await launch(); generating();
+      const originalQueue = session().queue;
+      const originalUsers = userTexts();
+      vi.mocked(ipc.interruptTurn).mockRejectedValueOnce(new Error("stdin timeout"));
+      await expect(state().prepareImmediateFollowUp(TAB, RUN)).rejects.toThrow("stdin timeout");
+      expect(session()).toMatchObject({ streaming: true, nativeTaskRunId: RUN, queueParked: false, interruptRequestedAt: null });
+      expect(session().error).toContain("stdin timeout");
+      await expect(state().prepareImmediateFollowUp(TAB, RUN)).resolves.toBeUndefined();
+      expect(ipc.interruptTurn).toHaveBeenCalledTimes(2);
+      expect(ipc.interruptTurn).toHaveBeenLastCalledWith(RUN);
+      expect(session().queue).toBe(originalQueue);
+      expect(userTexts()).toEqual(originalUsers);
+      expect(ipc.interruptSession).not.toHaveBeenCalled();
+      expect(ipc.sendFollowUp).not.toHaveBeenCalled();
+      expect(ipc.sendMessage).not.toHaveBeenCalled();
+    });
+
+    it("does not let a failed old Esc clear a replacement run's interrupt state", async () => {
+      await launch(); generating();
+      let reject!: (error: Error) => void;
+      vi.mocked(ipc.interruptTurn).mockImplementationOnce(() => new Promise<boolean>((_resolve, fail) => { reject = fail; }));
+      const pending = state().prepareImmediateFollowUp(TAB, RUN);
+      const rejected = expect(pending).rejects.toThrow("late IPC error");
+      setSession({ nativeTaskRunId: "replacement-run", interruptRequestedAt: 123, error: null });
+      runRouting.set("replacement-run", KEY);
+      reject(new Error("late IPC error"));
+      await rejected;
+      expect(session()).toMatchObject({ nativeTaskRunId: "replacement-run", interruptRequestedAt: 123, error: null });
+      expect(ipc.interruptTurn).toHaveBeenCalledTimes(1);
+      expect(ipc.interruptSession).not.toHaveBeenCalled();
+    });
+
+    it("rejects another busy engine without killing and accepts its loaded idle timeline", async () => {
+      const other = { engine: "cursor", sessionId: "cursor-s1", workspacePath: WS };
+      const key = sessionKey(other.engine, other.sessionId, other.workspacePath);
+      useChatStore.setState({ openTabs: [other], bySession: { [key]: { ...EMPTY_SESSION, messages: [], queue: [], streaming: true, nativeTaskRunId: "cursor-run" } } });
+      await expect(state().prepareImmediateFollowUp(other, "cursor-run")).rejects.toThrow();
+      useChatStore.setState({ bySession: { [key]: { ...state().bySession[key], streaming: false } } });
+      await expect(state().prepareImmediateFollowUp(other, null)).resolves.toBeUndefined();
+      expect(ipc.interruptTurn).not.toHaveBeenCalled();
+      expect(ipc.interruptSession).not.toHaveBeenCalled();
+      expect(ipc.sendMessage).not.toHaveBeenCalled();
+    });
+
+    function agyImmediate() {
+      const tab = { engine: "agy", sessionId: "agy-main", workspacePath: WS }, key = sessionKey(tab.engine, tab.sessionId, WS);
+      const child = { engine: "agy", sessionId: "agy-child", workspacePath: WS }, childKey = sessionKey(child.engine, child.sessionId, WS);
+      const childState = { ...EMPTY_SESSION, streaming: true, throughput: { runId: "agy-child-run", seq: 1, ended: false, sample: null } };
+      useChatStore.setState({ active: child, openTabs: [tab, child], bySession: {
+        [key]: { ...EMPTY_SESSION, messages: [{ seq: 1, role: "assistant", text: "partial Gemini reply", ts: null }], streaming: true, queueParked: false,
+          throughput: { runId: "agy-main-run", seq: 1, ended: false, sample: null } }, [childKey]: childState,
+      }, streamingByKey: { [key]: true, [childKey]: true } });
+      runRouting.set("agy-main-run", key); runRouting.set("agy-child-run", childKey);
+      return { tab, key, childKey, childState };
+    }
+
+    it("delivers the same durable AGY inbox message once after parent termination while its managed child keeps running", async () => {
+      const { tab, key, childKey, childState } = agyImmediate();
+      useChatStore.setState({ engines: [{ id: "agy", available: true, enabled: true, permissions: ["auto"] }] as never,
+        models: { agy: "gemini-4-argon-high" }, efforts: {}, providers: {}, archivedWorkspaces: [],
+        sessions: [{ ...metaOf("gemini-4-argon-high"), ...tab }], workspaces: [{ id: "work", path: WS, name: "Work" }] as never });
+      const { desktopTaskFacade } = await import("@/features/plugins/runtime/task-facade");
+      const { createTaskConversationBridge } = await import("@/features/plugins/runtime/task-conversation-bridge");
+      const native = await desktopTaskFacade(), saved = new Map<string, unknown>();
+      const stopChild = vi.fn();
+      const bridge = createTaskConversationBridge({ pluginId: "agy-immediate-integration", storage: {
+        get: async (_p, k) => saved.get(k) ?? null, set: async (_p, k, v) => { saved.set(k, structuredClone(v)); }, delete: async () => {},
+      }, facade: async () => ({ ...native, sessionCostReview: undefined, listen: async () => () => {}, stopChild,
+        leaderBranches: async () => [{ id: "managed-child", parentEngine: "agy", parentSessionId: tab.sessionId, parentWorkspacePath: WS,
+          engine: "agy", sessionId: "agy-child", workspacePath: WS, state: "running" }] }),
+        owned: async () => ({ proven: true, receipt: { requestId: "coord", taskId: "topic", projectId: "project", slotKey: "coordinator", executionId: "attached",
+          acceptedAt: 1, updatedAt: 1, status: "attached", sessionDecision: "attached", session: tab, workspacePath: WS, runId: null } }),
+        hold: () => {},
+        resolveImages: async () => [], runId: () => "agy-resumed-run", now: () => Date.now(),
+      });
+      try {
+        await bridge.sendMessage({ conversationRequestId: "coord", requestId: "queued-one", expectedInputRevision: 0, prompt: "最新约束🙂", deliveryMode: "queue" });
+        await bridge.sendMessage({ conversationRequestId: "coord", requestId: "queued-two", expectedInputRevision: 1, prompt: "后续排队内容", deliveryMode: "queue" });
+        await bridge.drain();
+        expect(await bridge.messageReceipt("coord", "queued-one")).toMatchObject({ status: "queued", inputRevision: 1 });
+        await Promise.all([bridge.sendMessageNow("coord", "queued-one", 1), bridge.sendMessageNow("coord", "queued-one", 1)]);
+        expect(ipc.interruptSession).toHaveBeenCalledExactlyOnceWith("agy-main-run");
+        expect(ipc.sendMessage).not.toHaveBeenCalled();
+        expect(await bridge.messageReceipt("coord", "queued-one")).toMatchObject({ status: "queued", inputRevision: 1 });
+        emit({ engine: "agy", sessionId: tab.sessionId, runId: "agy-main-run", seq: 2, kind: "done", data: { interrupted: true } });
+        await vi.waitFor(async () => { await bridge.drain(); expect(await bridge.messageReceipt("coord", "queued-one")).toMatchObject({ status: "received", inputRevision: 1, runId: "agy-resumed-run" }); });
+        expect(ipc.sendMessage).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ engine: "agy", sessionId: tab.sessionId, prompt: "最新约束🙂", runId: "agy-resumed-run" }));
+        expect(state().bySession[childKey]).toBe(childState); expect(runRouting.get("agy-child-run")).toBe(childKey);
+        expect(stopChild).not.toHaveBeenCalled();
+        expect(await bridge.messageReceipt("coord", "queued-two")).toMatchObject({ status: "queued", inputRevision: 2 });
+        await bridge.sendMessageNow("coord", "queued-one", 1);
+        expect(ipc.sendMessage).toHaveBeenCalledTimes(1); expect(ipc.interruptSession).toHaveBeenCalledTimes(1);
+        expect(state().bySession[key].messages.filter(m => m.role === "user" && m.text === "最新约束🙂")).toHaveLength(1);
+      } finally { bridge.dispose(); }
+    });
+
+    it("ends only the exact AGY parent run and waits for its real terminal event without sending", async () => {
+      const { tab, key, childKey, childState } = agyImmediate();
+      const original = state().bySession[key];
+      await state().prepareImmediateFollowUp(tab, "agy-main-run");
+      expect(ipc.interruptSession).toHaveBeenCalledExactlyOnceWith("agy-main-run");
+      expect(ipc.interruptTurn).not.toHaveBeenCalled();
+      expect(state().bySession[key]).toMatchObject({ streaming: true, interrupted: false, queueParked: false });
+      expect(state().bySession[key].messages).toBe(original.messages);
+      expect(state().bySession[childKey]).toBe(childState);
+      expect(runRouting.get("agy-child-run")).toBe(childKey);
+      expect(ipc.sendMessage).not.toHaveBeenCalled(); expect(ipc.sendFollowUp).not.toHaveBeenCalled();
+      await state().prepareImmediateFollowUp(tab, "agy-main-run");
+      expect(ipc.interruptSession).toHaveBeenCalledTimes(1);
+      emit({ engine: "agy", sessionId: tab.sessionId, runId: "agy-main-run", seq: 2, kind: "done", data: { interrupted: true } });
+      await flush();
+      expect(state().bySession[key].streaming).toBe(false);
+      expect(state().bySession[childKey]).toBe(childState);
+      expect(ipc.sendMessage).not.toHaveBeenCalled();
+    });
+
+    it.each(["wrong-run", "wrong-route", "card", "computer-use", "handoff", "compaction", "parked", "ended"])("refuses unsafe AGY immediate interruption: %s", async blocker => {
+      const { tab, key } = agyImmediate();
+      const changes = blocker === "card" ? { messages: [grantCard()] } : blocker === "computer-use" ? { activeComputerUse: true }
+        : blocker === "handoff" ? { handoff: {} } : blocker === "compaction" ? { compaction: {} }
+        : blocker === "parked" ? { queueParked: true } : blocker === "ended" ? { throughput: { runId: "agy-main-run", seq: 1, ended: true, sample: null } } : {};
+      useChatStore.setState(s => ({ bySession: { ...s.bySession, [key]: { ...s.bySession[key], ...changes } } } as never));
+      if (blocker === "wrong-route") runRouting.set("agy-main-run", "agy/other");
+      await expect(state().prepareImmediateFollowUp(tab, blocker === "wrong-run" ? "old-run" : "agy-main-run")).rejects.toThrow();
+      expect(ipc.interruptSession).not.toHaveBeenCalled(); expect(ipc.sendMessage).not.toHaveBeenCalled();
+    });
+
+    it.each([false, "failed"])("keeps a live AGY run intact after unconfirmed cancellation (%s) and permits retry", async outcome => {
+      const { tab, key } = agyImmediate();
+      if (outcome === false) vi.mocked(ipc.interruptSession).mockResolvedValueOnce(false);
+      else vi.mocked(ipc.interruptSession).mockRejectedValueOnce(new Error("native cancellation failed"));
+      await expect(state().prepareImmediateFollowUp(tab, "agy-main-run")).rejects.toThrow();
+      expect(state().bySession[key]).toMatchObject({ streaming: true, interruptRequestedAt: null, interrupted: false });
+      expect(runRouting.get("agy-main-run")).toBe(key);
+      await state().prepareImmediateFollowUp(tab, "agy-main-run");
+      expect(ipc.interruptSession).toHaveBeenCalledTimes(2);
+    });
+
+    it("does not overwrite a replacement AGY run when an old cancellation fails late", async () => {
+      const { tab, key } = agyImmediate(), pending = Promise.withResolvers<boolean>();
+      vi.mocked(ipc.interruptSession).mockReturnValueOnce(pending.promise);
+      const action = state().prepareImmediateFollowUp(tab, "agy-main-run");
+      const failure = expect(action).rejects.toThrow("late cancellation error");
+      const replacement = { ...state().bySession[key], nativeTaskRunId: "replacement-run", interruptRequestedAt: 123, error: null };
+      useChatStore.setState(s => ({ bySession: { ...s.bySession, [key]: replacement } }));
+      runRouting.delete("agy-main-run"); runRouting.set("replacement-run", key);
+      pending.reject(new Error("late cancellation error")); await failure;
+      expect(state().bySession[key]).toBe(replacement);
+      expect(ipc.interruptSession).toHaveBeenCalledExactlyOnceWith("agy-main-run");
+    });
+
+    it("accepts an already completed AGY run when terminal evidence beats the cancellation reply", async () => {
+      const { tab, key } = agyImmediate(), pending = Promise.withResolvers<boolean>();
+      vi.mocked(ipc.interruptSession).mockReturnValueOnce(pending.promise);
+      const action = state().prepareImmediateFollowUp(tab, "agy-main-run");
+      emit({ engine: "agy", sessionId: tab.sessionId, runId: "agy-main-run", seq: 2, kind: "done", data: {} });
+      pending.resolve(false); await expect(action).resolves.toBeUndefined();
+      expect(state().bySession[key]).toMatchObject({ streaming: false, error: null });
+      expect(ipc.sendMessage).not.toHaveBeenCalled();
     });
   });
 
@@ -1836,6 +2062,30 @@ describe("native run waiting for background tasks", () => {
         bySession: { [key]: { ...EMPTY_SESSION, messages: [] } },
       });
       await launch(tab);
+    });
+
+    it("prepares an eligible exact Codex turn without sending or interrupting it", async () => {
+      const before = current();
+      await expect(state().prepareImmediateFollowUp(tab, RUN)).resolves.toBeUndefined();
+      expect(current()).toBe(before);
+      expect(ipc.sendFollowUp).not.toHaveBeenCalled();
+      expect(ipc.sendMessage).not.toHaveBeenCalled();
+      expect(ipc.interruptTurn).not.toHaveBeenCalled();
+      expect(ipc.interruptSession).not.toHaveBeenCalled();
+    });
+
+    it.each(["wrong-run", "settings", "parked", "unknown-launch", "computer-use"])("refuses immediate Codex preparation for %s instead of killing", async blocker => {
+      if (blocker === "settings") useChatStore.setState({ permission: "plan" });
+      if (blocker === "parked") patch({ queueParked: true });
+      if (blocker === "unknown-launch") patch({ liveLaunch: undefined });
+      if (blocker === "computer-use") patch({ activeComputerUse: true });
+      const before = current();
+      await expect(state().prepareImmediateFollowUp(tab, blocker === "wrong-run" ? "other-run" : RUN)).rejects.toThrow();
+      expect(current()).toBe(before);
+      expect(ipc.sendFollowUp).not.toHaveBeenCalled();
+      expect(ipc.sendMessage).not.toHaveBeenCalled();
+      expect(ipc.interruptTurn).not.toHaveBeenCalled();
+      expect(ipc.interruptSession).not.toHaveBeenCalled();
     });
 
     it("steers the existing turn and preserves pending Chinese/emoji output, timer and usage", async () => {

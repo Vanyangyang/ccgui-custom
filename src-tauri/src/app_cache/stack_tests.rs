@@ -8,7 +8,10 @@ use tauri::Manager;
 
 fn app() -> tauri::App<tauri::test::MockRuntime> {
     let app = tauri::test::mock_builder()
-        .invoke_handler(tauri::generate_handler![super::summarize_session_handoff])
+        .invoke_handler(tauri::generate_handler![
+            super::summarize_session_handoff,
+            super::cancel_session_handoff,
+        ])
         .build(tauri::test::mock_context(tauri::test::noop_assets()))
         .unwrap();
     app.manage(crate::AppState {
@@ -33,6 +36,7 @@ fn app() -> tauri::App<tauri::test::MockRuntime> {
         relay: crate::relay::RelayState::default(),
         dsh_host: Arc::new(crate::dsh_host::DshHostState::default()),
         opencode_server: Arc::new(crate::engine::opencode_server::OpencodeServerState::default()),
+        agy_acp: Arc::new(crate::engine::agy_acp::AgyAcpState::default()),
         worktree_creations: crate::git_worktree::CreationRegistry::default(),
     });
     app
@@ -55,12 +59,17 @@ fn summarize_session_handoff_future_stays_small() {
                 None,
                 None,
                 None,
+                None,
+                None,
                 Some(HandoffCompressionSelection {
                     engine: "invalid-stack-probe-engine".into(),
                     model: "unused".into(),
                     provider_id: None,
                     effort: None,
                 }),
+                None,
+                None,
+                Default::default(),
             );
             let bytes = std::mem::size_of_val(&future);
             eprintln!("summarize_session_handoff future: {bytes} bytes");

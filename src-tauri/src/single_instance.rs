@@ -482,6 +482,7 @@ mod tests {
         fs,
         path::PathBuf,
         process::{Child, Command},
+        sync::atomic::{AtomicU64, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
     use windows::{
@@ -501,12 +502,25 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let path = std::env::temp_dir().join(format!(
-                "ccgui-instance-test-{}-{suffix}",
-                std::process::id()
-            ));
-            fs::create_dir_all(&path).unwrap();
-            Self(path)
+            Self::with_timestamp(suffix)
+        }
+
+        fn with_timestamp(suffix: u128) -> Self {
+            // SystemTime's nanosecond representation is not a unique clock tick.
+            // Parallel tests must never share a profile or remove one another's files.
+            static NEXT_PROFILE: AtomicU64 = AtomicU64::new(0);
+            loop {
+                let sequence = NEXT_PROFILE.fetch_add(1, Ordering::Relaxed);
+                let path = std::env::temp_dir().join(format!(
+                    "ccgui-instance-test-{}-{suffix}-{sequence}",
+                    std::process::id()
+                ));
+                match fs::create_dir(&path) {
+                    Ok(()) => return Self(path),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("cannot create isolated profile {}: {error}", path.display()),
+                }
+            }
         }
     }
 
@@ -631,6 +645,47 @@ mod tests {
         assert!(try_ownership(&mut contender).unwrap());
         drop(contender);
         assert!(matches!(Gate::acquire(&a.0).unwrap(), Outcome::Primary(_)));
+    }
+
+    #[test]
+    fn parallel_profiles_with_identical_timestamps_have_independent_owners() {
+        const WORKERS: usize = 16;
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let acquired = std::sync::Barrier::new(WORKERS + 1);
+        let release = std::sync::Barrier::new(WORKERS + 1);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        thread::scope(|scope| {
+            for _ in 0..WORKERS {
+                let (acquired, release, sender) = (&acquired, &release, sender.clone());
+                scope.spawn(move || {
+                    let profile = Profile::with_timestamp(timestamp);
+                    let key = profile_key(&profile.0).unwrap();
+                    let guard = open_gate(&key).unwrap();
+                    sender.send((profile.0.clone(), key, guard.owned)).unwrap();
+                    acquired.wait();
+                    release.wait();
+                    drop(guard);
+                });
+            }
+            acquired.wait();
+            let results: Vec<_> = receiver.iter().take(WORKERS).collect();
+            // Release every guard before asserting, including when isolation is broken.
+            release.wait();
+            let paths: std::collections::HashSet<_> = results.iter().map(|r| &r.0).collect();
+            let keys: std::collections::HashSet<_> = results.iter().map(|r| &r.1).collect();
+            assert_eq!(
+                paths.len(), WORKERS,
+                "same-clock profiles must have unique paths"
+            );
+            assert_eq!(
+                keys.len(), WORKERS,
+                "same-clock profiles must have unique mutex keys"
+            );
+            assert_eq!(results.iter().filter(|r| r.2).count(), WORKERS);
+        });
     }
 
     #[test]

@@ -355,4 +355,102 @@ describe("throughput sidecar lifecycle", () => {
       outputTps: null,
     });
   });
+
+  it("stamps Cursor active-time breakdown onto TurnSummaryBar and suppresses Claude subagent_mixed fallback", () => {
+    const cursor = { ...tab, engine: "cursor" };
+    const cursorKey = sessionKey(cursor.engine, cursor.sessionId, cursor.workspacePath);
+    useChatStore.setState({
+      active: cursor,
+      openTabs: [cursor],
+      activeEngine: "cursor",
+      bySession: {
+        [cursorKey]: {
+          ...EMPTY_SESSION,
+          streaming: true,
+          turnStartedAt: Date.now() - 25_000,
+          throughput: beginThroughput(run),
+          messages: [{ role: "user", text: "audit", seq: 1, ts: null }],
+        },
+      },
+    });
+    runRouting.set(run, cursorKey);
+    const cursorEv = (kind: ChatEngineEvent["kind"], seq: number, data: unknown): ChatEngineEvent => ({
+      ...cursor,
+      runId: run,
+      seq,
+      kind,
+      data,
+    });
+    emit(
+      cursorEv("delta", 2, "Cursor active-time reply"),
+      cursorEv("throughput", 3, {
+        version: 1,
+        source: "cursor",
+        status: "complete",
+        outputTokens: 200,
+        elapsedMs: 4_000,
+        generation: null,
+        generationReason: "unsupported",
+        turnReason: null,
+        breakdown: { modelMs: 4_000, toolMs: 3_300, waitMs: 0, startupMs: 17_700, wallMs: 25_000 },
+      }),
+      cursorEv("done", 4, {
+        usage: { usage_scope: "turn", input_tokens: 800, cache_read_input_tokens: 200, output_tokens: 200 },
+      }),
+    );
+    const settledCursor = useChatStore.getState().bySession[cursorKey];
+    const cursorReply = settledCursor.messages.findLast((m) => m.role === "assistant")!;
+    expect(buildTurnSummary(cursorReply, 1)).toMatchObject({
+      input: 1_000,
+      output: 200,
+      outputTps: 50,
+      speedBasis: "model",
+      breakdown: { modelMs: 4_000, toolMs: 3_300, waitMs: 0, startupMs: 17_700, wallMs: 25_000 },
+    });
+    expect((settledCursor.usage as Record<string, unknown>).turn_throughput).toBeUndefined();
+    drainPending(cursorKey);
+
+    // Claude subagent_mixed exclusion prevents falling back to output_tokens / durationMs
+    const subRun = run + "-sub";
+    useChatStore.setState({
+      active: tab,
+      openTabs: [tab],
+      activeEngine: "claude",
+      bySession: {
+        [key]: {
+          ...EMPTY_SESSION,
+          streaming: true,
+          turnStartedAt: Date.now() - 10_000,
+          throughput: beginThroughput(subRun),
+          messages: [{ role: "user", text: "delegate", seq: 1, ts: null }],
+        },
+      },
+    });
+    runRouting.set(subRun, key);
+    emit(
+      event("delta", 2, "Subagent reply", subRun),
+      event("throughput", 3, {
+        version: 1,
+        source: "claude",
+        status: "complete",
+        outputTokens: null,
+        elapsedMs: 2_000,
+        generation: null,
+        generationReason: "tools",
+        turnReason: "subagent_mixed",
+      }, subRun),
+      event("done", 4, {
+        usage: { input_tokens: 1_000, output_tokens: 5_000 },
+      }, subRun),
+    );
+    const claudeReply = session().messages.findLast((m) => m.role === "assistant")!;
+    expect(buildTurnSummary(claudeReply)).toMatchObject({
+      input: 1_000,
+      output: 5_000,
+      usageComplete: true,
+      outputTps: null,
+      speedBasis: null,
+    });
+    expect((session().usage as Record<string, unknown>).turn_throughput_reason).toBeUndefined();
+  });
 });

@@ -57,6 +57,8 @@ pub struct StartArgs {
     pub computer_use: Option<bool>,
     pub claude_ultracode: Option<bool>,
     pub claude_haiku_assist: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_service_tier_override: Option<String>,
     /// The caller must describe required capabilities, never silently drop them.
     pub require_host_chat: bool,
     pub require_leader: bool,

@@ -90,4 +90,58 @@ describe("the context gauge holds its scale when a usage snapshot omits the wind
 
     expect(contextMax()).toBe(1_000_000);
   });
+
+  it("updates Claude occupancy during a turn without counting repeated snapshots as bills", () => {
+    const run = "claude-live-context";
+    useChatStore.setState({ bySession: { [KEY]: { ...EMPTY_SESSION, usage: { model_context_window: 1_000_000 } } } });
+    expect(parseUsage(useChatStore.getState().bySession[KEY].usage)).toBeNull();
+    const first = { usage_scope: "last_request", input_tokens: 100, cache_read_input_tokens: 50_000, output_tokens: 1 };
+    handleEngineEvents([ev(run, "usage", 1, first)], deps());
+    expect(parseUsage(useChatStore.getState().bySession[KEY].usage)?.total).toBe(50_101);
+    handleEngineEvents([ev(run, "usage", 2, { ...first, output_tokens: 300 })], deps());
+    const session = useChatStore.getState().bySession[KEY];
+    expect(parseUsage(session.usage)?.total).toBe(50_400);
+    expect(contextMax()).toBe(1_000_000);
+    expect(session.turnUsage).toBeNull();
+    expect(ipc.usageRecord).not.toHaveBeenCalled();
+  });
+
+  it("keeps the live occupancy when the result carries a much larger turn bill", () => {
+    const run = "claude-live-context-done";
+    const snapshot = { usage_scope: "last_request", input_tokens: 100, cache_read_input_tokens: 50_000, output_tokens: 300 };
+    const billed = { input_tokens: 700, cache_read_input_tokens: 400_000, output_tokens: 2_000, model_context_window: 1_000_000 };
+    useChatStore.setState({ bySession: { [KEY]: { ...EMPTY_SESSION, messages: [
+      { seq: 1, role: "user", text: "hi", ts: "2026-10-29T00:00:00Z" },
+      { seq: 2, role: "assistant", text: "hello", ts: "2026-10-29T00:00:01Z" },
+    ] } } });
+    handleEngineEvents([ev(run, "usage", 1, snapshot), ev(run, "done", 2, { usage: billed })], deps());
+    const session = useChatStore.getState().bySession[KEY];
+    expect(parseUsage(session.usage)?.total).toBe(50_400);
+    expect(contextMax()).toBe(1_000_000);
+    expect(session.messages.at(-1)?.usage).toMatchObject({ ...billed, usage_scope: "turn" });
+    expect(ipc.usageRecord).toHaveBeenCalledTimes(1);
+    expect(ipc.usageRecord).toHaveBeenCalledWith(expect.objectContaining({ input: 700, cacheRead: 400_000, output: 2_000 }));
+  });
+
+  it("retains measured context after interruption without inventing a turn bill", () => {
+    const run = "claude-live-context-interrupted";
+    handleEngineEvents([
+      ev(run, "usage", 1, { usage_scope: "last_request", input_tokens: 30_000, output_tokens: 100 }),
+      ev(run, "done", 2, { interrupted: true, usage: { input_tokens: 0, output_tokens: 0 } }),
+    ], deps());
+    expect(parseUsage(useChatStore.getState().bySession[KEY].usage)?.total).toBe(30_100);
+    expect(ipc.usageRecord).not.toHaveBeenCalled();
+  });
+
+  it("does not let an in-flight history refresh overwrite a newer live snapshot", async () => {
+    let resolve!: (page: unknown) => void;
+    vi.mocked(ipc.loadSessionPage).mockImplementationOnce(() => new Promise(r => { resolve = r; }) as never);
+    const refresh = useChatStore.getState().refreshSessionUsage(KEY);
+    handleEngineEvents([ev("claude-live-context-race", "usage", 1, {
+      usage_scope: "last_request", input_tokens: 60_000, output_tokens: 200,
+    })], deps());
+    resolve({ messages: [{ seq: 1, role: "assistant", text: "old", ts: null, usage: WITH_WINDOW }], nextBefore: null, subagentHistory: [] });
+    await refresh;
+    expect(parseUsage(useChatStore.getState().bySession[KEY].usage)?.total).toBe(60_200);
+  });
 });

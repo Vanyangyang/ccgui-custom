@@ -1311,11 +1311,14 @@ fn published_task_tools_preserve_delegation_without_model_deletion() {
     let spawn = tools.iter().find(|tool| tool.name == "task_spawn").unwrap();
     let description = spawn.description.as_deref().unwrap();
     assert!(description.contains("same workspace share files"));
-    assert!(description.contains("same registered project as the native parent"));
+    assert!(description.contains("All four engines may dispatch across projects"));
+    assert!(description.contains("without a source-to-target grant"));
+    assert!(description.contains("Project membership and member roles do not restrict dispatch"));
+    assert!(!tools.iter().any(|tool| tool.name.contains("task_workspace_access")), "workspace grant management is retired");
     assert!(!description.contains("enabled Leader mode"));
     assert!(description.contains("Completed children retain their conversation and results"));
     let properties = spawn.input_schema.get("properties").unwrap();
-    assert!(properties["workspace_path"]["description"].as_str().unwrap().contains("development members"));
+    assert!(properties["workspace_path"]["description"].as_str().unwrap().contains("registered local"));
     assert!(!spawn.input_schema["required"].as_array().unwrap().contains(&json!("workspace_path")));
     assert!(properties.get("parent_workspace_path").is_none());
     assert!(properties.get("project_id").is_none());
@@ -1337,13 +1340,33 @@ fn published_task_tools_preserve_delegation_without_model_deletion() {
     let list_description = list.description.as_deref().unwrap();
     assert!(!list_description.contains("modelPolicy"));
     assert!(!list_description.contains("allowedModels"));
+    assert!(list_description.contains("including completed tasks"));
+    assert!(list_description.contains("include_result=true"));
+    assert!(list.input_schema["properties"].get("include_result").is_some());
     let skill = include_str!("../../resources/skills/ccgui-collab/SKILL.md");
     assert!(!skill.contains("modelPolicy"));
     assert!(!skill.contains("Before selecting a model"));
+    assert!(skill.contains("without a source-to-target grant"));
+    assert!(!skill.contains("human-confirmed source-to-target permission"));
 
     let wait = tools.iter().find(|tool| tool.name == "task_wait").unwrap();
     let description = wait.description.as_deref().unwrap();
     assert!(description.contains("during this call (listed in changedBranchIds)"));
     assert!(description.contains("assignments already finished when the call starts do not end a wait for other active assignments"));
-    assert!(description.contains("call again while you still need results"));
+    assert!(description.contains("stop calling tools and end this turn instead of polling task_wait in a loop"));
+    assert!(skill.contains("never poll `task_wait` in an endless loop within a single turn"));
+    assert!(skill.contains("taskPreview"));
+    assert!(skill.contains("resultPreview"));
+    assert_eq!(
+        RelayClient::request_timeout_for("list_chats", &json!({})),
+        Duration::from_secs(35)
+    );
+    assert_eq!(
+        RelayClient::request_timeout_for("task_wait", &json!({})),
+        Duration::from_secs(35)
+    );
+    assert_eq!(
+        RelayClient::request_timeout_for("task_wait", &json!({"timeout_seconds": 120})),
+        Duration::from_secs(135)
+    );
 }

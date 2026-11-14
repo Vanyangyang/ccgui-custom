@@ -10,6 +10,74 @@ function repo(label: string, threads: AiChatThread[], worktrees?: AiChatRepo[]):
   return { id: label, label, threads, worktrees };
 }
 
+function branch(state: NonNullable<AiChatThread["leaderBranch"]>["state"]): NonNullable<AiChatThread["leaderBranch"]> {
+  return {
+    id: "branch", parentEngine: "codex", parentSessionId: "parent", workspacePath: "/ws",
+    engine: "codex", sessionId: null, title: "branch", task: "", model: null, effort: null,
+    runId: null, state, createdAt: 1, updatedAt: 2, lastActivityAt: 2, deadlineAt: 90,
+    expired: false, result: "", resultTruncated: false, error: null,
+  };
+}
+
+it.each([false, true])("较旧的运行根任务优先于较新的闲置置顶任务（retrying=%s）", (retrying) => {
+  const rows = recentThreadsByActivity([repo("ws", [
+    thread({ id: "idle", label: "idle", updatedAt: 100, pinned: true }),
+    thread({ id: "active", label: "active", updatedAt: 1, streaming: true, retrying }),
+  ])]);
+  expect(rows.map((row) => row.id)).toEqual(["active", "idle"]);
+});
+
+it.each(["starting", "running", "waiting", "awaiting_cost_approval"] as const)("%s 后代使整棵树优先，按树内最新时间排序且不重排子孙", (state) => {
+  const grandchild = thread({ id: "grandchild", label: "grandchild", leaderBranch: branch(state) });
+  const parent = thread({ id: "parent", label: "parent", updatedAt: 1, children: [
+    thread({ id: "child", label: "child", children: [grandchild] }),
+    thread({ id: "sibling", label: "sibling", updatedAt: 20 }),
+  ] });
+  const rows = recentThreadsByActivity([repo("ws", [
+    thread({ id: "idle", label: "idle", updatedAt: 100 }),
+    thread({ id: "active-root", label: "active-root", updatedAt: 10, streaming: true }),
+    parent,
+  ])]);
+  expect(rows.map((row) => row.id)).toEqual(["parent", "active-root", "idle"]);
+  expect(rows[0].children?.map((row) => row.id)).toEqual(["child", "sibling"]);
+  expect(rows[0].children?.[0].children?.[0]).toMatchObject({ id: "grandchild", workspaceLabel: "ws" });
+  expect(grandchild.workspaceLabel).toBeUndefined();
+  expect(parent.children?.map((row) => row.id)).toEqual(["child", "sibling"]);
+});
+
+it.each([false, true])("运行后代结束后恢复时间顺序（有分支记录=%s）", (hasBranch) => {
+  const child = thread({ id: "child", label: "child", updatedAt: 2, streaming: true,
+    leaderBranch: hasBranch ? branch("running") : undefined });
+  const repos = [repo("ws", [
+    thread({ id: "idle", label: "idle", updatedAt: 100 }),
+    thread({ id: "parent", label: "parent", updatedAt: 1, children: [child] }),
+  ])];
+  expect(recentThreadsByActivity(repos).map((row) => row.id)).toEqual(["parent", "idle"]);
+  child.streaming = false;
+  if (hasBranch) child.leaderBranch = branch("completed");
+  expect(recentThreadsByActivity(repos).map((row) => row.id)).toEqual(["idle", "parent"]);
+});
+
+it("草稿优先于活动树，活动树同时间保持跨工作区遍历顺序", () => {
+  const rows = recentThreadsByActivity([
+    repo("ws", [
+      thread({ id: "active-a", label: "a", updatedAt: 20, streaming: true }),
+      thread({ id: "draft-parent", label: "parent", children: [thread({ label: "draft", isDraft: true })] }),
+    ], [repo("wt", [thread({ id: "active-b", label: "b", updatedAt: 20, streaming: true })])]),
+    repo("other", [thread({ id: "draft-root", label: "draft", isDraft: true }),
+      thread({ id: "active-c", label: "c", updatedAt: 20, streaming: true })]),
+  ]);
+  expect(rows.map((row) => row.id)).toEqual(["draft-parent", "draft-root", "active-a", "active-b", "active-c"]);
+});
+
+it.each(["completed", "failed", "stopped", "handed_off", "unknown", "reclaiming", "reclaimed"] as const)("%s 分支不提升闲置树优先级", (state) => {
+  const rows = recentThreadsByActivity([repo("ws", [
+    thread({ id: "old", label: "old", leaderBranch: branch(state) }),
+    thread({ id: "new", label: "new", updatedAt: 100 }),
+  ])]);
+  expect(rows.map((row) => row.id)).toEqual(["new", "old"]);
+});
+
 it("跨工作区按最后对话时间从新到旧，置顶不插队", () => {
   const rows = recentThreadsByActivity([
     repo("旧仓库", [thread({ id: "pinned-old", label: "置顶旧", updatedAt: 1, pinned: true })]),
@@ -61,7 +129,7 @@ it("没有会话时间戳时改用 Leader 分支的最后活动时间", () => {
           model: null,
           effort: null,
           runId: null,
-          state: "running",
+          state: "completed",
           createdAt: 1,
           updatedAt: 2,
           lastActivityAt: 80,

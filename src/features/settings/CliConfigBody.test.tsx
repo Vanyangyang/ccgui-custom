@@ -436,6 +436,24 @@ describe("CliEngineSettingsCard official edit entry", () => {
         model: "gemini-4-argon",
       }),
     );
+
+    // 同时支持一键挂载 Gemini 4 Carbon 并同步独立渠道 agy-vertex-carbon-byok
+    const quickMountButtons = Array.from(section.querySelectorAll("button")).filter(
+      (b) => b.textContent?.trim() === i18n.t("settings.agyByokQuickMount"),
+    );
+    expect(quickMountButtons.length).toBeGreaterThanOrEqual(1);
+    await act(async () => quickMountButtons[quickMountButtons.length - 1]!.click());
+
+    expect(ipc.upsertProvider).toHaveBeenCalledWith(
+      "agy",
+      "agy-vertex-carbon-byok",
+      expect.objectContaining({
+        name: "Gemini 4 Carbon (Vertex)",
+        baseUrl: expect.stringContaining("models/gemini-4-carbon:generateContent"),
+        remark: expect.stringContaining(SYNTHETIC_PROJECT),
+        model: "gemini-4-carbon",
+      }),
+    );
   });
 
   it("agy: a failed native refresh clears the old quota and reports failure", async () => {

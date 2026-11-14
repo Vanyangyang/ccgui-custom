@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, expect, it } from "vitest";
 import { EFFORT_LEVELS, getDefaultEffort, getEffortLevels, normalizeEffortLevel } from "./effort-levels";
 

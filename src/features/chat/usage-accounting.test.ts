@@ -5,11 +5,14 @@ import { handleEngineEvents, type EngineEventDeps } from "./store/engine-events"
 import { sessionKey } from "./store/persistence";
 import { EMPTY_SESSION, runRouting } from "./store/stream";
 import { parseUsage } from "./usage";
+import { selectAgyContext } from "./components/agy-context";
+import { beginNativeRun } from "./store/native-tasks";
 
 vi.mock("@/lib/ipc", () => ({
   ipc: {
     usageRecord: vi.fn(async () => {}),
     rescanSessions: vi.fn(async () => {}),
+    loadSessionPage: vi.fn(async () => ({ messages: [], nextBefore: null, subagentHistory: [] })),
   },
 }));
 vi.mock("@/lib/events", () => ({
@@ -82,6 +85,53 @@ describe("usage accounting", () => {
     // the same tokens.
     handleEngineEvents([event("done", 9, { usage: null })], deps());
     expect(ipc.usageRecord).toHaveBeenCalledTimes(1);
+  });
+
+  it("updates AGY official occupancy without billing it or contaminating another session", async () => {
+    const agyKey = sessionKey("agy", "s-1", "/tmp/ws");
+    const other = { ...EMPTY_SESSION, usage: { input_tokens: 77 } };
+    const agyTab = { engine: "agy", sessionId: "s-1", workspacePath: "/tmp/ws" };
+    runRouting.set(runId, agyKey);
+    useChatStore.setState({
+      openTabs: [agyTab], active: { engine: "codex", sessionId: "s-1", workspacePath: "/tmp/ws" },
+      bySession: { [KEY]: other, [agyKey]: { ...EMPTY_SESSION, streaming: true,
+        usage: { input_tokens: 30, output_tokens: 7 },
+        messages: [{ seq: 2, role: "assistant", text: "answer", live: true, ts: null }] } },
+    });
+    const emit = (kind: "usage" | "done", seq: number, data: unknown) =>
+      handleEngineEvents([{ ...event(kind, seq, data), engine: "agy" }], deps());
+    for (const [index, used] of [100_000, 20_000, 0].entries()) {
+      emit("usage", index + 2, {
+        context_usage_kind: "current_context", context_usage_source: "acp_usage_update",
+        context_usage: { input_tokens: used, output_tokens: 0 }, model_context_window: 1_000_000,
+      });
+      const current = useChatStore.getState().bySession[agyKey];
+      expect(selectAgyContext(current.usage)).toMatchObject({ total: used, occupancyKnown: true });
+      expect(parseUsage(current.usage)).toMatchObject({ input: 30, output: 7 });
+      expect(current.turnUsage).toBeFalsy();
+      expect(ipc.usageRecord).not.toHaveBeenCalled();
+    }
+    emit("done", 9, { usage: { input_tokens: 100, output_tokens: 20, model_context_window: 200_000 } });
+    expect(ipc.usageRecord).toHaveBeenCalledTimes(1);
+    expect(ipc.usageRecord).toHaveBeenCalledWith(expect.objectContaining({ input: 100, output: 20 }));
+    vi.mocked(ipc.loadSessionPage).mockResolvedValueOnce({ messages: [{ seq: 1, role: "assistant", text: "old", ts: null,
+      usage: { input_tokens: 80, context_usage_kind: "current_context", context_usage: { input_tokens: 90_000 }, model_context_window: 200_000 } }],
+      nextBefore: null, subagentHistory: [] });
+    await useChatStore.getState().refreshSessionUsage(agyKey);
+    expect(selectAgyContext(useChatStore.getState().bySession[agyKey].usage)).toMatchObject({ total: 0, max: 1_000_000, pct: 0 });
+    expect(useChatStore.getState().bySession[KEY]).toBe(other);
+    const settled = useChatStore.getState().bySession[agyKey];
+    useChatStore.setState((state) => ({ bySession: { ...state.bySession,
+      [agyKey]: { ...settled, ...beginNativeRun(settled, `${runId}-legacy`) },
+    } }));
+    vi.mocked(ipc.loadSessionPage).mockResolvedValueOnce({ messages: [{ seq: 1, role: "assistant", text: "new legacy turn", ts: null,
+      usage: { context_usage_kind: "last_prompt", context_usage: { input_tokens: 60_000, output_tokens: 0 } } }],
+      nextBefore: null, subagentHistory: [] });
+    await useChatStore.getState().refreshSessionUsage(agyKey);
+    expect(useChatStore.getState().bySession[agyKey].usage).toMatchObject({
+      context_usage_kind: "last_prompt", context_usage: { input_tokens: 60_000 },
+    });
+    expect(useChatStore.getState().bySession[agyKey].usage).not.toHaveProperty("context_usage_source");
   });
 
   it("ledgers a turn that reports once, at the end, exactly once", () => {

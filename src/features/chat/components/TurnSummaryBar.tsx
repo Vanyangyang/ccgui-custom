@@ -7,7 +7,7 @@ import Wrench from "lucide-react/dist/esm/icons/wrench";
 import Zap from "lucide-react/dist/esm/icons/zap";
 import type { Message } from "@/lib/ipc";
 import { formatTokens } from "@/utils/format-tokens";
-import { buildTurnSummary } from "../turn-summary";
+import { buildTurnSummary, type TurnSpeedBreakdown } from "../turn-summary";
 import { formatDuration } from "./format-duration";
 
 type Chip = {
@@ -17,10 +17,30 @@ type Chip = {
   tip: string;
 };
 
+function formatBreakdownParts(
+  breakdown: TurnSpeedBreakdown,
+  t: (key: string, options?: Record<string, unknown>) => string,
+): string {
+  const parts: string[] = [
+    t("chat.throughputBreakdownModel", { value: formatDuration(breakdown.modelMs) ?? "0.0s" }),
+  ];
+  if (breakdown.toolMs >= 50) {
+    parts.push(t("chat.throughputBreakdownTool", { value: formatDuration(breakdown.toolMs) ?? "0.1s" }));
+  }
+  if (breakdown.waitMs >= 50) {
+    parts.push(t("chat.throughputBreakdownWait", { value: formatDuration(breakdown.waitMs) ?? "0.1s" }));
+  }
+  if (breakdown.startupMs >= 50) {
+    parts.push(t("chat.throughputBreakdownStartup", { value: formatDuration(breakdown.startupMs) ?? "0.1s" }));
+  }
+  parts.push(t("chat.throughputBreakdownWall", { value: formatDuration(breakdown.wallMs) ?? "0.0s" }));
+  return parts.join(" · ");
+}
+
 /** What the finished reply cost, kept visible under it: total time, tokens,
- *  cache hits, reasoning, tool calls and average output speed. Every figure is
- *  something the engine reported or the turn measured; a missing one is left
- *  out instead of being shown as zero. */
+ *  cache hits, reasoning, tool calls and unified model inference speed. Every
+ *  figure is something the engine reported or the turn measured; a missing one
+ *  is left out instead of being shown as zero. */
 export const TurnSummaryBar = memo(function TurnSummaryBar({
   message,
   tools,
@@ -77,11 +97,19 @@ export const TurnSummaryBar = memo(function TurnSummaryBar({
     }
     if (summary.outputTps != null) {
       const tps = summary.outputTps;
+      const tip =
+        summary.speedBasis === "model"
+          ? summary.breakdown
+            ? t("chat.turnSummaryModelSpeedBreakdown", {
+                breakdown: formatBreakdownParts(summary.breakdown, t),
+              })
+            : t("chat.turnSummaryModelSpeed")
+          : t("chat.turnSummarySpeed");
       list.push({
         key: "speed",
         icon: Zap,
         text: t("chat.turnSummarySpeedValue", { value: tps < 10 ? tps.toFixed(1) : Math.round(tps) }),
-        tip: t("chat.turnSummarySpeed"),
+        tip,
       });
     }
     return list;

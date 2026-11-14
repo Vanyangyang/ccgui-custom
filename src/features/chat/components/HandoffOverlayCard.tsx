@@ -7,6 +7,7 @@ import Check from "lucide-react/dist/esm/icons/check";
 import ExternalLink from "lucide-react/dist/esm/icons/external-link";
 import Loader2 from "lucide-react/dist/esm/icons/loader-2";
 import RefreshCw from "lucide-react/dist/esm/icons/refresh-cw";
+import Square from "lucide-react/dist/esm/icons/square";
 import X from "lucide-react/dist/esm/icons/x";
 import { Button } from "@/components/base/buttons/button";
 import { requestCliMenuOpen } from "@/components/application/ai-chat/cli-menu";
@@ -15,6 +16,7 @@ import { EngineIcon } from "@/components/foundations/icons/engine-icon";
 import { useChatStore, type ActiveSession } from "../store";
 import { useHandoffStore } from "../session-cleanup";
 import { HandoffCompressionControls } from "./HandoffCompressionControls";
+import { HandoffChildrenControl } from "./HandoffChildrenControl";
 import { HandoffWorkspaceControl } from "./HandoffWorkspaceControl";
 
 export function HandoffOverlayCard({
@@ -30,6 +32,9 @@ export function HandoffOverlayCard({
     workspacePath ? s.byWorkspace[workspacePath] : undefined,
   );
   const retryGrok = useHandoffStore((s) => s.retryGrok);
+  const stopCompression = useHandoffStore((s) => s.stopCompression);
+  const recompressSelectedChildren = useHandoffStore((s) => s.recompressSelectedChildren);
+  const lowerCompressionEffort = useHandoffStore((s) => s.lowerCompressionEffort);
   const setArchiveSourceOnSend = useHandoffStore((s) => s.setArchiveSourceOnSend);
   const archiveSourceNow = useHandoffStore((s) => s.archiveSourceNow);
   const restoreSourceNow = useHandoffStore((s) => s.restoreSourceNow);
@@ -37,9 +42,17 @@ export function HandoffOverlayCard({
   const activeEngine = useChatStore((s) => s.activeEngine);
 
   const [elapsedMs, setElapsedMs] = useState(0);
+  const isActivelyCompressing = Boolean(
+    entry &&
+      (entry.grokStatus === "running" ||
+        (entry.compressionRunning === true &&
+          entry.mode === "grok" &&
+          !entry.compressionStopped &&
+          !entry.childrenSelectionModified)),
+  );
 
   useEffect(() => {
-    if (!entry || entry.mode !== "grok" || entry.grokStatus !== "running" || !entry.grokStartedAt) {
+    if (!entry || !isActivelyCompressing || !entry.grokStartedAt) {
       setElapsedMs(0);
       return;
     }
@@ -49,7 +62,7 @@ export function HandoffOverlayCard({
       setElapsedMs(Math.max(0, Date.now() - start));
     }, 200);
     return () => window.clearInterval(timer);
-  }, [entry?.id, entry?.mode, entry?.grokStatus, entry?.grokStartedAt]);
+  }, [entry?.id, isActivelyCompressing, entry?.grokStartedAt]);
 
   if (!active || active.sessionId !== null || !entry) return null;
 
@@ -62,6 +75,32 @@ export function HandoffOverlayCard({
       ? Math.max(0.1, entry.grokDurationMs / 1000).toFixed(1)
       : null;
   const runningSeconds = (elapsedMs / 1000).toFixed(1);
+  const progress = entry.grokProgress;
+  const progressLabel =
+    progress?.phase === "reading"
+      ? t("chat.handoffProgressReading")
+      : progress?.phase === "segments"
+        ? t("chat.handoffProgressSegments", {
+            completed: progress.completed ?? 0,
+            total: progress.total ?? 0,
+          })
+        : progress?.phase === "merging"
+          ? t("chat.handoffProgressMerging", {
+              round: progress.round ?? 1,
+              completed: progress.completed ?? 0,
+              total: progress.total ?? 0,
+            })
+          : progress?.phase === "verifying"
+            ? t("chat.handoffProgressVerifying")
+            : t("chat.handoffGrokRunning");
+  const callsTooltip =
+    progress?.timing && progress.timing.modelCalls > 0
+      ? t("chat.handoffProgressCallsTooltip", {
+          completed: progress.timing.completedModelCalls,
+          started: progress.timing.modelCalls,
+          active: progress.timing.activeModelCalls,
+        })
+      : undefined;
 
   const handleViewSource = async () => {
     if (entry.sourceArchived) {
@@ -110,14 +149,30 @@ export function HandoffOverlayCard({
               data-grok-status={entry.grokStatus}
               className="flex min-w-0 max-w-full flex-wrap items-center gap-1.5"
             >
-              {entry.mode !== "grok" ? null : entry.grokStatus === "running" ? (
-                <span className="inline-flex items-center gap-1.5 rounded-full bg-background-tertiary-warning px-2 py-0.5 text-caption-1-medium text-text-warning-primary">
-                  <Loader2 className="size-3 animate-spin" aria-hidden />
-                  <span>
-                    {t("chat.handoffGrokRunning")} ({runningSeconds}s)
+              {isActivelyCompressing ? (
+                <>
+                  <span
+                    title={callsTooltip}
+                    className="inline-flex items-center gap-1.5 rounded-full bg-background-tertiary-warning px-2 py-0.5 text-caption-1-medium text-text-warning-primary"
+                  >
+                    <Loader2 className="size-3 animate-spin" aria-hidden />
+                    <span>
+                      {progressLabel} ({runningSeconds}s)
+                    </span>
                   </span>
-                </span>
-              ) : entry.grokStatus === "done" ? (
+                  <button
+                    type="button"
+                    data-testid="handoff-grok-stop-btn"
+                    disabled={entry.sending === true}
+                    onClick={() => stopCompression(workspacePath)}
+                    title={t(entry.sending ? "chat.handoffSendingLock" : "chat.handoffGrokStopDesc")}
+                    className="inline-flex cursor-pointer items-center gap-1 rounded-md border border-border-button-default bg-background-primary-default px-2 py-0.5 text-caption-1-medium text-text-secondary transition-colors duration-150 hover:bg-background-secondary-hover hover:text-text-primary disabled:cursor-wait disabled:opacity-60"
+                  >
+                    <Square className="size-2.5 fill-current" aria-hidden />
+                    <span>{t("chat.handoffGrokStop")}</span>
+                  </button>
+                </>
+              ) : entry.mode !== "grok" ? null : entry.grokStatus === "done" ? (
                 <>
                   <span className="inline-flex items-center gap-1 rounded-full bg-background-tertiary-default px-2 py-0.5 text-caption-1-medium text-notification-success-foreground">
                     <Check className="size-3" aria-hidden />
@@ -137,20 +192,34 @@ export function HandoffOverlayCard({
                     <span>{t("chat.handoffGrokRetry")}</span>
                   </button>
                 </>
-              ) : entry.grokStatus === "error" || entry.grokStatus === "stale" ? (
+              ) : entry.grokStatus === "idle" || entry.grokStatus === "error" || entry.grokStatus === "stale" ? (
                 <>
-                  <span
-                    title={entry.grokError ?? undefined}
-                    className="inline-flex items-center gap-1 rounded-full bg-background-tertiary-default px-2 py-0.5 text-caption-1-regular text-text-tertiary"
-                  >
-                    <span>{t(entry.grokStatus === "stale" ? "chat.handoffGrokStale" : "chat.handoffGrokFailed")}</span>
-                  </span>
+                  {(entry.grokStatus !== "idle" || entry.compressionStopped) && (
+                    <span
+                      title={entry.grokError ?? undefined}
+                      className="inline-flex items-center gap-1 rounded-full bg-background-tertiary-default px-2 py-0.5 text-caption-1-regular text-text-tertiary"
+                    >
+                      <span>
+                        {t(
+                          entry.grokStatus === "stale"
+                            ? "chat.handoffGrokStale"
+                            : entry.grokStatus === "error"
+                              ? "chat.handoffGrokFailed"
+                              : "chat.handoffGrokStopped",
+                        )}
+                      </span>
+                    </span>
+                  )}
                   <button
                     type="button"
                     data-testid="handoff-grok-retry-btn"
                     disabled={entry.sending}
                     title={entry.sending ? t("chat.handoffSendingLock") : undefined}
-                    onClick={() => retryGrok(workspacePath)}
+                    onClick={() =>
+                      entry.compressionStopped || entry.childrenSelectionModified
+                        ? recompressSelectedChildren(workspacePath)
+                        : retryGrok(workspacePath)
+                    }
                     className="inline-flex cursor-pointer items-center gap-1 rounded-md px-1.5 py-0.5 text-caption-1-medium text-text-secondary transition-colors duration-150 hover:bg-background-primary-hover hover:text-text-primary"
                   >
                     <RefreshCw className="size-3" aria-hidden />
@@ -159,6 +228,8 @@ export function HandoffOverlayCard({
                 </>
               ) : null}
             </div>
+
+            <span aria-hidden className="mx-0.5 h-3.5 w-px shrink-0 bg-border-secondary" />
 
             <Button
               variant="ghost"
@@ -173,29 +244,12 @@ export function HandoffOverlayCard({
           </div>
         </header>
 
-        {(entry.childrenStatus === "loading" || entry.childrenStatus === "error" || !!entry.children?.total) && (
-          <div data-testid="handoff-children-status" role="status" className="text-caption-1-regular text-text-tertiary">
-            {entry.childrenStatus === "loading" ? (
-              <span className="inline-flex items-center gap-1.5">
-                <Loader2 className="size-3 animate-spin" aria-hidden />
-                {t("chat.handoffChildrenLoading")}
-              </span>
-            ) : entry.childrenStatus === "error" ? (
-              <span title={entry.childrenError}>{t("chat.handoffChildrenFailed")}</span>
-            ) : entry.childrenApplied === false ? (
-              t("chat.handoffChildrenNotApplied")
-            ) : (
-              <>
-                <span>{t("chat.handoffChildrenLoaded", { count: entry.children?.included ?? 0, attention: entry.children?.attention ?? 0 })}</span>
-                {!!entry.children?.omitted && (
-                  <span className="ml-2">{t("chat.handoffChildrenOmitted", { count: entry.children.omitted, attention: entry.children.omittedAttention })}</span>
-                )}
-              </>
-            )}
-          </div>
-        )}
+        <HandoffChildrenControl workspacePath={workspacePath} entry={entry} />
 
         <HandoffWorkspaceControl workspacePath={workspacePath} entry={entry} />
+        {entry.compressionRunning && entry.mode !== "grok" && <p role="status" className="text-caption-1-regular text-text-tertiary">
+          {t("crossSession.managedHandoffCompressionDiscardHint")}
+        </p>}
 
         {/* Bottom Row: Compression Mode Segmented Control + Takeover Engine/Model + Source Session Archive Control */}
         <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
@@ -205,12 +259,47 @@ export function HandoffOverlayCard({
             compressionModel={entry.compressionModel}
             compressionSelection={entry.compressionSelection}
             sending={entry.sending === true}
+            compressionRunning={entry.compressionRunning === true}
           />
           {entry.compressionPreferenceError && (
             <p role="status" className="text-caption-1-regular text-text-warning-primary">
               {t("chat.handoffPreferenceSaveFailed")}
             </p>
           )}
+          {entry.mode === "grok" &&
+            entry.compressionSelection?.engine !== "cursor" &&
+            (entry.compressionSelection?.effort === "xhigh" ||
+              entry.compressionSelection?.effort === "max" ||
+              entry.compressionSelection?.effort === "ultra") && (
+              <div
+                data-testid="handoff-high-effort-hint"
+                className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-background-tertiary-default px-2.5 py-1 text-caption-1-regular text-text-secondary"
+              >
+                <span>
+                  {t("chat.handoffHighEffortHint", {
+                    effort:
+                      entry.compressionSelection.effort === "xhigh"
+                        ? t("chat.effortXhigh")
+                        : entry.compressionSelection.effort === "max"
+                          ? t("chat.effortMax")
+                          : t("chat.effortUltra"),
+                  })}
+                </span>
+                <button
+                  type="button"
+                  data-testid="handoff-lower-effort-btn"
+                  disabled={entry.sending === true}
+                  onClick={() => lowerCompressionEffort(workspacePath, "medium")}
+                  className="shrink-0 cursor-pointer rounded-md border border-border-button-default bg-background-primary-default px-2 py-0.5 text-caption-1-medium text-text-primary transition-colors duration-150 hover:bg-background-secondary-hover disabled:cursor-wait disabled:opacity-60"
+                >
+                  {t(
+                    isActivelyCompressing
+                      ? "chat.handoffUseMediumEffort"
+                      : "chat.handoffUseMediumEffortAndRetry",
+                  )}
+                </button>
+              </div>
+            )}
 
           {/* Right side: Takeover Engine/Model Switcher + Archive Source Controls */}
           <div className="flex flex-wrap items-center gap-2">

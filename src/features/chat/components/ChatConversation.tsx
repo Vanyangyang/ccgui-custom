@@ -348,7 +348,6 @@ export const ChatConversation = memo(function ChatConversation({
   );
   const throughput = useChatStore((s) => key ? s.bySession[key]?.throughput : undefined);
   const hasSession = useChatStore((s) => key in s.bySession);
-  const draft = useChatStore((s) => s.drafts[key] ?? "");
   const sendShortcut = useChatStore((s) => s.sendShortcut);
   const claudeUltracode = useChatStore((s) =>
     active?.engine === "claude"
@@ -611,7 +610,6 @@ export const ChatConversation = memo(function ChatConversation({
           images={images}
           previews={previews}
           onRemoveImage={removeImage}
-          draft={draft}
           onDraftChange={handleDraftChange}
           onSubmit={submit}
           onQueue={active?.engine === "codex" && streaming ? queueDraft : undefined}

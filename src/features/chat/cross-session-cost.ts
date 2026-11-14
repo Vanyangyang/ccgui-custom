@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { leaderWorkspacePathKey } from "@/features/leader/workspace-path";
 import type { HostChatSession } from "@ccgui/plugin-sdk";
 import type { PromptCacheWindow, SessionMeta } from "@/lib/ipc";
 import type { ChatStore } from "./store/types";
@@ -7,8 +8,9 @@ import { runsModel } from "./store/live-follow-up";
 import { resolveSessionModel, type SessionState } from "./store/stream";
 import { resolveContextMaxInfo } from "./context-window-memory";
 import { hasReadableUsage, parseUsage, selectCursorContext } from "./usage";
-import { readAgyReferenceWindow, selectAgyContext } from "./components/agy-context";
+import { selectAgyContext } from "./components/agy-context";
 import { getSessionCacheHeat, promptCacheForEngine, usesUnlimitedPromptCache, type CacheHeat } from "./prompt-cache";
+import { estimatePendingRequestCost } from "./pending-request-cost";
 
 export interface CrossSessionCostReview {
   /** Time this local snapshot was read, not the upstream usage event time. */
@@ -34,6 +36,21 @@ function finiteTokens(value: number | undefined) {
   return value !== undefined && Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
+/** Match native session ownership; only Windows separator spelling is an alias. */
+export function sameSessionCostWorkspace(a: string, b: string): boolean {
+  return leaderWorkspacePathKey(a) === leaderWorkspacePathKey(b);
+}
+
+/** Saved-session store keys omit workspace. A conflicting visible tab makes
+ * its cached usage ambiguous even if the metadata catalog has only one row. */
+export function hasConflictingSessionCostTab(
+  target: { engine: string; sessionId: string; workspacePath: string },
+  tabs: ReadonlyArray<{ engine: string; sessionId: string | null; workspacePath: string }>,
+): boolean {
+  return tabs.some(tab => tab.engine === target.engine && tab.sessionId === target.sessionId &&
+    !sameSessionCostWorkspace(tab.workspacePath, target.workspacePath));
+}
+
 /** Read existing per-request/context telemetry; never infer tokens from file size
  * or session billing totals, and never launch a model to fill missing values. */
 export function crossSessionCostReview(
@@ -44,7 +61,7 @@ export function crossSessionCostReview(
   modelOverride?: string | null,
 ): CrossSessionCostReview {
   const session = state.bySession[sessionKey(meta.engine, meta.sessionId, meta.workspacePath)];
-  const tab = state.openTabs.find((t) => t.engine === meta.engine && t.sessionId === meta.sessionId && t.workspacePath === meta.workspacePath);
+  const tab = state.openTabs.find((t) => t.engine === meta.engine && t.sessionId === meta.sessionId && sameSessionCostWorkspace(t.workspacePath, meta.workspacePath));
   const model = modelOverride !== undefined ? modelOverride ?? undefined :
     resolveSessionModel(tab ?? { engine: meta.engine }, session, meta.model ?? state.models?.[meta.engine]);
   const usage = session?.usage;
@@ -64,15 +81,14 @@ export function crossSessionCostReview(
     kind: "unknown", reference: false, modelMismatch, usageModel,
   };
   if (meta.engine === "agy") {
-    const selection = selectAgyContext(usage, readAgyReferenceWindow(), window.known ? window.max : undefined);
+    const selection = selectAgyContext(usage, window.known ? window.max : undefined);
     context.used = finiteTokens(selection.total);
-    context.reference = selection.noteKey === "chat.agyReferenceWindowNote";
+    context.reference = false;
     if (!modelMismatch && !unattributedTaskUsage) {
       context.max = selection.max;
       context.capacityKnown = selection.capacityKnown;
     }
-    // A last-prompt sample is still not measured current occupancy, even when
-    // a user reference window permits the normal gauge to show a percentage.
+    // A last-prompt sample is still not measured current occupancy.
     const current = usage && typeof usage === "object" && "context_usage_kind" in usage &&
       usage.context_usage_kind === "current_context";
     context.kind = context.used === undefined ? "unknown" : current && !modelMismatch ? "current_context" : "last_request";
@@ -168,8 +184,18 @@ export interface PendingSessionSendCostGuard {
 }
 
 interface ApprovedCostSignature {
+  engine: string;
   model: string | null;
   cacheStartedAt: number | null;
+  evidence: string;
+}
+
+/** Ignore read time, but never carry approval across changed usage or prices. */
+export function sessionCostEvidence(review: CrossSessionCostReview, engine: string) {
+  const estimate = estimatePendingRequestCost({ engine, model: review.model ?? "", prompt: "", context: review.context });
+  return { model: review.model, cache: review.cache, cacheHeat: review.cacheHeat,
+    cacheExpiryDisabled: review.cacheExpiryDisabled === true, context: review.context,
+    pricing: estimate.pricing, priceUnavailableReason: estimate.unavailableReason };
 }
 
 interface SessionSendCostGuardState {
@@ -192,8 +218,7 @@ export const useSessionSendCostGuardStore = create<SessionSendCostGuardState>((s
   isApproved: (key, review) => {
     const approved = get().approvedByKey[key];
     if (!approved) return false;
-    return approved.model === (review.model ?? null) &&
-      approved.cacheStartedAt === (review.cache?.startedAt ?? null);
+    return approved.evidence === JSON.stringify(sessionCostEvidence(review, approved.engine));
   },
   markApproved: (key, review) =>
     set((state) => {
@@ -204,8 +229,10 @@ export const useSessionSendCostGuardStore = create<SessionSendCostGuardState>((s
         approvedByKey: {
           ...state.approvedByKey,
           [key]: {
+            engine: state.bySessionKey[key]?.engine ?? key.split("/", 1)[0],
             model: review.model ?? null,
             cacheStartedAt: review.cache?.startedAt ?? null,
+            evidence: JSON.stringify(sessionCostEvidence(review, state.bySessionKey[key]?.engine ?? key.split("/", 1)[0])),
           },
         },
       };
