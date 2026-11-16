@@ -17,6 +17,7 @@ import { useReleaseNotesTabStore } from "@/features/update/notes-tab";
 import { SelfUpdateStatusChip } from "@/features/update/SelfUpdateStatusChip";
 import { registerShortcutHandler } from "@/features/shortcuts/runtime";
 import { PerformanceDiagnosticsDialog } from "@/features/settings/PerformanceDiagnostics";
+import { TaskShutdownControl } from "@/features/task-shutdown/TaskShutdownControl";
 
 import { applyZoom, changeZoom, onZoomChange, readZoomPct, ZOOM_STEP } from "@/lib/zoom";
 
@@ -135,6 +136,7 @@ export function AppStatusBar() {
         </div>
       )}
       <div className="flex min-w-0 items-center gap-3">
+        <TaskShutdownControl />
         <button
           type="button"
           onClick={() => setShowDiagnostics(true)}

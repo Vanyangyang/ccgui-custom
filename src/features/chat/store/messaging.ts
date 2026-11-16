@@ -778,7 +778,7 @@ export function createMessagingActions(
           if (shouldInterruptTurn(get().bySession[liveKey], liveKey))
             await interruptReplyOnly(liveKey, get().bySession[liveKey]?.queueParked === true, true);
         } else {
-          await killByKey(liveKey);
+          await killByKey(liveKey, get().bySession[liveKey]?.queueParked === true);
         }
       }
     } catch (error) {
@@ -1515,17 +1515,19 @@ export function createMessagingActions(
   }
 
   /** Stop that ends the run: kill the process tree (and with it any background
-   *  task) and park the queue. */
-  async function killByKey(key: string) {
+   *  task). Native cancellation owns its queue release and returns true;
+   *  legacy process-stop callers retain their existing drain path. */
+  async function killByKey(key: string, parkQueue = true): Promise<boolean> {
     const session = get().bySession[key];
     const nativeRunId = session?.nativeTaskRunId;
     if (nativeRunId && session.streaming && !usesNativeInterrupt(key) && runRouting.get(nativeRunId) === key) {
       // Virtual native runs accept cancellation before their worker is reaped.
       // Keep the busy state and terminal route until Done/Error confirms that
-      // cleanup; parking immediately prevents that terminal from draining input.
+      // cleanup. Stop parks input; Send Now leaves it eligible for that terminal.
+      // Preserve a newer Stop even when this is a launch-registration retry.
       const requested = Date.now();
-      patchSession(set, key, { queueParked: true, interruptRequestedAt: requested });
-      if (interruptsInFlight.has(nativeRunId)) return;
+      patchSession(set, key, { queueParked: parkQueue || session.queueParked === true, interruptRequestedAt: requested });
+      if (interruptsInFlight.has(nativeRunId)) return true;
       const request = { at: requested };
       const launch = pendingNativeLaunches.get(nativeRunId);
       interruptsInFlight.set(nativeRunId, request);
@@ -1538,21 +1540,26 @@ export function createMessagingActions(
       try {
         const accepted = await ipc.interruptSession(nativeRunId);
         const currentKey = ownerKey();
-        if (accepted || !currentKey) return;
+        if (accepted || !currentKey) return true;
         if (launch && !launch.ready) {
           launch.retryInterrupt = true;
         } else if (launch?.ready && launch.runId !== nativeRunId) {
           // Only a remapped registration needs another address. Retrying the
           // same registered ID after false cannot discover a different run.
           interruptsInFlight.delete(nativeRunId);
-          await killByKey(currentKey);
+          await killByKey(currentKey, get().bySession[currentKey]?.queueParked === true);
         } else {
           // False confirms no live registered run; no terminal event is owed.
+          const parked = get().bySession[currentKey]?.queueParked === true;
           settleStopped(currentKey);
-          patchSession(set, currentKey, { settledRunIds: rememberSettledRun(get().bySession[currentKey], nativeRunId) });
+          patchSession(set, currentKey, {
+            settledRunIds: rememberSettledRun(get().bySession[currentKey], nativeRunId),
+            interrupted: parked,
+          });
           runRouting.delete(nativeRunId);
           untrackRun(nativeRunId);
           dropRunUsage(nativeRunId);
+          drainWhenRunEnded(currentKey);
         }
       } catch (error) {
         const currentKey = ownerKey();
@@ -1560,7 +1567,7 @@ export function createMessagingActions(
       } finally {
         if (interruptsInFlight.get(nativeRunId) === request) interruptsInFlight.delete(nativeRunId);
       }
-      return;
+      return true;
     }
     const deadRunIds = [...runRouting].filter(([, routed]) => routed === key).map(([runId]) => runId);
     // Settle locally FIRST: the killed run's done event can arrive while
@@ -1609,6 +1616,7 @@ export function createMessagingActions(
     // backoff, and Stop must complete immediately (every other caller
     // fires and forgets).
     void get().refreshSessionUsage(key);
+    return false;
   }
 
   /** A granted directory is stored for the NEXT launch: `--add-dir` is a launch
@@ -2018,9 +2026,14 @@ export function createMessagingActions(
       // leaves at the idle boundary that follows.
       if (running && releaseQueuedLive(targetKey, id)) return;
       // Launch settings, grants and noLive govern message delivery, not Esc.
-      if (running && await interruptReplyOnly(targetKey, false)) return;
-      if (running && usesNativeInterrupt(targetKey)) return;
-      if (running) await killByKey(targetKey);
+      if (running && usesNativeInterrupt(targetKey)) {
+        await interruptReplyOnly(targetKey, false);
+        return;
+      }
+      // Native cancellation releases through Done/Error or its confirmed-absent
+      // path. Do not drain again after a late IPC reply: a newer Stop may have
+      // intentionally kept the queue parked at that terminal boundary.
+      if (running && await killByKey(targetKey, false)) return;
       drainQueue(targetKey);
     },
 

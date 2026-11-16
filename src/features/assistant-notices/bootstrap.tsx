@@ -2,7 +2,12 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import i18n from "@/lib/i18n";
 import { ipc } from "@/lib/ipc";
-import { applyTheme, THEME_STORAGE_KEY } from "@/features/settings/theme";
+import {
+  applyAppearanceTokens,
+  applyTheme,
+  readCachedAppearance,
+  THEME_STORAGE_KEY,
+} from "@/features/settings/theme";
 import { applyFontPreferences, readCachedFontPreferences } from "@/features/settings/font";
 import { installTauriUnlistenGuard } from "@/lib/tauri-unlisten-guard";
 import { AssistantNoticesOverlay } from "./AssistantNoticesOverlay";
@@ -20,6 +25,7 @@ export function startAssistantNoticesApp() {
   let currentTheme = "";
   const theme=window.localStorage.getItem(THEME_STORAGE_KEY);
   if(theme)applyTheme(theme);
+  applyAppearanceTokens(readCachedAppearance(), false);
   applyFontPreferences(readCachedFontPreferences());
   document.documentElement.style.background="transparent";
   document.body.style.background="transparent";
@@ -34,6 +40,7 @@ export function startAssistantNoticesApp() {
       if (disposed || turn !== readGeneration) return;
       currentTheme = settings.theme;
       applyTheme(settings.theme);
+      applyAppearanceTokens({ themePreset: settings.themePreset, accentColor: settings.accentColor });
       applyFontPreferences({ fontFamily: settings.fontFamily ?? "", codeFontFamily: settings.codeFontFamily ?? "", fontFile: settings.fontFile ?? "", codeFontFile: settings.codeFontFile ?? "" });
       if (settings.language && settings.language !== i18n.language) void i18n.changeLanguage(settings.language);
     }).catch(() => {});

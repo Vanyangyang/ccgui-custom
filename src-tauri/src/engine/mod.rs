@@ -1130,6 +1130,11 @@ async fn send_message_inner_with_sink(
     let reader_abort = Arc::new(std::sync::OnceLock::new());
     {
         let mut map = state.processes.0.lock().map_err(|e| e.to_string())?;
+        // A shutdown/update fence may have closed admission after the fast
+        // check above. Recheck while publishing the pre-spawn reservation.
+        if crate::worker_host::paused() {
+            return Err("runtime_updating: task admission is paused briefly".into());
+        }
         if map.contains_key(&run_id) {
             return Err("run id already active".into());
         }

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { Key, KeyboardEvent } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import Check from "lucide-react/dist/esm/icons/check";
 import Upload from "lucide-react/dist/esm/icons/upload";
 
 import { Select, SelectItem } from "@/components/base/select/select";
@@ -13,9 +14,19 @@ import {
   SettingsRow,
   SettingsSectionLabel,
 } from "@/components/application/settings/settings-rows";
+import { cx } from "@/utils/cx";
 import { ipc, type AppSettings, type AutoTitleModel } from "@/lib/ipc";
 import { IS_WINDOWS, isWeb, pickFile } from "@/lib/platform";
-import { applyTheme } from "./theme";
+import type { ChatBackdropSettings } from "@/lib/ipc";
+import {
+  applyAppearanceFromSettings,
+  applyAppearanceTokens,
+  applyTheme,
+  normalizeAccentColor,
+  normalizeThemePreset,
+  type AccentColor,
+  type ThemePreset,
+} from "./theme";
 import {
   applyFontPreferences,
   CUSTOM_FONT_VALUE,
@@ -34,6 +45,7 @@ import {
 } from "./PromptHistorySettings";
 import { useChatStore } from "@/features/chat/store";
 import { AutoTitleModelSettings } from "./AutoTitleModelSettings";
+import { ChatBackdropSection } from "./ChatBackdropSettings";
 import { ComposerPredictionModelSettings } from "./ComposerPredictionModelSettings";
 import { useOnboardingStore } from "@/features/onboarding/store";
 
@@ -53,6 +65,36 @@ for (let v = ZOOM_MIN; v <= ZOOM_MAX; v += ZOOM_STEP) ZOOM_PRESETS.push(v);
 /** Extensions offered by the font file dialog; the backend additionally
  *  checks the first bytes, so a renamed file still fails with a clear error. */
 const FONT_FILE_EXTENSIONS = ["ttf", "otf", "ttc", "woff", "woff2"];
+
+const THEME_PRESET_OPTIONS: ReadonlyArray<{
+  id: ThemePreset;
+  labelKey: string;
+  sidebarBg: string;
+  mainBg: string;
+}> = [
+  { id: "mist", labelKey: "settings.themePresetMist", sidebarBg: "#e9eff8", mainBg: "#ffffff" },
+  { id: "warm", labelKey: "settings.themePresetWarm", sidebarBg: "#ebe2d4", mainBg: "#fbf8f2" },
+  {
+    id: "aurora",
+    labelKey: "settings.themePresetAurora",
+    sidebarBg: "linear-gradient(135deg, #dce8ff 0%, #ede4ff 100%)",
+    mainBg: "#ffffff",
+  },
+  { id: "classic", labelKey: "settings.themePresetClassic", sidebarBg: "#ededed", mainBg: "#ffffff" },
+];
+
+const ACCENT_COLOR_OPTIONS: ReadonlyArray<{
+  id: AccentColor;
+  labelKey: string;
+  swatch: string;
+}> = [
+  { id: "blue", labelKey: "settings.accentBlue", swatch: "#2563eb" },
+  { id: "indigo", labelKey: "settings.accentIndigo", swatch: "#4f46e5" },
+  { id: "violet", labelKey: "settings.accentViolet", swatch: "#7c3aed" },
+  { id: "teal", labelKey: "settings.accentTeal", swatch: "#0d9488" },
+  { id: "emerald", labelKey: "settings.accentEmerald", swatch: "#059669" },
+  { id: "amber", labelKey: "settings.accentAmber", swatch: "#d97706" },
+];
 
 /** AppSettings → the four font fields applyFontPreferences persists. */
 function fontPreferencesOf(settings: AppSettings): FontPreferences {
@@ -87,7 +129,7 @@ function useGeneralSettingsState() {
       .then((s) => {
         if (cancelled) return;
         setSettings(s);
-        applyTheme(s.theme);
+        applyAppearanceFromSettings(s);
       })
       .catch((e) => {
         if (!cancelled) setError(String(e));
@@ -123,6 +165,20 @@ function useGeneralSettingsState() {
     setSettings({ ...settings, theme });
     applyTheme(theme);
     void save({ theme });
+  };
+
+  const onThemePresetChange = (themePreset: ThemePreset) => {
+    if (!settings) return;
+    setSettings({ ...settings, themePreset });
+    applyAppearanceTokens({ themePreset, accentColor: settings.accentColor });
+    void save({ themePreset });
+  };
+
+  const onAccentColorChange = (accentColor: AccentColor) => {
+    if (!settings) return;
+    setSettings({ ...settings, accentColor });
+    applyAppearanceTokens({ themePreset: settings.themePreset, accentColor });
+    void save({ accentColor });
   };
 
   // 「窗口现在有没有系统装饰」= 当前实际生效的标题栏样式，用来判断设置是否
@@ -245,6 +301,10 @@ function useGeneralSettingsState() {
     if (!settings) return;
     saveBackground({ composerPredictionModel });
   };
+  const onChatBackdropChange = (chatBackdrop: ChatBackdropSettings) => {
+    if (!settings) return;
+    saveBackground({ chatBackdrop });
+  };
   /** Font mode commits (默认 / 系统 / 自定义): apply to the document root at
    *  once (bootstrap re-reads the mirror on the next launch) and persist.
    *  Entering 自定义 with an uploaded file re-applies that file right away;
@@ -290,11 +350,14 @@ function useGeneralSettingsState() {
   return {
     settings,
     error,
+    setError,
     limitText,
     decorated,
     restartPending,
     fontBusy,
     onThemeChange,
+    onThemePresetChange,
+    onAccentColorChange,
     onTitlebarChange,
     onRestart,
     onLanguageChange,
@@ -308,6 +371,7 @@ function useGeneralSettingsState() {
     onAutoTitleModelChange,
     onAutoTitleEffortChange,
     onComposerPredictionModelChange,
+    onChatBackdropChange,
     onFontModeChange,
     onFontFilePick,
   };
@@ -321,6 +385,8 @@ function AppearanceCard({
   restartPending,
   fontBusy,
   onThemeChange,
+  onThemePresetChange,
+  onAccentColorChange,
   onTitlebarChange,
   onRestart,
   onLanguageChange,
@@ -336,6 +402,8 @@ function AppearanceCard({
   restartPending: boolean;
   fontBusy: FontField | null;
   onThemeChange: (key: Key | null) => void;
+  onThemePresetChange: (preset: ThemePreset) => void;
+  onAccentColorChange: (accent: AccentColor) => void;
   onTitlebarChange: (key: Key | null) => void;
   onRestart: () => Promise<void>;
   onLanguageChange: (key: Key | null) => void;
@@ -346,6 +414,8 @@ function AppearanceCard({
   onThreadLimitKeyDown: (event: KeyboardEvent) => void;
 }) {
   const { t } = useTranslation();
+  const activePreset = normalizeThemePreset(settings.themePreset);
+  const activeAccent = normalizeAccentColor(settings.accentColor);
   return (
     <div className="flex w-full flex-col gap-2">
       <SettingsSectionLabel>{t("settings.appearance")}</SettingsSectionLabel>
@@ -361,6 +431,70 @@ function AppearanceCard({
             <SelectItem id="light">{t("settings.themeLight")}</SelectItem>
             <SelectItem id="dark">{t("settings.themeDark")}</SelectItem>
           </Select>
+        </SettingsRow>
+        <SettingsRow
+          anchor="themePreset"
+          label={t("settings.themePreset")}
+          description={t("settings.themePresetDesc")}
+        >
+          <div className="flex flex-wrap items-center justify-end gap-1.5">
+            {THEME_PRESET_OPTIONS.map((option) => {
+              const selected = activePreset === option.id;
+              return (
+                <button
+                  key={option.id}
+                  type="button"
+                  aria-pressed={selected}
+                  onClick={() => onThemePresetChange(option.id)}
+                  className={cx(
+                    "flex cursor-pointer items-center gap-1.5 rounded-lg border px-2 py-1 text-caption-1-medium transition-all duration-150",
+                    selected
+                      ? "border-accent-500 bg-pill-tab-blue-selected-background text-text-primary ring-1 ring-accent-500/30"
+                      : "border-border-button-default bg-background-primary-default text-text-secondary hover:border-border-button-hover hover:bg-background-primary-hover hover:text-text-primary",
+                  )}
+                >
+                  <span
+                    aria-hidden
+                    className="flex h-3.5 w-5 shrink-0 overflow-hidden rounded-[4px] border border-separator-border-strong/70"
+                  >
+                    <span className="h-full w-2" style={{ background: option.sidebarBg }} />
+                    <span className="h-full flex-1" style={{ background: option.mainBg }} />
+                  </span>
+                  <span className="whitespace-nowrap">{t(option.labelKey)}</span>
+                </button>
+              );
+            })}
+          </div>
+        </SettingsRow>
+        <SettingsRow
+          anchor="accentColor"
+          label={t("settings.accentColor")}
+          description={t("settings.accentColorDesc")}
+        >
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            {ACCENT_COLOR_OPTIONS.map((option) => {
+              const selected = activeAccent === option.id;
+              const label = t(option.labelKey);
+              return (
+                <button
+                  key={option.id}
+                  type="button"
+                  aria-label={label}
+                  title={label}
+                  aria-pressed={selected}
+                  onClick={() => onAccentColorChange(option.id)}
+                  style={{ backgroundColor: option.swatch }}
+                  className={cx(
+                    "flex size-6 cursor-pointer items-center justify-center rounded-full border border-black/10 text-white transition-transform duration-150 hover:scale-105",
+                    selected &&
+                      "ring-2 ring-text-primary ring-offset-2 ring-offset-background-primary-default",
+                  )}
+                >
+                  {selected && <Check className="size-3.5 stroke-[2.5]" aria-hidden />}
+                </button>
+              );
+            })}
+          </div>
         </SettingsRow>
       {IS_WINDOWS && !isWeb && (
           <SettingsRow
@@ -690,10 +824,13 @@ export function GeneralSection() {
   const {
     settings,
     error,
+    setError,
     limitText,
     decorated,
     restartPending,
     onThemeChange,
+    onThemePresetChange,
+    onAccentColorChange,
     onTitlebarChange,
     onRestart,
     onLanguageChange,
@@ -707,6 +844,7 @@ export function GeneralSection() {
     onAutoTitleModelChange,
     onAutoTitleEffortChange,
     onComposerPredictionModelChange,
+    onChatBackdropChange,
     fontBusy,
     onFontModeChange,
     onFontFilePick,
@@ -730,6 +868,8 @@ export function GeneralSection() {
           restartPending={restartPending}
           fontBusy={fontBusy}
           onThemeChange={onThemeChange}
+          onThemePresetChange={onThemePresetChange}
+          onAccentColorChange={onAccentColorChange}
           onTitlebarChange={onTitlebarChange}
           onRestart={onRestart}
           onLanguageChange={onLanguageChange}
@@ -738,6 +878,13 @@ export function GeneralSection() {
           onThreadLimitChange={onThreadLimitChange}
           onThreadLimitCommit={commitThreadLimitText}
           onThreadLimitKeyDown={onThreadLimitKeyDown}
+        />
+      )}
+      {settings && (
+        <ChatBackdropSection
+          settings={settings}
+          onSaveBackdrop={onChatBackdropChange}
+          onError={setError}
         />
       )}
       {settings && (

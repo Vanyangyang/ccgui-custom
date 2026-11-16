@@ -153,6 +153,98 @@ pub(crate) async fn initialize(
 pub(crate) fn enabled() -> bool {
     host().is_some_and(|host| host.ready.load(Ordering::SeqCst))
 }
+
+fn shutdown_worker_settled(status: &Value, observed: u64) -> bool {
+    status["physicalComplete"].as_bool() == Some(true)
+        && status["autoTitlePending"].as_bool() == Some(false)
+        && status["nativeComplete"].as_bool() == Some(true)
+        && status["activeRuns"].as_u64() == Some(0)
+        && status["journalFault"].as_bool() == Some(false)
+        && status["receiptFault"].as_bool() == Some(false)
+        && status["head"].as_u64() == Some(observed)
+        && status["durableThrough"].as_u64() == Some(observed)
+}
+
+/// Native completion can precede worker-owned auto-title work. Observe fresh
+/// status without retiring workers, advancing cursors, or pausing their work.
+pub(crate) async fn shutdown_activity() -> Vec<String> {
+    use futures_util::StreamExt;
+    let Some(owner) = host() else {
+        return vec!["native-coordinator-unavailable".into()];
+    };
+    if !owner.ready.load(Ordering::SeqCst) || owner.stopped.load(Ordering::SeqCst) {
+        return vec!["native-coordinator-unavailable".into()];
+    }
+    let routes: Vec<_> = match owner.workers.lock() {
+        Ok(routes) => routes.values().cloned().collect(),
+        Err(_) => return vec!["worker-background-work".into()],
+    };
+    let check = async {
+        let mut checks = futures_util::stream::iter(routes.into_iter().map(|route| async move {
+            if route.observation_fault.load(Ordering::SeqCst) { return false; }
+            // Archived routes already passed the immutable-tail validation.
+            if route.archived.load(Ordering::SeqCst) { return true; }
+            let request_id = uuid::Uuid::new_v4().to_string();
+            match route.client.request(&request_id, Command::Status).await {
+                Ok(status) => !route.observation_fault.load(Ordering::SeqCst)
+                    && shutdown_worker_settled(&status, route.observed.load(Ordering::SeqCst)),
+                Err(_) => false,
+            }
+        })).buffer_unordered(8);
+        while let Some(settled) = checks.next().await {
+            if !settled { return false; }
+        }
+        true
+    };
+    // One deadline covers all routes, including those waiting for a slot.
+    match tokio::time::timeout(Duration::from_secs(2), check).await {
+        Ok(true) => Vec::new(),
+        _ => vec!["worker-background-work".into()],
+    }
+}
+
+#[cfg(test)]
+mod shutdown_worker_activity_tests {
+    use super::*;
+
+    fn finished_status() -> Value {
+        json!({"physicalComplete":true,"autoTitlePending":false,
+            "nativeComplete":true,"activeRuns":0,"journalFault":false,
+            "receiptFault":false,"head":12,"durableThrough":12})
+    }
+
+    #[test]
+    fn completed_worker_can_settle_before_archival() {
+        assert!(shutdown_worker_settled(&finished_status(), 12));
+    }
+
+    #[test]
+    fn native_completion_does_not_hide_auto_title_or_unobserved_tail() {
+        let mut status = finished_status();
+        status["autoTitlePending"] = json!(true);
+        assert!(!shutdown_worker_settled(&status, 12));
+        assert!(!shutdown_worker_settled(&finished_status(), 11));
+        assert!(!shutdown_worker_settled(&finished_status(), 13));
+    }
+
+    #[test]
+    fn missing_faulted_and_incomplete_statuses_remain_blocking() {
+        for key in ["physicalComplete", "autoTitlePending", "nativeComplete", "activeRuns",
+            "journalFault", "receiptFault", "head", "durableThrough"] {
+            let mut status = finished_status();
+            status.as_object_mut().unwrap().remove(key);
+            assert!(!shutdown_worker_settled(&status, 12), "missing {key}");
+        }
+        for (key, value) in [("physicalComplete", json!(false)), ("nativeComplete", json!(false)),
+            ("activeRuns", json!(1)), ("journalFault", json!(true)), ("receiptFault", json!(true)),
+            ("durableThrough", json!(11)), ("head", json!(13)), ("activeRuns", json!("0"))] {
+            let mut status = finished_status();
+            status[key] = value;
+            assert!(!shutdown_worker_settled(&status, 12), "invalid {key}");
+        }
+    }
+}
+
 pub(crate) fn paused() -> bool {
     PAUSED.load(Ordering::SeqCst)
 }

@@ -503,7 +503,7 @@ export const ProcessDisclosure = memo(function ProcessDisclosure({
         onClick={toggleExpanded}
         className="flex w-full cursor-pointer flex-col text-left"
       >
-        <span className="flex items-center gap-1 py-0.5 text-body-regular text-text-secondary transition-colors hover:text-text-primary">
+        <span className="-mx-1.5 flex w-fit max-w-full items-center gap-1 rounded-md px-1.5 py-0.5 text-body-regular text-text-secondary transition-colors hover:bg-background-secondary-default/80 hover:text-text-primary">
           {singleThinking && <Brain className="size-3.5" aria-hidden />}
           {label}
           <ChevronRight

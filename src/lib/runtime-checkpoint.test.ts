@@ -2,6 +2,71 @@ import { describe, expect, it, vi } from "vitest";
 import { cloneCheckpointValue, createRuntimeCheckpointCoordinator } from "./runtime-checkpoint";
 
 describe("runtime checkpoint barrier", () => {
+  it("separates idle UI capture blockers from activity while sharing the hold predicate", async () => {
+    const coordinator = createRuntimeCheckpointCoordinator();
+    coordinator.initialize(undefined, { requiredParticipants: [] });
+    let transitioning = false;
+    coordinator.registerBlocker("window", () => ["plugin-window-without-checkpoint"], () => transitioning ? ["plugin-window-transition"] : []);
+    coordinator.registerBlocker("draft", () => ["unsaved-git-commit-message"], () => []);
+    expect(coordinator.activityReadiness()).toEqual([]);
+    coordinator.holdSubmissions()();
+    expect(coordinator.readiness(false)).toHaveLength(2);
+    await expect(coordinator.prepare()).rejects.toThrow(/plugin-window-without-checkpoint.*unsaved-git-commit-message/);
+    coordinator.abort();
+    transitioning = true;
+    expect(coordinator.activityReadiness()).toEqual([{ participant: "window", reason: "plugin-window-transition" }]);
+    expect(() => coordinator.holdSubmissions()).toThrow(/plugin-window-transition/);
+  });
+
+  it("retains required/restoring participants, ordinary readiness and operations in activity checks", () => {
+    const coordinator = createRuntimeCheckpointCoordinator();
+    coordinator.initialize({ version: 1, participants: { chat: {}, late: {} } }, { requiredParticipants: ["chat"] });
+    coordinator.abort();
+    expect(coordinator.activityReadiness()).toEqual(expect.arrayContaining([
+      { participant: "chat", reason: "participant-unavailable" }, { participant: "late", reason: "checkpoint-not-restored" },
+    ]));
+    coordinator.register({ id: "chat", capture: () => ({}), restore() {}, readiness: () => ["queue-pending"], captureReadiness: () => ["open-dialog"] });
+    coordinator.registerBlocker("legacy", () => ["legacy-operation"]);
+    coordinator.beginOperation("send-awaiting-ack");
+    expect(coordinator.activityReadiness()).toEqual(expect.arrayContaining([
+      { participant: "chat", reason: "queue-pending" }, { participant: "legacy", reason: "legacy-operation" }, { participant: "operation", reason: "send-awaiting-ack" },
+    ]));
+    expect(coordinator.activityReadiness().some(blocker => blocker.reason === "open-dialog")).toBe(false);
+    expect(() => coordinator.holdSubmissions()).toThrow(/queue-pending/);
+  });
+  it("holds final shutdown admission without capturing popovers and only its owner can release it", async () => {
+    const coordinator = createRuntimeCheckpointCoordinator();
+    coordinator.initialize(undefined, { requiredParticipants: ["chat"] });
+    const capture = vi.fn(() => ({}));
+    coordinator.register({ id: "chat", capture, restore: () => {}, captureReadiness: () => ["open-dialog"] });
+    const release = coordinator.holdSubmissions();
+    expect(coordinator.isPaused()).toBe(true);
+    expect(() => coordinator.beginOperation("send")).toThrow(/paused/);
+    await expect(coordinator.prepare()).rejects.toThrow(/pending system action/);
+    coordinator.abort(); coordinator.resumeCommitted(); await coordinator.resume();
+    expect(coordinator.isPaused()).toBe(true);
+    const resumed = vi.fn();
+    const waiting = coordinator.whenResumed().then(resumed);
+    expect(capture).not.toHaveBeenCalled();
+    release(); release(); await waiting;
+    expect(resumed).toHaveBeenCalledOnce();
+    expect(coordinator.isPaused()).toBe(false);
+    coordinator.beginOperation("new send")();
+  });
+
+  it("cannot take a shutdown hold over an in-flight operation or an update pause", async () => {
+    const coordinator = createRuntimeCheckpointCoordinator();
+    coordinator.initialize(undefined, { requiredParticipants: [] });
+    const done = coordinator.beginOperation("send-before-native-ack");
+    expect(() => coordinator.holdSubmissions()).toThrow(/send-before-native-ack/);
+    expect(coordinator.isPaused()).toBe(false);
+    done();
+    await coordinator.prepare();
+    expect(() => coordinator.holdSubmissions()).toThrow(/already paused/);
+    coordinator.abort();
+    coordinator.holdSubmissions()();
+  });
+
   it("waits for restoration ownership without changing readiness revisions", async () => {
     const coordinator = createRuntimeCheckpointCoordinator();
     coordinator.initialize({ version: 1, participants: { chat: {} } }, { requiredParticipants: ["chat"] });

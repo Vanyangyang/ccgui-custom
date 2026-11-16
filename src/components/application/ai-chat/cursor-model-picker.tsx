@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import Check from "lucide-react/dist/esm/icons/check";
 import { Switch } from "@/components/base/switch/switch";
@@ -16,6 +16,7 @@ import {
   readCursorParams,
   readCursorPins,
   writeCursorModelParams,
+  type CursorCatalogError,
   type CursorModel,
   type CursorParameter,
   type CursorParamValues,
@@ -170,16 +171,37 @@ export function CursorModelList({
   models,
   selectedModelId,
   query,
+  catalogError,
+  onRefreshCatalog,
   onPick,
 }: {
   models: CursorModel[];
   selectedModelId: string;
   query: string;
+  catalogError?: CursorCatalogError | null;
+  onRefreshCatalog?: () => void | Promise<void>;
   onPick: (id: string) => void;
 }) {
   const { t } = useTranslation();
   const { params } = useCursorModelPrefs();
   const selection = useCursorModelSelection(models);
+  const [refreshingCatalog, setRefreshingCatalog] = useState(false);
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
+  const refreshCatalog = async () => {
+    if (!onRefreshCatalog || refreshingCatalog) return;
+    setRefreshingCatalog(true);
+    try {
+      await onRefreshCatalog();
+    } catch {
+      // Catalog error state is surfaced via catalogError.
+    } finally {
+      if (mounted.current) setRefreshingCatalog(false);
+    }
+  };
   const visible = orderCursorModels(models, selection.selected, query);
   const pick = async (id: string) => {
     if (await selection.change(id, true)) onPick(id);
@@ -191,6 +213,29 @@ export function CursorModelList({
       <p className="px-2 py-1 text-caption-1-regular text-text-secondary">
         {t("chat.cursorSelectionNote")}
       </p>
+      {catalogError && (
+        <div
+          role="alert"
+          className={cx(
+            "mx-1 rounded-md px-2 py-1.5 text-caption-1-regular",
+            catalogError === "auth"
+              ? "bg-background-tertiary-warning text-text-warning-primary"
+              : "text-text-error-primary",
+          )}
+        >
+          <p>{t(catalogError === "auth" ? "chat.cursorCatalogAuthRequired" : "chat.cursorCatalogLoadFailed")}</p>
+          {onRefreshCatalog && (
+            <button
+              type="button"
+              disabled={refreshingCatalog}
+              className="mt-1 cursor-pointer underline disabled:cursor-wait disabled:opacity-50"
+              onClick={() => void refreshCatalog()}
+            >
+              {t("common.refresh")}
+            </button>
+          )}
+        </div>
+      )}
       {(selection.loading || selection.saving) && <p role="status" className="px-2 py-1 text-caption-1-regular text-text-secondary">
         {t(selection.saving ? "chat.cursorSelectionSaving" : "common.loading")}
       </p>}
@@ -210,7 +255,7 @@ export function CursorModelList({
             onPin={(on) => { void selection.change(model.id, on); }}
           />
         ))}
-        {visible.length === 0 && <span className="p-2 text-body-medium text-text-tertiary">{t("chat.noMatchingModels")}</span>}
+        {visible.length === 0 && (!catalogError || query.trim() !== "") && <span className="p-2 text-body-medium text-text-tertiary">{t("chat.noMatchingModels")}</span>}
       </div>
       {selected && <CursorParameterFooter model={selected} saved={params[selected.id]} />}
     </>

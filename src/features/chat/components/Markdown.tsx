@@ -31,6 +31,7 @@ import {
   decodeFileLink,
   isFileLinkUrl,
   isLinkableFilePath,
+  localFileUrlPath,
   resolveFilePath,
   toFileLink,
 } from "@/lib/fileLinks";
@@ -256,7 +257,7 @@ export default memo(function Markdown({
             </FileLink>
           );
         }
-        // Unrecognized or blocked scheme (blanked by urlTransform, file:,
+        // Unrecognized or blocked scheme (blanked by urlTransform,
         // in-page "#" which would hit HashRouter, ...): render the label as
         // plain text, never a navigable anchor.
         return <span>{children}</span>;
@@ -265,7 +266,7 @@ export default memo(function Markdown({
         // Block code (inside <pre>) carries the hljs class — leave it alone.
         if (className) return <code className={className}>{children}</code>;
         const value = extractText(children).trim();
-        if (!value || !isLinkableFilePath(value)) return <code>{children}</code>;
+        if (!value || (!isLinkableFilePath(value) && localFileUrlPath(value) === null)) return <code>{children}</code>;
         return (
           <FileLink href={toFileLink(value)} path={value} workspacePath={workspacePath}>
             <code>{children}</code>
@@ -338,8 +339,9 @@ export default memo(function Markdown({
         urlTransform={(url, key, node) =>
           // Images are validated by ChatImage before any browser/IPC access.
           key === "src" && node.tagName === "img" ? url :
-          // file: is deliberately excluded: model output must not smuggle in
-          // local-file URLs. Real file paths are handled via FileLink above.
+          // Local file URLs use our file action, never WebView navigation.
+          // Preserve URL encoding until resolveFilePath to avoid double decoding.
+          /^file:/i.test(url) ? (localFileUrlPath(url) === null ? "" : toFileLink(url)) :
           isFileLinkUrl(url) ||
           /^(https?|mailto):/i.test(url) ||
           url.startsWith("#") ||

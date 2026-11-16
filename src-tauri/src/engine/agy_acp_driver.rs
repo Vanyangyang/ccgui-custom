@@ -42,6 +42,8 @@ use crate::engine::{
 
 const CONFIG_TIMEOUT: Duration = Duration::from_secs(15);
 const SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+const LOAD_REPLAY_NO_BARRIER_QUIET: Duration = Duration::from_millis(1500);
+const LOAD_REPLAY_POST_BARRIER_SETTLE: Duration = Duration::from_millis(75);
 const AGY_PROMPT_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const CANCEL_SETTLE_TIMEOUT: Duration = Duration::from_millis(2500);
 const CANCELLED_MARKER: &str = "agy acp turn cancelled";
@@ -149,6 +151,195 @@ mod idle_timeout_tests {
         let (result, ()) = tokio::join!(call, peer);
         assert!(result.is_ok(), "{result:?}");
         assert!(!io.poisoned);
+    }
+
+    #[tokio::test]
+    async fn session_load_drains_delayed_replay_until_final_commands_barrier() {
+        let (client, server) = tokio::io::duplex(8192);
+        let (read, mut write) = tokio::io::split(client);
+        let mut read = BufReader::new(read);
+        let mut line_buf = Vec::new();
+        let mut next_id = 1;
+        let mut io = AcpIo {
+            reader: &mut read,
+            writer: &mut write,
+            line_buf: &mut line_buf,
+            next_id: &mut next_id,
+            outbound_rx: None,
+            poisoned: false,
+        };
+        let killed = AtomicBool::new(false);
+        let client_fut = async {
+            let mut observed_used = None;
+            let res = io
+                .load_session_and_drain_replay(
+                    "sid-1",
+                    json!({ "sessionId": "sid-1" }),
+                    Duration::from_secs(5),
+                    Duration::from_millis(400),
+                    Duration::from_millis(60),
+                    &killed,
+                    |line| {
+                        if let AcpLine::Notification { method, params } = line {
+                            if method == "session/update" {
+                                let update = params.get("update").unwrap_or(params);
+                                if update.get("sessionUpdate").and_then(Value::as_str)
+                                    == Some("usage_update")
+                                {
+                                    observed_used = update.get("used").and_then(Value::as_u64);
+                                }
+                            }
+                        }
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(res["sessionId"], "sid-1");
+            assert_eq!(observed_used, Some(777));
+            assert!(!io.poisoned);
+
+            let mut leaked_updates = 0usize;
+            let prompt = io
+                .call(
+                    "session/prompt",
+                    json!({ "sessionId": "sid-1" }),
+                    Duration::from_secs(2),
+                    &killed,
+                    None,
+                    |_| {
+                        leaked_updates += 1;
+                        None
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(leaked_updates, 0);
+            assert_eq!(prompt["stopReason"], "end_turn");
+            assert!(!io.poisoned);
+        };
+        let peer = async {
+            let (read, mut write) = tokio::io::split(server);
+            let mut read = BufReader::new(read);
+            let mut load_req = String::new();
+            read.read_line(&mut load_req).await.unwrap();
+            assert!(load_req.contains("\"session/load\""));
+            write
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"sessionId\":\"sid-1\"}}\n")
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            // Early commands update must be invalidated when replay content follows it.
+            write
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"sid-1\",\"update\":{\"sessionUpdate\":\"available_commands_update\",\"availableCommands\":[]}}}\n")
+                .await
+                .unwrap();
+            write
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"sid-1\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"stale-after-early-barrier\"}}}}\n")
+                .await
+                .unwrap();
+            // Sleep longer than post_barrier_settle (60ms) but under no_barrier_quiet (400ms)
+            // to prove the barrier was reset by the replay chunk.
+            tokio::time::sleep(Duration::from_millis(90)).await;
+            write
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"sid-1\",\"update\":{\"sessionUpdate\":\"agent_thought_chunk\",\"content\":{\"type\":\"text\",\"text\":\"stale-thought\"}}}}\n")
+                .await
+                .unwrap();
+            write
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"sid-1\",\"update\":{\"sessionUpdate\":\"available_commands_update\",\"availableCommands\":[]}}}\n")
+                .await
+                .unwrap();
+            write
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"sid-1\",\"update\":{\"sessionUpdate\":\"usage_update\",\"used\":777,\"size\":1000}}}\n")
+                .await
+                .unwrap();
+            let mut prompt_req = String::new();
+            read.read_line(&mut prompt_req).await.unwrap();
+            assert!(prompt_req.contains("\"session/prompt\""));
+            write
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"stopReason\":\"end_turn\"}}\n")
+                .await
+                .unwrap();
+        };
+        tokio::join!(client_fut, peer);
+    }
+
+    #[tokio::test]
+    async fn session_load_drains_replay_without_barrier_using_quiet_fallback() {
+        let (client, server) = tokio::io::duplex(8192);
+        let (read, mut write) = tokio::io::split(client);
+        let mut read = BufReader::new(read);
+        let mut line_buf = Vec::new();
+        let mut next_id = 1;
+        let mut io = AcpIo {
+            reader: &mut read,
+            writer: &mut write,
+            line_buf: &mut line_buf,
+            next_id: &mut next_id,
+            outbound_rx: None,
+            poisoned: false,
+        };
+        let killed = AtomicBool::new(false);
+        let client_fut = async {
+            let res = io
+                .load_session_and_drain_replay(
+                    "sid-fallback",
+                    json!({ "sessionId": "sid-fallback" }),
+                    Duration::from_secs(5),
+                    Duration::from_millis(120),
+                    Duration::from_millis(25),
+                    &killed,
+                    |_| {},
+                )
+                .await
+                .unwrap();
+            assert_eq!(res["sessionId"], "sid-fallback");
+            let mut leaked_updates = 0usize;
+            let prompt = io
+                .call(
+                    "session/prompt",
+                    json!({ "sessionId": "sid-fallback" }),
+                    Duration::from_secs(2),
+                    &killed,
+                    None,
+                    |_| {
+                        leaked_updates += 1;
+                        None
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(leaked_updates, 0);
+            assert_eq!(prompt["stopReason"], "end_turn");
+            assert!(!io.poisoned);
+        };
+        let peer = async {
+            let (read, mut write) = tokio::io::split(server);
+            let mut read = BufReader::new(read);
+            let mut load_req = String::new();
+            read.read_line(&mut load_req).await.unwrap();
+            write
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"sessionId\":\"sid-fallback\"}}\n")
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            write
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"sid-fallback\",\"update\":{\"sessionUpdate\":\"agent_thought_chunk\",\"content\":{\"type\":\"text\",\"text\":\"stale-thought\"}}}}\n")
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            write
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"sid-fallback\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"stale-text\"}}}}\n")
+                .await
+                .unwrap();
+            let mut prompt_req = String::new();
+            read.read_line(&mut prompt_req).await.unwrap();
+            assert!(prompt_req.contains("\"session/prompt\""));
+            write
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"stopReason\":\"end_turn\"}}\n")
+                .await
+                .unwrap();
+        };
+        tokio::join!(client_fut, peer);
     }
 }
 
@@ -663,6 +854,155 @@ where
         .await
     }
 
+    fn observe_session_load_line(
+        line: &AcpLine,
+        expected_sid: &str,
+        saw_commands_update: &mut bool,
+    ) {
+        let AcpLine::Notification { method, params } = line else {
+            return;
+        };
+        if method != "session/update" {
+            return;
+        }
+        if let Some(sid) = params.get("sessionId").and_then(Value::as_str) {
+            if sid != expected_sid {
+                return;
+            }
+        }
+        let update = params.get("update").unwrap_or(params);
+        match update.get("sessionUpdate").and_then(Value::as_str) {
+            Some("available_commands_update") => *saw_commands_update = true,
+            Some(
+                "user_message_chunk"
+                | "agent_thought_chunk"
+                | "agent_message_chunk"
+                | "tool_call"
+                | "tool_call_update"
+                | "plan",
+            ) => *saw_commands_update = false,
+            _ => {}
+        }
+    }
+
+    async fn load_session_and_drain_replay<F>(
+        &mut self,
+        session_id: &str,
+        params: Value,
+        timeout_dur: Duration,
+        no_barrier_quiet: Duration,
+        post_barrier_settle: Duration,
+        killed: &AtomicBool,
+        mut on_line: F,
+    ) -> Result<Value, String>
+    where
+        F: FnMut(&AcpLine),
+    {
+        let load_deadline = Instant::now() + timeout_dur;
+        let mut saw_commands_update = false;
+        let res = match self
+            .call(
+                "session/load",
+                params,
+                timeout_dur,
+                killed,
+                None,
+                |line| {
+                    Self::observe_session_load_line(line, session_id, &mut saw_commands_update);
+                    on_line(line);
+                    None
+                },
+            )
+            .await
+        {
+            Ok(res) => res,
+            Err(err) => {
+                self.poisoned = true;
+                return Err(err);
+            }
+        };
+
+        let target_sid = extract_session_id(&res).unwrap_or_else(|| session_id.to_string());
+        let mut quiet_since = Instant::now();
+        loop {
+            if killed.load(Ordering::SeqCst) {
+                self.poisoned = true;
+                return Err(CANCELLED_MARKER.to_string());
+            }
+            let required_quiet = if saw_commands_update {
+                post_barrier_settle
+            } else {
+                no_barrier_quiet
+            };
+            let elapsed = quiet_since.elapsed();
+            if elapsed >= required_quiet {
+                break;
+            }
+            let total_rem = load_deadline.saturating_duration_since(Instant::now());
+            if total_rem.is_zero() {
+                self.poisoned = true;
+                return Err("AGY ACP `session/load` timed out".to_string());
+            }
+            let wait = required_quiet
+                .saturating_sub(elapsed)
+                .min(total_rem)
+                .min(KILL_POLL);
+            enum DrainStep {
+                Line(Result<LineRead, std::io::Error>),
+                Tick,
+            }
+            let step = tokio::select! {
+                res = read_ndjson_line(self.reader, self.line_buf) => DrainStep::Line(res),
+                _ = tokio::time::sleep(wait) => DrainStep::Tick,
+            };
+            let bytes = match step {
+                DrainStep::Tick => continue,
+                DrainStep::Line(Ok(LineRead::Line(b))) => b,
+                DrainStep::Line(Ok(LineRead::Eof)) => {
+                    self.poisoned = true;
+                    return Err("AGY ACP `session/load` ended: daemon closed stdout".to_string());
+                }
+                DrainStep::Line(Ok(LineRead::TooLong)) => {
+                    self.poisoned = true;
+                    return Err(format!(
+                        "AGY ACP `session/load` emitted a frame over {} MiB",
+                        MAX_LINE_BYTES / (1024 * 1024)
+                    ));
+                }
+                DrainStep::Line(Err(err)) => {
+                    self.poisoned = true;
+                    return Err(format!("AGY ACP `session/load` read error: {err}"));
+                }
+            };
+            quiet_since = Instant::now();
+            let text = String::from_utf8_lossy(&bytes);
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+                continue;
+            };
+            let parsed = parse_acp_line(&value);
+            match parsed {
+                AcpLine::AgentRequest { id, .. } => {
+                    self.send_frame(&jsonrpc_error_response(
+                        &id,
+                        JSONRPC_METHOD_NOT_FOUND,
+                        "Unsupported request during session/load",
+                    ))
+                    .await?;
+                }
+                other => {
+                    Self::observe_session_load_line(&other, &target_sid, &mut saw_commands_update);
+                    on_line(&other);
+                }
+            }
+        }
+
+        Ok(res)
+    }
+
     async fn call_interactive<F>(
         &mut self,
         method: &str,
@@ -942,7 +1282,7 @@ async fn drive_session_turn<R, W>(
     host_instructions: &str,
     plugin_root: &str,
     mcp_servers: &[Value],
-    supports_resume: bool,
+    _supports_resume: bool,
     killed: &AtomicBool,
     telemetry: &mut AgyAcpTelemetry,
     last_usage: &mut Option<Value>,
@@ -973,29 +1313,28 @@ where
     let pre_turn_offset = pre_existing_transcript_len(profile, requested_session);
     let mut attached_result: Option<Value> = None;
     if let Some(sid) = requested_session {
-        // Resume avoids history replay while preserving the per-turn close and
-        // fresh lease rules/MCP binding. Legacy agents still use load.
+        // AGY 1.5.9 advertises resume, but reading conversation details is not
+        // enough to hydrate its executor after a process restart. Load through
+        // the history stream before sending, and drain post-response replay
+        // updates (async yields across compaction checkpoints can emit historical
+        // chunks after `session/load` replies until `available_commands_update`).
         let params = json!({
             "sessionId": sid, "cwd": cwd,
             "additionalDirectories": additional_dirs, "mcpServers": mcp_servers,
         });
-        let method = if supports_resume { "session/resume" } else { "session/load" };
-        let mut load_res = io
-            .call(
-                method,
-                params.clone(),
+        let load_res = io
+            .load_session_and_drain_replay(
+                sid,
+                params,
                 SESSION_RESUME_TIMEOUT,
+                LOAD_REPLAY_NO_BARRIER_QUIET,
+                LOAD_REPLAY_POST_BARRIER_SETTLE,
                 killed,
-                None,
-                |line| { context_usage.observe(line); None },
+                |line| {
+                    context_usage.observe(line);
+                },
             )
             .await;
-        if supports_resume && !io.poisoned && !killed.load(Ordering::SeqCst)
-            && load_res.as_ref().is_err_and(|err| err.starts_with("rpc:-32601:session/resume: "))
-        {
-            load_res = io.call("session/load", params, SESSION_RESUME_TIMEOUT, killed, None,
-                |line| { context_usage.observe(line); None }).await;
-        }
         match load_res {
             Ok(res) => attached_result = Some(res),
             Err(err) => {

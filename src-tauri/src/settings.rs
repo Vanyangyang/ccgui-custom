@@ -20,11 +20,68 @@ pub struct WorkspaceGroup {
     pub copies_folder: Option<String>,
 }
 
+/// 主对话画布背景预设与 DIY 配置（设置 → 通用 → 对话背景）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatBackdropSettings {
+    #[serde(default = "default_chat_backdrop_preset")]
+    pub preset: String,
+    #[serde(default = "default_chat_backdrop_opacity")]
+    pub opacity: u8,
+    #[serde(default = "default_chat_backdrop_speed")]
+    pub speed: u8,
+    #[serde(default = "default_chat_backdrop_scale")]
+    pub scale: u8,
+    #[serde(default = "default_chat_backdrop_scrim")]
+    pub scrim: u8,
+    #[serde(default = "default_chat_backdrop_color_mode")]
+    pub color_mode: String,
+    #[serde(default = "default_chat_backdrop_custom_color")]
+    pub custom_color: String,
+    #[serde(default)]
+    pub image_file: String,
+    #[serde(default = "default_chat_backdrop_blur")]
+    pub blur: u8,
+    #[serde(default = "default_chat_backdrop_fit")]
+    pub fit: String,
+    #[serde(default = "default_chat_backdrop_parallax")]
+    pub parallax: bool,
+}
+
+impl Default for ChatBackdropSettings {
+    fn default() -> Self {
+        Self {
+            preset: default_chat_backdrop_preset(),
+            opacity: default_chat_backdrop_opacity(),
+            speed: default_chat_backdrop_speed(),
+            scale: default_chat_backdrop_scale(),
+            scrim: default_chat_backdrop_scrim(),
+            color_mode: default_chat_backdrop_color_mode(),
+            custom_color: default_chat_backdrop_custom_color(),
+            image_file: String::new(),
+            blur: default_chat_backdrop_blur(),
+            fit: default_chat_backdrop_fit(),
+            parallax: default_chat_backdrop_parallax(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// Built-in visual style preset ("mist" | "warm" | "aurora" | "classic").
+    /// None defaults to "mist" on the frontend while keeping settings.json lean.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme_preset: Option<String>,
+    /// Built-in accent ramp ("blue" | "indigo" | "violet" | "teal" | "emerald" | "amber").
+    /// None defaults to "blue".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accent_color: Option<String>,
+    /// 主对话画布背景预设与 DIY 配置；None 表示采用前端默认（科技像素波）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_backdrop: Option<ChatBackdropSettings>,
     /// Windows 标题栏样式："native"（系统原生）| "mac"（仿 mac 自绘标题栏 +
     /// 三色按钮）。仅 Windows 生效；macOS 固定系统原生红绿灯（Overlay）。
     /// 窗口在启动时按此值创建，改动需重启应用。
@@ -348,6 +405,137 @@ fn normalize_sidebar_chat_list_mode(settings: &mut AppSettings) {
     };
 }
 
+fn default_chat_backdrop_preset() -> String {
+    "pixel-wave".to_string()
+}
+
+fn default_chat_backdrop_opacity() -> u8 {
+    48
+}
+
+fn default_chat_backdrop_speed() -> u8 {
+    50
+}
+
+fn default_chat_backdrop_scale() -> u8 {
+    50
+}
+
+fn default_chat_backdrop_scrim() -> u8 {
+    78
+}
+
+fn default_chat_backdrop_color_mode() -> String {
+    "accent".to_string()
+}
+
+fn default_chat_backdrop_custom_color() -> String {
+    "#06b6d4".to_string()
+}
+
+fn default_chat_backdrop_blur() -> u8 {
+    6
+}
+
+fn default_chat_backdrop_fit() -> String {
+    "cover".to_string()
+}
+
+fn default_chat_backdrop_parallax() -> bool {
+    true
+}
+
+fn normalize_hex_color(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.len() == 7
+        && trimmed.starts_with('#')
+        && trimmed[1..].bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        trimmed.to_ascii_lowercase()
+    } else {
+        default_chat_backdrop_custom_color()
+    }
+}
+
+fn normalize_chat_backdrop(backdrop: &mut ChatBackdropSettings) {
+    backdrop.preset = match backdrop.preset.trim().to_ascii_lowercase().as_str() {
+        "none" => "none".to_string(),
+        "pixel-wave" => "pixel-wave".to_string(),
+        "bayer-dither" => "bayer-dither".to_string(),
+        "flickering-grid" => "flickering-grid".to_string(),
+        "silk-ribbons" => "silk-ribbons".to_string(),
+        "komorebi" => "komorebi".to_string(),
+        "swiss-cross" => "swiss-cross".to_string(),
+        "blueprint-grid" => "blueprint-grid".to_string(),
+        "dot-constellation" => "dot-constellation".to_string(),
+        "aurora-mesh" => "aurora-mesh".to_string(),
+        "topographic" => "topographic".to_string(),
+        "custom-image" => "custom-image".to_string(),
+        _ => default_chat_backdrop_preset(),
+    };
+    backdrop.opacity = backdrop.opacity.clamp(10, 100);
+    backdrop.speed = backdrop.speed.clamp(0, 150);
+    backdrop.scale = backdrop.scale.clamp(20, 100);
+    backdrop.scrim = backdrop.scrim.clamp(0, 100);
+    backdrop.color_mode = match backdrop.color_mode.trim().to_ascii_lowercase().as_str() {
+        "custom" => "custom".to_string(),
+        _ => default_chat_backdrop_color_mode(),
+    };
+    backdrop.custom_color = normalize_hex_color(&backdrop.custom_color);
+    let cleaned_image = backdrop.image_file.trim();
+    backdrop.image_file = if cleaned_image.chars().any(|c| matches!(c, '\0' | '\r' | '\n')) {
+        String::new()
+    } else {
+        cleaned_image.to_string()
+    };
+    backdrop.blur = backdrop.blur.clamp(0, 24);
+    backdrop.fit = match backdrop.fit.trim().to_ascii_lowercase().as_str() {
+        "contain" => "contain".to_string(),
+        "repeat" => "repeat".to_string(),
+        _ => default_chat_backdrop_fit(),
+    };
+}
+
+fn normalize_appearance_settings(settings: &mut AppSettings) {
+    settings.theme = match settings.theme.trim().to_ascii_lowercase().as_str() {
+        "light" => "light".to_string(),
+        "dark" => "dark".to_string(),
+        "system" => "system".to_string(),
+        _ => default_theme(),
+    };
+    settings.theme_preset = match settings
+        .theme_preset
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("mist") => Some("mist".to_string()),
+        Some("warm") => Some("warm".to_string()),
+        Some("aurora") => Some("aurora".to_string()),
+        Some("classic") => Some("classic".to_string()),
+        _ => None,
+    };
+    settings.accent_color = match settings
+        .accent_color
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("blue") => Some("blue".to_string()),
+        Some("indigo") => Some("indigo".to_string()),
+        Some("violet") => Some("violet".to_string()),
+        Some("teal") => Some("teal".to_string()),
+        Some("emerald") => Some("emerald".to_string()),
+        Some("amber") => Some("amber".to_string()),
+        _ => None,
+    };
+    if let Some(ref mut backdrop) = settings.chat_backdrop {
+        normalize_chat_backdrop(backdrop);
+    }
+}
+
 /// Random 8-character pairing key: no vowels and no look-alikes, so it can
 /// be read out loud and typed on a phone without ambiguity.
 pub fn generate_pair_key() -> String {
@@ -403,6 +591,9 @@ impl Default for AppSettings {
 
         Self {
             theme: default_theme(),
+            theme_preset: None,
+            accent_color: None,
+            chat_backdrop: None,
             titlebar: default_titlebar(),
             workspace_groups: Vec::new(),
             workspace_aliases: HashMap::new(),
@@ -627,6 +818,7 @@ pub fn read_settings() -> Result<AppSettings, String> {
     remove_retired_connection_settings(&mut settings);
     normalize_pet_settings(&mut settings);
     normalize_sidebar_chat_list_mode(&mut settings);
+    normalize_appearance_settings(&mut settings);
     crate::auto_title::config::normalize(&mut settings);
     if settings.launch_proxy_protection_enabled.is_none()
         && crate::launch_protection::resolve_launch_proxy_protection_enabled(&settings)
@@ -973,6 +1165,7 @@ fn persist_settings_to(
     remove_retired_connection_settings(settings);
     normalize_pet_settings(settings);
     normalize_sidebar_chat_list_mode(settings);
+    normalize_appearance_settings(settings);
     crate::auto_title::config::normalize(settings);
     settings.composer_prediction_model = crate::composer_prediction::configured_prediction_model(
         settings.composer_prediction_model.as_deref(),
@@ -1853,6 +2046,109 @@ mod tests {
         assert_eq!(unknown.sidebar_chat_list_mode, None);
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(!raw.contains("sidebarChatListMode"));
+    }
+
+    #[test]
+    fn appearance_preset_and_accent_round_trip_and_normalize_unknown_values() {
+        let scratch = Scratch::new();
+        let path = scratch.path("settings.json");
+        let mut settings = AppSettings {
+            theme: "Light".to_string(),
+            theme_preset: Some(" warm ".to_string()),
+            accent_color: Some("Violet".to_string()),
+            ..AppSettings::default()
+        };
+        persist_settings_to(&mut settings, &path).unwrap();
+        let saved: AppSettings =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved.theme, "light");
+        assert_eq!(saved.theme_preset.as_deref(), Some("warm"));
+        assert_eq!(saved.accent_color.as_deref(), Some("violet"));
+
+        let mut unknown = AppSettings {
+            theme: "bogus".to_string(),
+            theme_preset: Some("neon-invalid".to_string()),
+            accent_color: Some("crimson".to_string()),
+            ..AppSettings::default()
+        };
+        persist_settings_to(&mut unknown, &path).unwrap();
+        assert_eq!(unknown.theme, "system");
+        assert_eq!(unknown.theme_preset, None);
+        assert_eq!(unknown.accent_color, None);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("themePreset"));
+        assert!(!raw.contains("accentColor"));
+    }
+
+    #[test]
+    fn chat_backdrop_settings_round_trip_and_clamp_out_of_range_values() {
+        let scratch = Scratch::new();
+        let path = scratch.path("settings.json");
+        let mut settings = AppSettings {
+            chat_backdrop: Some(ChatBackdropSettings {
+                preset: " BAYER-DITHER ".to_string(),
+                opacity: 2,
+                speed: 240,
+                scale: 5,
+                scrim: 180,
+                color_mode: "CUSTOM".to_string(),
+                custom_color: "#FF8800".to_string(),
+                image_file: "  G:/wallpapers/grid.png \0".to_string(),
+                blur: 99,
+                fit: "REPEAT".to_string(),
+                parallax: false,
+            }),
+            ..AppSettings::default()
+        };
+        persist_settings_to(&mut settings, &path).unwrap();
+        let saved: AppSettings =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let backdrop = saved.chat_backdrop.unwrap();
+        assert_eq!(backdrop.preset, "bayer-dither");
+        assert_eq!(backdrop.opacity, 10);
+        assert_eq!(backdrop.speed, 150);
+        assert_eq!(backdrop.scale, 20);
+        assert_eq!(backdrop.scrim, 100);
+        assert_eq!(backdrop.color_mode, "custom");
+        assert_eq!(backdrop.custom_color, "#ff8800");
+        assert_eq!(backdrop.image_file, "");
+        assert_eq!(backdrop.blur, 24);
+        assert_eq!(backdrop.fit, "repeat");
+        assert!(!backdrop.parallax);
+
+        let mut legacy: AppSettings =
+            serde_json::from_str(r#"{"chatBackdrop":{"preset":"KOMOREBI"}}"#).unwrap();
+        assert!(legacy.chat_backdrop.as_ref().unwrap().parallax);
+        persist_settings_to(&mut legacy, &path).unwrap();
+        assert_eq!(legacy.chat_backdrop.as_ref().unwrap().preset, "komorebi");
+        assert!(legacy.chat_backdrop.as_ref().unwrap().parallax);
+
+        let mut invalid = AppSettings {
+            chat_backdrop: Some(ChatBackdropSettings {
+                preset: "unknown-mode".to_string(),
+                opacity: 200,
+                speed: 45,
+                scale: 120,
+                scrim: 60,
+                color_mode: "rainbow".to_string(),
+                custom_color: "not-a-color".to_string(),
+                image_file: " D:/bg/wave.webp ".to_string(),
+                blur: 12,
+                fit: "stretch".to_string(),
+                parallax: true,
+            }),
+            ..AppSettings::default()
+        };
+        persist_settings_to(&mut invalid, &path).unwrap();
+        let normalized = invalid.chat_backdrop.unwrap();
+        assert_eq!(normalized.preset, "pixel-wave");
+        assert_eq!(normalized.opacity, 100);
+        assert_eq!(normalized.scale, 100);
+        assert_eq!(normalized.color_mode, "accent");
+        assert_eq!(normalized.custom_color, "#06b6d4");
+        assert_eq!(normalized.image_file, "D:/bg/wave.webp");
+        assert_eq!(normalized.fit, "cover");
+        assert!(normalized.parallax);
     }
 }
 #[tauri::command]

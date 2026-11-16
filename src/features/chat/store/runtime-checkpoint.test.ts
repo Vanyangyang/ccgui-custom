@@ -109,6 +109,44 @@ describe("chat runtime checkpoint with the real store", () => {
     expect(fake.send).not.toHaveBeenCalled();
   });
 
+  it.each(["legacy", "current"])("repairs pre-drain AGY replay-polluted timelines across self-update even without legacy tool rows (%s)", async (format) => {
+    const agyTab = { ...tab, engine: "agy", sessionId: "3a0c1174" };
+    const agyKey = "agy/3a0c1174";
+    const first = await boot(); await first.store.getState().init();
+    const messages = [
+      { seq: 1, role: "assistant", text: "prior turn final", ts: "2026-11-15T20:18:34Z" },
+      { seq: 2, role: "user", text: "new prompt", ts: "2026-11-15T20:36:57Z" },
+      { seq: 3, role: "thinking", text: "leaked older thinking", ts: "2026-11-15T20:36:58Z" },
+      { seq: 4, role: "assistant", text: "leaked older reply", ts: "2026-11-15T20:36:58Z" },
+    ];
+    first.store.setState({
+      active: tab,
+      openTabs: [tab, agyTab],
+      drafts: { [agyKey]: "unsent draft" },
+      bySession: { [agyKey]: { ...first.stream.EMPTY_SESSION, messages, usage: { input_tokens: 100, output_tokens: 20 } } },
+    });
+    const checkpoint = await first.coordinator.prepareRuntimeCheckpoint();
+    if (format === "legacy") {
+      delete (checkpoint.participants.chat as { agyLoadDrainVersion?: number }).agyLoadDrainVersion;
+    }
+    const next = await boot(checkpoint);
+    expect(next.store.getState().bySession[agyKey].messages).toEqual(messages);
+    expect(fake.loadPage).not.toHaveBeenCalled();
+    const repaired = [messages[0], messages[1]];
+    fake.loadPage.mockResolvedValueOnce({ messages: repaired, subagentHistory: [], nextBefore: null });
+    await next.coordinator.resumeRuntimeCheckpoint();
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    if (format === "legacy") {
+      expect(fake.loadPage).toHaveBeenCalledTimes(1);
+      expect(next.store.getState().bySession[agyKey].messages).toEqual(repaired);
+    } else {
+      expect(fake.loadPage).not.toHaveBeenCalled();
+      expect(next.store.getState().bySession[agyKey].messages).toEqual(messages);
+    }
+    expect(next.store.getState().drafts[agyKey]).toBe("unsent draft");
+    expect(fake.send).not.toHaveBeenCalled();
+  });
+
   it("retries a failed legacy history repair after another checkpoint instead of treating its error as a failed send", async () => {
     const agyTab = { ...tab, engine: "agy" }, agyKey = "agy/session-1";
     const first = await boot(); await first.store.getState().init();

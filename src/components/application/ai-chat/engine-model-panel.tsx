@@ -20,7 +20,7 @@ import { EFFORT_LABEL_KEYS, getEffortLevels, normalizeEffortLevel, supportsEffor
 import { EffortPicker } from "./effort-picker";
 import { supportsIndependentModelEffort, modelChoiceRows, type ModelChoiceRow } from "./model-effort";
 import { CursorModelList } from "./cursor-model-picker";
-import type { CursorModel } from "./cursor-models";
+import type { CursorCatalogError, CursorModel } from "./cursor-models";
 import type { MenuOption, ModelOption } from "./cli-menu";
 
 export interface ChannelOption {
@@ -594,6 +594,7 @@ export function EngineModelPanel({
   onClose,
   loading,
   cursorModels,
+  cursorCatalogError,
   selectionScope = "chat",
 }: {
   option: MenuOption;
@@ -622,6 +623,7 @@ export function EngineModelPanel({
   loading?: boolean;
   /** Cursor 的基础模型。有它时不再按努力档铺开文本目录。 */
   cursorModels?: CursorModel[];
+  cursorCatalogError?: CursorCatalogError | null;
 }) {
   const { t } = useTranslation();
   const { groups, empty } = useOrderedModelGroups(models, query, selectedModelId);
@@ -658,11 +660,13 @@ export function EngineModelPanel({
         />
       )}
       <ModelSearchField query={query} onQueryChange={onQueryChange} />
-      {option.id === "cursor" && cursorModels && cursorModels.length > 0 ? (
+      {option.id === "cursor" && (cursorCatalogError || (cursorModels && cursorModels.length > 0)) ? (
         <CursorModelList
-          models={cursorModels}
+          models={cursorModels ?? []}
           selectedModelId={selectedModelId}
           query={query}
+          catalogError={cursorCatalogError}
+          onRefreshCatalog={onRefresh}
           onPick={(id) => onPickModel(option.id, id)}
         />
       ) : (

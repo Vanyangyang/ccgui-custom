@@ -341,6 +341,8 @@ let cachedPluginRoot = null;
 let cancelTimer = null;
 let pendingPromptId = null;
 let activeSession = 'sid-warm-1';
+// Native resume can create a wrapper without loading the executable trajectory.
+const loadedSessions = new Set();
 
 function configOptions() {
   const modelOptions = ['gemini-4-argon', 'gemini-4-carbon', 'gemini-3.8-flash'];
@@ -383,6 +385,7 @@ rl.on('line', async (line) => {
   }
   if (msg.method === 'session/new') {
     activeSession = 'sid-warm-1';
+    loadedSessions.add(activeSession);
     if (!cachedTokenFile && msg.params?.mcpServers?.[0]?.env?.[0]?.value) {
       // Simulate language_server caching the MCP process env from first session!
       cachedTokenFile = msg.params.mcpServers[0].env[0].value;
@@ -401,13 +404,36 @@ rl.on('line', async (line) => {
     }
     cachedPluginRoot = msg.params?.additionalDirectories?.[0] || cachedPluginRoot;
     activeSession = msg.params.sessionId;
+    if (msg.method === 'session/load') loadedSessions.add(activeSession);
     contextUpdates('attach');
-    // Emit prior-turn replay chunk BEFORE responding to session/load!
-    if (msg.method === 'session/load') send({
-      jsonrpc: '2.0',
-      method: 'session/update',
-      params: { sessionId: msg.params.sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'STALE_HISTORY_REPLAY' } } },
-    });
+    // Emit prior-turn replay chunk BEFORE responding to session/load (unless delayedLoadReplay simulates compaction yields).
+    if (msg.method === 'session/load') {
+      const sid = msg.params.sessionId;
+      if (behavior.delayedLoadReplay) {
+        send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: sid, configOptions: configOptions() } });
+        setTimeout(() => {
+          send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: sid, update: { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'STALE_USER_REPLAY' } } } });
+          send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: sid, update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'STALE_THOUGHT_REPLAY' } } } });
+          send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: sid, update: { sessionUpdate: 'tool_call', toolCallId: 'tc-stale-replay', title: 'read_file', status: 'completed', rawInput: { Path: '/tmp/stale' } } } });
+          send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'STALE_HISTORY_REPLAY' } } } });
+        }, 40);
+        setTimeout(() => {
+          send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: sid, update: { sessionUpdate: 'available_commands_update', availableCommands: [] } } });
+          send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: sid, update: { sessionUpdate: 'usage_update', used: 420, size: 2000000 } } });
+        }, 70);
+        return;
+      }
+      send({
+        jsonrpc: '2.0',
+        method: 'session/update',
+        params: { sessionId: sid, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'STALE_HISTORY_REPLAY' } } },
+      });
+      send({
+        jsonrpc: '2.0',
+        method: 'session/update',
+        params: { sessionId: sid, update: { sessionUpdate: 'available_commands_update', availableCommands: [] } },
+      });
+    }
     send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: msg.params.sessionId, configOptions: configOptions() } });
     return;
   }
@@ -460,6 +486,10 @@ rl.on('line', async (line) => {
   }
   if (msg.method === 'session/prompt') {
     const sid = msg.params.sessionId;
+    if (behavior.coldResumeMissingTrajectory && !loadedSessions.has(sid)) {
+      send({jsonrpc:'2.0',id:msg.id,error:{code:-32603,message:`not_found: trajectory not found: ${sid}`}});
+      return;
+    }
     const text = msg.params?.prompt?.[0]?.text || '';
     contextUpdates('prompt', sid);
     if (behavior.errorDb) {
@@ -728,7 +758,7 @@ async fn independent_thinking_uses_capabilities_after_switching_models() {
 }
 
 #[tokio::test]
-async fn restore_uses_advertised_resume_with_one_explicit_legacy_fallback() {
+async fn restore_loads_trajectory_regardless_of_advertised_resume() {
     for behavior in [json!({}), json!({"resume":"supported"}), json!({"resume":"unsupported"})] {
         let fixture = FakeAcpFixture::with_behavior(behavior.clone()).expect("node fixture");
         let service = Arc::new(AgyAcpState::with_root(fixture.root.clone()));
@@ -739,11 +769,88 @@ async fn restore_uses_advertised_resume_with_one_explicit_legacy_fallback() {
         let methods: Vec<_> = fixture.requests().iter().filter_map(|r| r["method"].as_str().map(str::to_owned)).collect();
         assert!(!methods.iter().any(|method| method == "session/new"));
         assert_eq!(methods.iter().filter(|method| method.as_str() == "session/prompt").count(), 1);
-        assert_eq!(methods.iter().filter(|method| method.as_str() == "session/resume").count(), usize::from(behavior.get("resume").is_some()));
-        assert_eq!(methods.iter().filter(|method| method.as_str() == "session/load").count(), usize::from(behavior["resume"] != "supported"));
+        assert_eq!(methods.iter().filter(|method| method.as_str() == "session/resume").count(), 0);
+        assert_eq!(methods.iter().filter(|method| method.as_str() == "session/load").count(), 1);
         assert_eq!(methods.iter().filter(|method| method.as_str() == "session/close").count(), 1);
         service.kill_spawned();
     }
+}
+
+#[tokio::test]
+async fn cold_existing_session_loads_trajectory_before_prompt_after_each_process_restart() {
+    let fixture = FakeAcpFixture::with_behavior(json!({
+        "resume": "supported", "coldResumeMissingTrajectory": true
+    })).expect("node fixture");
+    for turn in 0..2 {
+        // A new pool has no warm process or in-memory trajectory from the prior turn.
+        let service = Arc::new(AgyAcpState::with_root(fixture.root.clone()));
+        let offset = fixture.requests().len();
+        let mut req = base_req(&fixture.root.join("ws"), Some("auto"));
+        req.session_id = Some("sid-existing-cold".into());
+        req.prompt = format!("cold turn {turn}");
+        let expected_prompt = req.prompt.clone();
+        let events = run_optimization_fixture(&fixture, &service, req, None).await;
+        service.kill_spawned();
+        assert!(!events.iter().any(|event| event["kind"] == "error"), "turn {turn}: {events:?}");
+        assert_eq!(events.iter().filter(|event| event["kind"] == "done").count(), 1);
+        assert!(!events.iter().any(|event| event.to_string().contains("STALE_HISTORY_REPLAY")));
+        let text: String = events.iter().filter(|event| event["kind"] == "delta")
+            .filter_map(|event| event["data"].as_str()).collect();
+        assert!(text.contains("|SID=sid-existing-cold|"), "{text}");
+        let requests = fixture.requests();
+        let current = &requests[offset..];
+        assert!(!current.iter().any(|request| request["method"] == "session/new" || request["method"] == "session/resume"));
+        let loads: Vec<_> = current.iter().enumerate().filter(|(_, request)| request["method"] == "session/load").collect();
+        let prompts: Vec<_> = current.iter().enumerate().filter(|(_, request)| request["method"] == "session/prompt").collect();
+        assert_eq!(loads.len(), 1, "{current:?}");
+        assert_eq!(prompts.len(), 1, "the user's prompt must never be replayed: {current:?}");
+        assert!(loads[0].0 < prompts[0].0);
+        assert_eq!(loads[0].1["params"]["sessionId"], "sid-existing-cold");
+        assert_eq!(prompts[0].1["params"]["sessionId"], "sid-existing-cold");
+        assert_eq!(prompts[0].1["params"]["prompt"][0]["text"], expected_prompt);
+        assert_eq!(fixture.spawn_pids().len(), turn + 1);
+    }
+}
+
+#[tokio::test]
+async fn compacted_session_load_drains_post_response_replay_before_prompt() {
+    let fixture = FakeAcpFixture::with_behavior(json!({
+        "delayedLoadReplay": true,
+        "contextUpdates": { "attach": [{ "used": 120, "size": 2000000 }] }
+    }))
+    .expect("node fixture");
+    let service = Arc::new(AgyAcpState::with_root(fixture.root.clone()));
+    let mut req = base_req(&fixture.root.join("ws"), Some("auto"));
+    req.session_id = Some("sid-compacted".into());
+    let events = run_optimization_fixture(&fixture, &service, req, None).await;
+    service.kill_spawned();
+
+    assert!(!events.iter().any(|e| e["kind"] == "error"), "{events:?}");
+    assert_eq!(events.iter().filter(|e| e["kind"] == "done").count(), 1, "{events:?}");
+    assert!(
+        !events.iter().any(|e| {
+            let s = e.to_string();
+            s.contains("STALE_USER_REPLAY")
+                || s.contains("STALE_THOUGHT_REPLAY")
+                || s.contains("tc-stale-replay")
+                || s.contains("STALE_HISTORY_REPLAY")
+        }),
+        "post-response session/load replay leaked into turn events: {events:?}"
+    );
+    let first_usage = events
+        .iter()
+        .find(|e| e["kind"] == "usage")
+        .expect("initial bound context usage event");
+    assert_eq!(
+        first_usage["data"]["context_usage"]["input_tokens"], 420,
+        "trailing usage_update after available_commands_update should replace pre-response 120: {first_usage:?}"
+    );
+    let text: String = events
+        .iter()
+        .filter(|e| e["kind"] == "delta")
+        .filter_map(|e| e["data"].as_str())
+        .collect();
+    assert!(text.contains("|SID=sid-compacted|"), "{text}");
 }
 
 #[tokio::test]
@@ -1060,7 +1167,7 @@ async fn broker_reuses_single_warm_daemon_across_workers_refreshes_tokens_and_su
         assert!(!entry.path().join("host-chat.json").exists());
     }
 
-    // Turn 2 (`session/resume` on the SAME warm daemon via a second worker!)
+    // Turn 2 (`session/load` on the SAME warm daemon via a second worker!)
     let tok2 = uuid::Uuid::new_v4().to_string();
     let srv2 = json!({
         "command": "fake-host-mcp",
@@ -1107,11 +1214,11 @@ async fn broker_reuses_single_warm_daemon_across_workers_refreshes_tokens_and_su
     let pids = fixture.spawn_pids();
     assert_eq!(pids.len(), 1, "expected 1 warm daemon spawn, got {pids:?}");
     let requests = fixture.requests();
-    assert!(!requests.iter().any(|r| r["method"] == "session/load"));
-    let resumed = requests.iter().find(|r| r["method"] == "session/resume").unwrap();
-    assert_eq!(resumed["params"]["cwd"], ws.to_string_lossy().as_ref());
-    assert!(resumed["params"]["additionalDirectories"].as_array().unwrap().contains(&json!(extra_dir.to_string_lossy())));
-    assert_eq!(resumed["params"]["mcpServers"].as_array().unwrap().len(), 1);
+    assert!(!requests.iter().any(|r| r["method"] == "session/resume"));
+    let loaded = requests.iter().find(|r| r["method"] == "session/load").unwrap();
+    assert_eq!(loaded["params"]["cwd"], ws.to_string_lossy().as_ref());
+    assert!(loaded["params"]["additionalDirectories"].as_array().unwrap().contains(&json!(extra_dir.to_string_lossy())));
+    assert_eq!(loaded["params"]["mcpServers"].as_array().unwrap().len(), 1);
     assert_eq!(requests.iter().filter(|r| r["method"] == "session/close").count(), 2);
 
     desktop_state.kill_spawned();
@@ -1489,6 +1596,7 @@ rl.on('line', (line) => {
     return;
   }
   if (msg.method === 'session/load') {
+    send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: msg.params.sessionId, update: { sessionUpdate: 'available_commands_update', availableCommands: [] } } });
     send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: msg.params.sessionId, configOptions: [] } });
     return;
   }

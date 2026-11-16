@@ -77,6 +77,8 @@ const ALLOWED_CLI_BINS: &[&str] = &[
     "subl",
     "zed",
     "atom",
+    "chrome",
+    "google-chrome",
 ];
 
 /// App names accepted for `open -a` on macOS (exact match after trimming).
@@ -91,6 +93,7 @@ const ALLOWED_MACOS_APPS: &[&str] = &[
     "Zed",
     "Xcode",
     "Finder",
+    "Google Chrome",
 ];
 
 /// Command names / install paths to try for an app, first match wins.
@@ -104,6 +107,16 @@ fn open_app_command_candidates(app: &str) -> Option<Vec<String>> {
     let mapped = match lowered.as_str() {
         "visual studio code" | "vs code" | "vscode" => "code",
         "intellij idea" | "intellij" => "idea",
+        "google chrome" | "google-chrome" | "chrome" => {
+            #[cfg(target_os = "windows")]
+            {
+                "chrome"
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                "google-chrome"
+            }
+        }
         other => other,
     };
     if !ALLOWED_CLI_BINS.contains(&mapped) {
@@ -120,6 +133,19 @@ fn open_app_command_candidates(app: &str) -> Option<Vec<String>> {
         }
     };
     match mapped {
+        "chrome" =>
+        {
+            #[cfg(target_os = "windows")]
+            for env in ["LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)"] {
+                if let Some(base) = std::env::var_os(env) {
+                    let path = PathBuf::from(base).join("Google\\Chrome\\Application\\chrome.exe");
+                    if path.is_file() {
+                        push(path.to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+        "google-chrome" => push("google-chrome-stable".to_string()),
         "code" => {
             push("code-insiders".to_string());
             #[cfg(target_os = "windows")]
@@ -568,11 +594,12 @@ pub(crate) async fn reveal_in_file_manager(path: String) -> Result<(), String> {
     }
 }
 
-#[cfg(all(test, target_os = "windows"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    #[cfg(target_os = "windows")]
     fn explorer_select_argument_quotes_the_path_for_explorer() {
         assert_eq!(
             explorer_select_arg("S:\\AIWorker\\Sublime Text 4\\patch.zip"),
@@ -583,5 +610,26 @@ mod tests {
             explorer_select_arg("C:\\tmp\\a.zip"),
             "/select,\"C:\\tmp\\a.zip\""
         );
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn chrome_aliases_resolve_to_platform_launch_candidates() {
+        for alias in ["Google Chrome", "chrome", "google-chrome"] {
+            let candidates = open_app_command_candidates(alias).expect("Chrome is allowed");
+            #[cfg(target_os = "windows")]
+            assert_eq!(candidates[0], "chrome");
+            #[cfg(not(target_os = "windows"))]
+            assert_eq!(candidates, vec!["google-chrome", "google-chrome-stable"]);
+        }
+        assert!(open_app_command_candidates("chrome --remote-debugging-port=9222").is_none());
+        assert!(open_app_command_candidates("powershell").is_none());
+        assert_eq!(open_app_command_candidates("VS Code").unwrap()[0], "code");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn chrome_is_an_allowed_macos_application() {
+        assert!(ALLOWED_MACOS_APPS.contains(&"Google Chrome"));
     }
 }

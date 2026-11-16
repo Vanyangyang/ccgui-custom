@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ChangesPanel } from "./ChangesPanel";
 import { useGitStore } from "./store";
 import { ChatSidePanel } from "@/features/chat/ChatSidePanel";
-import { getRuntimeCheckpointReadiness } from "@/lib/runtime-checkpoint";
+import { abortRuntimeCheckpoint, getRuntimeActivityReadiness, getRuntimeCheckpointReadiness, prepareRuntimeCheckpoint } from "@/lib/runtime-checkpoint";
 
 vi.mock("@/features/files/FilesPanel", () => ({ FilesPanel: () => <div>files</div> }));
 
@@ -110,13 +110,17 @@ describe("ChangesPanel virtual rows", () => {
     expect(section.querySelectorAll("li").length).toBeLessThan(40);
   });
 
-  it("blocks handoff for an unsaved commit draft even while the panel is hidden and unregisters on unmount", () => {
+  it("blocks handoff but not task completion for an unsaved commit draft, including while hidden", async () => {
     const blockers = () => getRuntimeCheckpointReadiness().filter((item) => item.participant.startsWith("git-changes:"));
     expect(blockers()).toEqual([]);
     act(() => Array.from(container.querySelectorAll("button")).find((button) => button.textContent === "write draft")!.click());
     expect(blockers().map((item) => item.reason)).toContain("unsaved-git-commit-message");
+    expect(getRuntimeActivityReadiness().filter(item => item.participant.startsWith("git-changes:"))).toEqual([]);
+    try { await expect(prepareRuntimeCheckpoint()).rejects.toThrow(/unsaved-git-commit-message/); }
+    finally { abortRuntimeCheckpoint(); }
     act(() => root.render(<ChangesPanel workspacePath="/repo" repoPath="/repo" visible={false} />));
     expect(blockers().map((item) => item.reason)).toContain("unsaved-git-commit-message");
+    expect(getRuntimeActivityReadiness().filter(item => item.participant.startsWith("git-changes:"))).toEqual([]);
     act(() => root.render(<div />));
     expect(blockers()).toEqual([]);
   });
@@ -126,8 +130,20 @@ describe("ChangesPanel virtual rows", () => {
     vi.mocked(useGitStore.getState().stage).mockImplementationOnce(() => new Promise<void>((resolve) => { settle = resolve; }));
     await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="git.stage"]')!.click());
     expect(getRuntimeCheckpointReadiness().some((item) => item.reason === "git-operation-pending")).toBe(true);
+    expect(getRuntimeActivityReadiness().some((item) => item.reason === "git-operation-pending")).toBe(true);
     await act(async () => { settle(); });
     expect(getRuntimeCheckpointReadiness().some((item) => item.reason === "git-operation-pending")).toBe(false);
+    expect(getRuntimeActivityReadiness().some((item) => item.reason === "git-operation-pending")).toBe(false);
+  });
+
+  it.each([false, true])("retains accepted panel mutation ownership after unmount, failure=%s", async failed => {
+    let resolve!: () => void; let reject!: (cause: Error) => void;
+    vi.mocked(useGitStore.getState().stage).mockImplementationOnce(() => new Promise<void>((yes, no) => { resolve = yes; reject = no; }));
+    await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="git.stage"]')!.click());
+    act(() => root.render(<div />));
+    expect(getRuntimeActivityReadiness()).toContainEqual({ participant: "operation", reason: "git-panel-mutation" });
+    await act(async () => { if (failed) reject(new Error("stage failed")); else resolve(); });
+    expect(getRuntimeActivityReadiness().some(item => item.reason === "git-panel-mutation")).toBe(false);
   });
 
   it("clears old discard confirmation and ignores late errors on repository switches", async () => {

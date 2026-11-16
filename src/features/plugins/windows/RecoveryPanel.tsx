@@ -69,7 +69,7 @@ export function DetachedRecoveryPanel({ client, status, getContent }: {
   const statusText = isReturnBlocked
     ? t("plugins.detached.returnBlocked")
     : t(status.phase === "unavailable" ? "plugins.detached.ownerUnavailable" : status.phase === "error" ? "plugins.detached.connectionError" : "plugins.detached.recovering");
-  return <section className="shrink-0 border-b border-border-primary px-4 py-3 text-sm text-text-secondary" aria-label={t("plugins.detached.recoveryTitle")}>
+  return <section className="relative z-10 shrink-0 border-b border-border-primary px-4 py-3 text-sm text-text-secondary" aria-label={t("plugins.detached.recoveryTitle")}>
     <p role="status">{statusText}</p>
     {!isReturnBlocked && <p className="mt-1">{t("plugins.detached.recoveryExit")}</p>}
     <div className="mt-2 flex flex-wrap items-center gap-2">

@@ -3,7 +3,17 @@ import ReactDOM from "react-dom/client";
 import App from "./App";
 import i18n from "./lib/i18n";
 import { ipc } from "./lib/ipc";
-import { applyTheme, THEME_STORAGE_KEY } from "./features/settings/theme";
+import {
+  applyAppearanceFromSettings,
+  applyAppearanceTokens,
+  applyTheme,
+  readCachedAppearance,
+  THEME_STORAGE_KEY,
+} from "./features/settings/theme";
+import {
+  applyBackdropPreferences,
+  readCachedBackdropPreferences,
+} from "./features/settings/backdrop";
 import { applyFontPreferences, readCachedFontPreferences } from "./features/settings/font";
 import { hydrateBetaFeatures } from "./features/settings/beta-features";
 import { initializePerformancePreference } from "./lib/performance-preference";
@@ -60,6 +70,8 @@ export function startApp() {
   // window never flashes the wrong color scheme while settings load.
   const cachedTheme = window.localStorage.getItem(THEME_STORAGE_KEY);
   if (cachedTheme) applyTheme(cachedTheme);
+  applyAppearanceTokens(readCachedAppearance(), false);
+  applyBackdropPreferences(readCachedBackdropPreferences(), false);
   // Same for the font preferences: set the root font variables before first
   // paint so custom UI/code fonts don't swap in visibly after settings load.
   applyFontPreferences(readCachedFontPreferences());
@@ -70,7 +82,7 @@ export function startApp() {
   void ipc
     .getAppSettings()
     .then((settings) => {
-      applyTheme(settings.theme);
+      applyAppearanceFromSettings(settings);
       applyFontPreferences({
         fontFamily: settings.fontFamily,
         codeFontFamily: settings.codeFontFamily,

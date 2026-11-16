@@ -1,4 +1,5 @@
 import { ipc } from "@/lib/ipc";
+import { toLocalFileUrl } from "@/lib/fileLinks";
 import { readStoredJson, readStoredBool, writeStored } from "@/lib/storage";
 import vscodeIcon from "@/assets/app-icons/vscode.png?url";
 import cursorIcon from "@/assets/app-icons/cursor.png?url";
@@ -54,6 +55,13 @@ export async function openPathInTarget(path: string, target: OpenAppTarget): Pro
   }
   if (!target.appName) return;
   await ipc.openWorkspaceIn(path, { appName: target.appName });
+}
+
+/** Browser arguments use a file URL so #, % and spaces remain filename data. */
+export async function openLocalFileInChrome(path: string): Promise<void> {
+  const url = toLocalFileUrl(path);
+  if (!url) throw new Error("Cannot resolve a local file URL");
+  await ipc.openWorkspaceIn(url, { appName: "Google Chrome" });
 }
 
 /** Launch a custom program entry at `path` with the workspace path appended. */

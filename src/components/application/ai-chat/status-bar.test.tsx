@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import i18n from "@/lib/i18n";
 import { StatusBar } from "./ai-chat-composer";
 import { cacheHeatRingStroke, cacheHeatTextColor } from "@/features/chat/session-cleanup";
+import { selectAgyContext } from "@/features/chat/components/agy-context";
 
 Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
 
@@ -17,6 +18,25 @@ describe("status bar context capacity", () => {
     root = createRoot(container);
   });
   afterEach(async () => { await act(async () => root.unmount()); container.remove(); });
+
+  it("uses AGY's official 512K report in both the percentage and breakdown capacity", async () => {
+    const context = selectAgyContext({
+      context_usage_kind: "current_context", context_usage_source: "acp_usage_update",
+      context_usage: { input_tokens: 256_000, output_tokens: 0 }, model_context_window: 512_000,
+    });
+    await act(async () => root.render(<StatusBar
+      contextMax={context.max} contextMaxKnown={context.capacityKnown}
+      contextOccupancyKnown={context.occupancyKnown} usagePct={context.pct}
+      contextSegments={context.parts.map(part => ({ label: "Tokens", tokens: part.tokens }))}
+    />));
+    const trigger = container.querySelector("button")!;
+    expect(trigger.textContent).toContain("50%");
+    await act(async () => trigger.click());
+    const text = document.querySelector('[role="dialog"]')?.textContent ?? "";
+    expect(text).toContain("512k");
+    expect(text).toContain("256k");
+    expect(text).not.toContain("1M");
+  });
 
   it("labels known capacity without a false occupancy ring or percentage", async () => {
     await act(async () => root.render(<StatusBar contextMax={1_000_000} contextMaxKnown contextOccupancyKnown={false} contextShowCapacity />));

@@ -153,4 +153,24 @@ describe("useEngineModels task isolation", () => {
       publishCursorCatalog(previousCatalog);
     }
   });
+
+  it("surfaces Cursor auth-required error, ignores dev-profile guard, and clears on forced refresh", async () => {
+    const previousCatalog = publishedCursorCatalog();
+    try {
+      mocks.cursorModelCatalog.mockRejectedValueOnce("cursor_auth_required: Sign in to Cursor explicitly before refreshing models");
+      await act(async () => root.render(<Harness scope="chat" />));
+      expect(state.cursorCatalogError).toBe("auth");
+      mocks.cursorModelCatalog.mockResolvedValueOnce([{ id: "grok-4.7", name: "Grok 4.7", parameters: [] }]);
+      await act(async () => state.refresh());
+      expect(mocks.cursorModelCatalog).toHaveBeenLastCalledWith(true);
+      expect(state.cursorCatalogError).toBeNull();
+      expect(state.cursorPickerModels.map(model => model.id)).toEqual(["grok-4.7"]);
+
+      mocks.cursorModelCatalog.mockRejectedValueOnce("Cursor automatic model discovery is disabled in development profiles");
+      await act(async () => state.refresh());
+      expect(state.cursorCatalogError).toBeNull();
+    } finally {
+      publishCursorCatalog(previousCatalog);
+    }
+  });
 });

@@ -117,7 +117,7 @@ export async function resolveChatFileLink(
   const local = await findByIndex(root, rel);
   if (local.length) return local.length === 1 ? local[0] : candidate;
   // Absolute links never acquire a different meaning from project membership.
-  if (/^(?:[a-z]:[/\\]|\/)/i.test(rawPath.trim())) return candidate;
+  if (/^(?:file:|[a-z]:[/\\]|\/)/i.test(rawPath.trim())) return candidate;
   const alternatives = distinctProjectRoots(projectRoots.map((path) => ({ path })))
     .filter((entry) => !isUnder(entry.path, root));
   const matches = await Promise.all(alternatives.map(async ({ path }) => {

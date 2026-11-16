@@ -20,6 +20,15 @@ export interface CursorModel {
 
 export type CursorParamValues = Record<string, string>;
 
+export type CursorCatalogError = "auth" | "failed";
+
+/** 将底层 Cursor 目录探测报错归一化为面板提示类型；开发隔离/主动禁用不报错误。 */
+export function classifyCursorCatalogError(message: string): CursorCatalogError | null {
+  if (/cursor_auth_required|authentication required/i.test(message)) return "auth";
+  if (/disabled in development profiles|^cursor is disabled$/i.test(message.trim())) return null;
+  return "failed";
+}
+
 const PINS_KEY = "ccgui.cursor.visible-models";
 const PARAMS_KEY = "ccgui.cursor.model-parameters";
 export const CURSOR_PREFS_EVENT = "ccgui-cursor-model-prefs";

@@ -16,12 +16,14 @@ vi.mock("@/lib/live-update-bootstrap", () => { fixture.mainImport(); return {}; 
 vi.mock("@/lib/ipc", () => ({ ipc: { refreshAppSettings: fixture.settings } }));
 vi.mock("@/lib/transport", () => ({ listen: fixture.listen }));
 vi.mock("@/lib/i18n", () => ({ default: { language: "en", changeLanguage: vi.fn() } }));
-vi.mock("@/features/settings/theme", () => ({ applyTheme: vi.fn(), THEME_STORAGE_KEY: "test-theme" }));
+vi.mock("@/features/settings/theme", () => ({
+  applyTheme: vi.fn(), applyAppearanceTokens: vi.fn(), readCachedAppearance: () => ({}), THEME_STORAGE_KEY: "test-theme",
+}));
 vi.mock("@/features/settings/font", () => ({ applyFontPreferences: vi.fn(), readCachedFontPreferences: () => ({}) }));
 vi.mock("@/lib/tauri-unlisten-guard", () => ({ installTauriUnlistenGuard: vi.fn() }));
 import { startAssistantNoticesApp } from "./bootstrap";
 import { dismissCrash } from "@/lib/crash";
-import { applyTheme } from "@/features/settings/theme";
+import { applyAppearanceTokens, applyTheme } from "@/features/settings/theme";
 import { applyFontPreferences } from "@/features/settings/font";
 import i18n from "@/lib/i18n";
 
@@ -61,6 +63,7 @@ it("marks the first committed overlay and keeps its cards after the real watchdo
   expect(document.querySelector("[data-notice]")).toBe(notice);
   expect(document.querySelector(".boot-failure")).toBeNull();
   expect(fixture.mainImport).not.toHaveBeenCalled();
+  expect(applyAppearanceTokens).toHaveBeenCalledWith({}, false);
 });
 
 it("leaves the watchdog armed when creating the React root fails", async () => {
@@ -91,6 +94,7 @@ it("follows settings events and ignores stale reads and post-unmount responses",
   fixture.settings.mockResolvedValueOnce({ theme: "light", language: "zh", fontFamily: "custom", fontFile: "font.woff2" });
   await act(async () => changed());
   expect(applyTheme).toHaveBeenLastCalledWith("light");
+  expect(applyAppearanceTokens).toHaveBeenLastCalledWith({ themePreset: undefined, accentColor: undefined });
   expect(applyFontPreferences).toHaveBeenLastCalledWith({ fontFamily: "custom", fontFile: "font.woff2", codeFontFamily: "", codeFontFile: "" });
   expect(i18n.changeLanguage).toHaveBeenLastCalledWith("zh");
   await act(async () => older.resolve({ theme: "dark", language: "en" }));

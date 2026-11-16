@@ -246,7 +246,7 @@ export default function ChatPage() {
         onNewWorktree={handleNewWorktree}
         onDeleteWorktree={handleDeleteWorktree}
       />
-      <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-background-primary-default md:rounded-l-[14px] md:border-l md:border-separator-border">
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-background-primary-default bg-[image:var(--surface-main-backdrop)] md:rounded-l-[14px] md:border-l md:border-separator-border md:[box-shadow:var(--shadow-main-panel)]">
         <SessionTabStrip
           tabs={tabItems}
           activeKey={activeTabKey}

@@ -2,21 +2,25 @@ import { useTranslation } from "react-i18next";
 import FileText from "lucide-react/dist/esm/icons/file-text";
 import FolderOpen from "lucide-react/dist/esm/icons/folder-open";
 import Link2 from "lucide-react/dist/esm/icons/link-2";
+import Chrome from "lucide-react/dist/esm/icons/chrome";
 import { ContextMenu, type ContextMenuEntry } from "@/components/context-menu";
 import { ipc } from "@/lib/ipc";
 import { useFilesStore } from "@/features/files/store";
 import { resolveChatProjectFileLink } from "@/features/chat/project-file-links";
+import { toLocalFileUrl } from "@/lib/fileLinks";
+import { errorText } from "@/lib/errors";
 import {
   OPEN_APP_ICONS,
   OPEN_APP_TARGETS,
   openPathInTarget,
+  openLocalFileInChrome,
   readSelectedOpenAppId,
 } from "@/features/open-app/open-app";
 
 export interface FileLinkMenuState {
   x: number;
   y: number;
-  /** Path as written in the message (may be workspace-relative). */
+  /** Path or local file URL as written in the message (may be workspace-relative). */
   path: string;
   /** Absolute path, or null when unresolvable (`~/`, `../`, empty). */
   resolvedPath: string | null;
@@ -38,8 +42,9 @@ export interface FileLinkMenuState {
  * - 在访达/资源管理器中显示 → OS file manager
  * - 复制链接 → file:// URL for absolute paths, raw path otherwise
  *
- * Failures are silent (console only), mirroring HeaderOpenActions: a missing
- * editor binary isn't worth an error surface in the chat timeline.
+ * HTML links also offer Chrome independently of the selected editor. Chrome
+ * launch failures use the existing global alert so closing the menu cannot
+ * hide a missing-installation or launch error.
  */
 export function FileLinkContextMenu({
   menu,
@@ -63,6 +68,16 @@ export function FileLinkContextMenu({
       : t("files.revealInFileManager");
 
   const resolved = menu.resolvedPath;
+  const isHtml = resolved !== null && /\.html?$/i.test(resolved);
+  const openInChrome = async () => {
+    try {
+      const path = await resolveChatProjectFileLink(menu.path, menu.workspacePath);
+      if (!path) throw new Error(t("files.fileLinkUnresolved"));
+      await openLocalFileInChrome(path);
+    } catch (error) {
+      window.alert(t("files.openInChromeFailed", { error: errorText(error) }));
+    }
+  };
   // The sync `resolved` gates an entry (instant feedback); the async resolver
   // upgrades it to the path actually on disk before the action runs — a link
   // whose file sits nested below the workspace root would otherwise open
@@ -94,6 +109,12 @@ export function FileLinkContextMenu({
           void useFilesStore.getState().openFile(path);
         }),
     },
+    ...(isHtml ? [{
+      id: "open-in-chrome",
+      label: t("files.openInApp", { app: "Chrome" }),
+      icon: <Chrome className="size-4" aria-hidden />,
+      onSelect: () => { void openInChrome(); },
+    }] : []),
     target.kind === "finder"
       ? revealEntry
       : {
@@ -113,7 +134,7 @@ export function FileLinkContextMenu({
       icon: <Link2 className="size-4" aria-hidden />,
       onSelect: () =>
         act((path) => {
-          const link = path.startsWith("/") ? `file://${path}` : path;
+          const link = toLocalFileUrl(path) ?? path;
           void navigator.clipboard.writeText(link).catch(() => {});
         }),
     },

@@ -20,6 +20,8 @@ interface ChatCheckpoint {
   version: 1;
   /** Distinguishes caches captured after historical-source discovery was fixed. */
   archiveSourcesVersion?: 1;
+  /** Distinguishes caches captured after AGY session/load post-response replay drain was fixed. */
+  agyLoadDrainVersion?: 1;
   state: ChatData;
   stream: StreamRuntimeCheckpoint;
   events: ReturnType<typeof captureEngineEventRuntime>;
@@ -62,6 +64,9 @@ function parseCheckpoint(value: unknown): ChatCheckpoint {
     throw new Error("Invalid chat runtime checkpoint");
   }
   const state = candidate.state;
+  if (candidate.agyLoadDrainVersion !== undefined && candidate.agyLoadDrainVersion !== 1) {
+    throw new Error("Invalid AGY load drain checkpoint version");
+  }
   if (candidate.reloadableSessionKeys !== undefined && (!Array.isArray(candidate.reloadableSessionKeys) ||
     candidate.reloadableSessionKeys.some(key => typeof key !== "string"))) throw new Error("Invalid reloadable session evidence");
   if (!STATE_KEYS.every((key) => key in state) || !object(state.bySession) || !object(state.drafts) || !Array.isArray(state.openTabs) || !Array.isArray(state.sessions) || !Array.isArray(state.workspaces)) {
@@ -123,7 +128,7 @@ export function createChatCheckpointParticipant(store: ChatCheckpointStore, get:
       flushPendingStreams(store.setState);
       const state = Object.fromEntries(STATE_KEYS.map((key) => [key, store.getState()[key]])) as ChatData;
       const reloadableSessionKeys = Object.keys(state.bySession).filter(key => hasReloadableHistory(state.bySession[key]));
-      return cloneCheckpointValue({ version: 1, archiveSourcesVersion: 1, state, stream: captureStreamRuntime(), events: captureEngineEventRuntime(), asks: [...askLoops], reloadableSessionKeys });
+      return cloneCheckpointValue({ version: 1, archiveSourcesVersion: 1, agyLoadDrainVersion: 1, state, stream: captureStreamRuntime(), events: captureEngineEventRuntime(), asks: [...askLoops], reloadableSessionKeys });
     },
     restore(value) {
       const snapshot = parseCheckpoint(value);
@@ -135,6 +140,11 @@ export function createChatCheckpointParticipant(store: ChatCheckpointStore, get:
         // Never guess where they belong; AGY's native history owns the saved
         // text. Keep the cache intact until the normal guarded read succeeds.
         if (snapshot.archiveSourcesVersion !== 1 && key.startsWith("agy/") && session.messages.some((m) => m.role === "tool")) {
+          session.historyReloadRequired = true;
+        }
+        // Pre-drain AGY sessions resumed across a compaction checkpoint could append
+        // prior turns' thoughts/text under a newly sent prompt while SQLite stayed clean.
+        if (snapshot.agyLoadDrainVersion !== 1 && key.startsWith("agy/") && session.messages.some((m) => m.role !== "user")) {
           session.historyReloadRequired = true;
         }
         if (session.messages.some((m) => m.model === "<synthetic>")) {

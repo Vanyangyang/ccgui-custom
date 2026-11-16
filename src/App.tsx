@@ -4,7 +4,11 @@ import { HashRouter, Route, Routes } from "react-router-dom";
 import ChatPage from "@/features/chat/ChatPage";
 import { CommandPalette } from "@/features/commands/CommandPalette";
 import PluginPageHost from "@/features/plugins/manager/PluginPageHost";
-import { bindSystemThemeSync, bindThemeChangePersistence } from "@/features/settings/theme";
+import {
+  bindSettingsAppearanceSync,
+  bindSystemThemeSync,
+  bindThemeChangePersistence,
+} from "@/features/settings/theme";
 import { UpdateToast } from "@/features/update/UpdateToast";
 import { useUpdateStore } from "@/features/update/store";
 import { announceReleaseAfterUpgrade } from "@/features/update/upgrade-announcement";
@@ -23,6 +27,7 @@ import { startWorktreeRuntime } from "@/features/worktree/store";
 import { LeaderManagementHost } from "@/features/leader/LeaderManagementHost";
 import { OnboardingTourHost } from "@/features/onboarding/OnboardingTour";
 import { WorkerRecoveryNotice } from "@/features/chat/components/WorkerRecoveryNotice";
+import { startTaskShutdownRuntime } from "@/features/task-shutdown/runtime";
 
 // Settings is a rare route; load it on demand so startup ships less JS.
 // Warm the chunk shortly after startup so the first click has no fetch gap.
@@ -48,6 +53,7 @@ function MainApp() {
   // flips app-wide — this used to live in the settings page, where it only
   // worked while Settings was open.
   useEffect(() => bindSystemThemeSync(), []);
+  useEffect(() => bindSettingsAppearanceSync(), []);
   // Prefetch the settings chunk once startup work has settled.
   useEffect(() => {
     const id = setTimeout(() => void loadSettingsPage(), 2000);
@@ -60,6 +66,7 @@ function MainApp() {
   useEffect(() => startLeaderRuntime(), []);
   useEffect(() => startCollaborationRuntime(), []);
   useEffect(() => startWorktreeRuntime(), []);
+  useEffect(() => startTaskShutdownRuntime(), []);
   // Intercept the window close button so quitting needs a confirmation.
   useEffect(() => installCloseConfirm(), []);
   // Global keyboard-shortcut runtime: one dispatcher handler binding the

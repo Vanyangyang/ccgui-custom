@@ -679,6 +679,47 @@ struct Inner {
     shutdown: bool,
 }
 
+fn shutdown_branch_pending(state: &str) -> bool {
+    !matches!(state, "completed" | "failed" | "stopped" | "handed_off" | "reclaimed")
+}
+
+/// Observe admission reservations and held tasks without refreshing history or
+/// checkpointing the coordinator. Unknown state must not authorize shutdown.
+pub(crate) fn shutdown_activity() -> Result<Vec<String>, String> {
+    let Some(manager) = MANAGER.get() else {
+        return Ok(vec!["child-coordinator-unavailable".into()]);
+    };
+    let child_pending = {
+        let inner = manager.inner.lock();
+        inner.shutdown || !inner.pending_bindings.is_empty() || !inner.retiring.is_empty()
+            || inner.runs.values().any(|run| !run.retired && run.launch_pending)
+            || inner.branches.values().any(|record| record.stopping
+                || shutdown_branch_pending(&record.branch.state)
+                || record.branch.delegation.as_ref().is_some_and(|assignment|
+                    shutdown_branch_pending(&assignment.state)))
+    };
+    let mut reasons = Vec::new();
+    if child_pending { reasons.push("child-tasks".into()); }
+    if parent_wakeup::has_shutdown_activity(&manager.db.0.lock())? {
+        reasons.push("parent-continuations".into());
+    }
+    Ok(reasons)
+}
+
+#[cfg(test)]
+mod shutdown_activity_tests {
+    use super::shutdown_branch_pending;
+    #[test]
+    fn unfinished_and_unknown_children_block_shutdown() {
+        for state in ["starting", "queued", "running", "waiting", "awaiting_cost_approval", "reclaiming", "stopping", "unknown", "future-state"] {
+            assert!(shutdown_branch_pending(state), "{state}");
+        }
+        for state in ["completed", "failed", "stopped", "handed_off", "reclaimed"] {
+            assert!(!shutdown_branch_pending(state), "{state}");
+        }
+    }
+}
+
 pub struct LeaderManager {
     db: Arc<Db>,
     processes: Arc<crate::engine::ProcessRegistry>,

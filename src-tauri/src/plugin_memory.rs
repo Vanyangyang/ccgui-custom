@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use std::{sync::Arc, time::Duration};
 use tauri::{State, WebviewWindow};
 
-pub(crate) use gate::{cancel_all, foreground};
+pub(crate) use gate::{cancel_all, foreground, has_active_work, pause_admission};
 fn permission(plugin: &str, source: Option<&SourceKind>) -> Result<(), String> {
     let (enabled, grants) =
         crate::plugins::plugin_enabled_permissions(plugin).map_err(|_| "plugin_unavailable")?;

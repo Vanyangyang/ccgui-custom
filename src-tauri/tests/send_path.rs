@@ -341,7 +341,9 @@ fn write_fake_codex_responses(fixture: &TestHarness, extra: Vec<(&str, Vec<Value
     #[cfg(windows)]
     let (path, mut script) = (
         fixture.root().join("bin/codex.ps1"),
-        format!("{mark}[IO.File]::WriteAllText('codex-args.json', (ConvertTo-Json -Compress -InputObject @($args)))\r\nwhile ($null -ne ($line = [Console]::In.ReadLine())) {{\r\n[IO.File]::AppendAllText('codex-requests.ndjson', $line + [Environment]::NewLine)\r\n$frame = $line | ConvertFrom-Json\r\nswitch ($frame.method) {{\r\n"),
+        // The app-server protocol is UTF-8 even when Windows defaults stdin to
+        // CP936. A multibyte prompt must not consume a JSON escape character.
+        format!("[Console]::InputEncoding = [Text.UTF8Encoding]::new($false)\r\n[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)\r\n{mark}[IO.File]::WriteAllText('codex-args.json', (ConvertTo-Json -Compress -InputObject @($args)))\r\nwhile ($null -ne ($line = [Console]::In.ReadLine())) {{\r\n[IO.File]::AppendAllText('codex-requests.ndjson', $line + [Environment]::NewLine)\r\n$frame = $line | ConvertFrom-Json\r\nswitch ($frame.method) {{\r\n"),
     );
     #[cfg(unix)]
     let (path, mut script) = (

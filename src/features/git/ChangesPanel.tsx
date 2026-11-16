@@ -14,7 +14,7 @@ import { Tooltip, TooltipContent } from "@/components/base/tooltip/tooltip";
 import { ConfirmDialog } from "@/components/dialogs";
 import { type GitFileEntry, type GitStatus } from "@/lib/ipc";
 import { errorText } from "@/lib/errors";
-import { registerRuntimeCheckpointBlocker } from "@/lib/runtime-checkpoint";
+import { beginRuntimeOperation, registerRuntimeCheckpointBlocker } from "@/lib/runtime-checkpoint";
 import { cx } from "@/utils/cx";
 import { useFilesStore } from "@/features/files/store";
 import { resolveWorkspaceRepository } from "@/features/files/repositorySelection";
@@ -101,7 +101,7 @@ export function ChangesPanel({
   useEffect(() => registerRuntimeCheckpointBlocker(`git-changes:${checkpointId}`, () => [
     ...(checkpointState.current.commitMsg.length || commitDrafts.current.size ? ["unsaved-git-commit-message"] : []),
     ...(pendingOperations.current || Object.keys(checkpointState.current.pending).length ? ["git-operation-pending"] : []),
-  ]), [checkpointId]);
+  ], () => pendingOperations.current || Object.keys(checkpointState.current.pending).length ? ["git-operation-pending"] : []), [checkpointId]);
   /** Paths awaiting discard confirmation (one row or a whole group). */
   const [discardTarget, setDiscardTarget] = useState<string[] | null>(null);
   useLayoutEffect(() => {
@@ -123,7 +123,10 @@ export function ChangesPanel({
     pendingOperations.current++;
     setPending((p) => ({ ...p, [key]: true }));
     setActionError(null);
-    void action()
+    void (async () => {
+      const done = key === "refresh" ? undefined : beginRuntimeOperation("git-panel-mutation");
+      try { return await action(); } finally { done?.(); }
+    })()
       .catch((err: unknown) => { if (targetRef.current === target) setActionError(errorText(err)); })
       .finally(() => {
         pendingOperations.current--;

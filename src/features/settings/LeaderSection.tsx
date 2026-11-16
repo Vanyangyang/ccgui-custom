@@ -8,6 +8,7 @@ import { Collapsible } from "@/components/application/collapsible/collapsible";
 import { SettingsCard, SettingsRow, SettingsSectionLabel } from "@/components/application/settings/settings-rows";
 import { EngineIcon } from "@/components/foundations/icons/engine-icon";
 import { CLI_DISPLAY_NAMES } from "@/components/foundations/icons/engine-brands";
+import { classifyCursorCatalogError } from "@/components/application/ai-chat/cursor-models";
 import { errorText } from "@/lib/errors";
 import { ipc, type AppSettings, type EngineModel } from "@/lib/ipc";
 import { listenSettingsChanged } from "@/lib/events";
@@ -66,18 +67,34 @@ function EnginePolicyCard({ engine, settings, policy, disabled, onChange }: {
   const retry = useActionFeedback({ spin: true });
   const mounted = useRef(false);
   const request = useRef(0);
-  const loadCatalog = useCallback(async () => {
+  const loadCatalog = useCallback(async (force = false) => {
     const currentRequest = ++request.current;
     const active = () => mounted.current && request.current === currentRequest;
     setLoading(true);
     try {
+      let cursorError: "auth" | "failed" | null = null;
+      if (engine === "cursor" && typeof ipc.cursorModelCatalog === "function") {
+        try {
+          await ipc.cursorModelCatalog(force);
+        } catch (reason) {
+          cursorError = classifyCursorCatalogError(errorText(reason));
+        }
+      }
       const result = await ipc.listEngineModels(engine);
-      if (active()) { setCatalog(result.models); setError(null); }
+      if (active()) {
+        setCatalog(result.models);
+        if (cursorError) {
+          const message = t(cursorError === "auth" ? "chat.cursorCatalogAuthRequired" : "chat.cursorCatalogLoadFailed");
+          setError(message);
+          throw new Error(message);
+        }
+        setError(null);
+      }
     } catch (reason) {
       if (active()) setError(errorText(reason));
       throw reason;
     } finally { if (active()) setLoading(false); }
-  }, [engine]);
+  }, [engine, t]);
   useEffect(() => {
     mounted.current = true;
     void loadCatalog().catch(() => {});
@@ -124,7 +141,7 @@ function EnginePolicyCard({ engine, settings, policy, disabled, onChange }: {
             <p role="alert" className="min-w-0 break-words text-body-2-regular text-text-error-primary">
               {t("settings.leaderCatalogError", { error })}
             </p>
-            <Button variant="secondary" size="small" disabled={disabled || loading || retry.feedback === "running"} onClick={() => void retry.start(loadCatalog).catch(() => {})}
+            <Button variant="secondary" size="small" disabled={disabled || loading || retry.feedback === "running"} onClick={() => void retry.start(() => loadCatalog(true)).catch(() => {})}
               aria-label={t("settings.leaderRetryCatalog", { engine: engineLabel })}>
               <ActionFeedbackIcon icon={RefreshCw} feedback={retry.feedback} spin iconClassName="size-[18px]" />
               {t("settings.leaderRetry")}

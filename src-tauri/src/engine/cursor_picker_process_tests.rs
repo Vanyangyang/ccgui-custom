@@ -149,6 +149,20 @@ async fn expired_auth_failure_can_refresh_and_binary_change_invalidates_cache() 
 }
 
 #[tokio::test]
+async fn forced_refresh_bypasses_cached_auth_error() {
+    let fixture = Fixture::new();
+    let cache = CatalogCache::default();
+    let error = cached_catalog_with_force(&cache, "fake", false, request_catalog_command(fixture.command("auth"), Duration::from_secs(5))).await.unwrap_err();
+    assert!(error.starts_with("cursor_auth_required:"));
+    fixture.assert_tree_stopped().await;
+    std::fs::remove_file(fixture.0.join("child.pid")).unwrap();
+    let models = cached_catalog_with_force(&cache, "fake", true, request_catalog_command(fixture.command("success"), Duration::from_secs(5))).await.unwrap();
+    assert_eq!(models[0].id, "fixture-model");
+    assert_eq!(fixture.lines("launches").len(), 2);
+    fixture.assert_tree_stopped().await;
+}
+
+#[tokio::test]
 async fn total_deadline_and_protocol_failure_sweep_descendants() {
     for mode in ["notifications", "failure"] {
         let fixture = Fixture::new();

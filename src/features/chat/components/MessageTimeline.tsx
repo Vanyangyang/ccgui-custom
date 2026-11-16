@@ -396,7 +396,7 @@ function UserMessageRow({
           {stripped.agentName}
         </span>
       )}
-      <div className="flex w-fit min-w-0 max-w-[72%] flex-col rounded-xl bg-bubble-user px-3.5 py-2.5 text-left text-body-regular whitespace-pre-wrap [overflow-wrap:anywhere] text-text-white max-md:max-w-[85%]">
+      <div className="flex w-fit min-w-0 max-w-[72%] flex-col rounded-2xl bg-bubble-user bg-[image:var(--gradient-bubble-user)] px-3.5 py-2.5 text-left text-body-regular whitespace-pre-wrap [overflow-wrap:anywhere] text-text-white [box-shadow:var(--shadow-bubble-user)] max-md:max-w-[85%]">
         <CollapsibleMessage>
           {message.images && message.images.length > 0 && (
             <MessageImages images={message.images} workspacePath={workspacePath} />

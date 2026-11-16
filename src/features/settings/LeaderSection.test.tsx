@@ -507,4 +507,26 @@ describe("LeaderSection", () => {
     await act(async () => read.resolve(stored));
     expect(updateAppSettings).not.toHaveBeenCalled();
   });
+
+  it("reports Cursor CLI re-login error when cursorModelCatalog rejects with auth required", async () => {
+    const { ipc } = await import("@/lib/ipc");
+    const spy = vi.fn(async (): Promise<Array<{ id: string; name: string; parameters: never[] }>> => {
+      throw "cursor_auth_required: Sign in to Cursor explicitly before refreshing models";
+    });
+    (ipc as unknown as { cursorModelCatalog?: typeof spy }).cursorModelCatalog = spy;
+    try {
+      await render();
+      expect(container.textContent).toContain(i18n.t("chat.cursorCatalogAuthRequired"));
+      spy.mockResolvedValueOnce([{ id: "grok-4.7", name: "Grok 4.7", parameters: [] }]);
+      const retryButtons = [...container.querySelectorAll<HTMLButtonElement>("button")].filter(
+        (item) => item.textContent === i18n.t("settings.leaderRetry"),
+      );
+      expect(retryButtons).toHaveLength(1);
+      await click(retryButtons[0]);
+      expect(spy).toHaveBeenLastCalledWith(true);
+      expect(container.textContent).not.toContain(i18n.t("chat.cursorCatalogAuthRequired"));
+    } finally {
+      delete (ipc as unknown as { cursorModelCatalog?: typeof spy }).cursorModelCatalog;
+    }
+  });
 });

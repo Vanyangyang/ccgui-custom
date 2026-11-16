@@ -37,6 +37,20 @@ const generalEntries: SettingsSearchEntry[] = [
     labelKey: "settings.theme",
     sectionKey: "settings.appearance",
   },
+  {
+    page: "general",
+    anchor: "themePreset",
+    labelKey: "settings.themePreset",
+    sectionKey: "settings.appearance",
+    keywords: ["style", "preset", "warm", "aurora", "mist", "配色", "风格", "护眼", "暖色"],
+  },
+  {
+    page: "general",
+    anchor: "accentColor",
+    labelKey: "settings.accentColor",
+    sectionKey: "settings.appearance",
+    keywords: ["accent", "color", "tint", "强调色", "主题色", "颜色"],
+  },
   // 标题栏样式只在原生 Windows 渲染；其他平台不索引，避免搜索结果
   // 命中一个当前平台根本没渲染的行。
   ...(IS_WINDOWS && !isWeb
@@ -85,6 +99,32 @@ const generalEntries: SettingsSearchEntry[] = [
     labelKey: "settings.onboardingEntry",
     sectionKey: "settings.appearance",
     keywords: ["onboarding", "guide", "tour", "引导", "教程", "新手"],
+  },
+  {
+    page: "general",
+    anchor: "chatBackdrop",
+    labelKey: "settings.chatBackdrop",
+    sectionKey: "settings.appearance",
+    keywords: [
+      "backdrop",
+      "background",
+      "wallpaper",
+      "particle",
+      "wave",
+      "grid",
+      "diy",
+      "contrast",
+      "背景",
+      "壁纸",
+      "粒子",
+      "波浪",
+      "正方形",
+      "科技",
+      "网格",
+      "对比度",
+      "护眼",
+      "自定义背景",
+    ],
   },
   // 行为
   {

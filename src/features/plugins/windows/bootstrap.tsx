@@ -6,6 +6,17 @@ import { AppCrashBoundary } from "@/components/crash/AppCrashBoundary";
 import { installGlobalCrashHandlers } from "@/lib/crash";
 import { installTauriUnlistenGuard } from "@/lib/tauri-unlisten-guard";
 import { applyFontPreferences, readCachedFontPreferences } from "@/features/settings/font";
+import {
+  applyBackdropPreferences,
+  notifyBackdropThemeChanged,
+  readCachedBackdropPreferences,
+} from "@/features/settings/backdrop";
+import {
+  applyAppearanceTokens,
+  bindCachedAppearanceSync,
+  readCachedAppearance,
+} from "@/features/settings/theme";
+import { ConversationBackdrop } from "@/features/chat/components/ConversationBackdrop";
 import i18n from "@/lib/i18n";
 import { invoke } from "@/lib/transport";
 import type { HostImagesApi, PluginDetachedRenderer, PluginDetachedSurfaceProps, PluginImageAttachment } from "@ccgui/plugin-sdk";
@@ -93,7 +104,14 @@ export function PluginWindow({ client }: { client: DetachedSurfaceClient }) {
   const dark = React.useSyncExternalStore(client.subscribe, client.getDark, client.getDark);
   const content = React.useRef<HTMLDivElement>(null);
   React.useLayoutEffect(() => { if (content.current) content.current.inert = status.phase !== "detached"; }, [status.phase]);
-  React.useEffect(() => { document.documentElement.classList.toggle("dark", dark); }, [dark]);
+  React.useEffect(() => {
+    document.documentElement.classList.toggle("dark", dark);
+    notifyBackdropThemeChanged();
+  }, [dark]);
+  React.useEffect(() => {
+    applyBackdropPreferences(readCachedBackdropPreferences(), false);
+    return bindCachedAppearanceSync();
+  }, []);
   React.useEffect(() => {
     let alive = true;
     let style: HTMLStyleElement | undefined;
@@ -118,15 +136,16 @@ export function PluginWindow({ client }: { client: DetachedSurfaceClient }) {
   const needsRecovery = ["recovering", "unavailable", "error"].includes(status.phase) || Boolean(status.returnBlocked);
   // Own the viewport and the containing block. Out-of-flow renderer content
   // must not enlarge the document and let scrolling carry the whole window away.
-  return <div className="fixed inset-0 flex min-h-0 min-w-0 flex-col overflow-hidden bg-background-primary-default text-text-primary" data-plugin-window-root>
-    <header className="flex min-h-12 shrink-0 items-center gap-3 border-b border-border-primary px-4 py-2">
+  return <div className="fixed inset-0 isolate flex min-h-0 min-w-0 flex-col overflow-hidden bg-background-primary-default text-text-primary [background-image:var(--surface-main-backdrop)]" data-plugin-window-root>
+    <ConversationBackdrop />
+    <header className="relative z-10 flex min-h-11 shrink-0 items-center gap-3 border-b border-border-primary bg-[var(--color-tabstrip-bg)] px-4 py-1.5 backdrop-blur-md">
       <span className="min-w-0 flex-1 truncate text-sm font-medium">{loaded?.info.title ?? t("plugins.detached.loading")}</span>
       <Button variant="secondary" size="small" disabled={status.phase !== "detached"}
         onClick={() => void client.requestReturn().catch(() => {})}>{labels?.returnToMain ?? t("plugins.detached.returnToMain")}</Button>
     </header>
     {needsRecovery ? <DetachedRecoveryPanel client={client} status={status} getContent={() => content.current} />
-      : (loadFailed || status.error) && <p role="alert" className="shrink-0 px-4 py-3 text-sm text-text-secondary">{errorText}</p>}
-    <div ref={content} className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+      : (loadFailed || status.error) && <p role="alert" className="relative z-10 shrink-0 px-4 py-3 text-sm text-text-secondary">{errorText}</p>}
+    <div ref={content} className="relative z-10 flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
       {Renderer && snapshot
         ? <RenderBoundary fallback={<p role="alert" className="p-4 text-sm">{errorText}</p>}>
           <Renderer snapshot={snapshot.state} dispatch={dispatch} registerReturnGuard={client.registerReturnGuard} />
@@ -139,6 +158,8 @@ export function PluginWindow({ client }: { client: DetachedSurfaceClient }) {
 /** This document never starts chat, plugin activation or main live-update. */
 export function startPluginWindowApp() {
   installTauriUnlistenGuard(); installGlobalCrashHandlers();
+  applyAppearanceTokens(readCachedAppearance(), false);
+  applyBackdropPreferences(readCachedBackdropPreferences(), false);
   applyFontPreferences(readCachedFontPreferences());
   const client = createDetachedSurfaceClient({ messages: { pending: i18n.t("plugins.detached.recovering"), notSent: i18n.t("plugins.detached.queuedNotSent") } });
   const root = createRoot(document.getElementById("root")!);

@@ -211,4 +211,29 @@ describe("EngineModelPanel channel picker", () => {
     expect(container.querySelector('[role="switch"]')).toBeNull();
   });
 
+  it("renders the Cursor re-login alert even when no concrete models are loaded", () => {
+    const onRefresh = vi.fn(async () => {});
+    act(() => {
+      root.render(
+        <EngineModelPanel
+          option={{ id: "cursor", label: "Cursor CLI" }}
+          models={[]}
+          selectedModelId="auto"
+          query=""
+          onQueryChange={() => {}}
+          effort="medium"
+          onPickModel={() => {}}
+          onEffortChange={() => {}}
+          onRefresh={onRefresh}
+          cursorModels={[]}
+          cursorCatalogError="auth"
+        />,
+      );
+    });
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain(
+      i18n.t("chat.cursorCatalogAuthRequired"),
+    );
+    expect(container.textContent).not.toContain(i18n.t("chat.noMatchingModels"));
+  });
+
 });

@@ -321,12 +321,24 @@ type CatalogResult = Result<Vec<CursorPickerModel>, String>;
 struct CachedCatalog { bin: String, expires: Instant, result: CatalogResult }
 type CatalogCache = tokio::sync::Mutex<Option<CachedCatalog>>;
 
-async fn cached_catalog(cache: &CatalogCache, bin: &str, query: impl std::future::Future<Output = CatalogResult>) -> CatalogResult {
+fn catalog_cache() -> &'static CatalogCache {
+    static CACHE: OnceLock<CatalogCache> = OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+async fn cached_catalog_with_force(
+    cache: &CatalogCache,
+    bin: &str,
+    force: bool,
+    query: impl std::future::Future<Output = CatalogResult>,
+) -> CatalogResult {
     // Holding this bounded, single-entry lock through the probe gives all
     // concurrent callers one answer without detached background login work.
     let mut cache = cache.lock().await;
-    if let Some(entry) = cache.as_ref().filter(|entry| entry.bin == bin && Instant::now() < entry.expires) {
-        return entry.result.clone();
+    if !force {
+        if let Some(entry) = cache.as_ref().filter(|entry| entry.bin == bin && Instant::now() < entry.expires) {
+            return entry.result.clone();
+        }
     }
     let result = query.await;
     let ttl = if result.is_ok() { 60 } else { 10 };
@@ -334,9 +346,17 @@ async fn cached_catalog(cache: &CatalogCache, bin: &str, query: impl std::future
     result
 }
 
+#[cfg(test)]
+async fn cached_catalog(cache: &CatalogCache, bin: &str, query: impl std::future::Future<Output = CatalogResult>) -> CatalogResult {
+    cached_catalog_with_force(cache, bin, false, query).await
+}
+
 pub async fn cursor_picker_catalog(bin: &str) -> Result<Vec<CursorPickerModel>, String> {
-    static CACHE: OnceLock<CatalogCache> = OnceLock::new();
-    cached_catalog(CACHE.get_or_init(Default::default), bin, async {
+    cursor_picker_catalog_with_force(bin, false).await
+}
+
+pub async fn cursor_picker_catalog_with_force(bin: &str, force: bool) -> Result<Vec<CursorPickerModel>, String> {
+    cached_catalog_with_force(catalog_cache(), bin, force, async {
         let mut command = super::command_for_binary(bin);
         command.arg("acp");
         request_catalog_command(command, Duration::from_secs(20)).await
@@ -357,9 +377,9 @@ pub(super) fn catalog_binary() -> Result<String, String> {
 }
 
 #[tauri::command]
-pub async fn cursor_model_catalog() -> Result<Vec<CursorPickerModel>, String> {
+pub async fn cursor_model_catalog(force: Option<bool>) -> Result<Vec<CursorPickerModel>, String> {
     let bin = catalog_binary()?;
-    cursor_picker_catalog(&bin).await
+    cursor_picker_catalog_with_force(&bin, force.unwrap_or(false)).await
 }
 
 #[cfg(test)]

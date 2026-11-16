@@ -298,10 +298,10 @@ export function Composer({
       ref={wrapperRef}
       data-onboarding-target="composer"
       className={cx(
-        "relative flex w-full flex-col gap-1 rounded-2xl border p-2 shadow-xs",
+        "relative flex w-full flex-col gap-1 rounded-2xl border p-2",
         isCollapsed
           ? "h-2 gap-0 border-transparent bg-transparent p-0 shadow-none"
-          : "border-separator-border bg-background-primary-default",
+          : "border-[color:var(--color-composer-border)] bg-[color:var(--color-composer-bg)] [box-shadow:var(--shadow-composer)] transition-[border-color,box-shadow] duration-200 focus-within:border-[color:var(--color-composer-focus-border)] focus-within:[box-shadow:var(--shadow-composer-focus)]",
         className,
       )}
     >

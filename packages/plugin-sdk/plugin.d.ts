@@ -267,6 +267,8 @@ export interface ConversationCatalog {
   workspaces: Array<{ id: string; path: string; name: string }>;
 }
 export interface ConversationViewProps { conversation: unknown; readOnly?: boolean; onAction?: (action: ConversationViewAction) => void }
+/** openFile.path is the original file path or local file: URL. Forward it
+ * unchanged to the host action handler; pre-decoding may corrupt filenames. */
 export type ConversationViewAction = { type: "openFile"; path: string; sourceId?: string; expectedRevision?: number } | HostTaskConversationAction;
 export type ConversationViewComponent = ComponentLike<ConversationViewProps>;
 /** Desktop owner only, host:chat. Persistent read-only discussion branches;
@@ -801,7 +803,8 @@ export type HostTaskManagedHandoffResult = {
 };
 /** Displayed pending identity is mandatory for mutating native actions. sourceId
  * is a renderer routing hint; the owning request and current native record are
- * independently validated by the host. */
+ * independently validated by the host. openFile.path is the original file path
+ * or local file: URL; forward it unchanged without pre-decoding. */
 export type HostTaskConversationAction = {
   sourceId?: string;
   conversationRequestId: string;

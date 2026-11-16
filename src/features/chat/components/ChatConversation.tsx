@@ -12,7 +12,7 @@ import {
   type ModelOption,
 } from "@/components/application/ai-chat/cli-menu";
 import { useCursorModelPrefs } from "@/components/application/ai-chat/cursor-model-picker";
-import { cursorContextTokens, matchCursorBase, type CursorModel } from "@/components/application/ai-chat/cursor-models";
+import { cursorContextTokens, matchCursorBase, type CursorCatalogError, type CursorModel } from "@/components/application/ai-chat/cursor-models";
 import {
   effectivePermission,
   useChatStore,
@@ -23,6 +23,7 @@ import {
 } from "../store";
 
 import { MessageTimeline } from "./MessageTimeline";
+import { ConversationBackdrop } from "./ConversationBackdrop";
 import { ConversationFooter } from "./ConversationFooter";
 import { ClaudeHaikuAssistControl } from "./ClaudeHaikuAssistControl";
 import { useComposerActions } from "./use-composer-actions";
@@ -154,6 +155,7 @@ function useConversationMenus({
   loadingEngines,
   allowedEngines,
   cursorModels,
+  cursorCatalogError,
 }: {
   engines: EngineInfo[];
   engineInfo: EngineInfo | undefined;
@@ -184,6 +186,7 @@ function useConversationMenus({
   /** 接管工作区(桥返回非 null):仅列允许表内引擎(null = 不过滤)。 */
   allowedEngines: string[] | null;
   cursorModels?: CursorModel[];
+  cursorCatalogError?: CursorCatalogError | null;
 }) {
   const { t } = useTranslation();
   const navigate = useNavigate();
@@ -259,6 +262,7 @@ function useConversationMenus({
           onRefreshModels={refreshModels}
           loadingEngines={loadingEngines}
           cursorModels={cursorModels}
+          cursorCatalogError={cursorCatalogError}
         />
       ),
     [
@@ -286,6 +290,7 @@ function useConversationMenus({
       refreshModels,
       loadingEngines,
       cursorModels,
+      cursorCatalogError,
     ],
   );
   const permissionMenu = useMemo(
@@ -452,6 +457,7 @@ export const ChatConversation = memo(function ChatConversation({
     modelsByEngine,
     channelsByEngine,
     cursorPickerModels,
+    cursorCatalogError,
     refresh: refreshModels,
     pendingEngines,
   } = useEngineModels(engines, models, pinModels, displayProviders, active?.workspacePath);
@@ -570,6 +576,7 @@ export const ChatConversation = memo(function ChatConversation({
       refreshModels,
       loadingEngines,
       cursorModels: cursorPickerModels,
+      cursorCatalogError,
     });
 
   if (active && conversationMode.exitBlocked && !conversationMode.mode) {
@@ -591,7 +598,8 @@ export const ChatConversation = memo(function ChatConversation({
       <ImageAnnotationTargetProvider value={annotationTarget}>
       <div className="flex min-h-0 min-w-0 flex-1 overflow-hidden max-md:flex-col">
         {/* 【拖放】整列都是落点：消息区和输入区都能把文件拖进当前对话。 */}
-        <div data-conversation-file-drop="" className="relative flex min-h-0 min-w-0 flex-1 flex-col">
+        <div data-conversation-file-drop="" className="relative isolate flex min-h-0 min-w-0 flex-1 flex-col">
+        <ConversationBackdrop />
         <ConversationBody
           active={active}
           hasSession={hasSession}

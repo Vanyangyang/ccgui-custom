@@ -148,8 +148,8 @@ export function SessionTab({
         "group relative flex h-7 max-w-48 shrink-0 cursor-default items-center gap-1.5 rounded-lg px-2.5 text-body-medium transition-colors",
         dragged && "opacity-50",
         isActive
-          ? "bg-background-secondary-default text-text-primary"
-          : "text-text-tertiary hover:bg-background-secondary-hover hover:text-text-secondary",
+          ? "bg-[color:var(--color-tab-active-bg)] text-text-primary [box-shadow:var(--shadow-tab-active)] ring-1 ring-inset ring-[color:var(--color-tab-active-border)]"
+          : "text-text-tertiary hover:bg-background-secondary-hover/70 hover:text-text-secondary",
       )}
     >
       <div

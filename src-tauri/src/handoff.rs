@@ -31,11 +31,19 @@ static ACTIVITIES: LazyLock<Mutex<HashMap<&'static str, usize>>> =
 pub(crate) struct Activity(&'static str);
 pub(crate) fn activity(kind: &'static str) -> Result<Activity, String> {
     let mut active = ACTIVITIES.lock().unwrap_or_else(|p| p.into_inner());
-    if crate::worker_host::paused() {
+    admit_activity(&mut active, kind, crate::worker_host::paused())?;
+    Ok(Activity(kind))
+}
+fn admit_activity(
+    active: &mut HashMap<&'static str, usize>,
+    kind: &'static str,
+    paused: bool,
+) -> Result<(), String> {
+    if paused {
         return Err("Runtime update is briefly pausing new native work".into());
     }
     *active.entry(kind).or_default() += 1;
-    Ok(Activity(kind))
+    Ok(())
 }
 impl Drop for Activity {
     fn drop(&mut self) {
@@ -383,7 +391,7 @@ async fn blocker_snapshot(app: &tauri::AppHandle) -> crate::worker_host::Blocker
         blockers.push("agy-acp-turn-active".into());
     }
     blockers.extend(crate::plugin_windows::blocking_reasons());
-    blockers.extend(activities.into_iter().map(str::to_owned));
+    blockers.extend(update_activity_reasons(&activities));
     if !CURRENT
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -399,7 +407,177 @@ async fn blocker_snapshot(app: &tauri::AppHandle) -> crate::worker_host::Blocker
 static ACTIVE_AUTO_BUILDS: LazyLock<Mutex< std::collections::HashSet<String>>> =
     LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 
+struct AutoBuildActivity {
+    batch_id: String,
+    _activity: Activity,
+}
+impl Drop for AutoBuildActivity {
+    fn drop(&mut self) {
+        ACTIVE_AUTO_BUILDS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.batch_id);
+    }
+}
+
+fn update_activity_reasons(activities: &[&str]) -> Vec<String> {
+    // The builder owns this shutdown barrier through prepare_self_update; it
+    // must not block its own handoff. Other native activities still block it.
+    activities.iter().copied()
+        .filter(|kind| *kind != "runtime-update-work")
+        .map(str::to_owned)
+        .collect()
+}
+
+fn shutdown_activity_reasons(activities: &HashMap<&'static str, usize>) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if activities.get("plugin-processes").is_some_and(|count| *count > 0) {
+        // Plugin polling must drain before shutdown, but does not restart the
+        // AI-task idle countdown on every short read operation.
+        reasons.push("native-operations".into());
+    }
+    if activities.iter().any(|(kind, count)| *kind != "plugin-processes" && *count > 0) {
+        reasons.push("background-work".into());
+    }
+    reasons
+}
+
+#[cfg(test)]
+mod shutdown_activity_classification_tests {
+    use super::{shutdown_activity_reasons, update_activity_reasons};
+    use std::collections::HashMap;
+
+    #[test]
+    fn plugin_poll_is_a_drain_barrier_not_an_ai_task() {
+        let activities = HashMap::from([("plugin-processes", 2)]);
+        assert_eq!(shutdown_activity_reasons(&activities), ["native-operations"]);
+    }
+
+    #[test]
+    fn actual_background_work_keeps_its_task_barrier() {
+        for kind in ["worktree-creation", "auto-title-pending", "runtime-update-work", "future-work"] {
+            assert_eq!(shutdown_activity_reasons(&HashMap::from([(kind, 1)])), ["background-work"]);
+        }
+    }
+
+    #[test]
+    fn auto_builder_blocks_shutdown_but_not_its_own_update_handoff() {
+        assert!(update_activity_reasons(&["runtime-update-work"]).is_empty());
+        assert_eq!(
+            shutdown_activity_reasons(&HashMap::from([("runtime-update-work", 1)])),
+            ["background-work"]
+        );
+        assert_eq!(
+            update_activity_reasons(&["runtime-update-work", "plugin-processes", "worktree-creation", "auto-title-pending"]),
+            ["plugin-processes", "worktree-creation", "auto-title-pending"]
+        );
+    }
+
+    #[test]
+    fn mixed_work_retains_both_barriers_until_each_activity_releases() {
+        let mut activities = HashMap::from([("plugin-processes", 1), ("worktree-creation", 1)]);
+        assert_eq!(shutdown_activity_reasons(&activities), ["native-operations", "background-work"]);
+        activities.remove("worktree-creation");
+        assert_eq!(shutdown_activity_reasons(&activities), ["native-operations"]);
+        activities.remove("plugin-processes");
+        assert!(shutdown_activity_reasons(&activities).is_empty());
+    }
+
+    #[test]
+    fn finished_service_spawn_does_not_keep_an_activity_barrier() {
+        // exec_spawn holds an activity only until it registers the service;
+        // service ownership is deliberately outside this activity input.
+        let mut activities = HashMap::from([("plugin-processes", 1)]);
+        assert_eq!(shutdown_activity_reasons(&activities), ["native-operations"]);
+        activities.remove("plugin-processes");
+        assert!(shutdown_activity_reasons(&activities).is_empty());
+        // Defensive handling if a caller retains an already released counter.
+        activities.insert("plugin-processes", 0);
+        activities.insert("auto-title-pending", 0);
+        assert!(shutdown_activity_reasons(&activities).is_empty());
+    }
+
+    #[test]
+    fn auto_build_admission_is_visible_to_the_shutdown_check_after_pause() {
+        use super::admit_activity;
+        use std::sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex, mpsc};
+
+        let activities = Arc::new(Mutex::new(HashMap::new()));
+        let paused = Arc::new(AtomicBool::new(false));
+        let (read_tx, read_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let builder = {
+            let activities = activities.clone();
+            let paused = paused.clone();
+            std::thread::spawn(move || {
+                // Match activity(): the paused read and registration share the
+                // activity mutex with shutdown's final observation.
+                let mut active = activities.lock().unwrap();
+                let was_paused = paused.load(Ordering::SeqCst);
+                read_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+                admit_activity(&mut active, "runtime-update-work", was_paused).unwrap();
+            })
+        };
+        read_rx.recv().unwrap();
+        paused.store(true, Ordering::SeqCst);
+        assert!(activities.try_lock().is_err());
+        resume_tx.send(()).unwrap();
+        builder.join().unwrap();
+        let mut active = activities.lock().unwrap();
+        assert_eq!(shutdown_activity_reasons(&active), ["background-work"]);
+        // A build arriving after the pause cannot register or poll a batch.
+        assert!(admit_activity(&mut active, "runtime-update-work", paused.load(Ordering::SeqCst)).is_err());
+        assert_eq!(active.get("runtime-update-work"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn cancelled_auto_build_releases_registration_and_activity() {
+        use super::{Activity, AutoBuildActivity, ACTIVE_AUTO_BUILDS, ACTIVITIES};
+        const KIND: &str = "auto-build-cancellation-test";
+        let batch_id = uuid::Uuid::new_v4().to_string();
+        // Isolate this lifetime test from the process-global worker pause flag.
+        ACTIVITIES.lock().unwrap().insert(KIND, 1);
+        ACTIVE_AUTO_BUILDS.lock().unwrap().insert(batch_id.clone());
+        let build = AutoBuildActivity { batch_id: batch_id.clone(), _activity: Activity(KIND) };
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _build = build;
+            started_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(!ACTIVE_AUTO_BUILDS.lock().unwrap().contains(&batch_id));
+        assert!(!ACTIVITIES.lock().unwrap().contains_key(KIND));
+    }
+}
+
+/// Pure activity observation, separate from update-preservation blockers.
+pub(crate) fn shutdown_activity() -> Result<Vec<String>, String> {
+    let mut reasons = shutdown_activity_reasons(
+        &*ACTIVITIES.lock().map_err(|_| "Background activity unavailable")?);
+    if !ACTIVE_AUTO_BUILDS.lock().map_err(|_| "Runtime update activity unavailable")?.is_empty() {
+        reasons.push("runtime-update-work".into());
+    }
+    if CURRENT.lock().map_err(|_| "Runtime update state unavailable")?.fence.is_some()
+        || PRESERVING.load(Ordering::SeqCst)
+    {
+        reasons.push("runtime-updating".into());
+    }
+    Ok(reasons)
+}
+
+pub(crate) async fn task_shutdown_operation() -> tokio::sync::MutexGuard<'static, ()> {
+    OPERATIONS.lock().await
+}
+
 fn ensure_auto_build() {
+    // Register before even polling the update channel. Shutdown observes this
+    // under the same mutex as the paused check, so accepted builders cannot hide
+    // in a check/register gap and later builders cannot start after the fence.
+    let Ok(activity) = activity("runtime-update-work") else { return; };
     let Ok(update) = store() else { return; };
     let Ok(Some(batch)) = update.poll_update_request() else { return; };
     if !ACTIVE_AUTO_BUILDS
@@ -409,7 +587,9 @@ fn ensure_auto_build() {
     {
         return;
     }
+    let build = AutoBuildActivity { batch_id: batch.id.clone(), _activity: activity };
     tauri::async_runtime::spawn(async move {
+        let _build = build;
         let batch_id = batch.id.clone();
         let owner = batch.owner.clone();
         if let Err(reason) = run_auto_build_batch(batch).await {
@@ -423,10 +603,6 @@ fn ensure_auto_build() {
                 eprintln!("self-update batch {batch_id} failure could not release its channel: {error}");
             }
         }
-        ACTIVE_AUTO_BUILDS
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(&batch_id);
     });
 }
 

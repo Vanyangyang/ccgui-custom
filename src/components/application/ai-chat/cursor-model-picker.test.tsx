@@ -133,3 +133,29 @@ it("reflects settings changes from another entry without re-authorizing removed 
   expect(modelSwitch().checked).toBe(false);
   expect(updateCursorModelSelection).not.toHaveBeenCalled();
 });
+
+it("shows an explicit re-login prompt with a refresh action when auth expires", async () => {
+  const onRefreshCatalog = vi.fn(async () => {});
+  const autoOnly: CursorModel[] = [{ id: "auto", name: "Auto", parameters: [] }];
+  await act(async () => {
+    root.render(
+      <CursorModelList
+        models={autoOnly}
+        selectedModelId="auto"
+        query=""
+        catalogError="auth"
+        onRefreshCatalog={onRefreshCatalog}
+        onPick={onPick}
+      />,
+    );
+  });
+  const alert = host.querySelector('[role="alert"]');
+  expect(alert?.textContent).toContain(i18n.t("chat.cursorCatalogAuthRequired"));
+  expect(host.querySelector<HTMLInputElement>('input[type="checkbox"]')?.disabled).toBe(true);
+  const refresh = [...alert!.querySelectorAll<HTMLButtonElement>("button")].find(
+    (node) => node.textContent === i18n.t("common.refresh"),
+  );
+  expect(refresh).toBeDefined();
+  await act(async () => { refresh!.click(); });
+  expect(onRefreshCatalog).toHaveBeenCalledOnce();
+});

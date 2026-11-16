@@ -2,6 +2,18 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { selectAgyContext } from "./agy-context";
 
 describe("AGY context provenance", () => {
+  it("uses the official 512K capacity for percentage without changing usage metadata", () => {
+    const usage = {
+      context_usage_kind: "current_context", context_usage_source: "acp_usage_update",
+      context_usage: { input_tokens: 256_000, output_tokens: 0 }, model_context_window: 512_000,
+    };
+    expect(selectAgyContext(usage, 1_048_576)).toMatchObject({
+      max: 512_000, reportedMax: 512_000, total: 256_000, pct: 50, occupancyKnown: true,
+      noteKey: undefined,
+    });
+    expect(usage.model_context_window).toBe(512_000);
+  });
+
   it("shows empty official occupancy and prioritizes its capacity over model windows", () => {
     for (const used of [100_000, 20_000, 0]) {
       expect(selectAgyContext({

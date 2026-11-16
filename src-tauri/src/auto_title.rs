@@ -341,6 +341,10 @@ async fn evaluate_inner(
     config: &NamingConfig,
     origin: Option<&origin::SettledOrigin>,
 ) -> Result<Evaluation, Stop> {
+    // Manual title generation can start while all chat runs are idle. Share the
+    // native admission fence so a final shutdown check cannot miss that launch.
+    let _activity = crate::handoff::activity("auto-title-pending")
+        .map_err(|_| Stop::Failed("failed"))?;
     EVALUATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let _lifetime = EvaluationLifetime;
     check_origin_cancelled(origin)?;

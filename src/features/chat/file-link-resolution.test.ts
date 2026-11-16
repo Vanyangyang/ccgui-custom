@@ -83,4 +83,22 @@ describe("resolveChatFileLink", () => {
     expect(await resolveChatFileLink("~/notes.txt", WS)).toBeNull();
     expect(await resolveChatFileLink("   ", WS)).toBeNull();
   });
+
+  it("resolves local file URLs without re-decoding their filenames", async () => {
+    expect(await resolveChatFileLink("file:///D:/a%2520b%23L53", WS)).toBe("D:/a%20b#L53");
+    expect(mocks.listDir).not.toHaveBeenCalled();
+    expect(mocks.listFileIndex).not.toHaveBeenCalled();
+  });
+
+  it("never rebinds a missing absolute file URL to another project", async () => {
+    mocks.listFileIndex.mockImplementation(async (path) => path === "/other" ? [{ rel: "a.wav", isDir: false }] : []);
+    expect(await resolveChatFileLink("file:///workspace/a.wav", "/workspace", ["/other"])).toBe("/workspace/a.wav");
+    expect(mocks.listFileIndex).not.toHaveBeenCalledWith("/other", true);
+  });
+
+  it("rejects remote file URLs before any filesystem lookup", async () => {
+    expect(await resolveChatFileLink("file://server/share/a.wav", WS)).toBeNull();
+    expect(mocks.listDir).not.toHaveBeenCalled();
+    expect(mocks.listFileIndex).not.toHaveBeenCalled();
+  });
 });

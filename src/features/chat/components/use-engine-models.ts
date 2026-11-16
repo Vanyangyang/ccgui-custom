@@ -3,12 +3,15 @@ import { useTranslation } from "react-i18next";
 import type { ModelOption } from "@/components/application/ai-chat/cli-menu";
 import type { ChannelOption } from "@/components/application/ai-chat/engine-model-panel";
 import {
+  classifyCursorCatalogError,
   collapseCursorModels,
   matchCursorBase,
   publishCursorCatalog,
   seedCursorParamsFromSlug,
+  type CursorCatalogError,
   type CursorModel,
 } from "@/components/application/ai-chat/cursor-models";
+import { errorText } from "@/lib/errors";
 import { ipc, type CliConfig, type CursorCatalogModel, type EngineCatalog, type EngineInfo } from "@/lib/ipc";
 import {
   CLI_CONFIG_CHANGED_EVENT,
@@ -38,6 +41,8 @@ export interface EngineModelsState {
   channelsByEngine: Record<string, ChannelOption[]>;
   /** 本地 Cursor 的基础模型。远程工作区为空，选择器退回该环境自己的目录。 */
   cursorPickerModels: CursorModel[];
+  /** 本地 Cursor ACP 目录认证过期或获取失败时的显式提示状态。 */
+  cursorCatalogError?: CursorCatalogError | null;
   refresh: () => Promise<void>;
   pendingEngines: Record<string, true>;
   currentChannels: Record<string, string>;
@@ -112,6 +117,7 @@ export function useEngineModels(
   );
   // 【cursor模型】ACP 目录带上下文等参数；失败时留空，改由文本目录折叠。
   const [cursorCatalog, setCursorCatalog] = useState<CursorModel[] | null>(null);
+  const [cursorCatalogError, setCursorCatalogError] = useState<CursorCatalogError | null>(null);
   const [remoteCatalogsByWs, setRemoteCatalogsByWs] = useState<
     Record<string, Record<string, EngineCatalog>>
   >({});
@@ -154,6 +160,7 @@ export function useEngineModels(
   useEffect(() => {
     if (cursorEnabled) return;
     cursorRequest.current = null;
+    setCursorCatalogError(null);
     for (const key of catalogRequests.current.keys()) {
       if (JSON.parse(key)[0] === "cursor") catalogRequests.current.delete(key);
     }
@@ -244,16 +251,22 @@ export function useEngineModels(
     if (!cursorEnabled || cursorRemote || selectionScope === "task") return;
     publishCursorCatalog(cursorPickerModels);
   }, [cursorEnabled, selectionScope, cursorRemote, cursorPickerModels]);
-  const loadCursorCatalog = useCallback(async () => {
+  const loadCursorCatalog = useCallback(async (force = false) => {
     if (selectionScope === "task") return;
     if (!cursorEnabled || !cursorEnabledRef.current) return;
     const token = {};
     cursorRequest.current = token;
     try {
-      const catalog = await ipc.cursorModelCatalog();
-      if (cursorEnabledRef.current && cursorRequest.current === token) setCursorCatalog(adoptCursorCatalog(catalog));
-    } catch {
-      if (cursorEnabledRef.current && cursorRequest.current === token) setCursorCatalog([]);
+      const catalog = await (force ? ipc.cursorModelCatalog(true) : ipc.cursorModelCatalog());
+      if (cursorEnabledRef.current && cursorRequest.current === token) {
+        setCursorCatalog(adoptCursorCatalog(catalog));
+        setCursorCatalogError(null);
+      }
+    } catch (reason) {
+      if (cursorEnabledRef.current && cursorRequest.current === token) {
+        setCursorCatalog([]);
+        setCursorCatalogError(classifyCursorCatalogError(errorText(reason)));
+      }
     }
   }, [cursorEnabled, selectionScope]);
   useEffect(() => {
@@ -572,7 +585,7 @@ export function useEngineModels(
     const results = await Promise.allSettled(probes);
     const failed = results.find(result => result.status === "rejected");
     if (failed?.status === "rejected") throw failed.reason;
-    if (context === "local") await loadCursorCatalog();
+    if (context === "local") await loadCursorCatalog(true);
   }, [engines, wsKey, context, requestCatalog, contextByWs, loadCursorCatalog, loadConfig, loadSettings, selectionScope]);
 
   // AGY's account catalog changes independently of the application. Keep the
@@ -604,6 +617,7 @@ export function useEngineModels(
     modelsByEngine,
     channelsByEngine,
     cursorPickerModels,
+    cursorCatalogError: context === "local" && !cursorRemote && cursorEnabled && selectionScope !== "task" ? cursorCatalogError : null,
     refresh,
     pendingEngines: pending,
     currentChannels,

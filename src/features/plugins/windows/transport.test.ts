@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createDetachedSurfaceOwner } from "./owner";
 import { createDetachedSurfaceClient } from "./client";
 import { copyJson, equalJson, EVENTS, jsonKey, type DetachedInit, type DetachedTransport, type JsonValue } from "./protocol";
-import { abortRuntimeCheckpoint, getRuntimeCheckpointReadiness, prepareRuntimeCheckpoint } from "@/lib/runtime-checkpoint";
+import { abortRuntimeCheckpoint, getRuntimeActivityReadiness, getRuntimeCheckpointReadiness, holdRuntimeSubmissions, prepareRuntimeCheckpoint, registerRuntimeCheckpointParticipant } from "@/lib/runtime-checkpoint";
 import { usePluginTabsStore } from "../runtime/center-tabs";
 
 function deferred<T>() { let resolve!: (value: T) => void; let reject!: (error: Error) => void; const promise = new Promise<T>((a, b) => { resolve = a; reject = b; }); return { promise, resolve, reject }; }
@@ -46,6 +46,106 @@ function clientFixture() {
 }
 
 describe("detached owner", () => {
+  function coverRequiredParticipants() {
+    for (const blocker of getRuntimeCheckpointReadiness().filter(item => item.reason === "participant-unavailable")) {
+      disposers.push(registerRuntimeCheckpointParticipant({ id: blocker.participant, capture: () => ({}), restore() {} }));
+    }
+  }
+  const actionOperations = () => getRuntimeActivityReadiness().filter(item => item.participant === "operation" && item.reason.startsWith("plugin-window-"));
+  it("owns accepted dispatch and queued actions synchronously without duplicating execution", async () => {
+    coverRequiredParticipants();
+    const f = ownerFixture(); await f.owner.open();
+    const first = deferred<JsonValue>(), second = deferred<JsonValue>();
+    f.dispatch.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
+    const one = { ...f.identity(), sequence: 1, action: { name: "first", args: [] } };
+    const two = { ...f.identity(), sequence: 2, action: { name: "second", args: [] } };
+    f.emit(EVENTS.action, one); f.emit(EVENTS.action, two); f.emit(EVENTS.action, two);
+    expect(actionOperations()).toHaveLength(2);
+    expect(() => holdRuntimeSubmissions()).toThrow(/plugin-window-action/);
+    await turns(); expect(f.dispatch).toHaveBeenCalledTimes(1);
+    first.resolve(null); await turns(); expect(f.dispatch).toHaveBeenCalledTimes(2);
+    expect(actionOperations()).toHaveLength(1);
+    second.reject(new Error("dispatch failed")); await turns();
+    expect(actionOperations()).toEqual([]);
+    expect(f.invoke.mock.calls.filter(([cmd]) => cmd === "plugin_window_respond").map(([, args]) => (args!.request as any).ok)).toEqual([true, false]);
+    holdRuntimeSubmissions()();
+  });
+  it.each([false, true])("does not release dispatch ownership on dispose before settlement, failure=%s", async failed => {
+    const f = ownerFixture(); await f.owner.open();
+    const gate = deferred<JsonValue>(); f.dispatch.mockReturnValueOnce(gate.promise);
+    f.emit(EVENTS.action, { ...f.identity(), sequence: 1, action: { name: "send", args: [] } }); await turns();
+    f.owner.dispose(); expect(actionOperations()).toHaveLength(1);
+    if (failed) gate.reject(new Error("dispatch failed")); else gate.resolve(null);
+    await turns(); expect(actionOperations()).toEqual([]);
+    expect(f.invoke.mock.calls.some(([cmd]) => cmd === "plugin_window_respond")).toBe(false);
+  });
+  it("retains ownership for an unconfirmed in-flight response even after owner disposal", async () => {
+    const f = ownerFixture(); await f.owner.open();
+    const gate = deferred<unknown>();
+    f.invoke.mockImplementation(async command => command === "plugin_window_respond" ? gate.promise : undefined);
+    f.emit(EVENTS.action, { ...f.identity(), sequence: 1, action: { name: "send", args: [] } }); await turns();
+    expect(f.invoke).toHaveBeenCalledWith("plugin_window_respond", expect.anything());
+    f.owner.dispose(); expect(actionOperations()).toHaveLength(1);
+    gate.resolve(undefined); await turns(); expect(actionOperations()).toEqual([]);
+  });
+  it("rejects dispatch during a hold and later confirms the same failed receipt without replay", async () => {
+    vi.useFakeTimers(); coverRequiredParticipants();
+    const f = ownerFixture(); await f.owner.open();
+    const release = holdRuntimeSubmissions();
+    const event = { ...f.identity(), sequence: 1, action: { name: "send", args: [] } };
+    try {
+      f.emit(EVENTS.action, event); await turns();
+      expect(f.dispatch).not.toHaveBeenCalled();
+      expect(f.invoke.mock.calls.some(([cmd]) => cmd === "plugin_window_respond")).toBe(false);
+    } finally { release(); }
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(f.invoke.mock.calls.filter(([cmd]) => cmd === "plugin_window_respond").map(([, args]) => args!.request)).toEqual([expect.objectContaining({ sequence: 1, ok: false })]);
+    f.emit(EVENTS.action, event); await turns(); expect(f.dispatch).not.toHaveBeenCalled();
+    f.emit(EVENTS.action, { ...event, sequence: 2 }); await turns(); expect(f.dispatch).toHaveBeenCalledTimes(1);
+    expect(actionOperations()).toEqual([]);
+  });
+  it("defers computed receipt retries during a hold and owns each actual retry until it settles", async () => {
+    vi.useFakeTimers(); coverRequiredParticipants();
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const f = ownerFixture(); await f.owner.open();
+      const gate = deferred<unknown>(); let attempts = 0;
+      f.invoke.mockImplementation(async command => {
+        if (command !== "plugin_window_respond") return;
+        if (++attempts === 1) throw new Error("temporary response error");
+        return gate.promise;
+      });
+      f.emit(EVENTS.action, { ...f.identity(), sequence: 1, action: { name: "send", args: [] } }); await turns();
+      expect(attempts).toBe(1); expect(actionOperations()).toEqual([]);
+      const release = holdRuntimeSubmissions();
+      try { await vi.advanceTimersByTimeAsync(3000); expect(attempts).toBe(1); }
+      finally { release(); }
+      await vi.advanceTimersByTimeAsync(3000); expect(attempts).toBe(2);
+      expect(() => holdRuntimeSubmissions()).toThrow(/plugin-window-response/);
+      f.owner.dispose(); expect(actionOperations()).toHaveLength(1);
+      gate.resolve(undefined); await turns(); expect(actionOperations()).toEqual([]);
+      expect(f.dispatch).toHaveBeenCalledTimes(1);
+    } finally { warning.mockRestore(); }
+  });
+  it("allows shutdown holds for idle detached windows but blocks opening and returning transitions", async () => {
+    coverRequiredParticipants();
+    const f = ownerFixture(); const gate = deferred<unknown>();
+    f.invoke.mockImplementation(async command => command === "plugin_window_open" ? gate.promise : undefined);
+    const opening = f.owner.open(); await turns();
+    expect(getRuntimeActivityReadiness()).toContainEqual({ participant: f.owner.checkpointParticipant, reason: "plugin-window-transition" });
+    expect(() => holdRuntimeSubmissions()).toThrow(/plugin-window-transition/);
+    gate.resolve({ ...f.identity(), label: "window" }); await opening;
+    expect(getRuntimeActivityReadiness()).toEqual([]);
+    holdRuntimeSubmissions()();
+    await expect(prepareRuntimeCheckpoint()).rejects.toThrow(/plugin-window-without-checkpoint/);
+    abortRuntimeCheckpoint();
+    const returning = f.owner.returnToMain(); await turns();
+    expect(getRuntimeActivityReadiness()).toContainEqual({ participant: f.owner.checkpointParticipant, reason: "plugin-window-transition" });
+    expect(() => holdRuntimeSubmissions()).toThrow(/plugin-window-transition/);
+    f.emit(EVENTS.returned, { ...f.identity(), tabId: "tab", reason: "return" }); await returning;
+    expect(getRuntimeActivityReadiness()).toEqual([]);
+    holdRuntimeSubmissions()();
+  });
   it("focuses main with the exact private owner identity without returning or submitting", async () => {
     const f = ownerFixture(); f.setState({ draft: "保留草稿 👩🏽‍💻" }); await f.owner.open();
     const identity = f.identity(), status = f.owner.getStatus();

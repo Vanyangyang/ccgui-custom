@@ -376,6 +376,43 @@ struct Inner {
     transport_reserved: usize,
 }
 
+/// Transport completion is only one barrier; target business receipts and
+/// unsent composer rows are additionally observed by the frontend.
+pub(crate) fn shutdown_activity() -> Vec<String> {
+    let Some(relay) = MANAGER.get() else { return vec!["host-messages".into()]; };
+    let inner = relay.inner.lock();
+    shutdown_activity_inner(&inner)
+}
+
+fn shutdown_activity_inner(inner: &Inner) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if !inner.ready || inner.shutdown
+        || !inner.pending.is_empty() || inner.transport_reserved != 0
+        || inner.transport.values().any(|receipt| receipt.completed_at_ms == 0)
+    { reasons.push("host-messages".into()); }
+    if inner.frozen.is_some() { reasons.push("runtime-updating".into()); }
+    reasons
+}
+
+#[cfg(test)]
+mod shutdown_activity_tests {
+    use super::*;
+    #[test]
+    fn relay_availability_and_own_fence_are_distinct_barriers() {
+        let mut inner = Inner::default();
+        assert_eq!(shutdown_activity_inner(&inner), ["host-messages"]);
+        inner.ready = true;
+        assert!(shutdown_activity_inner(&inner).is_empty());
+        inner.frozen = Some("fence".into());
+        assert_eq!(shutdown_activity_inner(&inner), ["runtime-updating"]);
+        inner.transport_reserved = 1;
+        assert_eq!(shutdown_activity_inner(&inner), ["host-messages", "runtime-updating"]);
+        inner.transport_reserved = 0;
+        inner.shutdown = true;
+        assert_eq!(shutdown_activity_inner(&inner), ["host-messages", "runtime-updating"]);
+    }
+}
+
 enum RelayEvent {
     Request(RequestEvent),
     RunEnded(Sender),

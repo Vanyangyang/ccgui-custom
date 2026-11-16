@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { ipc, type BranchInfo, type GitStatus } from "@/lib/ipc";
 import { errorText } from "@/lib/errors";
+import { beginRuntimeOperation } from "@/lib/runtime-checkpoint";
 
 const TTL_MS = 30_000;
 
@@ -60,6 +61,7 @@ export const useGitStore = create<GitStore>((set, get) => {
     workspacePath: string,
     action: () => Promise<unknown>,
   ) => {
+    const done = beginRuntimeOperation("git-mutation");
     try {
       return await action();
     } catch (err) {
@@ -68,6 +70,7 @@ export const useGitStore = create<GitStore>((set, get) => {
       }
       throw err;
     } finally {
+      done();
       // Status changed (or may have): drop the TTL and refetch.
       set((s) => ({
         fetchedAtByWorkspace: { ...s.fetchedAtByWorkspace, [workspacePath]: 0 },

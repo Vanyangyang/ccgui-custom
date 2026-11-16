@@ -650,8 +650,33 @@ export interface CliConfig {
   cursor: ProviderSection;
 }
 
+export interface ChatBackdropSettings {
+  preset: string;
+  opacity: number;
+  speed: number;
+  scale: number;
+  scrim: number;
+  colorMode: string;
+  customColor: string;
+  imageFile: string;
+  blur: number;
+  fit: string;
+  parallax: boolean;
+}
+
+export interface BackdropImageData {
+  mime: string;
+  dataBase64: string;
+}
+
 export interface AppSettings {
   theme: string;
+  /** Visual style preset ("mist" | "warm" | "aurora" | "classic"); absent/null = "mist". */
+  themePreset?: string | null;
+  /** Accent color ramp ("blue" | "indigo" | "violet" | "teal" | "emerald" | "amber"); absent/null = "blue". */
+  accentColor?: string | null;
+  /** 主对话画布背景预设与 DIY 配置；缺省为默认清透科技像素波。 */
+  chatBackdrop?: ChatBackdropSettings | null;
   /** Windows 标题栏样式："native" | "mac"（仿 mac 自绘标题栏）。仅 Windows 生效，
    *  改动需重启应用；macOS 恒为系统原生红绿灯。 */
   titlebar: string;
@@ -1417,6 +1442,8 @@ export const ipc = {
   /** Raw bytes of an uploaded font file, base64-encoded (设置 → 外观): the
    *  webview cannot read the native dialog's file itself. */
   readFontFile: (path: string) => invoke<string>("read_font_file", { path }),
+  /** User-picked custom chat backdrop image validated by magic bytes. */
+  readBackdropImage: (path: string) => invoke<BackdropImageData>("read_backdrop_image", { path }),
   importPet: (path: string) => invoke<PetSummary>("pet_import", { path }),
   removePet: (id: string) => invoke<void>("pet_remove", { id }),
   getPetPackage: (id: string) => invoke<PetPackage>("pet_get_package", { id }),
@@ -1555,7 +1582,8 @@ export const ipc = {
       invoke<EngineCatalog>("list_engine_models", { engine, workspace: workspace ?? null }),
     ),
   /** Cursor 基础模型及上下文、推理、Fast 参数。远程工作区不使用这份本机目录。 */
-  cursorModelCatalog: () => invoke<CursorCatalogModel[]>("cursor_model_catalog"),
+  cursorModelCatalog: (force?: boolean) =>
+    invoke<CursorCatalogModel[]>("cursor_model_catalog", force ? { force: true } : undefined),
   // history
   listSessions: () => invoke<SessionMeta[]>("list_sessions"),
   assignSessionSidebarWorkspaces: (requestId: string, assignments: SessionSidebarWorkspaceAssignment[]) =>

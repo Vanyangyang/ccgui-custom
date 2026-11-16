@@ -42,12 +42,13 @@ export function createRuntimeCheckpointCoordinator() {
   const participants = new Map<string, RuntimeCheckpointParticipant>();
   const pending = new Map<string, unknown>();
   const operations = new Map<symbol, string>();
-  const blockers = new Map<string, () => readonly string[]>();
+  const blockers = new Map<string, { read: () => readonly string[]; readActivity: () => readonly string[] }>();
   // A chat snapshot alone does not attest that plugins, terminal or other UI is
   // transferable. The host must register an explicit app-ui coverage participant.
   let required = new Set(["chat", "app-ui"]);
   let paused = false;
   let preparing = false;
+  let submissionHold: symbol | undefined;
   let revision = 0;
   const resumeWaiters = new Set<() => void>();
   const whenResumed = (signal?: AbortSignal): Promise<void> => {
@@ -64,22 +65,25 @@ export function createRuntimeCheckpointCoordinator() {
       signal?.addEventListener("abort", onAbort, { once: true });
     });
   };
-  const readiness = (capturing = true): RuntimeCheckpointBlocker[] => {
+  const collectReadiness = (capturing: boolean, activity: boolean): RuntimeCheckpointBlocker[] => {
     const result: RuntimeCheckpointBlocker[] = [];
     for (const id of required) if (!participants.has(id)) result.push({ participant: id, reason: "participant-unavailable" });
     for (const id of pending.keys()) if (!participants.has(id)) result.push({ participant: id, reason: "checkpoint-not-restored" });
     for (const [id, participant] of participants) for (const reason of participant.readiness?.() ?? []) result.push({ participant: id, reason });
     if (capturing) for (const [id, participant] of participants) for (const reason of participant.captureReadiness?.() ?? []) result.push({ participant: id, reason });
-    for (const [id, read] of blockers) for (const reason of read()) result.push({ participant: id, reason });
+    for (const [id, blocker] of blockers) for (const reason of (activity ? blocker.readActivity : blocker.read)()) result.push({ participant: id, reason });
     for (const reason of operations.values()) result.push({ participant: "operation", reason });
     return result;
   };
+  const readiness = (capturing = true) => collectReadiness(capturing, false);
+  const activityReadiness = () => collectReadiness(false, true);
   const assertAllowed = () => { if (paused) throw new Error("Runtime handoff has paused new submissions"); };
-  const assertReady = (capturing = true) => {
-    const found = readiness(capturing);
+  const assertNoBlockers = (found: readonly RuntimeCheckpointBlocker[]) => {
     if (found.length) throw new Error(`Runtime checkpoint is blocked: ${found.map((b) => `${b.participant}:${b.reason}`).join(", ")}`);
   };
+  const assertReady = (capturing = true) => assertNoBlockers(readiness(capturing));
   const resume = () => {
+    if (submissionHold) return;
     if (!paused) return;
     paused = false;
     // Ownership is available even if a participant's resumed callback fails.
@@ -120,12 +124,16 @@ export function createRuntimeCheckpointCoordinator() {
       revision++;
       return () => { if (participants.get(participant.id) === participant) { participants.delete(participant.id); revision++; } };
     },
-    registerBlocker(id: string, read: () => readonly string[]): () => void {
+    /** Activity may exclude idle, non-transferable UI. Existing blockers remain
+     * conservative unless their owner supplies this narrower work predicate. */
+    registerBlocker(id: string, read: () => readonly string[], readActivity: () => readonly string[] = read): () => void {
       if (blockers.has(id)) throw new Error(`Duplicate checkpoint blocker: ${id}`);
-      blockers.set(id, read);
-      return () => { if (blockers.get(id) === read) blockers.delete(id); };
+      const blocker = { read, readActivity };
+      blockers.set(id, blocker);
+      return () => { if (blockers.get(id) === blocker) blockers.delete(id); };
     },
     readiness,
+    activityReadiness,
     /** An observer captures one projection without taking mutation ownership. */
     captureParticipant(id: string): unknown {
       const participant = participants.get(id);
@@ -141,7 +149,24 @@ export function createRuntimeCheckpointCoordinator() {
       operations.set(token, reason);
       return () => { operations.delete(token); };
     },
+    /** Briefly freeze accepted UI work for the final power-action check, without
+     * capturing UI state or treating an open popover as unfinished work. */
+    holdSubmissions(): () => void {
+      if (paused || preparing) throw new Error("Runtime submissions are already paused");
+      assertNoBlockers(activityReadiness());
+      const token = Symbol("submission-hold");
+      submissionHold = token;
+      paused = true;
+      revision++;
+      return () => {
+        if (submissionHold !== token) return;
+        submissionHold = undefined;
+        revision++;
+        resume();
+      };
+    },
     async prepare(): Promise<RuntimeCheckpoint> {
+      if (submissionHold) throw new Error("Runtime submissions are held for a pending system action");
       if (preparing) throw new Error("Runtime checkpoint preparation is already in progress");
       paused = true;
       preparing = true;
@@ -174,6 +199,7 @@ export const initializeRuntimeCheckpoint = runtimeCheckpoint.initialize;
 export const registerRuntimeCheckpointParticipant = runtimeCheckpoint.register;
 export const registerRuntimeCheckpointBlocker = runtimeCheckpoint.registerBlocker;
 export const getRuntimeCheckpointReadiness = runtimeCheckpoint.readiness;
+export const getRuntimeActivityReadiness = runtimeCheckpoint.activityReadiness;
 export const captureRuntimeCheckpointParticipant = runtimeCheckpoint.captureParticipant;
 export const prepareRuntimeCheckpoint = runtimeCheckpoint.prepare;
 export const abortRuntimeCheckpoint = runtimeCheckpoint.abort;
@@ -184,6 +210,7 @@ export const isRuntimeSubmissionPaused = runtimeCheckpoint.isPaused;
 export const whenRuntimeSubmissionResumed = runtimeCheckpoint.whenResumed;
 export const assertRuntimeSubmissionAllowed = runtimeCheckpoint.assertAllowed;
 export const beginRuntimeOperation = runtimeCheckpoint.beginOperation;
+export const holdRuntimeSubmissions = runtimeCheckpoint.holdSubmissions;
 
 /** Preserve synchronous actions and promise results while tracking their entire
  * lifetime, including work started before the prepare barrier. */

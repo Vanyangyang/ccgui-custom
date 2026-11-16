@@ -21,7 +21,7 @@ import { usePopoverState } from "@/utils/use-dismiss-on-outside-press";
 import { EFFORT_LABEL_KEYS, getDefaultEffort, getEffortLevels, normalizeEffortLevel, supportsEffort, type EffortLevel } from "./effort-levels";
 import { EngineFlyout, EngineModelPanel, type ChannelOption } from "./engine-model-panel";
 import { cursorTriggerLabel, useCursorModelPrefs } from "./cursor-model-picker";
-import type { CursorModel } from "./cursor-models";
+import type { CursorCatalogError, CursorModel } from "./cursor-models";
 import { AGY_ENCODED_EFFORT_LEVELS, encodedModelEffort, modelBaseLabel, modelHasNoEffort } from "./model-effort";
 
 export type { EffortLevel } from "./effort-levels";
@@ -306,6 +306,7 @@ function EngineMenuBody({
   onRefreshModels,
   loadingEngines,
   cursorModels,
+  cursorCatalogError,
   selectionScope = "chat",
 }: {
   options: MenuOption[];
@@ -341,6 +342,7 @@ function EngineMenuBody({
   /** Engine ids whose catalog probe has not returned yet. */
   loadingEngines?: readonly string[];
   cursorModels?: CursorModel[];
+  cursorCatalogError?: CursorCatalogError | null;
   selectionScope?: "chat" | "task";
 }) {
   const flyoutOption = options.find((o) => o.id === openEngine);
@@ -398,6 +400,7 @@ function EngineMenuBody({
             onRefresh={onRefreshModels}
             loading={loadingEngines?.includes(flyoutOption.id)}
             cursorModels={flyoutOption.id === "cursor" ? cursorModels : undefined}
+            cursorCatalogError={flyoutOption.id === "cursor" ? cursorCatalogError : undefined}
           />
         )}
       </div>
@@ -429,6 +432,7 @@ function EngineModelDialog({
   onRefreshModels,
   onClose,
   cursorModels,
+  cursorCatalogError,
   selectionScope = "chat",
 }: {
   /** Engine being configured; undefined when the dialog is closed. */
@@ -453,6 +457,7 @@ function EngineModelDialog({
   onRefreshModels?: () => void | Promise<void>;
   onClose: () => void;
   cursorModels?: CursorModel[];
+  cursorCatalogError?: CursorCatalogError | null;
   selectionScope?: "chat" | "task";
 }) {
   const { t } = useTranslation();
@@ -486,6 +491,7 @@ function EngineModelDialog({
         onRefresh={onRefreshModels}
         onClose={onClose}
         cursorModels={option.id === "cursor" ? cursorModels : undefined}
+        cursorCatalogError={option.id === "cursor" ? cursorCatalogError : undefined}
       />
     </ModalShell>
   );
@@ -521,6 +527,7 @@ export function CliMenu({
   onRefreshModels,
   loadingEngines,
   cursorModels,
+  cursorCatalogError,
   selectionScope = "chat",
   disabled = false,
 }: {
@@ -551,6 +558,7 @@ export function CliMenu({
   /** Engine ids whose catalog probe has not returned yet (loading hint). */
   loadingEngines?: readonly string[];
   cursorModels?: CursorModel[];
+  cursorCatalogError?: CursorCatalogError | null;
   /** Task pickers keep selection local and omit chat-only workflow/speed controls. */
   selectionScope?: "chat" | "task";
   /** Locks selection and dismisses any open desktop or mobile panel. */
@@ -776,6 +784,7 @@ export function CliMenu({
             onRefreshModels={onRefreshModels}
             loadingEngines={loadingEngines}
             cursorModels={cursorModels}
+            cursorCatalogError={cursorCatalogError}
           />
         </AriaDialog>
       </AriaPopover>
@@ -804,6 +813,7 @@ export function CliMenu({
       onRefreshModels={onRefreshModels}
       onClose={() => setDialogEngine(null)}
       cursorModels={cursorModels}
+      cursorCatalogError={cursorCatalogError}
     />
     </>
   );

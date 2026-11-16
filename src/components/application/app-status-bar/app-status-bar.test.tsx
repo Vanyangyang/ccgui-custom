@@ -28,6 +28,7 @@ import { AppStatusBar } from "./app-status-bar";
 import { getAppVersion } from "@/lib/platform";
 import { useReleaseNotesTabStore } from "@/features/update/notes-tab";
 import { useLiveUpdateStore } from "@/features/update/live-update";
+import { useTaskShutdownStore } from "@/features/task-shutdown/runtime";
 import { statusBarRegistry } from "@ccgui/plugin-sdk";
 import type { Disposer } from "@ccgui/plugin-sdk";
 
@@ -97,6 +98,20 @@ describe("AppStatusBar plugin items (plan §4.2 #8)", () => {
     const text = container.textContent ?? "";
     expect(text.indexOf("EARLY")).toBeGreaterThanOrEqual(0);
     expect(text.indexOf("EARLY")).toBeLessThan(text.indexOf("LATE"));
+  });
+  it("places the native shutdown control immediately before performance", async () => {
+    const original = useTaskShutdownStore.getState().status;
+    try {
+      await act(async () => useTaskShutdownStore.setState({ status: {
+        supported: true, phase: "off", remainingSeconds: null, blockers: [], generation: 0, error: null,
+      } }));
+      const buttons = [...container.querySelectorAll("button")];
+      const index = buttons.findIndex(button => button.getAttribute("aria-label") === i18n.t("taskShutdown.title"));
+      expect(index).toBeGreaterThanOrEqual(0);
+      expect(buttons[index + 1].textContent).toContain(i18n.t("statusbar.performance"));
+    } finally {
+      await act(async () => useTaskShutdownStore.setState({ status: original }));
+    }
   });
   it("places zone:\"start\" chips in the left zone ahead of the builtin cluster", async () => {
     await act(async () => {

@@ -599,7 +599,7 @@ export function ConversationFooter({
       {dropHint && hintHost ? createPortal(dropHint, hintHost) : null}
       <div
         ref={dropRef}
-        className="relative flex w-full flex-col gap-2.5 bg-background-primary-default px-4 pt-2.5 pb-2"
+        className="relative flex w-full flex-col gap-2.5 bg-transparent px-4 pt-2.5 pb-2"
       >
         {dropHint && !hintHost ? dropHint : null}
         <MessageQueue

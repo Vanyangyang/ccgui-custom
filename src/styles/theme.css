@@ -186,49 +186,49 @@
 
   /* Foreground (icons + on-fill content) */
   --color-foreground-full:               var(--color-white);
-  --color-foreground-icon-primary:       var(--color-neutral-950);
+  --color-foreground-icon-primary:       #0f172a;
   --color-foreground-icon-hover:         var(--color-black);
-  --color-foreground-icon-secondary:     var(--color-neutral-500);
-  --color-foreground-icon-tertiary:      var(--color-neutral-400);
-  --color-foreground-icon-quaternary:    var(--color-neutral-300);
+  --color-foreground-icon-secondary:     #475569;
+  --color-foreground-icon-tertiary:      #64748b;
+  --color-foreground-icon-quaternary:    #cbd5e1;
   --color-foreground-icon-error:         var(--color-red-600);
-  --color-foreground-icon-disabled:      var(--color-neutral-300);
-  --color-foreground-disabled:           var(--color-neutral-400);
+  --color-foreground-icon-disabled:      #cbd5e1;
+  --color-foreground-disabled:           #94a3b8;
   --color-foreground-disabled-danger:    var(--color-red-300);
-  --color-input-disabled-foreground:     var(--color-neutral-300);
-  --color-icon-button-disabled-foreground: var(--color-neutral-300);
-  --color-button-primary-disabled-foreground: var(--color-neutral-400);
+  --color-input-disabled-foreground:     #cbd5e1;
+  --color-icon-button-disabled-foreground: #cbd5e1;
+  --color-button-primary-disabled-foreground: #94a3b8;
 
   /* Text */
-  --color-text-primary:         var(--color-neutral-950);
-  --color-text-secondary:       var(--color-neutral-500);
-  --color-text-tertiary:        var(--color-neutral-400);
-  --color-text-disabled:        var(--color-neutral-300);
+  --color-text-primary:         #0f172a;
+  --color-text-secondary:       #475569;
+  --color-text-tertiary:        #64748b;
+  --color-text-disabled:        #cbd5e1;
   --color-text-disabled-danger: var(--color-red-300);
-  --color-text-placeholder:     var(--color-neutral-400);
+  --color-text-placeholder:     #94a3b8;
   --color-text-error-primary:   var(--color-red-500);
   --color-text-warning-primary: var(--color-orange-600);
-  --color-input-disabled-text:  var(--color-neutral-300);
+  --color-input-disabled-text:  #cbd5e1;
   --color-text-white:           var(--color-white);
 
-  /* Background */
-  --color-background-full:              var(--color-white);
-  --color-background-primary-default:   var(--color-white);
-  --color-background-inner-default:     var(--color-white);
-  --color-background-primary-hover:     var(--color-neutral-100);
-  --color-background-primary-active:    var(--color-neutral-200);
-  --color-background-primary-disabled:  var(--color-neutral-100);
-  --color-input-disabled-background:    var(--color-neutral-100);
-  --color-background-secondary-default: var(--color-neutral-100);
-  --color-background-secondary-hover:   var(--color-neutral-200);
-  --color-background-tertiary-default:  var(--color-neutral-200);
-  --color-background-tertiary-hover:    var(--color-neutral-300);
+  /* Background — default light preset ("mist") */
+  --color-background-full:              #f6f8fc;
+  --color-background-primary-default:   #ffffff;
+  --color-background-inner-default:     #ffffff;
+  --color-background-primary-hover:     #f3f6fb;
+  --color-background-primary-active:    #e8eef6;
+  --color-background-primary-disabled:  #f1f4f9;
+  --color-input-disabled-background:    #f1f4f9;
+  --color-background-secondary-default: #f1f4f9;
+  --color-background-secondary-hover:   #e5eaf2;
+  --color-background-tertiary-default:  #e6ebf3;
+  --color-background-tertiary-hover:    #d5dde9;
   --color-background-tertiary-error:    var(--color-red-100);
   --color-background-tertiary-warning:  var(--color-orange-100);
   /* Figma background/quaternary/default — first used by the Storage
    * dropzone's upload-icon disc (node 4106:26587). */
-  --color-background-quaternary-default: var(--color-neutral-300);
-  --color-background-quaternary-hover:   var(--color-neutral-400);
+  --color-background-quaternary-default: #cbd5e1;
+  --color-background-quaternary-hover:   #94a3b8;
   --color-background-quaternary-error:   var(--color-red-200);
 
   /* Chat bubbles + overlay scrims */
@@ -248,24 +248,64 @@
   --color-status-unseen:    var(--color-green-500);
 
   /* Border */
-  --color-border-button-default:   var(--color-neutral-200);
-  --color-border-button-hover:     var(--color-neutral-300);
-  --color-border-button-active:    var(--color-neutral-400);
+  --color-border-primary:          var(--color-separator-border-strong);
+  --color-border-secondary:        var(--color-separator-border);
+  --color-border-button-default:   #dce3ee;
+  --color-border-button-hover:     #c5d0e0;
+  --color-border-button-active:    #94a3b8;
   --color-border-button-white:     var(--color-white);
   /* The system had no red border. Matches text/error/primary so an invalid
      field's edge and its message are the same red. */
   --color-border-error-default:    var(--color-red-500);
-  --color-border-checkbox-default: var(--color-neutral-300);
-  --color-border-checkbox-hover:   var(--color-neutral-400);
-  --color-border-checkbox-active:  var(--color-neutral-400);
-  --color-border-component-detail-container: var(--color-neutral-200);
-  --color-border-ai-profile-card:             var(--color-neutral-200);
-  --color-border-table:            var(--color-neutral-200);
-  --color-border-button-group:     var(--color-neutral-200);
-  --color-border-sidebar-profile-hover: var(--color-neutral-300);
-  --color-separator-border:        var(--color-neutral-200);
-  --color-separator-border-strong: var(--color-neutral-200);
+  --color-border-checkbox-default: #cbd5e1;
+  --color-border-checkbox-hover:   #94a3b8;
+  --color-border-checkbox-active:  #94a3b8;
+  --color-border-component-detail-container: #e2e8f0;
+  --color-border-ai-profile-card:             #e2e8f0;
+  --color-border-table:            #e2e8f0;
+  --color-border-button-group:     #dce3ee;
+  --color-border-sidebar-profile-hover: #c5d0e0;
+  --color-separator-border:        #e2e8f0;
+  --color-separator-border-strong: #cbd5e1;
   --color-border-focus-ring:       var(--color-accent-500);
+
+  /* Surface polish tokens (overridden per theme preset) */
+  --surface-main-backdrop: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--color-accent-500) 2.5%, #f8fafd) 0%,
+    #ffffff 120px
+  );
+  --surface-sidebar-backdrop: none;
+  --shadow-main-panel: -3px 0 16px -6px rgb(15 23 42 / 0.06);
+  --color-sidebar-row-selected-bg: #ffffff;
+  --shadow-sidebar-row-selected:
+    0 1px 2px 0 rgb(15 23 42 / 0.06),
+    0 0 0 1px rgb(15 23 42 / 0.06);
+  --color-tabstrip-bg: color-mix(in srgb, #f1f4f9 55%, #ffffff);
+  --color-tab-active-bg: #ffffff;
+  --color-tab-active-border: rgb(15 23 42 / 0.08);
+  --shadow-tab-active: 0 1px 2px 0 rgb(15 23 42 / 0.06);
+  --gradient-bubble-user: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--color-bubble-user) 92%, white) 0%,
+    var(--color-bubble-user) 100%
+  );
+  --shadow-bubble-user:
+    0 2px 8px -2px color-mix(in srgb, var(--color-bubble-user) 35%, transparent),
+    0 1px 2px 0 rgb(15 23 42 / 0.08);
+  --color-composer-bg: var(--color-background-inner-default);
+  --color-composer-border: var(--color-separator-border);
+  --shadow-composer:
+    0 4px 18px -4px rgb(15 23 42 / 0.07),
+    0 1px 2px 0 rgb(15 23 42 / 0.04);
+  --color-composer-focus-border: color-mix(
+    in srgb,
+    var(--color-accent-500) 55%,
+    var(--color-separator-border)
+  );
+  --shadow-composer-focus:
+    0 6px 22px -4px color-mix(in srgb, var(--color-accent-500) 16%, transparent),
+    0 0 0 3px color-mix(in srgb, var(--color-accent-500) 10%, transparent);
 
   /* State */
   --color-state-success-text: var(--color-lime-800);
@@ -273,13 +313,13 @@
 
   /* Selected control interiors remain light on colored tracks in both themes. */
   --color-control-indicator-background:        var(--color-white);
-  --color-control-indicator-background-subtle: var(--color-neutral-100);
+  --color-control-indicator-background-subtle: var(--color-background-secondary-default);
   /* Stepped against the composer: the pill is white and the add button is the
    * subtle grey sitting on it, so the control separates from the surface it
    * shares an edge with. Dark mode keeps its own pair, where the pill is the
    * lighter of the two and the button steps the other way. */
-  --color-ai-chat-composer-add-background:       var(--color-neutral-100);
-  --color-ai-chat-composer-add-hover-background: var(--color-neutral-200);
+  --color-ai-chat-composer-add-background:       var(--color-background-secondary-default);
+  --color-ai-chat-composer-add-hover-background: var(--color-background-secondary-hover);
   --color-agent-progress-ring:                     var(--color-white);
   --color-button-ghost-background:                var(--color-accent-100);
   --color-button-ghost-hover:                     var(--color-accent-200);
@@ -287,13 +327,13 @@
   --color-button-ghost-disabled:                  var(--color-accent-50);
   --color-button-ghost-foreground:                var(--color-accent-700);
   --color-button-ghost-disabled-foreground:       var(--color-accent-300);
-  --color-dropdown-item-hover-background:        var(--color-neutral-100);
+  --color-dropdown-item-hover-background:        var(--color-background-secondary-hover);
 
   /* Recently shipped component badge. Kept semantic so its compact blue
    * surface can retain the same hierarchy in both themes. */
-  --color-badge-neutral-background: var(--color-neutral-200);
+  --color-badge-neutral-background: var(--color-background-tertiary-default);
   --color-pill-tab-blue-selected-background: var(--color-accent-50);
-  --color-pill-tab-blue-hover-background: var(--color-neutral-100);
+  --color-pill-tab-blue-hover-background: var(--color-background-secondary-default);
 
   /* Notification status-icon surfaces. */
   --color-notification-success-foreground:     var(--color-lime-600);
@@ -476,6 +516,8 @@
   --color-notification-success-foreground:     var(--color-lime-300);
 
   /* Borders and separators */
+  --color-border-primary:          var(--color-neutral-700);
+  --color-border-secondary:        var(--color-neutral-800);
   --color-border-button-default:   var(--color-neutral-700);
   --color-border-button-hover:     var(--color-neutral-500);
   --color-border-button-active:    var(--color-neutral-600);
@@ -491,6 +533,38 @@
   --color-border-sidebar-profile-hover: var(--color-neutral-600);
   --color-separator-border:        var(--color-neutral-800);
   --color-separator-border-strong: var(--color-neutral-700);
+
+  /* Surface polish tokens (dark mode defaults) */
+  --surface-main-backdrop: none;
+  --surface-sidebar-backdrop: none;
+  --shadow-main-panel: -3px 0 16px -6px rgb(0 0 0 / 0.35);
+  --color-sidebar-row-selected-bg: var(--color-neutral-850);
+  --shadow-sidebar-row-selected:
+    0 1px 2px 0 rgb(0 0 0 / 0.28),
+    0 0 0 1px rgb(255 255 255 / 0.07);
+  --color-tabstrip-bg: var(--color-background-primary-default);
+  --color-tab-active-bg: var(--color-background-secondary-hover);
+  --color-tab-active-border: rgb(255 255 255 / 0.08);
+  --shadow-tab-active: 0 1px 2px 0 rgb(0 0 0 / 0.25);
+  --gradient-bubble-user: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--color-bubble-user) 92%, white) 0%,
+    var(--color-bubble-user) 100%
+  );
+  --shadow-bubble-user: 0 2px 8px -2px rgb(0 0 0 / 0.35);
+  --color-composer-bg: color-mix(in srgb, var(--color-white) 3%, var(--color-background-primary-default));
+  --color-composer-border: var(--color-separator-border-strong);
+  --shadow-composer:
+    0 4px 18px -4px rgb(0 0 0 / 0.35),
+    0 1px 2px 0 rgb(0 0 0 / 0.24);
+  --color-composer-focus-border: color-mix(
+    in srgb,
+    var(--color-accent-500) 55%,
+    var(--color-separator-border-strong)
+  );
+  --shadow-composer-focus:
+    0 6px 22px -4px color-mix(in srgb, var(--color-accent-500) 22%, transparent),
+    0 0 0 3px color-mix(in srgb, var(--color-accent-500) 14%, transparent);
 
   /* Figma's dark table status pairs. */
   --color-status-lime-background:   color-mix(in srgb, var(--color-lime-950) 60%, transparent);
@@ -529,6 +603,298 @@
   --color-chart-neutral: var(--color-neutral-800);
   --color-chart-agents-bar:        var(--color-purple-500);
   --color-chart-agents-bar-active: var(--color-purple-600);
+}
+
+/* ---------------------------------------------------------------------------
+ * Accent color overrides (html[data-accent="..."])
+ * --------------------------------------------------------------------------- */
+html[data-accent="indigo"] {
+  --color-accent-50:  var(--color-indigo-50);
+  --color-accent-100: var(--color-indigo-100);
+  --color-accent-200: var(--color-indigo-200);
+  --color-accent-300: var(--color-indigo-300);
+  --color-accent-400: var(--color-indigo-400);
+  --color-accent-500: var(--color-indigo-500);
+  --color-accent-600: var(--color-indigo-600);
+  --color-accent-700: var(--color-indigo-700);
+  --color-accent-800: var(--color-indigo-800);
+  --color-accent-900: var(--color-indigo-900);
+  --color-accent-950: var(--color-indigo-950);
+}
+html[data-accent="indigo"]:not(.dark) {
+  --color-bubble-user: var(--color-accent-600);
+}
+
+html[data-accent="violet"] {
+  --color-accent-50:  var(--color-violet-50);
+  --color-accent-100: var(--color-violet-100);
+  --color-accent-200: var(--color-violet-200);
+  --color-accent-300: var(--color-violet-300);
+  --color-accent-400: var(--color-violet-400);
+  --color-accent-500: var(--color-violet-500);
+  --color-accent-600: var(--color-violet-600);
+  --color-accent-700: var(--color-violet-700);
+  --color-accent-800: var(--color-violet-800);
+  --color-accent-900: var(--color-violet-900);
+  --color-accent-950: var(--color-violet-950);
+}
+html[data-accent="violet"]:not(.dark) {
+  --color-bubble-user: var(--color-accent-600);
+}
+
+html[data-accent="teal"] {
+  --color-accent-50:  var(--color-teal-50);
+  --color-accent-100: var(--color-teal-100);
+  --color-accent-200: var(--color-teal-200);
+  --color-accent-300: var(--color-teal-300);
+  --color-accent-400: var(--color-teal-400);
+  --color-accent-500: var(--color-teal-500);
+  --color-accent-600: var(--color-teal-600);
+  --color-accent-700: var(--color-teal-700);
+  --color-accent-800: var(--color-teal-800);
+  --color-accent-900: var(--color-teal-900);
+  --color-accent-950: var(--color-teal-950);
+}
+html[data-accent="teal"]:not(.dark) {
+  --color-bubble-user: var(--color-accent-600);
+}
+
+html[data-accent="emerald"] {
+  --color-accent-50:  var(--color-emerald-50);
+  --color-accent-100: var(--color-emerald-100);
+  --color-accent-200: var(--color-emerald-200);
+  --color-accent-300: var(--color-emerald-300);
+  --color-accent-400: var(--color-emerald-400);
+  --color-accent-500: var(--color-emerald-500);
+  --color-accent-600: var(--color-emerald-600);
+  --color-accent-700: var(--color-emerald-700);
+  --color-accent-800: var(--color-emerald-800);
+  --color-accent-900: var(--color-emerald-900);
+  --color-accent-950: var(--color-emerald-950);
+}
+html[data-accent="emerald"]:not(.dark) {
+  --color-bubble-user: var(--color-accent-600);
+}
+
+html[data-accent="amber"] {
+  --color-accent-50:  var(--color-amber-50);
+  --color-accent-100: var(--color-amber-100);
+  --color-accent-200: var(--color-amber-200);
+  --color-accent-300: var(--color-amber-300);
+  --color-accent-400: var(--color-amber-500);
+  --color-accent-500: var(--color-amber-600);
+  --color-accent-600: var(--color-amber-700);
+  --color-accent-700: var(--color-amber-800);
+  --color-accent-800: var(--color-amber-900);
+  --color-accent-900: var(--color-amber-950);
+  --color-accent-950: var(--color-amber-950);
+}
+html[data-accent="amber"]:not(.dark) {
+  --color-bubble-user: var(--color-accent-600);
+}
+
+/* ---------------------------------------------------------------------------
+ * Theme presets (html[data-theme-preset="..."])
+ * Default light (:root) is "mist".
+ * --------------------------------------------------------------------------- */
+html[data-theme-preset="warm"]:not(.dark) {
+  --color-foreground-icon-primary:       #1f1c18;
+  --color-foreground-icon-secondary:     #575046;
+  --color-foreground-icon-tertiary:      #7d7468;
+  --color-foreground-icon-quaternary:    #d2c8b8;
+  --color-foreground-icon-disabled:      #d2c8b8;
+  --color-foreground-disabled:           #9e9487;
+  --color-input-disabled-foreground:     #d2c8b8;
+  --color-icon-button-disabled-foreground: #d2c8b8;
+  --color-button-primary-disabled-foreground: #9e9487;
+
+  --color-text-primary:     #1f1c18;
+  --color-text-secondary:   #575046;
+  --color-text-tertiary:    #7d7468;
+  --color-text-disabled:    #d2c8b8;
+  --color-text-placeholder: #9e9487;
+  --color-input-disabled-text: #d2c8b8;
+
+  --color-background-full:              #f8f5ef;
+  --color-background-primary-default:   #fbf9f5;
+  --color-background-inner-default:     #fffefb;
+  --color-background-primary-hover:     #f3ede3;
+  --color-background-primary-active:    #e9e1d4;
+  --color-background-primary-disabled:  #f1ece3;
+  --color-input-disabled-background:    #f1ece3;
+  --color-background-secondary-default: #f1ece3;
+  --color-background-secondary-hover:   #e6dfd3;
+  --color-background-tertiary-default:  #e7dfd2;
+  --color-background-tertiary-hover:    #d8cebe;
+  --color-background-quaternary-default: #d2c8b8;
+  --color-background-quaternary-hover:   #b8ac99;
+
+  --color-border-button-default:        #ddd5c6;
+  --color-border-button-hover:          #c8beac;
+  --color-border-button-active:         #9e9487;
+  --color-border-checkbox-default:      #c8beac;
+  --color-border-checkbox-hover:        #9e9487;
+  --color-border-checkbox-active:       #9e9487;
+  --color-border-component-detail-container: #e3dcd0;
+  --color-border-ai-profile-card:       #e3dcd0;
+  --color-border-table:                 #e3dcd0;
+  --color-border-button-group:          #ddd5c6;
+  --color-border-sidebar-profile-hover: #c8beac;
+  --color-separator-border:             #e3dcd0;
+  --color-separator-border-strong:      #d2c8b8;
+
+  --surface-main-backdrop: linear-gradient(
+    180deg,
+    color-mix(in srgb, #f5efe6 45%, #fbf9f5) 0%,
+    #fbf9f5 140px
+  );
+  --surface-sidebar-backdrop: none;
+  --shadow-main-panel: -3px 0 16px -6px rgb(45 34 20 / 0.07);
+  --color-sidebar-row-selected-bg: #fffdf9;
+  --shadow-sidebar-row-selected:
+    0 1px 2px 0 rgb(45 34 20 / 0.06),
+    0 0 0 1px rgb(45 34 20 / 0.07);
+  --color-tabstrip-bg: #f5f0e7;
+  --color-tab-active-bg: #fffdf9;
+  --color-tab-active-border: rgb(45 34 20 / 0.09);
+  --shadow-tab-active: 0 1px 2px 0 rgb(45 34 20 / 0.06);
+  --shadow-composer:
+    0 4px 18px -4px rgb(45 34 20 / 0.08),
+    0 1px 2px 0 rgb(45 34 20 / 0.04);
+}
+
+html.dark[data-theme-preset="warm"] {
+  --color-text-primary:     #ece7df;
+  --color-text-secondary:   #c7bfb3;
+  --color-text-tertiary:    #9f968a;
+  --color-text-placeholder: #7a7267;
+
+  --color-background-full:              #12100e;
+  --color-background-primary-default:   #1c1917;
+  --color-background-secondary-default: #161412;
+  --color-background-secondary-hover:   #221f1c;
+  --color-background-tertiary-default:  #26221f;
+  --color-background-tertiary-hover:    #342e2a;
+  --color-separator-border:             #2e2925;
+  --color-separator-border-strong:      #3d3630;
+  --color-border-primary:               #3d3630;
+  --color-border-secondary:             #2e2925;
+  --color-border-button-default:        #3d3630;
+  --color-border-button-hover:          #574e46;
+  --color-border-button-active:         #4a423b;
+  --color-border-component-detail-container: #2e2925;
+  --color-border-ai-profile-card:       #2e2925;
+  --color-border-table:                 #2e2925;
+
+  --color-sidebar-row-selected-bg: #26221f;
+  --color-tabstrip-bg: #1c1917;
+  --color-tab-active-bg: #26221f;
+  --color-composer-bg: #231f1c;
+}
+
+html[data-theme-preset="aurora"]:not(.dark) {
+  --color-background-full:
+    color-mix(in srgb, var(--color-accent-50) 40%, #f6f8fc);
+  --color-background-secondary-default:
+    color-mix(in srgb, var(--color-accent-50) 50%, #f1f4f9);
+  --color-background-secondary-hover:
+    color-mix(in srgb, var(--color-accent-100) 45%, #e5eaf2);
+  --color-separator-border:
+    color-mix(in srgb, var(--color-accent-200) 32%, #e2e8f0);
+  --surface-sidebar-backdrop: radial-gradient(
+    120% 60% at 0% 0%,
+    color-mix(in srgb, var(--color-accent-400) 10%, transparent) 0%,
+    transparent 70%
+  );
+  --surface-main-backdrop: radial-gradient(
+    90% 180px at 50% 0%,
+    color-mix(in srgb, var(--color-accent-400) 8%, transparent) 0%,
+    transparent 100%
+  );
+  --shadow-sidebar-row-selected:
+    0 1px 3px 0 color-mix(in srgb, var(--color-accent-500) 12%, rgb(15 23 42 / 0.05)),
+    0 0 0 1px color-mix(in srgb, var(--color-accent-500) 22%, transparent);
+  --color-tabstrip-bg:
+    color-mix(in srgb, var(--color-accent-50) 38%, #f8fafd);
+  --color-tab-active-border:
+    color-mix(in srgb, var(--color-accent-500) 22%, transparent);
+  --shadow-tab-active:
+    0 1px 3px 0 color-mix(in srgb, var(--color-accent-500) 12%, rgb(15 23 42 / 0.05));
+}
+
+html.dark[data-theme-preset="aurora"] {
+  --surface-sidebar-backdrop: radial-gradient(
+    120% 60% at 0% 0%,
+    color-mix(in srgb, var(--color-accent-400) 11%, transparent) 0%,
+    transparent 70%
+  );
+  --surface-main-backdrop: radial-gradient(
+    90% 180px at 50% 0%,
+    color-mix(in srgb, var(--color-accent-400) 9%, transparent) 0%,
+    transparent 100%
+  );
+  --shadow-sidebar-row-selected:
+    0 1px 3px 0 rgb(0 0 0 / 0.35),
+    0 0 0 1px color-mix(in srgb, var(--color-accent-400) 26%, transparent);
+  --color-tab-active-border:
+    color-mix(in srgb, var(--color-accent-400) 24%, transparent);
+}
+
+html[data-theme-preset="classic"]:not(.dark) {
+  --color-foreground-icon-primary:       var(--color-neutral-950);
+  --color-foreground-icon-secondary:     var(--color-neutral-500);
+  --color-foreground-icon-tertiary:      var(--color-neutral-400);
+  --color-foreground-icon-quaternary:    var(--color-neutral-300);
+  --color-foreground-icon-disabled:      var(--color-neutral-300);
+  --color-foreground-disabled:           var(--color-neutral-400);
+  --color-input-disabled-foreground:     var(--color-neutral-300);
+  --color-icon-button-disabled-foreground: var(--color-neutral-300);
+  --color-button-primary-disabled-foreground: var(--color-neutral-400);
+
+  --color-text-primary:     var(--color-neutral-950);
+  --color-text-secondary:   var(--color-neutral-500);
+  --color-text-tertiary:    var(--color-neutral-400);
+  --color-text-disabled:    var(--color-neutral-300);
+  --color-text-placeholder: var(--color-neutral-400);
+  --color-input-disabled-text: var(--color-neutral-300);
+
+  --color-background-full:              var(--color-white);
+  --color-background-primary-default:   var(--color-white);
+  --color-background-inner-default:     var(--color-white);
+  --color-background-primary-hover:     var(--color-neutral-100);
+  --color-background-primary-active:    var(--color-neutral-200);
+  --color-background-primary-disabled:  var(--color-neutral-100);
+  --color-input-disabled-background:    var(--color-neutral-100);
+  --color-background-secondary-default: var(--color-neutral-100);
+  --color-background-secondary-hover:   var(--color-neutral-200);
+  --color-background-tertiary-default:  var(--color-neutral-200);
+  --color-background-tertiary-hover:    var(--color-neutral-300);
+  --color-background-quaternary-default: var(--color-neutral-300);
+  --color-background-quaternary-hover:   var(--color-neutral-400);
+
+  --color-border-button-default:        var(--color-neutral-200);
+  --color-border-button-hover:          var(--color-neutral-300);
+  --color-border-button-active:         var(--color-neutral-400);
+  --color-border-checkbox-default:      var(--color-neutral-300);
+  --color-border-checkbox-hover:        var(--color-neutral-400);
+  --color-border-checkbox-active:       var(--color-neutral-400);
+  --color-border-component-detail-container: var(--color-neutral-200);
+  --color-border-ai-profile-card:       var(--color-neutral-200);
+  --color-border-table:                 var(--color-neutral-200);
+  --color-border-button-group:          var(--color-neutral-200);
+  --color-border-sidebar-profile-hover: var(--color-neutral-300);
+  --color-separator-border:             var(--color-neutral-200);
+  --color-separator-border-strong:      var(--color-neutral-200);
+
+  --surface-main-backdrop: none;
+  --surface-sidebar-backdrop: none;
+  --shadow-main-panel: none;
+  --color-sidebar-row-selected-bg: var(--color-neutral-200);
+  --shadow-sidebar-row-selected: none;
+  --color-tabstrip-bg: var(--color-white);
+  --color-tab-active-bg: var(--color-neutral-100);
+  --color-tab-active-border: transparent;
+  --shadow-tab-active: 0 1px 1px 0 rgb(0 0 0 / 0.04);
 }
 
 /* Re-export semantic tokens as Tailwind utilities. The `inline` form means
@@ -581,6 +947,8 @@
   --color-overlay-backdrop: var(--color-overlay-backdrop);
   --color-effort-flame-wash: var(--color-effort-flame-wash);
 
+  --color-border-primary:          var(--color-border-primary);
+  --color-border-secondary:        var(--color-border-secondary);
   --color-border-button-default:   var(--color-border-button-default);
   --color-border-button-hover:     var(--color-border-button-hover);
   --color-border-button-active:    var(--color-border-button-active);

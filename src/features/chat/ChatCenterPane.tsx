@@ -13,6 +13,7 @@ import { creatorChatWorkspace, startCreatorChat } from "@/features/plugins/hub/c
 import { ReleaseNotesPane } from "@/features/update/ReleaseNotesPane";
 import { focusComposerWhenVisible } from "@/features/chat/focus-composer";
 import { SplitLayout } from "./split/SplitLayout";
+import { ConversationBackdrop } from "./components/ConversationBackdrop";
 import type { ActiveSession } from "./store";
 import { publishChatHostPresence } from "@/features/assistant-notices/host-presence";
 
@@ -32,14 +33,27 @@ const PluginHub = lazy(() =>
 /** One stacked center surface: invisible surfaces stay mounted (never
  * display:none) so WKWebView keeps its scroll boxes and editor drafts
  * alive — see the virtualizer note in FileTree. */
-function Surface({ visible, children }: { visible: boolean; children: ReactNode }) {
+function Surface({
+  visible,
+  backdrop = false,
+  dataSurface,
+  children,
+}: {
+  visible: boolean;
+  backdrop?: boolean;
+  dataSurface?: string;
+  children: ReactNode;
+}) {
   return (
     <div
+      data-surface={dataSurface}
       className={cx(
         "flex min-w-0 flex-col overflow-hidden bg-background-primary-default",
+        backdrop && "isolate [background-image:var(--surface-main-backdrop)]",
         visible ? "relative min-w-0 flex-1 basis-0" : "invisible absolute inset-0",
       )}
     >
+      {backdrop && visible && <ConversationBackdrop />}
       {children}
     </div>
   );
@@ -48,7 +62,7 @@ function Surface({ visible, children }: { visible: boolean; children: ReactNode 
 /** One keep-alive item inside a surface; only the active item is laid out. */
 function SurfaceItem({ active, children }: { active: boolean; children: ReactNode }) {
   return (
-    <div className={cx("min-h-0 flex-col", active ? "flex flex-1" : "invisible absolute inset-0")}>
+    <div className={cx("min-h-0 flex-col", active ? "relative z-10 flex flex-1" : "invisible absolute inset-0")}>
       {children}
     </div>
   );
@@ -247,7 +261,7 @@ export function ChatCenterPane({
       {/* Plugin center tabs: one pane per open tab, keep-alive like the
           other surfaces. */}
       {pluginTabs.length > 0 && (
-        <Surface visible={surfaces.plugin}>
+        <Surface visible={surfaces.plugin} backdrop dataSurface="plugin">
           {pluginTabs.map((tabId) => (
             <PluginCenterTab key={tabId} tabId={tabId} active={tabId === activePluginTabId} />
           ))}

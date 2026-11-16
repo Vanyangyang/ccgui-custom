@@ -4,6 +4,38 @@ use super::*;
 
 const NAMESPACE: &str = "$ccgui-task-parent-wakeup";
 
+/// Query only the outbox namespace; do not checkpoint, consume, or repair rows.
+/// Malformed or future states conservatively retain the shutdown barrier.
+pub(super) fn has_shutdown_activity(conn: &rusqlite::Connection) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM plugin_kv WHERE plugin_id=?1 AND
+         CASE WHEN json_valid(value) THEN COALESCE(json_extract(value,'$.state'), '')
+         NOT IN ('delivered','consumed','cancelled') ELSE 1 END)",
+        [NAMESPACE], |row| row.get(0),
+    ).map_err(|_| "Task continuation activity unavailable".to_string())
+}
+
+#[cfg(test)]
+mod shutdown_activity_tests {
+    use super::*;
+    #[test]
+    fn delayed_continuations_and_uncertainty_block_without_mutating_outbox() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE plugin_kv(plugin_id TEXT,key TEXT,value TEXT);").unwrap();
+        assert!(!has_shutdown_activity(&conn).unwrap());
+        for state in ["pending", "starting", "unknown", "future-state", "delivered", "consumed", "cancelled"] {
+            conn.execute("DELETE FROM plugin_kv", []).unwrap();
+            let raw = json!({"state":state}).to_string();
+            conn.execute("INSERT INTO plugin_kv VALUES(?1,'branch',?2)", params![NAMESPACE, raw]).unwrap();
+            assert_eq!(has_shutdown_activity(&conn).unwrap(), !matches!(state, "delivered" | "consumed" | "cancelled"));
+            let stored: String = conn.query_row("SELECT value FROM plugin_kv", [], |row| row.get(0)).unwrap();
+            assert_eq!(stored, raw);
+        }
+        conn.execute("UPDATE plugin_kv SET value='invalid'", []).unwrap();
+        assert!(has_shutdown_activity(&conn).unwrap());
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ParentWakeup {

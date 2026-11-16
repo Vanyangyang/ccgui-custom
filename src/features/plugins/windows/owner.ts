@@ -5,7 +5,7 @@ import {
   type OwnerIdentity, type ReturnedEvent, type ReturnBlockedEvent,
 } from "./protocol";
 import { createSnapshotReader, createSnapshotUpdate } from "./json-snapshot";
-import { assertRuntimeSubmissionAllowed, registerRuntimeCheckpointBlocker } from "@/lib/runtime-checkpoint";
+import { assertRuntimeSubmissionAllowed, beginRuntimeOperation, registerRuntimeCheckpointBlocker } from "@/lib/runtime-checkpoint";
 import { registerPluginTabLifecycle } from "../runtime/center-tabs";
 
 export type Presentation = "docked" | "detached";
@@ -234,8 +234,13 @@ export function createDetachedSurfaceOwner(options: DetachedSurfaceOwnerOptions)
     schedulePublication();
   });
   function stopHeartbeat() { if (heartbeat) clearInterval(heartbeat); heartbeat = undefined; }
-  async function respond(event: Pick<ActionEvent, "windowId" | "registrationId" | "sequence">, receipt: ActionReceipt, report = true): Promise<"accepted" | "expired" | "retry"> {
+  async function respond(event: Pick<ActionEvent, "windowId" | "registrationId" | "sequence">, receipt: ActionReceipt, report = true, operationOwned = false): Promise<"accepted" | "expired" | "retry"> {
     if (disposed || !sameWindow(identity, event)) return "retry";
+    let done: (() => void) | undefined;
+    if (!operationOwned) {
+      try { done = beginRuntimeOperation("plugin-window-response"); }
+      catch { return "retry"; } // A held response is retained, never recomputed.
+    }
     try {
       if (incremental) {
         const { snapshot: current, ...result } = receipt;
@@ -250,15 +255,15 @@ export function createDetachedSurfaceOwner(options: DetachedSurfaceOwnerOptions)
       if (reason === "plugin_window_action_not_pending_or_expired") { fail("Detached action result is no longer retained"); return "expired"; }
       fail("Unable to confirm detached action result");
       return "retry";
-    }
+    } finally { done?.(); }
   }
-  async function confirm(sequence: number, report = false) {
+  async function confirm(sequence: number, report = false, operationOwned = false) {
     const pending = confirmations.get(sequence);
     if (!pending || pending.sending || disposed || !sameWindow(identity, pending.event)) return;
     pending.sending = true;
     // Only resend an already computed result. The action callback is never run
     // again, and snapshots are shared/current rather than retained per attempt.
-    const outcome = await respond(pending.event, { ...pending.result, snapshot }, report);
+    const outcome = await respond(pending.event, { ...pending.result, snapshot }, report, operationOwned);
     pending.sending = false;
     if (outcome !== "retry" && confirmations.get(sequence) === pending) {
       confirmations.delete(sequence); confirmationBytes -= pending.bytes;
@@ -284,36 +289,47 @@ export function createDetachedSurfaceOwner(options: DetachedSurfaceOwnerOptions)
     }
     nextSequence++;
     const target = identity;
-    const receipt = execution.then(async (): Promise<ActionReceipt> => {
-      if (disposed || identity !== target) return { sequence: event.sequence, ok: false, error: "Owner unavailable", snapshot };
-      try {
-        assertRuntimeSubmissionAllowed();
-        const value = await options.dispatch(action);
-        refreshSnapshot();
-        return { sequence: event.sequence, ok: true, value: copyJson(value === undefined ? null : value, MAX_RESULT_BYTES), snapshot };
-      } catch {
-        try { refreshSnapshot(); } catch { /* Keep the last valid snapshot. */ }
-        return { sequence: event.sequence, ok: false, error: "Detached action failed", snapshot };
+    // Own accepted work before enqueueing, including time behind another action.
+    // Disposal cannot release this ownership while dispatch/response is in flight.
+    let done: (() => void) | undefined;
+    try { done = beginRuntimeOperation("plugin-window-action"); } catch { /* Produce the normal failed receipt without dispatch. */ }
+    try {
+      const receipt = execution.then(async (): Promise<ActionReceipt> => {
+        if (disposed || identity !== target) return { sequence: event.sequence, ok: false, error: "Owner unavailable", snapshot };
+        try {
+          if (!done) throw new Error("Runtime submissions paused");
+          assertRuntimeSubmissionAllowed();
+          const value = await options.dispatch(action);
+          refreshSnapshot();
+          return { sequence: event.sequence, ok: true, value: copyJson(value === undefined ? null : value, MAX_RESULT_BYTES), snapshot };
+        } catch {
+          try { refreshSnapshot(); } catch { /* Keep the last valid snapshot. */ }
+          return { sequence: event.sequence, ok: false, error: "Detached action failed", snapshot };
+        }
+      });
+      execution = receipt.then(() => {});
+      const entry = { action: actionKey, receipt: receipt as Promise<ActionReceipt> | undefined };
+      receipts.set(event.sequence, entry);
+      const result = await receipt;
+      if (disposed || identity !== target || !sameWindow(identity, event)) { entry.receipt = undefined; return; }
+      const { snapshot: _snapshot, ...confirmedResult } = result;
+      const bytes = new TextEncoder().encode(JSON.stringify(confirmedResult)).length;
+      if (confirmations.size < 64 && confirmationBytes + bytes <= 16 * 1024 * 1024) {
+        confirmations.set(event.sequence, { event: { windowId: event.windowId, registrationId: event.registrationId, sequence: event.sequence }, result: confirmedResult, bytes, sending: false });
+        confirmationBytes += bytes;
+        await confirm(event.sequence, true, Boolean(done));
+      } else {
+        // A full recovery buffer cannot justify replay or unbounded retention.
+        await respond(event, result, true, Boolean(done));
       }
-    });
-    execution = receipt.then(() => {});
-    const entry = { action: actionKey, receipt: receipt as Promise<ActionReceipt> | undefined };
-    receipts.set(event.sequence, entry);
-    const result = await receipt;
-    if (disposed || identity !== target || !sameWindow(identity, event)) { entry.receipt = undefined; return; }
-    const { snapshot: _snapshot, ...confirmedResult } = result;
-    const bytes = new TextEncoder().encode(JSON.stringify(confirmedResult)).length;
-    if (confirmations.size < 64 && confirmationBytes + bytes <= 16 * 1024 * 1024) {
-      confirmations.set(event.sequence, { event: { windowId: event.windowId, registrationId: event.registrationId, sequence: event.sequence }, result: confirmedResult, bytes, sending: false });
-      confirmationBytes += bytes;
-      await confirm(event.sequence, true);
-    } else {
-      // A full recovery buffer cannot justify replay or unbounded retention.
-      await respond(event, result);
+      // Native owns completed receipts. Retain only the small dedup key, not a snapshot per action.
+      entry.receipt = undefined;
+      if (receipts.size > 128) receipts.delete(receipts.keys().next().value!);
+    } finally {
+      // Computed receipts awaiting a future retry are history, not executing
+      // work. Each actual retry takes its own short-lived response ownership.
+      done?.();
     }
-    // Native owns completed receipts. Retain only the small dedup key, not a snapshot per action.
-    entry.receipt = undefined;
-    if (receipts.size > 128) receipts.delete(receipts.keys().next().value!);
   }
   function receiveReturned(event: ReturnedEvent) {
     if (disposed || event.ownerToken !== ownerToken || event.registrationId !== registrationId || event.tabId !== options.tabId) return;
@@ -447,6 +463,7 @@ export function createDetachedSurfaceOwner(options: DetachedSurfaceOwnerOptions)
   // until that event reopens its tab, even when the user closed the tab while
   // the floating view was active. This blocker has no checkpoint payload.
   const unregisterRuntimeBlocker = registerRuntimeCheckpointBlocker(`plugin-window-owner:${registrationId}`, () =>
-    !disposed && (identity || openPromise || returnPromise) ? ["plugin-window-without-checkpoint"] : []);
+    !disposed && (identity || openPromise || returnPromise) ? ["plugin-window-without-checkpoint"] : [],
+    () => !disposed && (openPromise || returnPromise) ? ["plugin-window-transition"] : []);
   return { checkpointParticipant: `plugin-window-owner:${registrationId}`, open, present, restore, flushPresentation, focusMain, cancelRestore: () => { intentRevision++; }, returnToMain, dispose, getStatus: () => status, subscribeStatus(listener) { statusListeners.add(listener); return () => { statusListeners.delete(listener); }; } };
 }

@@ -21,10 +21,13 @@ struct State {
     backoff: Option<Instant>,
     failures: u32,
     stopped: bool,
+    admission_pauses: usize,
     active: Option<(u64, String, String, watch::Sender<bool>)>,
     cancelled_requests: VecDeque<(Instant, String, String)>,
 }
 pub(crate) struct Foreground(Arc<Gate>);
+/// Stops new preparation/admission without cancelling an already accepted lease.
+pub(crate) struct AdmissionPause(Arc<Gate>);
 pub(crate) struct Lease {
     gate: Arc<Gate>,
     pub epoch: u64,
@@ -64,6 +67,7 @@ impl Gate {
             backoff: None,
             failures: 0,
             stopped: false,
+            admission_pauses: 0,
             active: None,
             cancelled_requests: VecDeque::new(),
         }))
@@ -125,6 +129,9 @@ impl Gate {
     }
     pub fn read_epoch(&self, busy: impl FnOnce() -> bool, paused: bool) -> Result<u64, ()> {
         let mut s = self.0.lock();
+        if s.admission_pauses > 0 {
+            return Err(());
+        }
         if paused || s.stopped {
             Self::invalidate(&mut s);
             return Err(());
@@ -143,6 +150,11 @@ impl Gate {
         s.epoch == epoch && (s.foreground == 0 || s.sent_epoch == Some(epoch)) && !s.stopped
     }
     fn delay(s: &mut State, now: Instant, registry_busy: bool, paused: bool) -> u64 {
+        // Shutdown preparation must not turn a status read into cancellation,
+        // even after the native worker admission fence becomes paused.
+        if s.admission_pauses > 0 {
+            return 30_000;
+        }
         if paused || s.stopped {
             Self::invalidate(s);
             return 30_000;
@@ -236,6 +248,18 @@ impl Gate {
         s.failures = 0;
         s.backoff = None;
     }
+    pub fn pause_admission(self: &Arc<Self>) -> AdmissionPause {
+        self.0.lock().admission_pauses += 1;
+        AdmissionPause(self.clone())
+    }
+    pub fn has_active_work(&self) -> bool {
+        self.0.lock().active.is_some()
+    }
+}
+impl Drop for AdmissionPause {
+    fn drop(&mut self) {
+        self.0 .0.lock().admission_pauses -= 1;
+    }
 }
 impl Drop for Foreground {
     fn drop(&mut self) {
@@ -267,12 +291,47 @@ pub(crate) fn foreground() -> Foreground {
 pub(crate) fn cancel_all(shutdown: bool) {
     GATE.cancel(None, shutdown);
 }
+pub(crate) fn pause_admission() -> AdmissionPause {
+    GATE.pause_admission()
+}
+pub(crate) fn has_active_work() -> bool {
+    GATE.has_active_work()
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     fn ready() -> Arc<Gate> {
         Gate::test_ready()
+    }
+    #[tokio::test]
+    async fn shutdown_admission_pause_preserves_sent_work_and_releases_by_ownership() {
+        let g = ready();
+        let mut lease = g.admit("p", "sent", || false, false).unwrap();
+        assert!(lease.mark_sent());
+        let epoch = lease.epoch;
+        let pause = g.pause_admission();
+        let nested_pause = g.pause_admission();
+        assert!(g.has_active_work());
+        for paused in [false, true] {
+            assert!(g.read_epoch(|| false, paused).is_err());
+            assert!(g.status(|| false, paused) > 0);
+            assert!(g.admit("p", "new", || false, paused).is_err());
+            assert_eq!(g.epoch(), epoch);
+            assert!(g.valid(epoch));
+            assert!(!*lease.cancelled.borrow());
+        }
+        assert_eq!(lease.run(async { 42 }).await, Ok(42));
+        drop(lease);
+        assert!(!g.has_active_work());
+        drop(pause);
+        assert!(g.read_epoch(|| false, false).is_err());
+        drop(nested_pause);
+        assert_eq!(g.read_epoch(|| false, false), Ok(epoch));
+        // Completion still enforces the existing call cooldown.
+        assert!(g.status(|| false, false) > 59_000);
+        g.0.lock().calls.clear();
+        assert!(g.admit("p", "after-shutdown-cancelled", || false, false).is_ok());
     }
     #[tokio::test]
     async fn sent_request_survives_foreground_but_explicit_cancel_and_maintenance_win() {

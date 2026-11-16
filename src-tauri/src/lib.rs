@@ -29,6 +29,7 @@ pub mod event_sink;
 pub mod files;
 pub mod image_preview;
 pub mod workspace_projects;
+pub mod backdrop;
 pub mod fonts;
 pub mod git;
 pub mod git_worktree;
@@ -73,6 +74,8 @@ mod worker_host;
 mod worker_archive;
 mod handoff;
 mod live_update;
+mod task_shutdown;
+mod task_shutdown_activity;
 mod frontend_assets;
 pub mod settings;
 pub mod skills_hub;
@@ -539,6 +542,7 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             if matches!(event, tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed) {
+                task_shutdown::cancel_on_window_close(window.label());
                 // CloseRequested is important: detached close waits for the
                 // action queue, whose current Handoff may await this dialog.
                 host_confirmation::cancel_parent(window.app_handle(), window.label());
@@ -687,8 +691,9 @@ pub fn run() {
             settings::update_app_settings,
             settings::update_cursor_model_selection,
             settings::set_window_theme,
-            // uploaded font files (设置 → 外观 字体行)
+            // uploaded font files (设置 → 外观 字体行) & custom chat backdrop image
             fonts::read_font_file,
+            backdrop::read_backdrop_image,
             // desktop pet
             pets::pet_list,
             pets::pet_import,
@@ -909,6 +914,9 @@ pub fn run() {
             terminal::terminal_close,
             // metrics
             metrics::app_metrics,
+            task_shutdown::task_shutdown_status,
+            task_shutdown::task_shutdown_set,
+            task_shutdown::task_shutdown_poll,
             metrics::performance_diagnostics,
             metrics::performance_diagnostics_enabled,
             metrics::performance_diagnostics_set_enabled,

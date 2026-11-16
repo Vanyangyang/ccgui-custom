@@ -182,7 +182,7 @@ export function AiChatSidebar({
         "flex h-full shrink-0 flex-col overflow-hidden select-none",
         flat
           ? "bg-background-full"
-          : "bg-background-secondary-default",
+          : "bg-background-secondary-default bg-[image:var(--surface-sidebar-backdrop)]",
         className,
       )}
     >

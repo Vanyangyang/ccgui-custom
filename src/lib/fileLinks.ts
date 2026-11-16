@@ -85,6 +85,41 @@ export function decodeFileLink(url: string) {
   }
 }
 
+/** Decode a local file URL once. Keep the original URL until this boundary:
+ * decoding it earlier would let raw-path handling decode percent signs again
+ * or mistake an encoded filename ending in #L53 / :12 for a source location.
+ * Network authorities, UNC paths and encoded separators are not local links. */
+export function localFileUrlPath(value: string): string | null {
+  if (!/^file:\/\/(?:localhost)?\//i.test(value) || /[\\\u0000-\u001f\u007f]/.test(value)) return null;
+  try {
+    const url = new URL(value);
+    if (url.hostname || /%2f|%5c/i.test(url.pathname)) return null;
+    const path = decodeURIComponent(url.pathname);
+    if (path === "/" || path.startsWith("//") || /[\\\u0000-\u001f\u007f]/.test(path)) return null;
+    // URL pathname keeps the slash before a Windows drive; file IPC does not.
+    return path.replace(/^\/(?=[A-Za-z]:\/)/, "");
+  } catch {
+    return null;
+  }
+}
+
+/** Serialize a resolved filesystem path, not an already-encoded link target. */
+export function toLocalFileUrl(path: string): string | null {
+  if (/[\u0000-\u001f\u007f]/.test(path)) return null;
+  try {
+    if (/^[A-Za-z]:[\\/]/.test(path)) {
+      const normalized = path.replace(/\\/g, "/");
+      return `file:///${normalized.slice(0, 2)}${normalized.slice(2).split("/").map(encodeURIComponent).join("/")}`;
+    }
+    if (path.startsWith("/") && !path.startsWith("//") && !path.includes("\\")) {
+      return `file://${path.split("/").map(encodeURIComponent).join("/")}`;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Resolve a markdown-sourced path to an absolute one. Relative paths anchor
  * at the session's workspace; slash-prefixed Windows drive paths are normalized.
@@ -95,6 +130,7 @@ export function decodeFileLink(url: string) {
  * filesystem never sees `%E7%BB%86…` as a literal name.
  */
 export function resolveFilePath(path: string, workspacePath: string): string | null {
+  if (/^file:/i.test(path.trim())) return localFileUrlPath(path.trim());
   // Strip the leading slash on `/D:/...` (Git-Bash / MSYS style drive prefix)
   // *before* stripping the `:line[:col]` suffix. Doing the location strip
   // first leaves the `/` in place only in odd inputs; normalizing the drive

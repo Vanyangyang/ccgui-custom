@@ -3,6 +3,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
 import i18n from "@/lib/i18n";
 import { applyFontPreferences, readCachedFontPreferences } from "@/features/settings/font";
+import { applyAppearanceTokens, readCachedAppearance } from "@/features/settings/theme";
 import { HostConfirmation } from "./HostConfirmation";
 import type { ConfirmationContent } from "./types";
 
@@ -45,6 +46,7 @@ export function startHostConfirmationApp(): () => void {
   if (import.meta.hot) import.meta.hot.dispose(stop);
   const fail = () => { teardown(true); };
   void (async () => {
+    applyAppearanceTokens(readCachedAppearance(), false);
     applyFontPreferences(readCachedFontPreferences());
     const content = await invoke<ConfirmationContent>("host_confirmation_read");
     if (disposed) return;

@@ -405,7 +405,9 @@ function ThreadItem({
       className={cx(
         "group flex w-full cursor-pointer items-center gap-1.5 rounded-2lg py-[5px] pr-2 transition-colors duration-150 ease motion-reduce:transition-none",
         flat ? "pl-2" : "pl-9",
-        isSelected ? "bg-background-secondary-hover" : "hover:bg-background-secondary-hover",
+        isSelected
+          ? "bg-[color:var(--color-sidebar-row-selected-bg)] [box-shadow:var(--shadow-sidebar-row-selected)]"
+          : "hover:bg-background-secondary-hover/80",
         comms.active && "bg-status-purple-background/50",
         comms.related && "ring-1 ring-inset ring-status-purple-text",
       )}
@@ -428,7 +430,10 @@ function ThreadItem({
           <EngineIcon
             engine={engine}
             size={12}
-            className="size-3 shrink-0 text-foreground-icon-secondary"
+            className={cx(
+              "size-3 shrink-0 transition-colors",
+              isSelected ? "text-accent-600 dark:text-accent-400" : "text-foreground-icon-secondary",
+            )}
           />
         )}
         <ThreadStatusDot streaming={streaming} retrying={retrying} unseen={unseen} />
